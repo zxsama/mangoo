@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-export const INTERFACE_STYLE_STORAGE_KEY = "megle.interfaceStyle";
+export const INTERFACE_STYLE_STORAGE_KEY = "mangoo.interfaceStyle";
 
 // Single screen-space circle model. The hover glow is ONE circle centred on the
 // cursor: full strength inside the bright core, fading to nothing at the sensing

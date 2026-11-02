@@ -1,10 +1,9 @@
 import {
   ChevronDown,
   ChevronRight,
-  Folder,
-  FolderOpen,
   FolderX
-} from "lucide-react";
+} from "../../design/icons";
+import { DEFAULT_FOLDER_COLOR, FolderGlyph } from "./FolderGlyph";
 import type { CSSProperties, RefObject } from "react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { folderShowsOpenIcon, isFolderKnownChildless } from "../../core/folderTreeState";
@@ -196,6 +195,38 @@ export function LibrarySidebar({
   );
 }
 
+type TreeGuide = { color: string; continues: boolean };
+
+/** Row-local segments share the sticky row's clipping and never intercept input. */
+function TreeGuides({ guides }: { guides: TreeGuide[] }) {
+  return <span className="tree-guides" aria-hidden="true">
+    {guides.map((guide, index) => {
+      const directParent = index === guides.length - 1;
+      if (!directParent && !guide.continues) return null;
+      const terminal = directParent && !guide.continues;
+      return <span
+        key={index}
+        className="tree-guide"
+        data-tree-guide-connector={terminal ? "true" : undefined}
+        data-tree-guide-last={terminal ? "true" : undefined}
+        style={{ "--tree-guide-depth": String(index), color: guide.color } as CSSProperties}
+      />;
+    })}
+  </span>;
+}
+
+function folderIsKnownChildless(library: LibraryState, folderId: number, hasChildren?: boolean) {
+  return isFolderKnownChildless({
+    hasChildren,
+    // Ancestor hydration can populate the cache without completing a page.
+    childrenLoaded: library.folderChildNextCursorByParent[folderId] === null,
+    loadedChildCount: library.folderChildrenByParent[folderId]?.length ?? 0,
+    hasMore: Boolean(library.folderChildNextCursorByParent[folderId]),
+    loading: library.loadingFolderIds.has(folderId) || library.loadingMoreFolderIds.has(folderId),
+    loadFailed: library.failedFolderIds.has(folderId)
+  });
+}
+
 function RootNode({
   library,
   root,
@@ -206,28 +237,23 @@ function RootNode({
   library: LibraryState;
   root: RootRecord;
   highlightedFolderId: number | null;
-  onRootContextMenu?: (event: {
-    root: RootRecord;
-    x: number;
-    y: number;
-    shiftKey: boolean;
-  }) => void;
-  onFolderContextMenu?: (event: {
-    folder: FolderRecord;
-    x: number;
-    y: number;
-    shiftKey: boolean;
-  }) => void;
+  onRootContextMenu?: LibrarySidebarProps["onRootContextMenu"];
+  onFolderContextMenu?: LibrarySidebarProps["onFolderContextMenu"];
 }) {
   const rootFolderId = root.rootFolderId;
-  const expanded = rootFolderId ? library.expandedFolderIds.has(rootFolderId) : false;
-  const children = rootFolderId ? library.folderChildrenByParent[rootFolderId] ?? [] : [];
+  const knownChildless = rootFolderId !== null && folderIsKnownChildless(library, rootFolderId);
+  const expandable = rootFolderId !== null && !knownChildless;
+  const expanded = expandable && library.expandedFolderIds.has(rootFolderId);
+  const children = rootFolderId !== null ? library.folderChildrenByParent[rootFolderId] ?? [] : [];
   const selected = root.id === library.selectedRootId && library.selectedFolderId === rootFolderId;
+  const color = root.color ?? DEFAULT_FOLDER_COLOR;
+  const hasMore = rootFolderId !== null && Boolean(library.folderChildNextCursorByParent[rootFolderId]);
 
   return (
     <div className="tree-branch">
       <div
         className={selected ? "tree-item selected" : "tree-item"}
+        data-interactive-pointer-target-selector=".tree-label"
         data-depth="0"
         data-folder-id={rootFolderId ?? undefined}
         data-root-id={root.id}
@@ -235,56 +261,47 @@ function RootNode({
           rootFolderId !== null && rootFolderId === highlightedFolderId ? "true" : undefined
         }
         role="treeitem"
-        aria-expanded={rootFolderId ? expanded : undefined}
+        aria-expanded={expandable ? expanded : undefined}
         aria-selected={selected}
-        onContextMenu={(event) => {
-          if (!onRootContextMenu) return;
-          event.preventDefault();
-          onRootContextMenu({
-            root,
-            x: event.clientX,
-            y: event.clientY,
-            shiftKey: event.shiftKey
-          });
-        }}
-        style={treeItemStyle(0)}
+        style={treeItemStyle(0, color)}
       >
-        <button
+        {expandable ? <button
           className="tree-disclosure"
-          disabled={!rootFolderId}
-          onClick={() => rootFolderId && library.toggleFolderExpanded(rootFolderId)}
+          data-pointer-glow="off"
+          onClick={() => library.toggleFolderExpanded(rootFolderId)}
           type="button"
           aria-label={expanded ? "Collapse root" : "Expand root"}
         >
           {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
-        </button>
+        </button> : <span className="tree-disclosure tree-disclosure--leaf" aria-hidden="true" />}
         <button
           className="tree-label"
           onClick={() => library.setSelectedRootId(root.id)}
+          onContextMenu={(event) => {
+            if (!onRootContextMenu) return;
+            event.preventDefault();
+            onRootContextMenu({ root, x: event.clientX, y: event.clientY, shiftKey: event.shiftKey });
+          }}
           type="button"
         >
-          {root.reachable === false ? (
-            <FolderX size={16} className="tree-root-offline" aria-label="资源库离线" />
-          ) : expanded ? (
-            <FolderOpen size={16} />
-          ) : (
-            <Folder size={16} />
-          )}
-          <span>{root.displayName}</span>
+          <FolderGlyph icon={root.icon} color={root.color} open={folderShowsOpenIcon({ expanded, knownChildless, selected })} />
+          <span className="tree-name">{root.displayName}</span>
+          {root.reachable === false ? <FolderX size={14} className="tree-root-offline" aria-label="资源库离线" /> : null}
+          <span
+            aria-label={`${root.fileCount ?? root.mediaCount} files`}
+            className="tree-media-count"
+            title={`${(root.fileCount ?? root.mediaCount).toLocaleString()} files including subfolders`}
+          >
+            {(root.fileCount ?? root.mediaCount).toLocaleString()}
+          </span>
         </button>
-        <span
-          aria-label={`${root.mediaCount} media files`}
-          className="tree-media-count"
-          title={`${root.mediaCount.toLocaleString()} media files including subfolders`}
-        >
-          {root.mediaCount.toLocaleString()}
-        </span>
       </div>
       {expanded ? (
         <div role="group">
-          {children.map((folder) => (
+          {children.map((folder, index) => (
             <FolderNode
               depth={1}
+              guides={[{ color, continues: index < children.length - 1 || hasMore }]}
               folder={folder}
               key={folder.id}
               library={library}
@@ -292,7 +309,7 @@ function RootNode({
               onFolderContextMenu={onFolderContextMenu}
             />
           ))}
-          <LoadMoreChildren folderId={rootFolderId} library={library} />
+          <LoadMoreChildren folderId={rootFolderId} library={library} guides={[{ color, continues: false }]} />
         </div>
       ) : null}
     </div>
@@ -301,44 +318,32 @@ function RootNode({
 
 function FolderNode({
   depth,
+  guides,
   folder,
   highlightedFolderId,
   library,
   onFolderContextMenu
 }: {
   depth: number;
+  guides: TreeGuide[];
   folder: FolderRecord;
   highlightedFolderId: number | null;
   library: LibraryState;
-  onFolderContextMenu?: (event: {
-    folder: FolderRecord;
-    x: number;
-    y: number;
-    shiftKey: boolean;
-  }) => void;
+  onFolderContextMenu?: LibrarySidebarProps["onFolderContextMenu"];
 }) {
-  const expanded = library.expandedFolderIds.has(folder.id);
   const children = library.folderChildrenByParent[folder.id] ?? [];
   const selected = library.selectedFolderId === folder.id;
-  const loading = library.loadingFolderIds.has(folder.id);
-  // Hide the expand chevron for folders with no subfolders. Core reports
-  // `hasChildren` on every folder row, so a childless folder renders a leaf
-  // marker up front — no chevron that flashes in and then vanishes once an
-  // empty child page loads. The "loaded and empty" clause is a fallback that
-  // also collapses the affordance if a stale `hasChildren: true` turns out empty
-  // after loading. A folder still loading keeps the chevron.
-  const knownChildless = isFolderKnownChildless({
-    hasChildren: folder.hasChildren,
-    childrenLoaded: library.folderChildrenByParent[folder.id] !== undefined,
-    loadedChildCount: children.length,
-    loading
-  });
+  const knownChildless = folderIsKnownChildless(library, folder.id, folder.hasChildren);
+  const expanded = !knownChildless && library.expandedFolderIds.has(folder.id);
   const showsOpenIcon = folderShowsOpenIcon({ expanded, knownChildless, selected });
+  const color = folder.color ?? DEFAULT_FOLDER_COLOR;
+  const hasMore = Boolean(library.folderChildNextCursorByParent[folder.id]);
 
   return (
     <div className="tree-branch">
       <div
         className={selected ? "tree-item selected" : "tree-item"}
+        data-interactive-pointer-target-selector=".tree-label"
         data-depth={depth}
         data-folder-id={folder.id}
         data-root-id={folder.rootId}
@@ -346,23 +351,15 @@ function FolderNode({
         role="treeitem"
         aria-expanded={knownChildless ? undefined : expanded}
         aria-selected={selected}
-        onContextMenu={(event) => {
-          if (!onFolderContextMenu) return;
-          event.preventDefault();
-          onFolderContextMenu({
-            folder,
-            x: event.clientX,
-            y: event.clientY,
-            shiftKey: event.shiftKey
-          });
-        }}
-        style={treeItemStyle(depth)}
+        style={treeItemStyle(depth, color)}
       >
+        <TreeGuides guides={guides} />
         {knownChildless ? (
           <span className="tree-disclosure tree-disclosure--leaf" aria-hidden="true" />
         ) : (
           <button
             className="tree-disclosure"
+            data-pointer-glow="off"
             onClick={() => library.toggleFolderExpanded(folder.id)}
             type="button"
             aria-label={expanded ? "Collapse folder" : "Expand folder"}
@@ -373,24 +370,30 @@ function FolderNode({
         <button
           className="tree-label"
           onClick={() => library.setSelectedFolder(folder)}
+          onContextMenu={(event) => {
+            if (!onFolderContextMenu) return;
+            event.preventDefault();
+            onFolderContextMenu({ folder, x: event.clientX, y: event.clientY, shiftKey: event.shiftKey });
+          }}
           type="button"
         >
-          {showsOpenIcon ? <FolderOpen size={16} /> : <Folder size={16} />}
-          <span>{folder.name}</span>
+          <FolderGlyph icon={folder.icon} color={folder.color} open={showsOpenIcon} size={16} />
+          <span className="tree-name">{folder.name}</span>
+          <span
+            aria-label={`${folder.fileCount ?? folder.mediaCount} files`}
+            className="tree-media-count"
+            title={`${(folder.fileCount ?? folder.mediaCount).toLocaleString()} files including subfolders`}
+          >
+            {(folder.fileCount ?? folder.mediaCount).toLocaleString()}
+          </span>
         </button>
-        <span
-          aria-label={`${folder.mediaCount} media files`}
-          className="tree-media-count"
-          title={`${folder.mediaCount.toLocaleString()} media files including subfolders`}
-        >
-          {folder.mediaCount.toLocaleString()}
-        </span>
       </div>
-      {expanded && !knownChildless ? (
+      {expanded ? (
         <div role="group">
-          {children.map((child) => (
+          {children.map((child, index) => (
             <FolderNode
               depth={depth + 1}
+              guides={[...guides, { color, continues: index < children.length - 1 || hasMore }]}
               folder={child}
               key={child.id}
               library={library}
@@ -398,16 +401,17 @@ function FolderNode({
               onFolderContextMenu={onFolderContextMenu}
             />
           ))}
-          <LoadMoreChildren depth={depth + 1} folderId={folder.id} library={library} />
+          <LoadMoreChildren depth={depth + 1} folderId={folder.id} library={library} guides={[...guides, { color, continues: false }]} />
         </div>
       ) : null}
     </div>
   );
 }
 
-function treeItemStyle(depth: number): CSSProperties {
+function treeItemStyle(depth: number, color = DEFAULT_FOLDER_COLOR): CSSProperties {
   return {
     "--tree-depth": String(depth),
+    "--tree-identity-color": color,
     "--tree-sticky-offset": "0px",
     "--tree-sticky-z": String(80 - Math.min(depth, 60))
   } as CSSProperties;
@@ -462,7 +466,7 @@ function updateTreeStickyOcclusion(sidebar: HTMLElement): void {
   const tree = sidebar.querySelector<HTMLElement>(".tree-list");
   if (!tree) return;
 
-  const rows = Array.from(tree.querySelectorAll<HTMLElement>(".tree-item[role='treeitem']"));
+  const rows = Array.from(tree.querySelectorAll<HTMLElement>(".tree-item[role='treeitem'], .tree-page-row"));
   if (rows.length === 0) return;
 
   const sidebarRect = sidebar.getBoundingClientRect();
@@ -586,7 +590,7 @@ function resolvePinnedClipTops(pinnedLayouts: PinnedTreeRowLayout[]): Map<HTMLEl
 
 function clearTreeStickyOcclusion(sidebar: HTMLElement): void {
   sidebar
-    .querySelectorAll<HTMLElement>(".tree-item[data-tree-sticky-occluded='true']")
+    .querySelectorAll<HTMLElement>("[data-tree-sticky-occluded='true']")
     .forEach(clearTreeRowOcclusion);
   sidebar
     .querySelectorAll<HTMLElement>(".tree-item[data-tree-sticky-pinned='true']")
@@ -619,10 +623,12 @@ function clearTreeRowState(row: HTMLElement): void {
 function LoadMoreChildren({
   depth = 1,
   folderId,
+  guides,
   library
 }: {
   depth?: number;
   folderId: number | null;
+  guides: TreeGuide[];
   library: LibraryState;
 }) {
   if (!folderId || !library.folderChildNextCursorByParent[folderId]) {
@@ -632,14 +638,16 @@ function LoadMoreChildren({
   const loading = library.loadingMoreFolderIds.has(folderId);
 
   return (
-    <button
+    <div className="tree-page-row" style={treeItemStyle(depth)}>
+      <TreeGuides guides={guides} />
+      <button
       className="tree-load-more"
       disabled={loading}
       onClick={() => void library.loadMoreFolderChildren(folderId)}
-      style={{ "--tree-depth": String(depth) } as CSSProperties}
       type="button"
     >
       Load more children
-    </button>
+      </button>
+    </div>
   );
 }

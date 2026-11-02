@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { after, before, describe, it } from "node:test";
-import { createServer, type ViteDevServer } from "vite";
+import { createServer, type ViteDevServer } from "./viteTestServer.mts";
 
 interface RegionalBlurLifecycleResult {
   ok: boolean;

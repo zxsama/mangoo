@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import type { DesktopProcessLogBatch } from "@megle/notification-contract";
+import type { DesktopProcessLogBatch } from "@mangoo/notification-contract";
 import {
   beginNotificationAction,
   notificationOperationActionKey,

@@ -5,19 +5,20 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   createAndActivateManagedLibrary,
-  managedLibraryHostEnv
+  managedLibraryHostEnv,
+  resolveCoreBinary
 } from "../dev/managed-library-harness.mjs";
 
 const root = process.cwd();
 const token = "managed-library-lifecycle-bench";
-const addr = process.env.MEGLE_LIBRARY_BENCH_ADDR ?? "127.0.0.1:47421";
+const addr = process.env.MANGOO_LIBRARY_BENCH_ADDR ?? "127.0.0.1:47421";
 const baseUrl = `http://${addr}/api`;
-const output = process.env.MEGLE_LIBRARY_BENCH_OUTPUT ?? path.join(root, ".tmp", "bench", "managed-library-lifecycle.json");
+const output = process.env.MANGOO_LIBRARY_BENCH_OUTPUT ?? path.join(root, ".tmp", "bench", "managed-library-lifecycle.json");
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lP7zWQAAAABJRU5ErkJggg==", "base64");
 
 async function api(apiPath, init = {}) {
   const headers = new Headers(init.headers);
-  headers.set("x-megle-session", token);
+  headers.set("x-mangoo-session", token);
   if (init.body) headers.set("content-type", "application/json");
   const response = await fetch(`${baseUrl}${apiPath}`, { ...init, headers });
   const text = await response.text();
@@ -55,45 +56,55 @@ function processSample(pid) {
 }
 
 async function main() {
-  const dataDir = await mkdtemp(path.join(tmpdir(), "megle-library-bench-"));
+  const dataDir = await mkdtemp(path.join(tmpdir(), "mangoo-library-bench-"));
   const mediaRoot = path.join(dataDir, "media");
   await mkdir(mediaRoot, { recursive: true });
   await Promise.all(Array.from({ length: 100 }, (_, index) => writeFile(path.join(mediaRoot, `sample-${index}.png`), png)));
-  execFileSync("cargo", ["build", "-q", "-p", "megle-core"], { cwd: root, stdio: "inherit" });
-  const corePath = path.join(root, "target", "debug", process.platform === "win32" ? "megle-core.exe" : "megle-core");
+  if (!process.env.MANGOO_CORE_BINARY) {
+    execFileSync("cargo", ["build", "-q", "-p", "mangoo-core"], { cwd: root, stdio: "inherit" });
+  }
+  const corePath = resolveCoreBinary({ root });
   const core = spawn(corePath, [], {
     cwd: root,
-    env: { ...process.env, ...managedLibraryHostEnv(dataDir), MEGLE_SESSION_TOKEN: token, MEGLE_CORE_ADDR: addr, RUST_LOG: "warn" },
+    env: { ...process.env, ...managedLibraryHostEnv(dataDir), MANGOO_SESSION_TOKEN: token, MANGOO_CORE_ADDR: addr, RUST_LOG: "warn" },
     stdio: ["ignore", "ignore", "inherit"],
     windowsHide: true
   });
   try {
     await waitForHealth();
     const createStarted = performance.now();
-    const first = await createAndActivateManagedLibrary({ baseUrl, token, name: "Baseline A", managedRoot: path.join(dataDir, "library-a") });
+    const first = await createAndActivateManagedLibrary({
+      baseUrl, token, name: "Baseline A",
+      databasePath: path.join(dataDir, "library-a", "Database"),
+      contentRoots: [{ path: mediaRoot, createIfMissing: false }]
+    });
     const firstCreationMs = performance.now() - createStarted;
     const roots = await api("/roots");
     const rootItems = Array.isArray(roots) ? roots : roots.items;
-    const managedRoot = rootItems.find((item) => item.path === first.library.managedRoot);
-    if (!managedRoot) throw new Error(`managed Library root was not registered: ${JSON.stringify(roots)}`);
+    const contentRoot = rootItems.find((item) => path.resolve(item.path) === path.resolve(mediaRoot));
+    if (!contentRoot || rootItems.length !== 1) throw new Error(`Library content root was not registered: ${JSON.stringify(roots)}`);
     const accepted = await api("/tasks/scan", {
       method: "POST",
-      headers: { "x-megle-context-revision": String(first.contextRevision) },
-      body: JSON.stringify({ rootId: managedRoot.id })
+      headers: { "x-mangoo-context-revision": String(first.contextRevision) },
+      body: JSON.stringify({ rootId: contentRoot.id })
     });
     await waitForScan(accepted.taskId);
-    const second = await createAndActivateManagedLibrary({ baseUrl, token, name: "Baseline B", managedRoot: path.join(dataDir, "library-b") });
+    const second = await createAndActivateManagedLibrary({
+      baseUrl, token, name: "Baseline B",
+      databasePath: path.join(dataDir, "library-b", "Database"),
+      contentRoots: [{ path: path.join(dataDir, "library-b", "Files"), createIfMissing: true }]
+    });
 
     let active = await api("/libraries/active");
     const switchMs = [];
     for (let index = 0; index < 20; index += 1) {
       const target = index % 2 === 0 ? first.library.libraryUuid : second.library.libraryUuid;
       const started = performance.now();
-      active = await api(`/libraries/${target}/activate`, { method: "POST", headers: { "x-megle-context-revision": String(active.contextRevision) } });
+      active = await api(`/libraries/${target}/activate`, { method: "POST", headers: { "x-mangoo-context-revision": String(active.contextRevision) } });
       switchMs.push(performance.now() - started);
     }
     if (active.library.libraryUuid !== first.library.libraryUuid) {
-      active = await api(`/libraries/${first.library.libraryUuid}/activate`, { method: "POST", headers: { "x-megle-context-revision": String(active.contextRevision) } });
+      active = await api(`/libraries/${first.library.libraryUuid}/activate`, { method: "POST", headers: { "x-mangoo-context-revision": String(active.contextRevision) } });
     }
 
     const browseMs = [];
@@ -108,7 +119,7 @@ async function main() {
     const afterIdle = processSample(core.pid);
     const report = {
       capturedAtUtc: new Date().toISOString(),
-      environment: { platform: process.platform, arch: process.arch, node: process.version, sampleMedia: 100, idleWindowMs },
+      environment: { platform: process.platform, arch: process.arch, node: process.version, corePath, sampleMedia: 100, idleWindowMs },
       firstCreationMs,
       librarySwitch: { samples: switchMs.length, p50Ms: percentile(switchMs, 0.5), p95Ms: percentile(switchMs, 0.95), maxMs: Math.max(...switchMs) },
       browseHotPath: { samples: browseMs.length, p50Ms: percentile(browseMs, 0.5), p95Ms: percentile(browseMs, 0.95), maxMs: Math.max(...browseMs) },
@@ -133,7 +144,7 @@ async function main() {
         killed.once("close", resolve);
       });
     }
-    if (process.env.MEGLE_LIBRARY_BENCH_KEEP !== "1") await rm(dataDir, { recursive: true, force: true });
+    if (process.env.MANGOO_LIBRARY_BENCH_KEEP !== "1") await rm(dataDir, { recursive: true, force: true });
   }
 }
 

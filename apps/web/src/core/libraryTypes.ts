@@ -10,7 +10,7 @@ export type {
   LibraryPreflightRequest,
   LibraryPreflightResponse,
   LibrarySummary,
-} from "@megle/core-client";
+} from "@mangoo/core-client";
 
 export type LibraryLoadPhase =
   | "starting-core"

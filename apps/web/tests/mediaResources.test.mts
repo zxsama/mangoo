@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import { register } from "node:module";
 import { describe, it } from "node:test";
 
-import type { MediaRecord } from "@megle/core-client";
+import type { MediaRecord } from "@mangoo/core-client";
 
 register("./resolve-source-imports.mjs", import.meta.url);
 (globalThis as typeof globalThis & { window: Record<string, unknown> }).window = {
-  megleDesktop: { coreUrl: "http://127.0.0.1:47321/api" }
+  mangooDesktop: { coreUrl: "http://127.0.0.1:47321/api" }
 };
 
 const {

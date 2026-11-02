@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { registerOverlayScrollbarOwner, resolveOverlayScrollbarOwner } from "../design/overlays/overlayScrollbarOwner";
 
 type ScrollAxis = "vertical" | "horizontal";
 
@@ -31,6 +32,15 @@ export function useOverlayScrollbars() {
     let visibilityObserver: MutationObserver | null = null;
 
     document.body.append(vertical.rail, horizontal.rail);
+    const unregisterOwners = [vertical, horizontal].map((scrollbar) =>
+      registerOverlayScrollbarOwner([scrollbar.rail, scrollbar.thumb], () => {
+        if (!activeElement || document.body.dataset.shellResizing === "true") return null;
+        const canScroll = scrollbar === vertical
+          ? activeElement.scrollHeight > activeElement.clientHeight + 1
+          : activeElement.scrollWidth > activeElement.clientWidth + 1;
+        return canScroll ? activeElement : null;
+      })
+    );
 
     const cleanup = () => {
       if (animationFrame) {
@@ -42,6 +52,7 @@ export function useOverlayScrollbars() {
         scrollIdleFrame = 0;
       }
       visibilityObserver?.disconnect();
+      unregisterOwners.forEach((unregister) => unregister());
       vertical.rail.remove();
       horizontal.rail.remove();
     };
@@ -187,8 +198,8 @@ export function useOverlayScrollbars() {
     }
 
     function handlePointerDown(event: PointerEvent) {
-      const axis = resolveScrollbarAxis(event.target);
-      if (!axis || !activeElement) return;
+      const axis = event.currentTarget === vertical.rail ? "vertical" : "horizontal";
+      if (!activeElement || resolveOverlayScrollbarOwner(event.target) !== activeElement) return;
 
       event.preventDefault();
       const rail = axis === "vertical" ? vertical.rail : horizontal.rail;
@@ -286,8 +297,8 @@ export function useOverlayScrollbars() {
       scheduleOverlaySync();
     }
 
-    vertical.thumb.addEventListener("pointerdown", handlePointerDown);
-    horizontal.thumb.addEventListener("pointerdown", handlePointerDown);
+    vertical.rail.addEventListener("pointerdown", handlePointerDown);
+    horizontal.rail.addEventListener("pointerdown", handlePointerDown);
     vertical.thumb.addEventListener("pointerenter", handleVerticalThumbEnter);
     horizontal.thumb.addEventListener("pointerenter", handleHorizontalThumbEnter);
     vertical.thumb.addEventListener("pointerleave", handleVerticalThumbLeave);
@@ -310,14 +321,15 @@ export function useOverlayScrollbars() {
 
     document.addEventListener("pointermove", handlePointerMove, { passive: true });
     document.addEventListener("pointerup", handlePointerUp);
+    document.addEventListener("pointercancel", handlePointerUp);
     document.addEventListener("scroll", handleScroll, true);
-    window.addEventListener("megle:shell-resize-state", handleShellResizeState);
+    window.addEventListener("mangoo:shell-resize-state", handleShellResizeState);
     window.addEventListener("resize", handleResize, { passive: true });
 
     return () => {
       activeElement?.removeEventListener("scroll", scheduleOverlaySync);
-      vertical.thumb.removeEventListener("pointerdown", handlePointerDown);
-      horizontal.thumb.removeEventListener("pointerdown", handlePointerDown);
+      vertical.rail.removeEventListener("pointerdown", handlePointerDown);
+      horizontal.rail.removeEventListener("pointerdown", handlePointerDown);
       vertical.thumb.removeEventListener("pointerenter", handleVerticalThumbEnter);
       horizontal.thumb.removeEventListener("pointerenter", handleHorizontalThumbEnter);
       vertical.thumb.removeEventListener("pointerleave", handleVerticalThumbLeave);
@@ -328,8 +340,9 @@ export function useOverlayScrollbars() {
       horizontal.rail.removeEventListener("pointerleave", handleHorizontalRailLeave);
       document.removeEventListener("pointermove", handlePointerMove);
       document.removeEventListener("pointerup", handlePointerUp);
+      document.removeEventListener("pointercancel", handlePointerUp);
       document.removeEventListener("scroll", handleScroll, true);
-      window.removeEventListener("megle:shell-resize-state", handleShellResizeState);
+      window.removeEventListener("mangoo:shell-resize-state", handleShellResizeState);
       window.removeEventListener("resize", handleResize);
       cleanup();
     };
@@ -345,12 +358,12 @@ function readOverlayScrollbarInset(element: HTMLElement, propertyName: string) {
 function createScrollbar(axis: ScrollAxis): ScrollbarElements {
   const rail = document.createElement("div");
   const thumb = document.createElement("div");
-  rail.className = `megle-overlay-scrollbar megle-overlay-scrollbar-${axis}`;
+  rail.className = `mangoo-overlay-scrollbar mangoo-overlay-scrollbar-${axis}`;
   rail.setAttribute("data-scrollbar-visible", "false");
   rail.setAttribute("data-scrollbar-hover", "false");
   rail.setAttribute("data-scrollbar-area-hover", "false");
   rail.setAttribute("data-scrollbar-dragging", "false");
-  thumb.className = "megle-overlay-scrollbar-thumb";
+  thumb.className = "mangoo-overlay-scrollbar-thumb";
   thumb.dataset.scrollbarAxis = axis;
   rail.append(thumb);
   return { rail, thumb };
@@ -367,12 +380,6 @@ function setOverlayVisible(scrollbar: ScrollbarElements, visible: boolean) {
 function resolveThumbSize(viewportSize: number, scrollSize: number, railSize: number) {
   if (scrollSize <= 0 || railSize <= 0) return 0;
   return Math.max(SCROLLBAR_MIN_THUMB_PX, (viewportSize / scrollSize) * railSize);
-}
-
-function resolveScrollbarAxis(target: EventTarget | null): ScrollAxis | null {
-  if (!(target instanceof HTMLElement)) return null;
-  const axis = target.dataset.scrollbarAxis;
-  return axis === "vertical" || axis === "horizontal" ? axis : null;
 }
 
 function isScrollableElement(element: HTMLElement) {

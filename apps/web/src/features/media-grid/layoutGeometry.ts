@@ -1,4 +1,4 @@
-import type { MediaRecord } from "@megle/core-client";
+import type { MediaRecord } from "@mangoo/core-client";
 import { mediaContentSignature } from "../../core/mediaContentSignature.ts";
 import type { LibraryLayoutMode } from "./layoutMode.ts";
 

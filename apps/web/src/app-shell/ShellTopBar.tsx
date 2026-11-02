@@ -10,7 +10,7 @@ import {
   PanelLeftOpen,
   Package,
   Settings
-} from "lucide-react";
+} from "../design/icons";
 import type * as React from "react";
 import type { ComponentProps, ReactNode, RefCallback } from "react";
 import { LiquidGlassButton } from "../design/liquid-glass";
@@ -318,7 +318,7 @@ export function LibraryTitlebarToolbar({
         />
       </div>
       <div className="titlebar-workspace-summary titlebar-library-summary" title={title}>
-        {mediaCount} media
+        {mediaCount} files
         {searchActive ? " / filtered" : ""}
         {scanActive ? " / scanning" : ""}
       </div>

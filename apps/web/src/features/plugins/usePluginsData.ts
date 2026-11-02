@@ -5,10 +5,11 @@ import type {
   HostPluginProjection,
   PluginDiscoveryError,
   PluginDiscoveryResponse
-} from "@megle/core-client";
-import { CoreApiError } from "@megle/core-client";
+} from "@mangoo/core-client";
+import { CoreApiError } from "@mangoo/core-client";
 import { createCoreClient } from "../../core/client";
 import { PLUGINS_QUERY_KEY } from "./usePluginAuth";
+import { broadcastPluginChange, usePluginQuerySync } from "./pluginQuerySync";
 
 export const PLUGIN_LIST_REFRESH_MS = 30_000;
 export const PLUGIN_DISCOVERY_COOLDOWN_MS = 5_000;
@@ -108,6 +109,7 @@ type PluginMutationResult =
 export function usePluginsData(): PluginsState {
   const client = useMemo(() => createCoreClient(), []);
   const queryClient = useQueryClient();
+  usePluginQuerySync(queryClient);
   const mountedRef = useRef(false);
   const [selectedPluginId, setSelectedPluginId] = useState<string | null>(null);
   const [busyPluginIds, setBusyPluginIds] = useState<Set<string>>(() => new Set());
@@ -211,12 +213,14 @@ export function usePluginsData(): PluginsState {
           return { kind: "remove", pluginId: request.pluginId };
       }
     },
-    onMutate: (request) => {
+    onMutate: async (request) => {
       setActionError(null);
       if (request.kind === "remove") setRemovalError(null);
       markBusy(pluginMutationId(request), true);
+      await queryClient.cancelQueries({ queryKey: PLUGINS_QUERY_KEY });
     },
     onSuccess: async (result) => {
+      broadcastPluginChange();
       if (result.kind === "replace") {
         queryClient.setQueryData<HostPluginListResponse>(PLUGINS_QUERY_KEY, (current) => ({
           items: replacePlugin(current?.items ?? [], result.plugin)

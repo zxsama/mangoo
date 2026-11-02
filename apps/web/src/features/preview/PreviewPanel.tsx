@@ -1,8 +1,10 @@
-import { Folder as FolderIcon } from "lucide-react";
+import { FolderGlyph } from "../library/FolderGlyph";
 import { type ReactNode } from "react";
-import type { FolderRecord, MediaRecord, ThumbnailResponse } from "@megle/core-client";
+import type { FolderRecord, MediaRecord, ThumbnailResponse } from "@mangoo/core-client";
 import { MediaLoadingRing } from "../loading/MediaLoadingRing";
 import { MediaPreview } from "./MediaPreview";
+import { FileFormatBadge } from "../media-grid/FileFormatArtwork";
+import { isThumbnailUnavailable } from "../../core/mediaResources";
 
 interface PreviewPanelProps {
   selectedFolder: FolderRecord | null;
@@ -46,6 +48,7 @@ export function PreviewPanel({
                 preserveNaturalFrame={false}
                 preferOriginalWhilePending
               />
+              <FileFormatBadge file={selectedMedia} />
             </div>
           ) : null}
           <dl className="metadata-list">
@@ -58,7 +61,7 @@ export function PreviewPanel({
             <dt>Dimensions</dt>
             <dd>{formatDimensions(selectedMedia)}</dd>
             <dt>Thumbnail</dt>
-            <dd>{thumbnailStatus(thumbnail?.state ?? selectedMedia.thumbnailState)}</dd>
+            <dd>{thumbnailStatus(thumbnail?.state ?? (isThumbnailUnavailable(selectedMedia) && selectedMedia.thumbnailState !== "ready" ? "unavailable" : selectedMedia.thumbnailState))}</dd>
           </dl>
           {children}
         </>
@@ -76,7 +79,7 @@ export function PreviewPanel({
               />
             ) : (
               <div className="preview-folder-cover-empty" aria-hidden="true">
-                <FolderIcon size={34} />
+                <FolderGlyph icon={selectedFolder.icon} color={selectedFolder.color} size={34} />
               </div>
             )}
           </div>
@@ -110,6 +113,7 @@ function thumbnailStatus(state: ThumbnailResponse["state"] | string | null | und
   if (state === "skipped_small") {
     return "Skipped";
   }
+  if (state === "unavailable") return "File icon";
   return (
     <span aria-label="Thumbnail refreshing" className="metadata-inline-spinner" role="status">
       <MediaLoadingRing size={16} />

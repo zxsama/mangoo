@@ -16,7 +16,7 @@
 - Disk files are NEVER touched. `file_operations` audit rows are kept (refs go NULL).
 - New task kind wire value: `root_purge`. Update BOTH `contracts/core-api/openapi.yaml` (`TaskKind` enum) and `packages/core-client/src/generated-contract.ts` (`TaskKind` union); `npm run check:core-api` and `check:core-client` must pass.
 - `PURGE_BATCH_SIZE = 5000` (Rust `const`), tuned so one batch's writer job stays short on `thumb_blobs` (BLOB) deletes.
-- Rust: `cargo fmt` clean, `cargo test -p megle-core` green. Web: `npm --workspace @megle/web run typecheck`, `npm --workspace @megle/web run test`, `npm run check:web` green.
+- Rust: `cargo fmt` clean, `cargo test -p mangoo-core` green. Web: `npm --workspace @mangoo/web run typecheck`, `npm --workspace @mangoo/web run test`, `npm run check:web` green.
 - Commit with explicit paths (never `git add -A`). Branch `perf/million-thumbnail-hotloop` (already off master).
 - Spec: `docs/superpowers/specs/2026-07-19-library-folder-hard-delete-design.md`.
 
@@ -111,7 +111,7 @@ fn migration_0019_adds_root_pending_delete_column_and_index() {
 
 - [ ] **Step 4: Run test to verify it fails**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH"; cargo test -p megle-core migration_0019_adds_root_pending_delete -- --nocapture`
+Run: `export PATH="$HOME/.cargo/bin:$PATH"; cargo test -p mangoo-core migration_0019_adds_root_pending_delete -- --nocapture`
 Expected: FAIL — column `pending_delete_at` not present (gate not wired yet).
 
 - [ ] **Step 5: Wire the apply_migrations gate**
@@ -126,7 +126,7 @@ if !self.migration_applied(19)? {
 
 - [ ] **Step 6: Run test to verify it passes**
 
-Run: `cargo test -p megle-core migration_0019_adds_root_pending_delete`
+Run: `cargo test -p mangoo-core migration_0019_adds_root_pending_delete`
 Expected: PASS.
 
 - [ ] **Step 7: Register in the schema check**
@@ -142,7 +142,7 @@ and add to `REQUIRED_INDEXES`:
 
 - [ ] **Step 8: Run the schema check + fmt**
 
-Run: `npm run check:schema && cargo fmt -p megle-core -- --check`
+Run: `npm run check:schema && cargo fmt -p mangoo-core -- --check`
 Expected: PASS (schema check applies all migrations to a temp DB and finds the index).
 
 - [ ] **Step 9: Commit**
@@ -240,7 +240,7 @@ fn mark_root_for_purge_is_o1_and_idempotent() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p megle-core mark_root_for_purge_is_o1_and_idempotent`
+Run: `cargo test -p mangoo-core mark_root_for_purge_is_o1_and_idempotent`
 Expected: FAIL — `MarkRootForPurge`/`mark_root_for_purge` not defined.
 
 - [ ] **Step 3: Implement**
@@ -315,7 +315,7 @@ Note: `tasks` uses `folder_id` only when that column exists; `create_root_scan_t
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p megle-core mark_root_for_purge_is_o1_and_idempotent`
+Run: `cargo test -p mangoo-core mark_root_for_purge_is_o1_and_idempotent`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -415,7 +415,7 @@ Note: `set_rating` is illustrative — during implementation use the actual user
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p megle-core purge_root_next_batch`
+Run: `cargo test -p mangoo-core purge_root_next_batch`
 Expected: FAIL — `purge_root_next_batch` not defined.
 
 - [ ] **Step 3: Implement the stateless batch machine**
@@ -516,7 +516,7 @@ Implementation note: phase 1 deletes `root_purge` tasks too, which would delete 
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p megle-core purge_root_next_batch`
+Run: `cargo test -p mangoo-core purge_root_next_batch`
 Expected: PASS (both tests).
 
 - [ ] **Step 5: Commit**
@@ -591,7 +591,7 @@ fn root_purge_task_drains_root_and_succeeds() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p megle-core root_purge_task_drains_root_and_succeeds`
+Run: `cargo test -p mangoo-core root_purge_task_drains_root_and_succeeds`
 Expected: FAIL — `unsupported task kind: root_purge`.
 
 - [ ] **Step 3: Implement the dispatch branch**
@@ -629,7 +629,7 @@ Adapt the exact writer handle, progress-update helper, and yield mechanism to ma
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p megle-core root_purge_task_drains_root_and_succeeds`
+Run: `cargo test -p mangoo-core root_purge_task_drains_root_and_succeeds`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -674,7 +674,7 @@ fn startup_recovery_reenqueues_purge_for_pending_delete_roots() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p megle-core startup_recovery_reenqueues_purge`
+Run: `cargo test -p mangoo-core startup_recovery_reenqueues_purge`
 Expected: FAIL — `ensure_pending_delete_purge_tasks` not defined.
 
 - [ ] **Step 3: Implement `ensure_pending_delete_purge_tasks` + wire startup**
@@ -720,7 +720,7 @@ database
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p megle-core startup_recovery_reenqueues_purge`
+Run: `cargo test -p mangoo-core startup_recovery_reenqueues_purge`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -748,7 +748,7 @@ Mirror the nearest existing route test (find via `grep -n "remove_root\|async fn
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p megle-core <remove_root_test_name>`
+Run: `cargo test -p mangoo-core <remove_root_test_name>`
 Expected: FAIL (current `remove_root` calls `disable_root`, no purge task).
 
 - [ ] **Step 3: Rewrite `remove_root`**
@@ -778,7 +778,7 @@ Add `use crate::db::MarkRootForPurge;` (or the correct path) at the top of `rout
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p megle-core <remove_root_test_name>`
+Run: `cargo test -p mangoo-core <remove_root_test_name>`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -811,7 +811,7 @@ fn list_roots_and_get_root_hide_pending_delete_roots() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p megle-core list_roots_and_get_root_hide_pending_delete_roots`
+Run: `cargo test -p mangoo-core list_roots_and_get_root_hide_pending_delete_roots`
 Expected: FAIL (root still listed — `mark_root_for_purge` sets `enabled=0`, so `WHERE enabled=1` already hides it; this test may PASS already). If it PASSES, keep the test as a guard and skip step 3. If not, apply step 3.
 
 - [ ] **Step 3: Add explicit guard (defensive, independent of enabled)**
@@ -824,7 +824,7 @@ WHERE roots.enabled = 1 AND roots.pending_delete_at IS NULL
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `cargo test -p megle-core list_roots_and_get_root_hide_pending_delete_roots`
+Run: `cargo test -p mangoo-core list_roots_and_get_root_hide_pending_delete_roots`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -867,7 +867,7 @@ fn commit_scan_batch_refuses_pending_delete_root() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p megle-core commit_scan_batch_refuses_pending_delete_root`
+Run: `cargo test -p mangoo-core commit_scan_batch_refuses_pending_delete_root`
 Expected: FAIL (write currently succeeds; `mark_root_for_purge` sets enabled=0 so `ensure_root_enabled` may already reject — if it PASSES, keep as guard).
 
 - [ ] **Step 3: Extend `ensure_root_enabled_in_transaction`**
@@ -895,7 +895,7 @@ if !ok {
 
 - [ ] **Step 5: Run tests + build**
 
-Run: `cargo test -p megle-core commit_scan_batch_refuses_pending_delete_root && cargo build -p megle-core`
+Run: `cargo test -p mangoo-core commit_scan_batch_refuses_pending_delete_root && cargo build -p mangoo-core`
 Expected: PASS + builds.
 
 - [ ] **Step 6: Commit**
@@ -933,7 +933,7 @@ fn add_root_rejects_path_being_purged() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cargo test -p megle-core add_root_rejects_path_being_purged`
+Run: `cargo test -p mangoo-core add_root_rejects_path_being_purged`
 Expected: FAIL — `add_root` currently re-enables the row.
 
 - [ ] **Step 3: Implement**
@@ -944,7 +944,7 @@ Also: since removal no longer produces `enabled=0`, the `if !enabled { ... }` re
 
 - [ ] **Step 4: Run tests + grep for dead callers**
 
-Run: `cargo test -p megle-core add_root_rejects_path_being_purged && grep -rn "disable_root" crates/core/src`
+Run: `cargo test -p mangoo-core add_root_rejects_path_being_purged && grep -rn "disable_root" crates/core/src`
 Expected: test PASS; `disable_root` has no non-test callers (remove it + its tests).
 
 - [ ] **Step 5: Commit**
@@ -1047,7 +1047,7 @@ Adapt `selectRoot(null)` to the actual selection-clear function in the hook.
 
 - [ ] **Step 6: Typecheck + web tests + boundary check**
 
-Run: `npm --workspace @megle/web run typecheck && npm --workspace @megle/web run test && npm run check:web`
+Run: `npm --workspace @mangoo/web run typecheck && npm --workspace @mangoo/web run test && npm run check:web`
 Expected: PASS.
 
 - [ ] **Step 7: Commit**
@@ -1070,7 +1070,7 @@ Expected: structure, contracts, schema, web, typecheck, and `cargo test --worksp
 
 - [ ] **Step 2: Real-app debug run**
 
-Run: `MEGLE_DEBUG=1 MEGLE_REMOTE_DEBUG=1 npm run dev` (logs to a file). In the app, remove the 652k-file root.
+Run: `MANGOO_DEBUG=1 MANGOO_REMOTE_DEBUG=1 npm run dev` (logs to a file). In the app, remove the 652k-file root.
 Observe / assert:
 - Root disappears from the sidebar immediately; confirm dialog showed the data-loss warning.
 - Core log: `writer running a job` / `writer job closure returned in <Nms>` for purge batches — **no long job**, WAL stays bounded (`wal now <=~64MB`).

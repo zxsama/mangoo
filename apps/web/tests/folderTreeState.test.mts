@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   expandFolderPath,
+  compareFolderRecords,
   folderShowsOpenIcon,
   isFolderKnownChildless,
   mergeFolderAncestorPath,
@@ -30,6 +31,15 @@ function folder(id: number, name: string, parentId: number | null): {
 }
 
 describe("folder tree interaction state", () => {
+  it("keeps descending keyset pages and hydrated ancestors in SQLite BINARY name/id order", () => {
+    const rows = [folder(1, "a", 10), folder(2, "A", 10), folder(3, "\uE000", 10), folder(4, "😀", 10), folder(5, "a", 10)];
+    const sorted = [...rows].sort((a, b) => compareFolderRecords(a, b, "name_desc"));
+    assert.deepEqual(sorted.map(({ id }) => id), [4, 3, 5, 1, 2]);
+    const first = { 10: sorted.slice(0, 2) };
+    const hydrated = mergeFolderChildrenByParent(first, 10, [rows[0]], "name_desc");
+    const paged = mergeFolderChildrenByParent(hydrated, 10, sorted.slice(2), "name_desc");
+    assert.deepEqual(paged[10].map(({ id }) => id), [4, 3, 5, 1, 2]);
+  });
   it("opens only the currently selected leaf icon", () => {
     assert.equal(
       folderShowsOpenIcon({ expanded: true, knownChildless: true, selected: true }),
@@ -82,6 +92,17 @@ describe("folder tree interaction state", () => {
       }),
       false
     );
+  });
+
+  it("keeps unknown, paged, loading, failed and newly populated branches reachable", () => {
+    const empty = { childrenLoaded: false, loadedChildCount: 0, loading: false };
+    assert.equal(isFolderKnownChildless(empty), false, "missing metadata is unknown");
+    assert.equal(isFolderKnownChildless({ ...empty, hasChildren: false }), true);
+    assert.equal(isFolderKnownChildless({ ...empty, childrenLoaded: true }), true);
+    for (const evidence of [{ loadedChildCount: 1 }, { hasMore: true }, { loading: true }, { loadFailed: true }]) {
+      assert.equal(isFolderKnownChildless({ ...empty, hasChildren: false, childrenLoaded: true, ...evidence }), false);
+    }
+    assert.equal(isFolderKnownChildless({ ...empty, hasChildren: true, childrenLoaded: false }), false, "invalidated empty page is unknown again");
   });
 
   it("merges an ancestor path without replacing or duplicating paged children", () => {

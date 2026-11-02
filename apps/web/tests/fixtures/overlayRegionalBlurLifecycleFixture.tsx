@@ -25,8 +25,8 @@ function RegionalBlurLifecycleFixture() {
     const handlePhase = (event: Event) => {
       setPhase((event as CustomEvent<FixturePhase>).detail);
     };
-    window.addEventListener("megle-regional-blur-phase", handlePhase);
-    return () => window.removeEventListener("megle-regional-blur-phase", handlePhase);
+    window.addEventListener("mangoo-regional-blur-phase", handlePhase);
+    return () => window.removeEventListener("mangoo-regional-blur-phase", handlePhase);
   }, []);
 
   return (

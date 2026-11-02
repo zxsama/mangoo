@@ -737,6 +737,7 @@ pub async fn download_candidate_reusing(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::reducer::ProtocolState;
     use crate::sync::types::*;
 
     fn event(library: LibraryUuid, actor: &ActorId, sequence: u64, value: &str) -> EventEnvelope {
@@ -830,6 +831,115 @@ mod tests {
             .await
             .unwrap();
         provider.object_head(context, &key).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn all_file_upgrade_reads_legacy_seed_and_mixed_history_without_rewriting_hashes() {
+        let library = LibraryUuid::new();
+        let actor = ActorId {
+            device_uuid: DeviceUuid::new(),
+            stream_uuid: StreamUuid::new(),
+            actor_epoch: ActorEpochUuid::new(),
+        };
+        let mut legacy = event(library, &actor, 1, "legacy");
+        legacy.reducer_version = 2;
+        let legacy = crate::sync::codec::seal_event(legacy).unwrap();
+        let legacy_bytes = crate::sync::codec::encode_event(&legacy).unwrap();
+        let legacy_hash = legacy.integrity_hash;
+        let mut legacy_location = legacy.clone();
+        legacy_location.operation = crate::sync::types::Operation::SetLocation {
+            revision_uuid: RevisionUuid::new(),
+            parent_uuid: None,
+            name: "e\u{301}".to_owned(),
+            supersedes: Default::default(),
+        };
+        legacy_location = crate::sync::codec::seal_event(legacy_location).unwrap();
+        let mut legacy_state = ProtocolState::default();
+        legacy_state.apply(&legacy_location);
+        let serialized = canonical_bytes(&legacy_state).unwrap();
+        assert!(!String::from_utf8_lossy(&serialized).contains("preserve_legal_name"));
+        let decoded: ProtocolState = serde_json::from_slice(&serialized).unwrap();
+        assert_eq!(canonical_bytes(&decoded).unwrap(), serialized);
+        let legacy_names = crate::sync::reducer::legalize_locations(&decoded, EntityUuid::new());
+        assert_eq!(
+            legacy_names[&legacy_location.entity_uuid].display_name,
+            "\u{e9}"
+        );
+        let mut new_location = legacy_location.clone();
+        new_location.reducer_version = 3;
+        new_location.event_uuid = EventUuid::new();
+        new_location = crate::sync::codec::seal_event(new_location).unwrap();
+        let mut new_state = ProtocolState::default();
+        new_state.apply(&new_location);
+        let new_names = crate::sync::reducer::legalize_locations(&new_state, EntityUuid::new());
+        assert_eq!(
+            new_names[&new_location.entity_uuid].display_name,
+            "e\u{301}"
+        );
+
+        let mut seed = checkpoint(library, vec![legacy.clone()]);
+        seed.reducer_version = 2;
+        seed.digest = [0; 32];
+        seed.digest = sha256(&canonical_bytes(&seed).unwrap());
+        let seed_bytes = canonical_bytes(&seed).unwrap();
+        seed.verify().unwrap();
+        let context = TransportContext {
+            namespace: library.to_string(),
+            binding_epoch: uuid::Uuid::from_u128(1).to_string(),
+            transport_generation: 1,
+        };
+        let provider = crate::sync::provider::InMemorySyncProvider::default();
+        let seed_metadata = put(&provider, &context, &seed, None).await;
+        download_candidate(&provider, &context, &seed_metadata)
+            .await
+            .unwrap();
+        let next = event(library, &actor, 2, "new");
+        assert_eq!(next.reducer_version, 3);
+        let snapshot = checkpoint(library, vec![legacy.clone(), next.clone()]);
+        assert_eq!(snapshot.reducer_version, 3);
+        assert_eq!(snapshot.checkpoint_schema_version, 5);
+        let metadata = put(
+            &provider,
+            &context,
+            &snapshot,
+            Some(hex_hash(&seed_metadata.sha256)),
+        )
+        .await;
+        download_candidate(&provider, &context, &metadata)
+            .await
+            .unwrap();
+        assert_eq!(canonical_bytes(&seed).unwrap(), seed_bytes);
+        assert_eq!(
+            crate::sync::codec::encode_event(&snapshot.events[0]).unwrap(),
+            legacy_bytes
+        );
+        assert_eq!(snapshot.events[0].integrity_hash, legacy_hash);
+        // Match the released v2 client's exact capability predicates: it must
+        // reject both the v3 event and snapshot before projection/scanning.
+        assert_ne!(next.reducer_version, 2);
+        assert_ne!(snapshot.reducer_version, 2);
+        let directory =
+            std::env::temp_dir().join(format!("mangoo-mixed-history-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("catalog.sqlite");
+        {
+            let db = crate::db::Database::open(&path).unwrap();
+            db.apply_migrations().unwrap();
+            db.apply_remote_sync_events(&[legacy, next]).unwrap();
+        }
+        let db = crate::db::Database::open(&path).unwrap();
+        db.apply_migrations().unwrap();
+        let stored: Vec<u8> = db
+            .connection_for_fsops()
+            .query_row(
+                "SELECT payload FROM sync_events WHERE actor_seq=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, legacy_bytes);
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

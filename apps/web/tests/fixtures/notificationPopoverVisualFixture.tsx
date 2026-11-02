@@ -1,7 +1,7 @@
-import { Bell } from "lucide-react";
+import { Bell } from "../../src/design/icons";
 import { StrictMode, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import type { ThumbnailFailureDetail } from "@megle/notification-contract";
+import type { ThumbnailFailureDetail } from "@mangoo/notification-contract";
 import "../../src/styles.css";
 import "../../src/design/overlays/overlay.css";
 import { LiquidGlassButton, LiquidGlassLayer } from "../../src/design/liquid-glass";

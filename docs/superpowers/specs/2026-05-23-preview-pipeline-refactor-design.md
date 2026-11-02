@@ -1,10 +1,10 @@
-# Megle Preview Pipeline Refactor Design
+# Mangoo Preview Pipeline Refactor Design
 
 Updated: 2026-05-23
 
 ## 1. 背景
 
-Megle 当前的预览链路仍然基于 Phase 7 的单一缩略图模型：
+Mangoo 当前的预览链路仍然基于 Phase 7 的单一缩略图模型：
 
 - Core 只维护 `grid_320` 一档缩略图状态。
 - 持久化资产落在数据库旁的 `thumbnail-cache/` 文件树。
@@ -269,7 +269,7 @@ HTTP 端点映射：
 
 返回响应头新增：
 
-- `x-megle-served-by`
+- `x-mangoo-served-by`
 
 ### 7.4 `/api/media/{fileId}/preview`
 
@@ -458,7 +458,7 @@ Web 侧统一通过 core-client 消费：
 要求至少一次真实 GUI smoke：
 
 - `npm run dev`
-- 配合 `MEGLE_AUTO_ADD_ROOT`
+- 配合 `MANGOO_AUTO_ADD_ROOT`
 - 观察首帧 placeholder、右侧轻预览、中央原图替换是否符合预期
 
 ## 12. 交付判定

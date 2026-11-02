@@ -298,7 +298,7 @@ test("failed shutdown can retry without reopening library work", async () => {
   await assert.rejects(queue.enqueue(async () => "unreachable"), LifecycleClosedError);
 });
 
-test("health timeout aborts a connected request that never returns headers", async () => {
+test("health timeout aborts a connected request that never returns headers", async (context) => {
   const accepted = deferred();
   const sockets: Array<{ destroyed: boolean }> = [];
   const server = createServer(() => accepted.resolve());
@@ -306,25 +306,40 @@ test("health timeout aborts a connected request that never returns headers", asy
   const baseUrl = await listenOnLoopback(server);
   const controller = new AbortController();
   const baselineAbortListeners = getEventListeners(controller.signal, "abort").length;
+  // Keep the safety guard on the real clock. Advance the production request's
+  // 50 ms deadline only after a real connection is accepted; cold fetch startup
+  // can otherwise consume the deadline and leave accepted.promise unresolved.
+  const clearSafetyTimeout = clearTimeout;
   const safetyAbort = setTimeout(
     () => controller.abort(new Error("test safety abort")),
     750
   );
-  const startedAt = performance.now();
+  context.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const startedAt = Date.now();
   try {
+    let settled = false;
     const rejection = assert.rejects(
       waitForCoreHealth(baseUrl, "session-token", 50, controller.signal),
       /Core did not become healthy|timed out/i
-    );
-    await accepted.promise;
+    ).finally(() => { settled = true; });
+    await Promise.race([
+      accepted.promise,
+      rejection.then(() => { throw new Error("health request settled before accepting a connection"); })
+    ]);
+    context.mock.timers.tick(24);
+    await Promise.resolve();
+    assert.equal(settled, false, "connected health request must not time out before its deadline");
+    context.mock.timers.tick(26);
     await rejection;
-    const elapsedMs = performance.now() - startedAt;
+    const elapsedMs = Date.now() - startedAt;
     assert.ok(elapsedMs >= 25, `health timeout fired too early after ${elapsedMs}ms`);
     assert.ok(elapsedMs < 500, `health timeout remained pending for ${elapsedMs}ms`);
     assert.equal(getEventListeners(controller.signal, "abort").length, baselineAbortListeners);
   } finally {
-    clearTimeout(safetyAbort);
+    clearSafetyTimeout(safetyAbort);
+    controller.abort();
     await closeHttpServer(server);
+    context.mock.timers.reset();
   }
   assert.ok(sockets.length > 0, "health request must establish a real server connection");
   assert.ok(sockets.every((socket) => socket.destroyed), "server sockets must close after timeout");
@@ -385,7 +400,7 @@ test("healthy Core response completes without retaining lifecycle listeners", as
   let observedSession = "";
   const server = createServer((request, response) => {
     observedPath = request.url ?? "";
-    observedSession = String(request.headers["x-megle-session"] ?? "");
+    observedSession = String(request.headers["x-mangoo-session"] ?? "");
     response.writeHead(200, { "content-type": "application/json" });
     response.end('{"status":"ok"}');
   });

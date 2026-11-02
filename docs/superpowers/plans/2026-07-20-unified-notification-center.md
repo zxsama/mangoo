@@ -121,7 +121,7 @@ test("ackNotificationOutbox posts the committed high-water sequence", async () =
 
 - [ ] **Step 2: Run the tests and confirm the methods are absent**
 
-Run: `npm --workspace @megle/core-client run test -- --test-name-pattern="NotificationOutbox"`
+Run: `npm --workspace @mangoo/core-client run test -- --test-name-pattern="NotificationOutbox"`
 
 Expected: FAIL because `listNotificationOutbox` and `ackNotificationOutbox` do not exist.
 
@@ -351,7 +351,7 @@ Run:
 
 ```powershell
 npm run check:schema
-cargo test -p megle-core migration_0021 -- --nocapture
+cargo test -p mangoo-core migration_0021 -- --nocapture
 ```
 
 Expected: PASS.
@@ -417,7 +417,7 @@ fn acknowledged_events_replay_safely_and_dirty_heads_recover() {
 
 - [ ] **Step 2: Run the focused test and confirm failure**
 
-Run: `cargo test -p megle-core notification_outbox -- --nocapture`
+Run: `cargo test -p mangoo-core notification_outbox -- --nocapture`
 
 Expected: FAIL because the module and methods are absent.
 
@@ -471,7 +471,7 @@ Recovery marks non-task heads left pending/running after a Core crash as failed 
 
 - [ ] **Step 6: Verify and commit**
 
-Run: `cargo test -p megle-core notification_outbox -- --nocapture`
+Run: `cargo test -p mangoo-core notification_outbox -- --nocapture`
 
 Expected: PASS.
 
@@ -544,8 +544,8 @@ Seed files and folders, start root purge, and assert the first running snapshot 
 Run:
 
 ```powershell
-cargo test -p megle-core root_scan_lifecycle_updates_one_notification_operation -- --nocapture
-cargo test -p megle-core root_purge_notification -- --nocapture
+cargo test -p mangoo-core root_scan_lifecycle_updates_one_notification_operation -- --nocapture
+cargo test -p mangoo-core root_purge_notification -- --nocapture
 ```
 
 Expected: FAIL.
@@ -574,8 +574,8 @@ Before the first purge batch, compute the bounded purge work total from the exac
 Run:
 
 ```powershell
-cargo test -p megle-core task_lifecycle -- --nocapture
-cargo test -p megle-core root_purge -- --nocapture
+cargo test -p mangoo-core task_lifecycle -- --nocapture
+cargo test -p mangoo-core root_purge -- --nocapture
 ```
 
 Expected: PASS, including existing root-purge recovery tests.
@@ -611,7 +611,7 @@ assert_eq!(head.total_value, Some(3));
 
 - [ ] **Step 2: Run focused tests and confirm failure**
 
-Run: `cargo test -p megle-core fsops::tests -- --nocapture`
+Run: `cargo test -p mangoo-core fsops::tests -- --nocapture`
 
 Expected: FAIL on the missing group field and head.
 
@@ -628,8 +628,8 @@ After each item audit transaction, update the operation head's progress. Apply t
 Run:
 
 ```powershell
-cargo test -p megle-core fsops::tests -- --nocapture
-cargo test -p megle-core file_ops -- --nocapture
+cargo test -p mangoo-core fsops::tests -- --nocapture
+cargo test -p mangoo-core file_ops -- --nocapture
 ```
 
 Expected: PASS.
@@ -656,7 +656,7 @@ Add tests for immediate data, timeout-empty response, wake-after-commit, replay-
 
 - [ ] **Step 2: Run route tests and confirm 404**
 
-Run: `cargo test -p megle-core notification_outbox_route -- --nocapture`
+Run: `cargo test -p mangoo-core notification_outbox_route -- --nocapture`
 
 Expected: FAIL with route not found.
 
@@ -691,7 +691,7 @@ Ok(Json(outbox_response(read_outbox(&state, query.after_sequence, limit).await?)
 Run:
 
 ```powershell
-cargo test -p megle-core notification_outbox_route -- --nocapture
+cargo test -p mangoo-core notification_outbox_route -- --nocapture
 npm run check:core-api
 ```
 
@@ -733,7 +733,7 @@ it("commits operation revisions and cursor atomically", async () => {
 
 - [ ] **Step 2: Run the test and confirm missing modules**
 
-Run: `npm --workspace @megle/desktop run test -- --test-name-pattern="notification store"`
+Run: `npm --workspace @mangoo/desktop run test -- --test-name-pattern="notification store"`
 
 Expected: FAIL because the store does not exist.
 
@@ -805,8 +805,8 @@ Change only the desktop test command to suppress Node 22's known warning:
 Run:
 
 ```powershell
-npm --workspace @megle/desktop run test -- --test-name-pattern="notification store"
-npm --workspace @megle/desktop run typecheck
+npm --workspace @mangoo/desktop run test -- --test-name-pattern="notification store"
+npm --workspace @mangoo/desktop run typecheck
 ```
 
 Expected: PASS.
@@ -855,7 +855,7 @@ it("does not ack when the global store is unavailable", async () => {
 
 - [ ] **Step 2: Run the tests and confirm failure**
 
-Run: `npm --workspace @megle/desktop run test -- --test-name-pattern="notification service"`
+Run: `npm --workspace @mangoo/desktop run test -- --test-name-pattern="notification service"`
 
 Expected: FAIL because `NotificationService` is absent.
 
@@ -896,8 +896,8 @@ Actions reject inactive-library operations with an explicit non-destructive mess
 Run:
 
 ```powershell
-npm --workspace @megle/desktop run test -- --test-name-pattern="notification service"
-npm --workspace @megle/desktop run typecheck
+npm --workspace @mangoo/desktop run test -- --test-name-pattern="notification service"
+npm --workspace @mangoo/desktop run typecheck
 ```
 
 Expected: PASS.
@@ -935,7 +935,7 @@ assert.deepEqual(buffer.snapshot({}).map((line) => line.message), ["two", "three
 
 - [ ] **Step 2: Run and confirm failure**
 
-Run: `npm --workspace @megle/desktop run test -- --test-name-pattern="process log"`
+Run: `npm --workspace @mangoo/desktop run test -- --test-name-pattern="process log"`
 
 Expected: FAIL.
 
@@ -952,8 +952,8 @@ Change `startCoreProcess` to accept an `onLog(source, level, text)` callback. Sp
 Run:
 
 ```powershell
-npm --workspace @megle/desktop run test -- --test-name-pattern="process log"
-npm --workspace @megle/desktop run typecheck
+npm --workspace @mangoo/desktop run test -- --test-name-pattern="process log"
+npm --workspace @mangoo/desktop run typecheck
 ```
 
 Expected: PASS.
@@ -992,7 +992,7 @@ Extend every closed role map and persisted-position reader with `notifications`.
 
 ```ts
 notifications: {
-  title: "Megle 通知中心",
+  title: "Mangoo 通知中心",
   route: "#/notifications",
   width: 1040,
   height: 720,
@@ -1001,7 +1001,7 @@ notifications: {
 }
 ```
 
-Reuse `openSecondaryWindow`; do not add another reveal/material implementation. Add `megle:open-notifications-window` and `megle:close-notifications-window`.
+Reuse `openSecondaryWindow`; do not add another reveal/material implementation. Add `mangoo:open-notifications-window` and `mangoo:close-notifications-window`.
 
 - [ ] **Step 4: Own service startup and library switching in Main**
 
@@ -1013,16 +1013,16 @@ Expose a single nested bridge:
 
 ```ts
 notifications: {
-  getCompactSnapshot: () => ipcRenderer.invoke("megle:notifications-compact"),
-  listHistory: (query) => ipcRenderer.invoke("megle:notifications-history", query),
-  cancel: (libraryId, operationId) => ipcRenderer.invoke("megle:notifications-cancel", libraryId, operationId),
-  retry: (libraryId, operationId) => ipcRenderer.invoke("megle:notifications-retry", libraryId, operationId),
-  reportError: (input) => ipcRenderer.invoke("megle:notifications-report-error", input),
-  publishThumbnailSummary: (input) => ipcRenderer.invoke("megle:notifications-thumbnail-summary", input),
-  onChanged: (cb) => subscribe("megle:notifications-changed", cb),
-  getLogs: (query) => ipcRenderer.invoke("megle:process-logs", query),
-  onLogs: (cb) => subscribe("megle:process-logs-changed", cb),
-  emitRendererLogs: (entries) => ipcRenderer.send("megle:renderer-logs", entries)
+  getCompactSnapshot: () => ipcRenderer.invoke("mangoo:notifications-compact"),
+  listHistory: (query) => ipcRenderer.invoke("mangoo:notifications-history", query),
+  cancel: (libraryId, operationId) => ipcRenderer.invoke("mangoo:notifications-cancel", libraryId, operationId),
+  retry: (libraryId, operationId) => ipcRenderer.invoke("mangoo:notifications-retry", libraryId, operationId),
+  reportError: (input) => ipcRenderer.invoke("mangoo:notifications-report-error", input),
+  publishThumbnailSummary: (input) => ipcRenderer.invoke("mangoo:notifications-thumbnail-summary", input),
+  onChanged: (cb) => subscribe("mangoo:notifications-changed", cb),
+  getLogs: (query) => ipcRenderer.invoke("mangoo:process-logs", query),
+  onLogs: (cb) => subscribe("mangoo:process-logs-changed", cb),
+  emitRendererLogs: (entries) => ipcRenderer.send("mangoo:renderer-logs", entries)
 }
 ```
 
@@ -1036,7 +1036,7 @@ Run:
 
 ```powershell
 npm run check:desktop
-npm --workspace @megle/web run typecheck
+npm --workspace @mangoo/web run typecheck
 ```
 
 Expected: PASS.
@@ -1080,7 +1080,7 @@ it("uses failed over active for the subtle indicator", () => {
 
 - [ ] **Step 2: Run and confirm failure**
 
-Run: `npm --workspace @megle/web run test -- --test-name-pattern="notification"`
+Run: `npm --workspace @mangoo/web run test -- --test-name-pattern="notification"`
 
 Expected: FAIL because the model is absent.
 
@@ -1114,8 +1114,8 @@ export function progressView(operation: DesktopNotificationOperation): ProgressV
 Run:
 
 ```powershell
-npm --workspace @megle/web run test -- --test-name-pattern="notification"
-npm --workspace @megle/web run typecheck
+npm --workspace @mangoo/web run test -- --test-name-pattern="notification"
+npm --workspace @mangoo/web run typecheck
 ```
 
 Expected: PASS.
@@ -1357,7 +1357,7 @@ Replace broad `setError(...)` paths in `useLibraryData` with `reportLibraryError
 Run:
 
 ```powershell
-npm --workspace @megle/web run test -- --test-name-pattern="notification"
+npm --workspace @mangoo/web run test -- --test-name-pattern="notification"
 npm run check:web
 ```
 
@@ -1407,7 +1407,7 @@ Validators must reject reintroduction of separate Tasks/Recent titlebar surfaces
 
 - [ ] **Step 4: Update project documentation**
 
-Add to `README.md` that Megle has a persistent all-library notification center with aggregated task progress and local process logs. Add a `Unified Notification Center` section to `CLAUDE.md` covering:
+Add to `README.md` that Mangoo has a persistent all-library notification center with aggregated task progress and local process logs. Add a `Unified Notification Center` section to `CLAUDE.md` covering:
 
 ```text
 Core library DB -> notification operation head + Outbox
@@ -1483,9 +1483,9 @@ Expected: every command PASS and benchmark invariants hold.
 Run:
 
 ```powershell
-$env:MEGLE_VISUAL_OS_BACKDROP='1'
+$env:MANGOO_VISUAL_OS_BACKDROP='1'
 node .tmp\visual-check\desktop-ui-regression.mjs
-Remove-Item Env:\MEGLE_VISUAL_OS_BACKDROP
+Remove-Item Env:\MANGOO_VISUAL_OS_BACKDROP
 ```
 
 Expected: PASS for the compact popover, one-instance notification window, shared material, titlebar outline, no pane divider, and secondary-window reveal lifecycle.
@@ -1498,7 +1498,7 @@ Using a real library, verify:
 2. Remove a root and confirm determinate progress, final success before task disappearance, and restart recovery.
 3. Run move/rename/delete batches and confirm one logical result per user command.
 4. Generate/scroll thumbnails and confirm one aggregate summary and no per-item notifications.
-5. Switch libraries and restart Megle; confirm all-library history persists with source labels.
+5. Switch libraries and restart Mangoo; confirm all-library history persists with source labels.
 6. Trigger a broad non-blocking error; confirm no center-pane banner and one deduplicated notification.
 7. Open process logs; confirm Main/Core/Renderer sources, filters, pause/follow, copy, and export.
 8. Browse, scroll, resize dividers, switch layouts, and preview media while tasks run; confirm no visible notification-induced stalls or request amplification.

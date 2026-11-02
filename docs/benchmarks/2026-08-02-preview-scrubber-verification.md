@@ -36,7 +36,7 @@ PIN_PERSISTED:              true
 | Never hides mid-drag | Pointer moved to the top of the stage while the button was down — stayed visible |
 | Auto-hide resumes after release | `visible=false` with the pointer still away |
 | Pin defeats auto-hide | `visible=true` with the pointer at the top of the stage |
-| Pin persists | `previewScrubberPinned: true` in `megle.preview.preferences` |
+| Pin persists | `previewScrubberPinned: true` in `mangoo.preview.preferences` |
 
 **Arithmetic cross-check.** 75% of a 31-image folder is index 23, which is
 position **24/31**, and the thumb for index 23 sits at 23/30 = **76.667%**. Both

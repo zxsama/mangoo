@@ -56,7 +56,7 @@ TanStack Virtual
 
 推荐决策：
 
-- Core 以独立进程 `megle-core.exe` 运行。
+- Core 以独立进程 `mangoo-core.exe` 运行。
 - 桌面版通过 localhost HTTP 或 named pipe 调用 Core。
 - API 从第一天按未来 Web/Docker 设计，不把业务逻辑写进 Electron main。
 

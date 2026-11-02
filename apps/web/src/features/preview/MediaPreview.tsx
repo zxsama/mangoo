@@ -1,10 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties, SyntheticEvent } from "react";
 import { flushSync } from "react-dom";
-import type { MediaRecord, ThumbnailResponse } from "@megle/core-client";
+import type { MediaRecord, ThumbnailResponse } from "@mangoo/core-client";
 import {
   mediaContentSignature,
+  mediaPreviewKind,
+  mediaPreviewContentSignature,
   mediaFileContentSignature,
+  isThumbnailUnavailable,
   preloadImageObjectUrl,
   previewPlaceholderDataUrl,
   readCachedThumbnailObjectUrl,
@@ -12,6 +15,7 @@ import {
   requestThumbnailBlob,
   thumbnailObjectUrlCacheKey
 } from "../../core/mediaResources";
+import { FileFormatArtwork } from "../media-grid/FileFormatArtwork";
 import { PreviewCanvas } from "./PreviewCanvas";
 import { selectPreviewRenderLane } from "./previewRenderLane";
 import { resolveVideoPreviewNaturalSize } from "./videoPreviewSizing";
@@ -55,19 +59,22 @@ export function MediaPreview({
   stableFrame?: boolean;
   thumbnail?: ThumbnailResponse;
 }) {
+  const previewKind = mediaPreviewKind(media);
+  const canUseOriginal = previewKind !== "static-thumbnail" || !isThumbnailUnavailable(media);
   const viewportLongPx = usePreviewViewportLongPx();
   const previewPlaceholderUrl = previewPlaceholderDataUrl(media);
   const stableFrameStyle = stableFrame ? previewStableFrameStyle(media) : undefined;
   const shouldPreserveNaturalFrame =
     preserveNaturalFrame ?? (source === "original" && stableFrame);
-  const originalVersionKey = mediaFileContentSignature(media);
+  const originalVersionKey = mediaPreviewContentSignature(media);
   const hasLiveReadyThumbnail = thumbnail?.state === "ready" && thumbnail.updatedAt !== null;
   const shouldUseOriginalWhilePending =
     source === "thumbnail" &&
     preferOriginalWhilePending &&
-    media.kind === "image" &&
+    previewKind === "original-image" &&
     thumbnail?.state !== "failed" &&
     thumbnail?.state !== "skipped_small" &&
+    thumbnail?.state !== "unavailable" &&
     !hasLiveReadyThumbnail;
   const fallbackThumbnail = useThumbnailFallbackUrl(
     source === "original" && hasLiveReadyThumbnail ? media.id : null,
@@ -75,6 +82,16 @@ export function MediaPreview({
     hasLiveReadyThumbnail ? thumbnail.updatedAt : null
   );
   const fallbackUrl = fallbackThumbnail ?? previewPlaceholderUrl;
+  const hasRowReadyThumbnail = media.thumbnailState === "ready";
+  const hasCachedThumbnail = readCachedThumbnailObjectUrl(thumbnailObjectUrlCacheKey(media.id, mediaFileContentSignature(media), null)) !== null;
+  const canLoadThumbnail = hasLiveReadyThumbnail || hasRowReadyThumbnail || hasCachedThumbnail;
+  const showsStaticFallback = !canUseOriginal && !canLoadThumbnail;
+  useEffect(() => {
+    if (!showsStaticFallback) return;
+    onLoadingChange?.(false);
+    onMediaReady?.();
+    onVideoElementChange?.(null);
+  }, [showsStaticFallback, media.id, onLoadingChange, onMediaReady, onVideoElementChange]);
 
   // Gate on the LITERAL `source` prop, not on `shouldUseOriginalWhilePending`.
   // The inspector panel (PreviewPanel.tsx) renders source="thumbnail" with
@@ -82,7 +99,8 @@ export function MediaPreview({
   // bitmap pool would spend the preview budget on thumbnails.
   if (
     source === "original" &&
-    selectPreviewRenderLane({ source, kind: media.kind, ext: media.ext }) === "canvas"
+    canUseOriginal &&
+    selectPreviewRenderLane({ source, kind: media.kind, ext: media.ext, presentation: media.presentation }) === "canvas"
   ) {
     return (
       <PreviewCanvas
@@ -98,13 +116,13 @@ export function MediaPreview({
     );
   }
 
-  if (source === "original" || shouldUseOriginalWhilePending) {
+  if ((source === "original" && canUseOriginal) || shouldUseOriginalWhilePending) {
     return (
       <ReadyPreviewMedia
         alt={media.name}
         fallbackUrl={fallbackUrl}
         frameStyle={stableFrameStyle}
-        kind={media.kind}
+        kind={previewKind === "original-video" ? "video" : "image"}
         media={media}
         onLoadingChange={onLoadingChange}
         onMediaReady={onMediaReady}
@@ -117,12 +135,12 @@ export function MediaPreview({
     );
   }
 
-  if (hasLiveReadyThumbnail) {
+  if (canLoadThumbnail) {
     return (
       <ReadyPreviewMedia
         alt={media.name}
         fallbackUrl={previewPlaceholderUrl}
-        kind={media.kind}
+        kind={previewKind === "original-video" ? "video" : "image"}
         media={media}
         onLoadingChange={onLoadingChange}
         onMediaReady={onMediaReady}
@@ -133,44 +151,11 @@ export function MediaPreview({
     );
   }
 
-  if (thumbnail?.state === "failed") {
-    return (
-      <div className="preview-placeholder failed" style={stableFrameStyle}>
-        <span>thumbnail failed</span>
-      </div>
-    );
-  }
-
-  if (thumbnail?.state === "skipped_small") {
-    if (previewPlaceholderUrl) {
-      return (
-        <PreviewFallbackImage
-          alt={media.name}
-          frameStyle={stableFrameStyle}
-          src={previewPlaceholderUrl}
-          state="skipped"
-        />
-      );
-    }
-    return (
-      <div className="preview-placeholder skipped" style={stableFrameStyle}>
-        <span>{media.kind ?? "file"}</span>
-      </div>
-    );
-  }
-
   if (previewPlaceholderUrl) {
-    return (
-      <PreviewFallbackImage
-        alt={media.name}
-        frameStyle={stableFrameStyle}
-        src={previewPlaceholderUrl}
-        state="pending"
-      />
-    );
+    return <PreviewFallbackImage alt={media.name} frameStyle={stableFrameStyle} src={previewPlaceholderUrl} state="pending" />;
   }
+  return <div className="preview-placeholder file-fallback" style={stableFrameStyle}><FileFormatArtwork file={media} /></div>;
 
-  return <div className="preview-placeholder pending preview-placeholder-empty" style={stableFrameStyle} />;
 }
 
 function schedulePreviewObjectUrlRevoke(objectUrl: string): void {
@@ -502,11 +487,11 @@ function ReadyPreviewMedia({
     />
   ) : null;
 
-  if (error && !src) {
+  if (error) {
     return (
       <>
         <div className="preview-placeholder failed" style={renderedFrameStyle}>
-          <span>load error</span>
+          <FileFormatArtwork file={media} />
         </div>
         {pendingImage}
       </>
@@ -524,7 +509,7 @@ function ReadyPreviewMedia({
     }
     return (
       <>
-        <div className="preview-placeholder pending preview-placeholder-empty" style={renderedFrameStyle} />
+        <div className="preview-placeholder file-fallback" style={renderedFrameStyle}><FileFormatArtwork file={media} /></div>
         {pendingImage}
       </>
     );

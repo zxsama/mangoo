@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SQLite WAL concurrency benchmark for Megle Phase 0.
+SQLite WAL concurrency benchmark for Mangoo Phase 0.
 
 Simulates foreground browse queries while a background worker writes thumbnail
 records. This validates that background indexing/thumbnail updates do not block

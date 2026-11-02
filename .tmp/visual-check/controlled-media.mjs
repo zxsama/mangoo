@@ -3,7 +3,7 @@ import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const FIXTURE_KIND = "megle-task8-controlled-media-v1";
+const FIXTURE_KIND = "mangoo-task8-controlled-media-v1";
 const FIXTURES = [
   { relativePath: "landscape-sample.bmp", width: 1600, height: 900, seed: 17 },
   { relativePath: "portrait-sample.bmp", width: 900, height: 1600, seed: 43 },
@@ -80,7 +80,7 @@ export async function resolveRepositoryRoot(harnessUrl) {
   const candidate = path.resolve(path.dirname(harnessPath), "..", "..");
   try {
     const packageJson = JSON.parse(await readFile(path.join(candidate, "package.json"), "utf8"));
-    if (packageJson.name !== "megle") {
+    if (packageJson.name !== "mangoo") {
       throw new Error(`package name is ${JSON.stringify(packageJson.name)}`);
     }
     await Promise.all([

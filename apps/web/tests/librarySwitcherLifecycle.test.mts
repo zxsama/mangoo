@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { after, before, describe, it } from "node:test";
-import { createServer, type ViteDevServer } from "vite";
+import { createServer, type ViteDevServer } from "./viteTestServer.mts";
 
 interface LibrarySwitcherLifecycleResult {
   ok: boolean;
@@ -270,12 +270,12 @@ describe("mounted LibrarySwitcher lifecycle", () => {
     });
   });
 
-  it("uses one shared roving radio menu for icon and color choices", () => {
-    assert.equal(result.iconMenu.surfaceRole, "group");
-    assert.equal(result.iconMenu.menuRoleCount, 1);
+  it("uses an anchored popup with two keyboard radio groups", () => {
+    assert.equal(result.iconMenu.surfaceRole, "dialog");
+    assert.equal(result.iconMenu.menuRoleCount, 0);
     assert.ok(result.iconMenu.radioItems > 2);
     assert.equal(result.iconMenu.checkedItems, 2);
-    assert.equal(result.iconMenu.rovingTabStops, 1);
+    assert.equal(result.iconMenu.rovingTabStops, 2);
     assert.equal(result.iconMenu.focusedRadioItem, true);
     assert.equal(result.iconMenu.keyboardSelections, 1);
     assert.equal(result.iconMenu.visualGridPresent, true);
@@ -310,18 +310,18 @@ describe("mounted LibrarySwitcher lifecycle", () => {
     });
   });
 
-  it("enrolls an existing selected folder after the native picker closes the switcher on window blur", () => {
+  it("adds folders locally after native picker blur even with a bound Library", () => {
     assert.deepEqual(result.addFolderAfterBlur, {
-      addedPath: null,
-      addCalls: 0,
-      committedRootUuid: "11111111-1111-4111-8111-111111111111",
-      commitCalls: 1,
-      enrollmentMode: "enroll-existing",
+      addedPath: "C:\\Fixture\\selected-folder",
+      addCalls: 1,
+      committedRootUuid: null,
+      commitCalls: 0,
+      enrollmentMode: null,
       enrolledExistingRoot: true,
-      refreshCalls: 1,
+      refreshCalls: 0,
       reloadsAfterSelection: 0,
-      requestedName: "selected-folder",
-      rootFolderUuidIsValid: true,
+      requestedName: null,
+      rootFolderUuidIsValid: false,
       localAddedPath: "C:\\Fixture\\local-folder",
       localAddCalls: 1,
       localEnrollmentCalls: 0,
@@ -333,7 +333,7 @@ describe("mounted LibrarySwitcher lifecycle", () => {
     });
   });
 
-  it("keeps create, restore, and first-run library dialogs open until explicit close", () => {
+  it("keeps local create and first-run dialogs open without built-in restore", () => {
     assert.deepEqual(result.managedLibraryWizard, {
       createPersisted: true,
       explicitCloseRemoved: true,

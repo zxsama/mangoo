@@ -107,6 +107,7 @@ pub fn build_subtree_delete_turn(
         truth.locations.insert(
             revision,
             super::reducer::LocationRevision {
+                preserve_legal_name: false,
                 revision_uuid: revision,
                 parent_uuid: parent
                     .map(|v| Uuid::from_slice(&v).map(super::types::EntityUuid))

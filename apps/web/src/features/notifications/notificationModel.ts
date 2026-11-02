@@ -5,7 +5,7 @@ import type {
   DesktopProcessLogBatch,
   DesktopThumbnailCacheSummary,
   NotificationWindowIntent
-} from "@megle/notification-contract";
+} from "@mangoo/notification-contract";
 
 export type NotificationIndicator = "idle" | "active" | "failure";
 

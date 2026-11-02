@@ -355,6 +355,7 @@ fn start_managed_worker_with_ffmpeg(
                 _ = worker_cancellation.cancelled(), if !receiver_closed => {
                     receiver.close();
                     receiver_closed = true;
+                    invoke_worker_task_hook("worker_stopping", 0, worker_database.path());
                 }
                 maybe_completed_task_id = task_completion_receiver.recv() => {
                     if let Some(completed_task_id) = maybe_completed_task_id {
@@ -466,32 +467,6 @@ fn drain_pending_persisted_tasks(database: &mut Database, ffmpeg_available: bool
     }
 }
 
-fn reconcile_in_flight_thumbnail_task_ids(
-    database: &Database,
-    in_flight_thumbnail_task_ids: &mut HashSet<i64>,
-) {
-    in_flight_thumbnail_task_ids.retain(|task_id| {
-        database
-            .get_task(*task_id)
-            .ok()
-            .flatten()
-            .is_some_and(|task| task.kind == "thumbnail" && task.status == "running")
-    });
-}
-
-fn reconcile_in_flight_non_thumbnail_task_ids(
-    database: &Database,
-    in_flight_non_thumbnail_task_ids: &mut HashSet<i64>,
-) {
-    in_flight_non_thumbnail_task_ids.retain(|task_id| {
-        database
-            .get_task(*task_id)
-            .ok()
-            .flatten()
-            .is_some_and(|task| task.kind != "thumbnail" && task.status == "running")
-    });
-}
-
 fn schedule_pending_worker_tasks_with_concurrency(
     database: &mut Database,
     writer: &DbWriter,
@@ -502,8 +477,9 @@ fn schedule_pending_worker_tasks_with_concurrency(
     in_flight_thumbnail_task_ids: &mut HashSet<i64>,
     in_flight_non_thumbnail_task_ids: &mut HashSet<i64>,
 ) {
-    reconcile_in_flight_thumbnail_task_ids(database, in_flight_thumbnail_task_ids);
-    reconcile_in_flight_non_thumbnail_task_ids(database, in_flight_non_thumbnail_task_ids);
+    // In-flight IDs track native task ownership, not persisted status. A
+    // queued task is still pending; a finished task can still own its Catalog
+    // pin. Only its post-drop completion notification releases ownership.
     let pending_task_ids = match pending_drain_task_ids(database) {
         Ok(ids) => ids,
         Err(error) => {
@@ -524,6 +500,7 @@ fn schedule_pending_worker_tasks_with_concurrency(
             in_flight_non_thumbnail_task_ids,
         );
     }
+    invoke_worker_task_hook("worker_drain", 0, database.path());
 }
 
 #[cfg(test)]
@@ -535,7 +512,6 @@ fn schedule_pending_tasks_with_thumbnail_concurrency(
     thumbnail_completion_sender: &mpsc::UnboundedSender<i64>,
     in_flight_thumbnail_task_ids: &mut HashSet<i64>,
 ) {
-    reconcile_in_flight_thumbnail_task_ids(database, in_flight_thumbnail_task_ids);
     let pending_task_ids = match pending_drain_task_ids(database) {
         Ok(ids) => ids,
         Err(error) => {
@@ -632,6 +608,17 @@ enum ThumbnailSpawnResult {
     Deferred,
 }
 
+struct TaskCompletion {
+    task_id: i64,
+    sender: mpsc::UnboundedSender<i64>,
+}
+
+impl Drop for TaskCompletion {
+    fn drop(&mut self) {
+        let _ = self.sender.send(self.task_id);
+    }
+}
+
 fn try_spawn_thumbnail_task(
     database: &Database,
     writer: &DbWriter,
@@ -662,7 +649,7 @@ fn try_spawn_thumbnail_task(
     let Ok(thumbnail_permit) = semaphore.try_acquire_owned() else {
         return ThumbnailSpawnResult::Deferred;
     };
-    let Ok(Some(mut thumbnail_database)) = database.reopen() else {
+    let Ok(Some(thumbnail_database)) = database.reopen() else {
         // This IS a genuine pending thumbnail task (kind/status already
         // confirmed above) — a reopen failure here must not fall through to
         // an inline run on the shared worker connection (that would bypass
@@ -682,15 +669,27 @@ fn try_spawn_thumbnail_task(
     // per-task worker connection never grows an unbounded WAL.
     let writer = writer.clone();
     tokio::task::spawn_blocking(move || {
+        // Declare completion first, then move the native owners into locals:
+        // reverse drop order also closes them before completion on panic.
+        let _completion = TaskCompletion {
+            task_id,
+            sender: thumbnail_completion_sender,
+        };
         let _thumbnail_permit = thumbnail_permit;
+        let mut thumbnail_database = thumbnail_database;
         run_task(
             &mut thumbnail_database,
             Some(&writer),
             task_id,
             ffmpeg_available,
         );
-        let _ = thumbnail_completion_sender.send(task_id);
+        invoke_worker_task_hook("task_completed", task_id, thumbnail_database.path());
+        // Completion is also the runtime's shutdown fence: retire the pinned
+        // Catalog and admission permit before reporting that this task is done.
+        drop(thumbnail_database);
+        drop(_thumbnail_permit);
     });
+    invoke_worker_task_hook("task_dispatched", task_id, database.path());
     ThumbnailSpawnResult::Spawned
 }
 
@@ -717,7 +716,7 @@ fn try_spawn_non_thumbnail_task(
     let Ok(non_thumbnail_permit) = non_thumbnail_permit.clone().try_acquire_owned() else {
         return ThumbnailSpawnResult::Deferred;
     };
-    let Ok(Some(mut task_database)) = database.reopen() else {
+    let Ok(Some(task_database)) = database.reopen() else {
         // Same reasoning as try_spawn_thumbnail_task: this is a confirmed
         // pending non-thumbnail (root_scan / interactive_folder_scan) task,
         // so a reopen failure must never fall through to an inline run.
@@ -736,10 +735,18 @@ fn try_spawn_non_thumbnail_task(
     // connection never grows an unbounded WAL.
     let writer = writer.clone();
     tokio::task::spawn_blocking(move || {
+        let _completion = TaskCompletion {
+            task_id,
+            sender: task_completion_sender,
+        };
         let _non_thumbnail_permit = non_thumbnail_permit;
+        let mut task_database = task_database;
         run_task(&mut task_database, Some(&writer), task_id, ffmpeg_available);
-        let _ = task_completion_sender.send(task_id);
+        invoke_worker_task_hook("task_completed", task_id, task_database.path());
+        drop(task_database);
+        drop(_non_thumbnail_permit);
     });
+    invoke_worker_task_hook("task_dispatched", task_id, database.path());
     ThumbnailSpawnResult::Spawned
 }
 
@@ -857,6 +864,23 @@ fn handle_task_error_for_attempt(
             return;
         }
     };
+    if task.kind == "thumbnail" {
+        let builtin_source = task
+            .file_id
+            .and_then(|id| database.get_thumbnail_source(id).ok().flatten())
+            .is_some_and(|source| matches!(source.media_kind.as_deref(), Some("image" | "video")));
+        if !builtin_source {
+            // Decoder content failures are committed only while their captured
+            // publication guard is held. The outer worker may run after a new
+            // plugin epoch starts, so it owns task cleanup, never image state.
+            let _ = database.try_mark_task_failed_for_attempt(
+                task_id,
+                attempt_generation,
+                &error_message,
+            );
+            return;
+        }
+    }
     invoke_worker_task_hook("task_failure_transition", task_id, database.path());
     let transition_result = if task.kind == "thumbnail" {
         if let Some(file_id) = task.file_id {
@@ -1001,6 +1025,7 @@ fn run_task_with_database(
                 items_total: None,
                 folders_seen: 0,
                 media_files_seen: 0,
+                files_seen: 0,
                 skipped_files: 0,
             };
             let mut last_flushed_items = -TASK_PROGRESS_FLUSH_INTERVAL_ITEMS;
@@ -1087,6 +1112,7 @@ fn run_task_with_database(
                 items_total: None,
                 folders_seen: summary.folders_seen as i64,
                 media_files_seen: summary.media_files_seen as i64,
+                files_seen: summary.files_seen as i64,
                 skipped_files: summary.skipped_files as i64,
             };
             database.update_task_scan_progress_for_attempt(
@@ -1121,6 +1147,7 @@ fn run_task_with_database(
                 items_total: None,
                 folders_seen: 0,
                 media_files_seen: 0,
+                files_seen: 0,
                 skipped_files: 0,
             };
             let mut last_flushed_items = -TASK_PROGRESS_FLUSH_INTERVAL_ITEMS;
@@ -1197,6 +1224,7 @@ fn run_task_with_database(
                 items_total: None,
                 folders_seen: summary.folders_seen as i64,
                 media_files_seen: summary.media_files_seen as i64,
+                files_seen: summary.files_seen as i64,
                 skipped_files: summary.skipped_files as i64,
             };
             database.update_task_scan_progress_for_attempt(
@@ -1450,6 +1478,17 @@ fn run_thumbnail_task_with_cache_and_before_publish_for_attempt(
         .resolve_file_source_path(file_id)?
         .ok_or_else(|| anyhow::anyhow!("source path not found for file {file_id}"))?;
     let media_kind = source.media_kind.as_deref();
+    if !matches!(media_kind, Some("image" | "video")) {
+        return run_decoder_thumbnail_task(
+            database,
+            writer,
+            task_id,
+            attempt_generation,
+            &source,
+            &source_path,
+            before_publish,
+        );
+    }
     let generated = match media_kind {
         Some("image") => generate_image_thumbnail_bytes_with_checkpoint(&source_path, || {
             run_thumbnail_processing_checkpoint(database, task_id, attempt_generation)
@@ -1562,6 +1601,172 @@ fn run_thumbnail_task_with_cache_and_before_publish_for_attempt(
     Ok(())
 }
 
+fn run_decoder_thumbnail_task(
+    database: &mut Database,
+    writer: Option<&DbWriter>,
+    task_id: i64,
+    attempt_generation: i64,
+    source: &crate::db::ThumbnailSourceRecord,
+    source_path: &Path,
+    before_publish: impl FnOnce(&mut Database),
+) -> anyhow::Result<()> {
+    use crate::plugins::decoder::{DecoderError, DecoderPurpose};
+    let (manager, cancellation) = database
+        .decoder_context()
+        .ok_or(DecoderError::Unavailable)?;
+    let extension = crate::decode::formats::lowercase_extension(source_path);
+    let fingerprint = source.source_fingerprint(GRID_320_PROFILE);
+    let root_token = database.root_binding_token_for_task(task_id)?;
+    // The existing no-follow source opener pins parent identity and denies
+    // competing writes on Windows until the atomic publication is complete.
+    let (file, _directory_guard) = crate::sync::file_policy::open_source(source_path)?;
+    let stamp = crate::sync::identity::source_stamp(source_path)?;
+    let source_pin = file.try_clone()?;
+    let task_cancel = cancellation.child_token();
+    let _cancel_on_drop = task_cancel.clone().drop_guard();
+    let result = tokio::runtime::Handle::current().block_on(async {
+        let decode = manager.decode_owned(file, &extension, DecoderPurpose::Thumbnail, 1024, task_cancel.clone());
+        tokio::pin!(decode);
+        let mut poll = tokio::time::interval(std::time::Duration::from_millis(100));
+        loop {
+            tokio::select! {
+                result = &mut decode => break result,
+                _ = poll.tick() => {
+                    if database.task_is_cancelled(task_id).unwrap_or(true)
+                        || !database.task_attempt_is_current(task_id, attempt_generation).unwrap_or(false) {
+                        task_cancel.cancel();
+                    }
+                }
+            }
+        }
+    });
+    let raster = match result {
+        Ok(raster) => raster,
+        Err(failure) => {
+            let error = failure.error;
+            let file_id = source.file_id;
+            let Some(failure_guard) = failure.publication_guard else {
+                return Err(error.into());
+            };
+            let Some(key) = failure.cache_key else {
+                return Err(error.into());
+            };
+            let message = error.to_string();
+            let publish = move |db: &mut Database| {
+                if cancellation.is_cancelled()
+                    || failure_guard.cancellation().is_cancelled()
+                    || matches!(error, DecoderError::Busy | DecoderError::Cancelled)
+                {
+                    // Cleanup is joined before disable completes. A closed
+                    // owner may retire its task, never publish a failed image.
+                    db.try_mark_task_failed_for_attempt(task_id, attempt_generation, &message)?;
+                    return Ok(());
+                }
+                failure_guard
+                    .publish(|| -> anyhow::Result<()> {
+                        if cancellation.is_cancelled() {
+                            return Ok(());
+                        }
+                        if let Some(token) = root_token.as_ref() {
+                            db.require_sync_root_binding_token(token)?;
+                        }
+                        // Pending work may have been admitted before an explicit
+                        // restart. Store the epoch that actually decoded it with
+                        // the terminal transition, rather than inheriting enqueue
+                        // provenance from an older epoch.
+                        db.try_mark_thumbnail_task_failed_with_decoder_for_attempt(
+                            file_id,
+                            GRID_320_PROFILE,
+                            Some(&fingerprint),
+                            &message,
+                            "permanent",
+                            error == DecoderError::SourceChanged,
+                            task_id,
+                            attempt_generation,
+                            Some(&key),
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap_or(Ok(()))?;
+                // Closing between the admission check and publication still
+                // retires this task without a content side effect.
+                db.try_mark_task_failed_for_attempt(task_id, attempt_generation, &message)?;
+                Ok(())
+            };
+            match writer {
+                Some(writer) => writer.write_blocking(publish)?,
+                None => publish(database)?,
+            }
+            return Ok(());
+        }
+    };
+    let generated = match raster.into_webp() {
+        Ok(generated) => generated,
+        Err(error) => return Err(error.into()),
+    };
+    before_publish(database);
+    if cancellation.is_cancelled() || crate::sync::identity::source_stamp(source_path)? != stamp {
+        anyhow::bail!("{THUMBNAIL_SOURCE_CHANGED_ERROR}");
+    }
+    let file_id = source.file_id;
+    let now = unix_timestamp();
+    let byte_size = generated.data.len() as i64;
+    let state = ThumbnailStateUpsert {
+        file_id,
+        profile: GRID_320_PROFILE.into(),
+        state: "ready".into(),
+        cache_key: None,
+        width: Some(generated.width),
+        height: Some(generated.height),
+        byte_size: Some(byte_size),
+        error: None,
+        source_fingerprint: Some(fingerprint.clone()),
+    };
+    let blob = ThumbBlobRecord {
+        file_id,
+        profile: GRID_320_PROFILE.into(),
+        data: generated.data,
+        width: generated.width,
+        height: generated.height,
+        byte_size,
+        output_format: GENERATED_FORMAT.into(),
+        created_at: now,
+        updated_at: now,
+    };
+    let key = generated.identity.cache_key();
+    let publish = move |db: &mut Database| {
+        let _source_pin = source_pin;
+        generated
+            .publication_guard
+            .publish(|| {
+                if cancellation.is_cancelled() {
+                    return Ok(false);
+                }
+                if let Some(token) = root_token.as_ref() {
+                    db.require_sync_root_binding_token(token)?;
+                }
+                db.publish_thumbnail_with_decoder(
+                    state,
+                    blob,
+                    None,
+                    &fingerprint,
+                    task_id,
+                    attempt_generation,
+                    Some(&key),
+                )
+            })
+            .unwrap_or(Ok(false))
+    };
+    let published = match writer {
+        Some(writer) => writer.write_blocking(publish)?,
+        None => publish(database)?,
+    };
+    if !published {
+        anyhow::bail!("{THUMBNAIL_SOURCE_CHANGED_ERROR}");
+    }
+    Ok(())
+}
+
 fn unix_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1582,6 +1787,313 @@ mod tests {
         FileUpsert, FolderUpsert, NewRoot, ROOT_SCAN_FOREGROUND_FAIRNESS_CONSUMED_PRIORITY,
     };
     use tokio::sync::Notify;
+
+    #[test]
+    fn worker_shutdown_owns_queued_and_terminal_tasks_until_native_release() {
+        #[derive(Default)]
+        struct Probe {
+            dispatched: AtomicBool,
+            completed: AtomicBool,
+            stopping: AtomicBool,
+            drains: AtomicUsize,
+        }
+        async fn until(condition: impl Fn() -> bool) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !condition() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for (terminal_before_drop, panic_before_drop) in [(false, false), (true, false), (true, true)] {
+                let temporary = tempfile::tempdir().unwrap();
+                let storage = temporary.path().join("Database");
+                let content = temporary.path().join("Files");
+                fs::create_dir(&storage).unwrap();
+                fs::create_dir(&content).unwrap();
+                let path = storage.join("catalog.sqlite");
+                let database = Database::open(&path).unwrap();
+                database.apply_migrations().unwrap();
+                let root = database.add_root(NewRoot {
+                    path: content.to_string_lossy().into_owned(),
+                    display_name: "Files".into(),
+                }).unwrap();
+                let task_id = database.create_root_scan_task(root).unwrap();
+                let probe = Arc::new(Probe::default());
+                let (release, released) = std::sync::mpsc::channel();
+                let released = Arc::new(std::sync::Mutex::new(released));
+                let hook_release = released.clone();
+                let hook_path = path.clone();
+                let hook_probe = probe.clone();
+                let _hook = set_worker_task_hook_for_test(Arc::new(move |kind, _, path| {
+                    if path != Some(hook_path.as_path()) { return; }
+                    match kind {
+                        "task_dispatched" => hook_probe.dispatched.store(true, Ordering::Release),
+                        "worker_drain" => { hook_probe.drains.fetch_add(1, Ordering::AcqRel); }
+                        "worker_stopping" => hook_probe.stopping.store(true, Ordering::Release),
+                        "task_completed" if terminal_before_drop => {
+                            hook_probe.completed.store(true, Ordering::Release);
+                            let _ = hook_release.lock().unwrap().recv();
+                            assert!(!panic_before_drop, "native task ownership unwind fixture");
+                        }
+                        _ => {}
+                    }
+                }));
+                let blocker = if !terminal_before_drop {
+                    let (started, ready) = tokio::sync::oneshot::channel();
+                    let blocking_release = released.clone();
+                    let blocker = tokio::task::spawn_blocking(move || {
+                        started.send(()).unwrap();
+                        let _ = blocking_release.lock().unwrap().recv();
+                    });
+                    ready.await.unwrap();
+                    Some(blocker)
+                } else { None };
+                let writer = DbWriter::spawn(database.reopen().unwrap().unwrap());
+                let worker = start_managed_worker_with_ffmpeg(
+                    database.reopen().unwrap().unwrap(), writer.clone(), false,
+                );
+                until(|| probe.dispatched.load(Ordering::Acquire)).await;
+                if terminal_before_drop {
+                    until(|| probe.completed.load(Ordering::Acquire)).await;
+                    assert_eq!(database.get_task(task_id).unwrap().unwrap().status, "succeeded");
+                } else {
+                    assert_eq!(database.get_task(task_id).unwrap().unwrap().status, "pending");
+                }
+                let drains = probe.drains.load(Ordering::Acquire);
+                worker.sender().send(task_id).await.unwrap();
+                until(|| probe.drains.load(Ordering::Acquire) > drains).await;
+                worker.cancellation.cancel();
+                until(|| probe.stopping.load(Ordering::Acquire)).await;
+                let stopped_early = worker.join_handle.lock().await.as_ref().unwrap().is_finished();
+                release.send(()).unwrap();
+                if let Some(blocker) = blocker { blocker.await.unwrap(); }
+                timeout(Duration::from_secs(10), worker.shutdown()).await.unwrap().unwrap();
+                writer.shutdown().await.unwrap();
+                drop(database);
+                fs::rename(&storage, temporary.path().join("Retired")).unwrap();
+                assert!(!stopped_early,
+                    "worker retired before its native task connection closed (terminal={terminal_before_drop})");
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn decoder_task_real_process_rejects_late_plugin_library_source_and_root_results() {
+        for fence in [
+            "plugin",
+            "plugin_reenabled",
+            "library",
+            "source",
+            "root",
+            "none",
+        ] {
+            let (temporary, manager, manifest) =
+                crate::plugins::decoder::tests::real_decoder().await;
+            let media_root = temporary.path().join("media");
+            fs::create_dir_all(&media_root).unwrap();
+            let source_path = media_root.join("sample.ppm");
+            fs::write(&source_path, b"P3\n2 1\n255\n255 0 0 0 255 0\n").unwrap();
+            let mut db = Database::open(temporary.path().join("catalog.sqlite")).unwrap();
+            db.apply_migrations().unwrap();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            db.attach_decoder_context(manager.clone(), cancel.clone());
+            let id = seed_media_file(&db, &media_root, "sample.ppm");
+            db.execute_batch_for_test("DELETE FROM media;").unwrap();
+            let task_id = db
+                .request_thumbnail_task(
+                    id,
+                    GRID_320_PROFILE,
+                    crate::db::ThumbnailTaskPriority::Selected,
+                )
+                .unwrap()
+                .task_id
+                .unwrap();
+            let attempt = db.current_task_attempt_generation(task_id).unwrap();
+            let root_id = db.get_thumbnail_source(id).unwrap().unwrap().root_id;
+            let writer = DbWriter::spawn(db.reopen().unwrap().unwrap());
+            let stop_manager = manager.clone();
+            let plugin_id = manifest.id.clone();
+            let restart_manifest = manifest.clone();
+            let runtime_root = temporary.path().to_path_buf();
+            let result = tokio::task::spawn_blocking(move || {
+                let result = run_thumbnail_task_with_cache_and_before_publish_for_attempt(
+                    &mut db,
+                    Some(&writer),
+                    task_id,
+                    attempt,
+                    &media_root,
+                    false,
+                    |database| {
+                        #[cfg(windows)]
+                        {
+                            assert!(
+                                fs::OpenOptions::new()
+                                    .write(true)
+                                    .open(&source_path)
+                                    .is_err(),
+                                "authorized source is pinned through publication"
+                            );
+                            assert!(
+                                fs::rename(&source_path, media_root.join("replaced.ppm")).is_err()
+                            );
+                        }
+                        match fence {
+                            "plugin" | "plugin_reenabled" => {
+                                stop_manager.close_plugin(&plugin_id, 2)
+                            }
+                            "library" => cancel.cancel(),
+                            "source" => database
+                                .execute_batch_for_test("UPDATE files SET size=size+1;")
+                                .unwrap(),
+                            "root" => {
+                                database.disable_root(root_id).unwrap();
+                            }
+                            _ => {}
+                        }
+                    },
+                );
+                let was_error = result.is_err();
+                if fence == "plugin_reenabled" {
+                    tokio::runtime::Handle::current().block_on(async {
+                        stop_manager.stop_plugin(&plugin_id, 2).await.unwrap();
+                        crate::plugins::decoder::tests::activate_real_decoder(
+                            &runtime_root,
+                            &stop_manager,
+                            &restart_manifest,
+                            3,
+                        )
+                        .await;
+                    });
+                }
+                if let Err(error) = result {
+                    handle_task_error_for_attempt(&mut db, task_id, attempt, error);
+                }
+                let blob = db.get_thumb_blob(id, GRID_320_PROFILE).unwrap();
+                let status = db.get_task(task_id).unwrap().unwrap().status;
+                if fence == "none" {
+                    assert!(!was_error);
+                    let image = image::load_from_memory(&blob.unwrap().data).unwrap();
+                    assert_eq!((image.width(), image.height()), (2, 1));
+                    assert_eq!(status, "succeeded");
+                } else {
+                    assert!(was_error, "{fence} must fence the result");
+                    assert!(blob.is_none(), "{fence} must leave no published bytes");
+                    assert_ne!(status, "succeeded");
+                    assert_ne!(status, "running");
+                    assert!(
+                        db.get_thumbnail_failure(id, GRID_320_PROFILE)
+                            .unwrap()
+                            .is_none(),
+                        "{fence} outer cleanup cannot publish a failed image"
+                    );
+                }
+                tokio::runtime::Handle::current()
+                    .block_on(writer.shutdown())
+                    .unwrap();
+            })
+            .await;
+            manager.stop_plugin(&manifest.id, 4).await.unwrap();
+            result.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn decoder_task_pending_before_restart_records_current_failure_epoch() {
+        let (temporary, manager, manifest) = crate::plugins::decoder::tests::real_decoder().await;
+        let media_root = temporary.path().join("media");
+        fs::create_dir_all(&media_root).unwrap();
+        fs::write(media_root.join("invalid.ppm"), b"P3\n1 1\n15\n15 0 0\n").unwrap();
+        let mut db = Database::open(temporary.path().join("catalog.sqlite")).unwrap();
+        db.apply_migrations().unwrap();
+        db.attach_decoder_context(manager.clone(), tokio_util::sync::CancellationToken::new());
+        let id = seed_media_file(&db, &media_root, "invalid.ppm");
+        db.execute_batch_for_test("DELETE FROM media;").unwrap();
+        let task_id = db
+            .request_thumbnail_task(
+                id,
+                GRID_320_PROFILE,
+                crate::db::ThumbnailTaskPriority::Selected,
+            )
+            .unwrap()
+            .task_id
+            .unwrap();
+        manager.stop_plugin(&manifest.id, 2).await.unwrap();
+        crate::plugins::decoder::tests::activate_real_decoder(
+            temporary.path(),
+            &manager,
+            &manifest,
+            3,
+        )
+        .await;
+        let requested = db
+            .request_thumbnail_task(
+                id,
+                GRID_320_PROFILE,
+                crate::db::ThumbnailTaskPriority::Selected,
+            )
+            .unwrap();
+        assert_eq!(requested.task_id, Some(task_id));
+        assert!(!requested.queued, "the old pending task is reused");
+        let failure_key = manager
+            .matching("ppm", crate::plugins::decoder::DecoderPurpose::Thumbnail)
+            .unwrap()
+            .failure_cache_key();
+        let attempt = db.current_task_attempt_generation(task_id).unwrap();
+        let writer = DbWriter::spawn(db.reopen().unwrap().unwrap());
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = run_thumbnail_task_with_cache_and_before_publish_for_attempt(
+                &mut db,
+                Some(&writer),
+                task_id,
+                attempt,
+                &media_root,
+                false,
+                |_| {},
+            ) {
+                handle_task_error_for_attempt(&mut db, task_id, attempt, error);
+            }
+            assert_eq!(db.get_task(task_id).unwrap().unwrap().status, "failed");
+            assert_eq!(
+                db.get_thumbnail(id, GRID_320_PROFILE)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "failed"
+            );
+            let source = db.get_thumbnail_source(id).unwrap().unwrap();
+            assert!(db
+                .decoder_cache_matches(
+                    id,
+                    GRID_320_PROFILE,
+                    &source.source_fingerprint(GRID_320_PROFILE),
+                    Some(&failure_key)
+                )
+                .unwrap());
+            let repeated = db
+                .request_thumbnail_task(
+                    id,
+                    GRID_320_PROFILE,
+                    crate::db::ThumbnailTaskPriority::Selected,
+                )
+                .unwrap();
+            assert!(!repeated.should_enqueue);
+            assert_eq!(repeated.thumbnail.state, "failed");
+            tokio::runtime::Handle::current()
+                .block_on(writer.shutdown())
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        manager.stop_plugin(&manifest.id, 4).await.unwrap();
+    }
     use tokio::time::timeout;
 
     #[test]
@@ -3967,7 +4479,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn schedule_pending_tasks_clears_stale_in_flight_thumbnail_ids() {
+    async fn schedule_pending_tasks_keeps_owned_thumbnail_ids_until_completion() {
         let temp_root = unique_temp_dir("thumbnail_stale_in_flight_root");
         fs::create_dir_all(&temp_root).expect("create media root");
         write_test_image(&temp_root.join("pending.jpg"), 800, 400);
@@ -4008,6 +4520,24 @@ mod tests {
             &mut in_flight_thumbnail_task_ids,
         );
 
+        assert_eq!(
+            database.get_task(task_id).unwrap().unwrap().status,
+            "pending"
+        );
+        assert!(in_flight_thumbnail_task_ids.contains(&task_id));
+        assert!(completion_receiver.try_recv().is_err());
+        // The completion receiver, rather than a Catalog status query, owns
+        // removal. Once that owner releases the ID, normal scheduling resumes.
+        in_flight_thumbnail_task_ids.remove(&task_id);
+        schedule_pending_tasks_with_thumbnail_concurrency(
+            &mut database,
+            &writer,
+            true,
+            &thumbnail_permits,
+            &completion_sender,
+            &mut in_flight_thumbnail_task_ids,
+        );
+
         timeout(Duration::from_secs(5), async {
             completion_receiver
                 .recv()
@@ -4015,7 +4545,7 @@ mod tests {
                 .expect("background thumbnail completion")
         })
         .await
-        .expect("stale in-flight id should not prevent pending thumbnail from starting");
+        .expect("released ownership should allow the pending thumbnail to start");
 
         let task = database
             .get_task(task_id)
@@ -4929,7 +5459,7 @@ mod tests {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
         std::env::temp_dir().join(format!(
-            "megle_thumbnail_task_test_{}_{}_{}_{}",
+            "mangoo_thumbnail_task_test_{}_{}_{}_{}",
             label,
             std::process::id(),
             std::time::SystemTime::now()
@@ -5212,7 +5742,7 @@ mod tests {
     fn root_purge_worker_rolls_back_failed_batch_and_retries_same_operation() {
         let db_dir = unique_temp_dir("purge-progress-trigger");
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
         let mut database = Database::open(&db_path).expect("open database");
         database.apply_migrations().expect("apply migrations");
         let root_id = database

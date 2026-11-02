@@ -13,8 +13,8 @@ import { useDampedWheelScroll } from "./useDampedWheelScroll";
 import { CHANNEL_MATRICES } from "../features/preview/previewRenderSettings";
 import { LiquidGlassSurface } from "../design/liquid-glass";
 
-const SHELL_LEFT_WIDTH_STORAGE_KEY = "megle.shell.left-width";
-const SHELL_RIGHT_WIDTH_STORAGE_KEY = "megle.shell.right-width";
+const SHELL_LEFT_WIDTH_STORAGE_KEY = "mangoo.shell.left-width";
+const SHELL_RIGHT_WIDTH_STORAGE_KEY = "mangoo.shell.right-width";
 const SHELL_LEFT_DEFAULT_WIDTH = 292;
 const SHELL_RIGHT_DEFAULT_WIDTH = 270;
 const SHELL_LEFT_MIN_WIDTH = 220;
@@ -64,7 +64,7 @@ export function AppShell({
     document.body.dataset.shellResizing = "false";
     return () => {
       document.body.dataset.shellResizing = "false";
-      window.dispatchEvent(new Event("megle:shell-resize-state"));
+      window.dispatchEvent(new Event("mangoo:shell-resize-state"));
     };
   }, []);
 
@@ -113,7 +113,7 @@ export function AppShell({
       event.stopPropagation();
       event.currentTarget.setPointerCapture(event.pointerId);
       document.body.dataset.shellResizing = "true";
-      window.dispatchEvent(new Event("megle:shell-resize-state"));
+      window.dispatchEvent(new Event("mangoo:shell-resize-state"));
       setActiveResizeSide(side);
       resizeColumnAtPointer(side, event);
     },
@@ -137,7 +137,7 @@ export function AppShell({
     // otherwise :focus-visible can keep the divider highlighted after hover ends.
     event.currentTarget.blur();
     document.body.dataset.shellResizing = "false";
-    window.dispatchEvent(new Event("megle:shell-resize-state"));
+    window.dispatchEvent(new Event("mangoo:shell-resize-state"));
     setActiveResizeSide(null);
   }, []);
 

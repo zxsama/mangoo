@@ -1,5 +1,5 @@
 {
-  "name": "@megle/core-client",
+  "name": "@mangoo/core-client",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -11,11 +11,16 @@
     "./generated-contract": {
       "types": "./src/generated-contract.ts",
       "default": "./src/generated-contract.ts"
+    },
+    "./node": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
     }
   },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
     "check": "node scripts/check-contract.mjs",
-    "test": "node --experimental-strip-types --test tests/client.test.mts",
+    "test": "node --experimental-strip-types --test tests/*.test.mts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { FolderRecord, MediaRecord } from "@megle/core-client";
+import { subscribePluginChanges } from "../plugins/pluginQuerySync";
+import type { FolderRecord, MediaRecord } from "@mangoo/core-client";
 import { createCoreClient } from "../../core/client";
 
 const FOLDER_COVER_FETCH_LIMIT = 96;
@@ -19,6 +20,12 @@ export function useFolderCovers(
   const inFlightControllersByFolderId = useRef<Map<number, AbortController>>(new Map());
   const mountedRef = useRef(true);
   const [requestVersion, setRequestVersion] = useState(0);
+
+  useEffect(() => subscribePluginChanges(() => {
+    abortAllControllers(inFlightControllersByFolderId.current);
+    inFlightFolderIds.current.clear();
+    setCoversByFolderId(new Map());
+  }), []);
 
   useEffect(() => {
     mountedRef.current = true;

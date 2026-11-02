@@ -11,7 +11,18 @@ const stateExpression = `({
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 async function dispatchNativeInput(window, request) {
-  if (request.type === "key") {
+  if (request.type === "window-hidden-cycle") {
+    window.hide();
+    await delay(180);
+    window.show();
+    window.focus();
+  } else if (request.type === "cdp-key") {
+    if (!window.webContents.debugger.isAttached()) window.webContents.debugger.attach("1.3");
+    const key = request.keyCode;
+    const windowsVirtualKeyCode = { Tab: 9, Enter: 13, Escape: 27 }[key];
+    await window.webContents.debugger.sendCommand("Input.dispatchKeyEvent", { type: "keyDown", key, code: key, windowsVirtualKeyCode, text: key === "Enter" ? "\r" : "" });
+    await window.webContents.debugger.sendCommand("Input.dispatchKeyEvent", { type: "keyUp", key, code: key, windowsVirtualKeyCode });
+  } else if (request.type === "key") {
     window.webContents.sendInputEvent({
       type: "keyDown",
       keyCode: request.keyCode,
@@ -39,6 +50,13 @@ async function dispatchNativeInput(window, request) {
       x: request.x,
       y: request.y
     });
+  } else if (request.type === "mouse-drag") {
+    window.webContents.sendInputEvent({ type: "mouseMove", x: request.x, y: request.y });
+    window.webContents.sendInputEvent({ type: "mouseDown", button: "left", clickCount: 1, x: request.x, y: request.y });
+    await delay(30);
+    window.webContents.sendInputEvent({ type: "mouseMove", x: request.endX, y: request.endY });
+    await delay(30);
+    window.webContents.sendInputEvent({ type: "mouseUp", button: "left", clickCount: 1, x: request.endX, y: request.endY });
   } else if (request.type === "mouse-move") {
     window.webContents.sendInputEvent({ type: "mouseMove", x: request.x, y: request.y });
   } else {
@@ -70,7 +88,11 @@ async function main() {
   window.show();
   window.focus();
   await delay(100);
-  const deadline = Date.now() + 30_000;
+  // The registration follow-up visits all 502 choices with native input plus
+  // grouped navigation, search, custom colors and every appearance entrypoint.
+  // The previous 384-choice sweep took about 80s; keep this larger sweep bounded
+  // without changing the ordinary overlay lifecycle deadline.
+  const deadline = Date.now() + (new URL(fixtureUrl).searchParams.has("followup") ? 140_000 : 30_000);
   let result = null;
   let handledInputId = 0;
   while (Date.now() < deadline && result === null) {

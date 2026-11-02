@@ -25,7 +25,7 @@ describe("library switcher overlay migration", () => {
     assert.match(switcherSource, /openRoot\("managed-library"\)/);
     assert.match(settingsPanelsSource, /openRoot\("managed-library"\)/);
     assert.match(managedLibraryWizardSource, /rootId="managed-library"/);
-    assert.match(managedLibraryWizardSource, /overlayRootId="managed-library"/);
+    assert.doesNotMatch(managedLibraryWizardSource, /PluginAccountSetup|usePluginAuth|SyncRestore/);
     assert.match(managedLibraryWizardSource, /OverlayDialogBody/);
     assert.match(managedLibraryWizardSource, /OverlayField/);
     assert.match(managedLibraryWizardSource, /data-overlay-scroll-container/);
@@ -54,11 +54,12 @@ describe("library switcher overlay migration", () => {
     assert.match(appSource, /autoFocus=\{librarySwitcherAutoFocus\}/);
   });
 
-  it("uses shared radio-menu semantics for the overlay icon picker", () => {
-    assert.match(libraryGlyphSource, /OverlayMenuList/);
-    assert.match(libraryGlyphSource, /OverlayMenuItem/);
-    assert.match(libraryGlyphSource, /role="menuitemradio"/);
-    assert.match(libraryGlyphSource, /checked=\{/);
+  it("uses separate controlled radio groups in the shared appearance editor", () => {
+    assert.match(libraryGlyphSource, /role="radiogroup"/);
+    assert.match(libraryGlyphSource, /role="radio"/);
+    assert.match(libraryGlyphSource, /aria-checked=/);
+    assert.doesNotMatch(libraryGlyphSource, /OverlayMenuList|menuitemradio/);
+    for (const caller of [switcherSource, settingsPanelsSource, managedLibraryWizardSource]) assert.match(caller, /LibraryAppearanceEditor/);
   });
 
   it("keeps retired local LibrarySwitcher surfaces out of the global stylesheet", () => {

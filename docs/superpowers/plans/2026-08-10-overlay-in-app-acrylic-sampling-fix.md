@@ -295,9 +295,9 @@ At each dialog-blur value, open the real notification popup over the populated m
 Run:
 
 ```powershell
-$env:MEGLE_VISUAL_OS_BACKDROP='1'
+$env:MANGOO_VISUAL_OS_BACKDROP='1'
 node .tmp\visual-check\desktop-ui-regression.mjs
-Remove-Item Env:\MEGLE_VISUAL_OS_BACKDROP
+Remove-Item Env:\MANGOO_VISUAL_OS_BACKDROP
 ```
 
 Expected GREEN: zero/default/maximum screenshots exist; independent fixture and real Library portal measurements pass; popup, nested popup, modal, fallback, and cleanup topology pass; no interaction timeout, console error, network error, or leftover GUI process is reported.

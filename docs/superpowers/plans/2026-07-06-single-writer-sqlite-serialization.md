@@ -152,7 +152,7 @@ mod tests {
 
 - [ ] **Step 4: Run the test to verify it fails to compile**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p megle-core db::writer 2>&1 | tail -20`
+Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p mangoo-core db::writer 2>&1 | tail -20`
 Expected: compile error — `DbWriter` / `spawn` / `write` not found.
 
 - [ ] **Step 5: Implement the writer actor**
@@ -190,7 +190,7 @@ impl DbWriter {
     pub fn spawn(database: Database) -> DbWriter {
         let (sender, receiver) = mpsc::unbounded_channel::<QueuedJob>();
         std::thread::Builder::new()
-            .name("megle-db-writer".to_string())
+            .name("mangoo-db-writer".to_string())
             .spawn(move || run_writer_actor(database, receiver))
             .expect("spawn db writer thread");
         DbWriter { sender }
@@ -244,13 +244,13 @@ fn run_one(database: &mut Database, queued: QueuedJob) {
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p megle-core db::writer 2>&1 | tail -20`
+Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p mangoo-core db::writer 2>&1 | tail -20`
 Expected: `test result: ok. 3 passed`
 
 - [ ] **Step 7: Format and commit**
 
 ```bash
-export PATH="$HOME/.cargo/bin:$PATH" && cargo fmt -p megle-core
+export PATH="$HOME/.cargo/bin:$PATH" && cargo fmt -p mangoo-core
 git add crates/core/src/db/writer.rs crates/core/src/db/mod.rs
 git commit -m "feat(core): single-writer DbWriter actor over the SQLite write connection"
 ```
@@ -262,7 +262,7 @@ git commit -m "feat(core): single-writer DbWriter actor over the SQLite write co
 **Files:**
 - Modify: `crates/core/src/api/mod.rs` (AppState struct + `new` + `new_with_worker` + a `writer()` accessor)
 - Modify: `crates/core/src/main.rs` (no signature change expected; `AppState::new_with_worker` still receives the two `Database`s)
-- Test: existing `cargo test -p megle-core` (compile + route tests exercise this)
+- Test: existing `cargo test -p mangoo-core` (compile + route tests exercise this)
 
 **Interfaces:**
 - Consumes: `DbWriter::spawn(Database) -> DbWriter` from Task 1.
@@ -435,13 +435,13 @@ Remove the now-unused helpers `is_database_locked_error` (added earlier) only if
 
 - [ ] **Step 3: Run route tests to verify the contract holds**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p megle-core api::routes 2>&1 | tail -25`
+Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p mangoo-core api::routes 2>&1 | tail -25`
 Expected: the thumbnail route tests that asserted `state == "queued"` after `GET /thumbnail` now need updating (they asserted the OLD enqueue-on-GET behavior). Update those specific tests:
 - `thumbnail_route_queues_missing_grid_320_row`, `thumbnail_route_queues_missing_thumbnail_once_on_repeated_requests`, `thumbnail_route_reenqueues_promoted_pending_thumbnail_task`, `thumbnail_route_wakes_existing_pending_thumbnail_task` assert that `GET /thumbnail` enqueues. Since generation now flows through `/tasks/thumbnail-priority-scope`, change these tests to POST `/api/tasks/thumbnail-priority-scope` (with the file id in `visibleFileIds`) to trigger the enqueue, then assert the queued task exactly as before. Keep the pure-read assertion for `GET /thumbnail`: it returns `202` + `state` pending/queued reflecting the row, and does NOT itself enqueue.
 
 - [ ] **Step 4: Run the updated tests**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p megle-core api::routes 2>&1 | tail -25`
+Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p mangoo-core api::routes 2>&1 | tail -25`
 Expected: `test result: ok` (all route tests pass, including the migrated enqueue-via-priority-scope tests).
 
 - [ ] **Step 5: Commit (with Tasks 2/4/5)**
@@ -457,7 +457,7 @@ git commit -m "refactor(core): route writes through DbWriter; get_thumbnail is r
 
 **Files:**
 - Modify: `crates/core/src/tasks.rs`
-- Test: existing `cargo test -p megle-core` worker/thumbnail tests
+- Test: existing `cargo test -p mangoo-core` worker/thumbnail tests
 
 **Interfaces:**
 - Consumes: `DbWriter` (Task 1); the worker's own `Database` stays as a READ/scheduling connection.
@@ -488,7 +488,7 @@ Remove the `write_gate` yield calls inside `run_thumbnail_task_with_cache...` pu
 
 - [ ] **Step 3: Run worker + thumbnail tests**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p megle-core tasks 2>&1 | tail -25 && cargo test -p megle-core thumbnail 2>&1 | tail -25`
+Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p mangoo-core tasks 2>&1 | tail -25 && cargo test -p mangoo-core thumbnail 2>&1 | tail -25`
 Expected: `test result: ok` for both (worker recovery, thumbnail publish, priority yield tests updated to the writer path where they asserted the old gate).
 
 - [ ] **Step 4: Commit (with Tasks 2/3/5)**
@@ -505,7 +505,7 @@ git commit -m "refactor(core): thumbnail worker commits through DbWriter; remove
 **Files:**
 - Modify: `crates/core/src/scan/mod.rs`, `crates/core/src/watch/mod.rs`
 - Delete: `crates/core/src/write_gate.rs` and its `mod write_gate;` in `crates/core/src/main.rs`
-- Test: full `cargo test -p megle-core`
+- Test: full `cargo test -p mangoo-core`
 
 **Interfaces:**
 - Consumes: `DbWriter` (Task 1).
@@ -554,7 +554,7 @@ In `crates/core/src/main.rs`, remove the `mod write_gate;` line. Remove any rema
 
 - [ ] **Step 4: Full compile + test gate**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo fmt -p megle-core && cargo test -p megle-core 2>&1 | tail -15`
+Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo fmt -p mangoo-core && cargo test -p mangoo-core 2>&1 | tail -15`
 Expected: `test result: ok. N passed; 0 failed` (all Core tests).
 
 - [ ] **Step 5: Commit**
@@ -617,15 +617,15 @@ git commit -m "chore(core): checks assert DbWriter route usage; client comments 
 - No source changes (verification task). Uses `tools/dev` CDP harness.
 
 **Interfaces:**
-- Consumes: the running app (`MEGLE_DB_PATH=.data/megle-dev.sqlite MEGLE_REMOTE_DEBUG=1 npm run dev`).
+- Consumes: the running app (`MANGOO_DB_PATH=.data/mangoo-dev.sqlite MANGOO_REMOTE_DEBUG=1 npm run dev`).
 
 - [ ] **Step 1: Rebuild + relaunch**
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-powershell.exe -NoProfile -Command "Get-Process electron,megle-core -ErrorAction SilentlyContinue | Stop-Process -Force"
-sleep 3 && cargo build -p megle-core
-MEGLE_DB_PATH="D:/Megle/.data/megle-dev.sqlite" MEGLE_REMOTE_DEBUG=1 nohup npm run dev > /tmp/megle-dev.log 2>&1 &
+powershell.exe -NoProfile -Command "Get-Process electron,mangoo-core -ErrorAction SilentlyContinue | Stop-Process -Force"
+sleep 3 && cargo build -p mangoo-core
+MANGOO_DB_PATH="D:/Mangoo/.data/mangoo-dev.sqlite" MANGOO_REMOTE_DEBUG=1 nohup npm run dev > /tmp/mangoo-dev.log 2>&1 &
 ```
 Wait for CDP page on 9222.
 

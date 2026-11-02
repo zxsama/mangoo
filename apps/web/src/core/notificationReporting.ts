@@ -1,13 +1,13 @@
 import type {
   ThumbnailCacheSnapshotResponse,
   ThumbnailCacheStatsResponse
-} from "@megle/core-client";
+} from "@mangoo/core-client";
 import {
   rendererErrorIdentityKey,
   type DesktopRendererErrorReport,
   type DesktopThumbnailCacheSummary
-} from "@megle/notification-contract";
-import { getDesktopBridge, type MegleDesktopBridge } from "./desktop.ts";
+} from "@mangoo/notification-contract";
+import { getDesktopBridge, type MangooDesktopBridge } from "./desktop.ts";
 
 const LIBRARY_ID_MAX_LENGTH = 256;
 const LIBRARY_NAME_MAX_LENGTH = 256;
@@ -65,7 +65,7 @@ export function emitRendererStartupLog(): boolean {
   try {
     emit([{
       level: "info",
-      message: "Megle renderer ready",
+      message: "Mangoo renderer ready",
       metadata: {
         eventKind: "startup_ready",
         windowRole: bridge.windowRole ?? "main"
@@ -255,7 +255,7 @@ export function publishThumbnailCacheStats(
     .catch(() => false);
 }
 
-function desktopBridge(): MegleDesktopBridge | null {
+function desktopBridge(): MangooDesktopBridge | null {
   if (typeof window === "undefined") return null;
   return getDesktopBridge();
 }

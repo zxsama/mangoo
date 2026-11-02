@@ -123,7 +123,7 @@ impl MediaWorkLimiter {
             .counters
             .reserved_temp_bytes
             .fetch_add(bytes, Ordering::AcqRel);
-        let available = free_space_bytes(path).unwrap_or(u64::MAX);
+        let available = free_space_bytes(path).unwrap_or(0);
         if previous.saturating_add(bytes) > self.max_temp_bytes
             || available
                 < previous
@@ -145,6 +145,19 @@ impl MediaWorkLimiter {
             bytes,
             counters: Arc::clone(&self.counters),
         })
+    }
+
+    /// The worker budget bounds the active chunk/pack window. Durable spool or
+    /// destination payload is capacity-checked against the actual filesystem,
+    /// independently of that window, so a single file can exceed 16 GiB.
+    fn reserve_content_work(
+        &self,
+        path: &Path,
+        durable_bytes: u64,
+        window_bytes: u64,
+    ) -> anyhow::Result<MediaTempReservation> {
+        require_publication_capacity(free_space_bytes(path)?, durable_bytes, window_bytes)?;
+        self.reserve_temporary_disk(path, window_bytes)
     }
     pub async fn run_bounded<T, F>(
         &self,
@@ -417,12 +430,6 @@ impl MediaRestoreWorker {
             .await?;
             return Ok(true);
         }
-        let _temp_reservation = self.limiter.reserve_temporary_disk(
-            &self.cache_root,
-            job.expected_length
-                .saturating_add(super::MAX_RANGE_BYTES)
-                .saturating_add(64 * 1024 * 1024),
-        )?;
         let revision = job.content_revision_uuid;
         if job.binding_epoch != Some(binding_epoch) || job.transport_generation != generation {
             self.fail(&owner, revision, "failed", "stale_generation", i64::MAX)
@@ -430,12 +437,57 @@ impl MediaRestoreWorker {
             return Ok(true);
         }
         let suffix = job.asset_uuid.simple().to_string();
-        let destination = super::materialize::windows_safe_relative_path(
+        let destination = match super::materialize::windows_safe_relative_path(
             Path::new(&job.destination_relpath),
             &suffix,
-        )?;
+        ) {
+            Ok(path) => path,
+            Err(_) => {
+                self.fail(
+                    &owner,
+                    job.content_revision_uuid,
+                    "path-conflict",
+                    "unsupported_destination",
+                    now + 30_000,
+                )
+                .await?;
+                return Ok(true);
+            }
+        };
         let managed_root = PathBuf::from(&job.managed_root);
         let target = managed_root.join(&destination);
+        let policy_database = self.writer.write(|database| database.reopen()).await?;
+        let owned_target = policy_database
+            .as_ref()
+            .map(|database| database.is_owned_collection_path(&managed_root, &target))
+            .transpose();
+        let owned_target = match owned_target {
+            Ok(owned) => owned.unwrap_or(false),
+            Err(_) => {
+                self.fail(
+                    &owner,
+                    revision,
+                    "failed",
+                    "ownership_pending",
+                    now + 30_000,
+                )
+                .await?;
+                return Ok(true);
+            }
+        };
+        if crate::sync::file_policy::require_no_links(&managed_root, &target).is_err()
+            || owned_target
+        {
+            self.fail(
+                &owner,
+                revision,
+                "path-conflict",
+                "unsupported_destination",
+                now + 30_000,
+            )
+            .await?;
+            return Ok(true);
+        }
         if job.content_hash != [0; 32]
             && target.exists()
             && super::materialize::verified_matches(&target, job.expected_length, job.content_hash)?
@@ -552,6 +604,52 @@ impl MediaRestoreWorker {
             return Ok(true);
         }
         let ranges = super::recovery::plan_ranges(&manifest)?;
+        let mut additional_cache = 0u64;
+        for range in &ranges {
+            let cached = self
+                .writer
+                .write({
+                    let range = range.clone();
+                    move |db| {
+                        super::inventory::verified_range_relpath(
+                            db.connection_for_fsops(),
+                            range.pack_hash,
+                            range.start,
+                            range.end,
+                        )
+                    }
+                })
+                .await?;
+            let required = range.end.saturating_sub(range.start);
+            let existing = cached
+                .and_then(|(relative, _)| {
+                    std::fs::symlink_metadata(self.cache_root.join(relative)).ok()
+                })
+                .filter(|m| m.is_file() && !crate::sync::file_policy::is_link(m))
+                .map_or(0, |m| m.len().min(required));
+            additional_cache = additional_cache.saturating_add(required.saturating_sub(existing));
+        }
+        let reservation = (|| -> anyhow::Result<MediaTempReservation> {
+            let window = super::MAX_RANGE_BYTES.saturating_add(64 * 1024 * 1024);
+            require_restore_capacity(
+                free_space_bytes(&self.cache_root)?,
+                free_space_bytes(&managed_root)?,
+                additional_cache,
+                job.expected_length,
+                window,
+                same_storage_volume(&self.cache_root, &managed_root)?,
+            )?;
+            self.limiter
+                .reserve_temporary_disk(&self.cache_root, window)
+        })();
+        let _temp_reservation = match reservation {
+            Ok(value) => value,
+            Err(_) => {
+                self.fail(&owner, revision, "disk-full", "disk_capacity", now + 30_000)
+                    .await?;
+                return Ok(true);
+            }
+        };
         self.phase(&owner, revision, "downloading", 0).await?;
         let mut verified_chunks = BTreeMap::new();
         let mut downloaded = 0u64;
@@ -633,6 +731,7 @@ impl MediaRestoreWorker {
             .await?;
         let content_hash = super::parse_hash(&manifest.content_sha256)?;
         let manifest_for_materialization = manifest;
+        let cancelled = self.limiter.cancellation();
         let source_mtime_ms = job.source_mtime_ms;
         let managed_root_for_materialization = managed_root.clone();
         let root_binding_database = self.writer.write(|database| database.reopen()).await?;
@@ -641,16 +740,29 @@ impl MediaRestoreWorker {
         }
         self.phase(&owner, revision, "publishing", downloaded)
             .await?;
+        let staging_writer = self.writer.clone();
+        let staging_owner = owner.clone();
         let result = self
             .limiter
             .run_bounded(1, super::MAX_RANGE_BYTES, move || {
-                super::materialize::materialize_from_verified_ranges_with_pre_publish(
+                let staging = prepare_owned_staging(
+                    &staging_writer,
+                    &managed_root_for_materialization,
+                    revision,
+                    &staging_owner,
+                )?;
+                super::materialize::materialize_from_verified_ranges_with_checks(
                     &managed_root_for_materialization,
                     &destination,
                     revision,
                     &manifest_for_materialization,
                     &verified_chunks,
                     source_mtime_ms,
+                    Some(staging),
+                    || {
+                        anyhow::ensure!(!cancelled.load(Ordering::Acquire), "media work cancelled");
+                        Ok(())
+                    },
                     move || {
                         if let (Some(database), Some(token)) =
                             (root_binding_database.as_ref(), root_binding_guard)
@@ -796,6 +908,7 @@ impl MediaPublicationWorker {
         let job = self
             .writer
             .write_authoritative(move |database| {
+                database.seed_pending_file_publications()?;
                 super::inventory::bind_pending_publication_jobs(
                     database.connection_for_fsops(),
                     binding_epoch,
@@ -878,6 +991,48 @@ impl MediaPublicationWorker {
             }
             job.source_path = current_source_path.to_string_lossy().into_owned();
         }
+        let asset = job.asset_uuid;
+        let source_root = self
+            .writer
+            .write(move |db| {
+                Ok(db.connection_for_fsops().query_row(
+                    "SELECT r.path FROM roots r JOIN files f ON f.root_id=r.id
+                     WHERE f.asset_uuid=?1",
+                    [asset.as_bytes().as_slice()],
+                    |row| row.get::<_, String>(0),
+                )?)
+            })
+            .await?;
+        let policy_database = self.writer.write(|database| database.reopen()).await?;
+        let owned_source = policy_database
+            .as_ref()
+            .map(|database| {
+                database
+                    .is_owned_collection_path(Path::new(&source_root), Path::new(&job.source_path))
+            })
+            .transpose();
+        if !matches!(owned_source, Ok(None | Some(false))) {
+            let (error_code, retry_at) = if owned_source.is_err() {
+                ("ownership_pending", now + 30_000)
+            } else {
+                ("unsupported_source", i64::MAX)
+            };
+            let intent = job.intent_uuid;
+            let owner = owner.clone();
+            self.writer
+                .write_authoritative(move |db| {
+                    super::inventory::fail_publication_job(
+                        db.connection_for_fsops(),
+                        intent,
+                        &owner,
+                        error_code,
+                        retry_at,
+                        now,
+                    )
+                })
+                .await?;
+            return Ok(true);
+        }
         let foreground_pending = self
             .writer
             .write(|database| database.has_pending_foreground_thumbnail_task())
@@ -900,12 +1055,6 @@ impl MediaPublicationWorker {
                 .await?;
             return Ok(true);
         }
-        let _temp_reservation = self.limiter.reserve_temporary_disk(
-            &self.object_root,
-            job.expected_source_length
-                .saturating_add(super::DATA_PACK_MAX_BYTES)
-                .saturating_add(64 * 1024 * 1024),
-        )?;
         if job
             .binding_epoch
             .as_ref()
@@ -936,6 +1085,32 @@ impl MediaPublicationWorker {
             })
             .await?;
         if !sealed_graph_exists {
+            let reservation = self.limiter.reserve_content_work(
+                &self.object_root,
+                job.expected_source_length
+                    .saturating_add(job.expected_source_length / 100),
+                super::DATA_PACK_MAX_BYTES.saturating_add(64 * 1024 * 1024),
+            );
+            let _temp_reservation = match reservation {
+                Ok(value) => value,
+                Err(_) => {
+                    let intent = job.intent_uuid;
+                    let owner = owner.clone();
+                    self.writer
+                        .write_authoritative(move |database| {
+                            super::inventory::fail_publication_job(
+                                database.connection_for_fsops(),
+                                intent,
+                                &owner,
+                                "disk_capacity",
+                                now + 30_000,
+                                now,
+                            )
+                        })
+                        .await?;
+                    return Ok(true);
+                }
+            };
             let owner_for_phase = owner.clone();
             self.writer
                 .write_authoritative(move |database| {
@@ -1083,15 +1258,73 @@ fn unix_timestamp_millis() -> i64 {
         .unwrap_or(0)
 }
 
+fn existing_storage_directory(path: &Path) -> std::io::Result<&Path> {
+    path.ancestors()
+        .find(|candidate| candidate.is_dir())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "storage directory unavailable",
+            )
+        })
+}
+
+fn same_storage_volume(left: &Path, right: &Path) -> std::io::Result<bool> {
+    let left = crate::library_path::local_file_identity(existing_storage_directory(left)?)?;
+    let right = crate::library_path::local_file_identity(existing_storage_directory(right)?)?;
+    Ok(left.split(':').take(2).eq(right.split(':').take(2)))
+}
+
+fn require_publication_capacity(
+    available: u64,
+    durable_bytes: u64,
+    window_bytes: u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        available
+            >= durable_bytes
+                .saturating_add(window_bytes)
+                .saturating_add(64 * 1024 * 1024),
+        "content storage capacity exhausted"
+    );
+    Ok(())
+}
+
+fn require_restore_capacity(
+    cache_free: u64,
+    target_free: u64,
+    cache_bytes: u64,
+    target_bytes: u64,
+    window: u64,
+    same_volume: bool,
+) -> anyhow::Result<()> {
+    let cache_required = cache_bytes
+        .saturating_add(window)
+        .saturating_add(64 * 1024 * 1024);
+    let target_required = target_bytes.saturating_add(64 * 1024 * 1024);
+    if same_volume {
+        anyhow::ensure!(
+            cache_free.min(target_free) >= cache_required.saturating_add(target_bytes),
+            "shared cache and destination capacity exhausted"
+        );
+    } else {
+        anyhow::ensure!(
+            cache_free >= cache_required,
+            "range cache capacity exhausted"
+        );
+        anyhow::ensure!(
+            target_free >= target_required,
+            "destination capacity exhausted"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn free_space_bytes(path: &Path) -> std::io::Result<u64> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-    let existing = if path.exists() {
-        path
-    } else {
-        path.parent().unwrap_or(path)
-    };
+    let existing = existing_storage_directory(path)?;
     let wide: Vec<u16> = existing.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut available = 0_u64;
     if unsafe {
@@ -1113,11 +1346,7 @@ fn free_space_bytes(path: &Path) -> std::io::Result<u64> {
 fn free_space_bytes(path: &Path) -> std::io::Result<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
-    let existing = if path.exists() {
-        path
-    } else {
-        path.parent().unwrap_or(path)
-    };
+    let existing = existing_storage_directory(path)?;
     let name = CString::new(existing.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -1131,6 +1360,110 @@ fn free_space_bytes(path: &Path) -> std::io::Result<u64> {
 #[cfg(not(any(windows, unix)))]
 fn free_space_bytes(_path: &Path) -> std::io::Result<u64> {
     Ok(u64::MAX)
+}
+
+fn prepare_owned_staging(
+    writer: &DbWriter,
+    root: &Path,
+    revision: uuid::Uuid,
+    owner: &str,
+) -> anyhow::Result<super::materialize::OwnedMaterializationStaging> {
+    use rusqlite::OptionalExtension;
+    let owner = owner.to_owned();
+    let previous = writer.write_blocking(move |db| {
+        Ok(db.connection_for_fsops().query_row(
+            "SELECT staging_relpath,staging_directory_identity,staging_file_identity FROM media_materialization_jobs WHERE content_revision_uuid=?1 AND staging_relpath IS NOT NULL",
+            [revision.as_bytes().as_slice()], |row| Ok((row.get::<_,String>(0)?,row.get::<_,Option<String>>(1)?,row.get::<_,Option<String>>(2)?))).optional()?)
+    })?;
+    if let Some((relative, expected, file_identity)) = previous {
+        let partial = root.join(&relative);
+        let directory = partial
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("invalid staging path"))?;
+        // Legacy shared staging names have no durable ownership proof. Preserve
+        // them and choose a new private directory instead of deleting/adopting.
+        let owned_layout = relative.starts_with(&format!(".mangoo-work-{}-", revision.simple()))
+            && partial.file_name() == Some(std::ffi::OsStr::new("payload.partial"))
+            && directory.parent() == Some(root);
+        if owned_layout && directory.exists() {
+            let expected = expected.ok_or_else(|| {
+                anyhow::anyhow!("materialization staging ownership pending; retry required")
+            })?;
+            let guard = crate::library_path::MarkerDirectoryGuard::open(directory)?;
+            anyhow::ensure!(
+                guard.identity() == expected,
+                "materialization staging identity changed"
+            );
+            // The exact payload path belongs to the identity-bound operation
+            // directory; never clean any other entries or recursively delete it.
+            let file_identity = file_identity
+                .ok_or_else(|| anyhow::anyhow!("materialization payload ownership pending"))?;
+            match guard
+                .delete_file_child_expected(std::ffi::OsStr::new("payload.partial"), &file_identity)
+            {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            drop(guard);
+            crate::library_path::safe_remove_empty_directory_expected(directory, &expected)?;
+        }
+    }
+    // A new random path never claims an earlier user directory. Persist the
+    // plan before creation so simultaneous observation retries pending evidence.
+    let relative = format!(
+        ".mangoo-work-{}-{}/payload.partial",
+        revision.simple(),
+        uuid::Uuid::now_v7().simple()
+    );
+    let planned = relative.clone();
+    let planned_owner = owner.clone();
+    writer.write_authoritative_blocking(move |db| {
+        let changed = db.connection_for_fsops().execute(
+            "UPDATE media_materialization_jobs SET staging_relpath=?1,staging_directory_identity=NULL,staging_file_identity=NULL WHERE content_revision_uuid=?2 AND owner_token=?3",
+            rusqlite::params![planned,revision.as_bytes().as_slice(),planned_owner])?;
+        anyhow::ensure!(changed == 1, "materialization staging claim expired");
+        Ok(())
+    })?;
+    let directory = root
+        .join(&relative)
+        .parent()
+        .expect("staging parent")
+        .to_path_buf();
+    let root_guard = crate::library_path::MarkerDirectoryGuard::open(root)?;
+    let guard = match root_guard
+        .create_directory_child(directory.file_name().expect("staging leaf"))
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            // Only remove our pending DB intent; an occupied path is not ours.
+            writer.write_authoritative_blocking(move |db| {
+            db.connection_for_fsops().execute("UPDATE media_materialization_jobs SET staging_relpath=NULL WHERE content_revision_uuid=?1 AND owner_token=?2 AND staging_relpath=?3 AND staging_directory_identity IS NULL", rusqlite::params![revision.as_bytes().as_slice(),owner,relative])?;
+            Ok(())
+        })?;
+            return Err(error.into());
+        }
+    };
+    root_guard.verify_unchanged()?;
+    let identity = guard.identity().to_owned();
+    let payload = guard.open_temporary(std::ffi::OsStr::new("payload.partial"), true)?;
+    let payload_identity = guard.file_identity(&payload)?;
+    let owned_file_identity = payload_identity.clone();
+    let owned_identity = identity.clone();
+    writer.write_authoritative_blocking(move |db| {
+        let changed = db.connection_for_fsops().execute(
+            "UPDATE media_materialization_jobs SET staging_directory_identity=?1,staging_file_identity=?5 WHERE content_revision_uuid=?2 AND owner_token=?3 AND staging_relpath=?4 AND staging_directory_identity IS NULL",
+            rusqlite::params![owned_identity,revision.as_bytes().as_slice(),owner,relative,owned_file_identity])?;
+        anyhow::ensure!(changed == 1, "materialization staging claim expired");
+        Ok(())
+    })?;
+    Ok(super::materialize::OwnedMaterializationStaging {
+        directory,
+        identity,
+        guard: Some(guard),
+        payload_identity: Some(payload_identity),
+        payload: Some(payload),
+    })
 }
 
 fn materialized_identity(
@@ -1176,18 +1509,18 @@ mod tests {
     }
 
     fn physical_transfer_root() -> PathBuf {
-        std::env::var_os("MEGLE_SYNC_LARGE_TRANSFER_ROOT")
+        std::env::var_os("MANGOO_SYNC_LARGE_TRANSFER_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 std::env::temp_dir().join(format!(
-                    "megle-physical-transfer-{}",
+                    "mangoo-physical-transfer-{}",
                     uuid::Uuid::now_v7().simple()
                 ))
             })
     }
 
     fn physical_transfer_bytes() -> u64 {
-        std::env::var("MEGLE_SYNC_LARGE_TRANSFER_BYTES")
+        std::env::var("MANGOO_SYNC_LARGE_TRANSFER_BYTES")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(10 * 1024 * 1024 * 1024)
@@ -1263,10 +1596,10 @@ mod tests {
     async fn activate_physical_provider(
         root: &Path,
     ) -> crate::plugins::runtime::supervisor::ActivatedProvider {
-        const PLUGIN_ID: &str = "com.megle.fake-sync";
-        let bundled_root = std::env::var_os("MEGLE_SYNC_BUNDLED_PLUGINS_DIR")
+        const PLUGIN_ID: &str = "com.mangoo.fake-sync";
+        let bundled_root = std::env::var_os("MANGOO_SYNC_BUNDLED_PLUGINS_DIR")
             .map(PathBuf::from)
-            .expect("MEGLE_SYNC_BUNDLED_PLUGINS_DIR must identify the packaged Provider root");
+            .expect("MANGOO_SYNC_BUNDLED_PLUGINS_DIR must identify the packaged Provider root");
         let plugin_root = bundled_root.join(PLUGIN_ID);
         let manifest = crate::plugins::parse_manifest(&plugin_root.join("plugin.json")).unwrap();
         crate::plugins::runtime::supervisor::activate_and_register(
@@ -1279,7 +1612,7 @@ mod tests {
             crate::plugins::runtime::trust::embedded_trust_registry(),
             root.join("provider-runtime"),
             None,
-            None,
+            std::collections::BTreeMap::new(),
         )
         .await
         .unwrap()
@@ -1434,22 +1767,22 @@ mod tests {
             .arg("--exact")
             .arg("sync::media::worker::tests::physical_large_transfer_child")
             .arg("--nocapture")
-            .env("MEGLE_SYNC_LARGE_TRANSFER_ROOT", root)
-            .env("MEGLE_SYNC_LARGE_TRANSFER_BYTES", byte_length.to_string())
-            .env("MEGLE_SYNC_LARGE_TRANSFER_PHASE", phase)
+            .env("MANGOO_SYNC_LARGE_TRANSFER_ROOT", root)
+            .env("MANGOO_SYNC_LARGE_TRANSFER_BYTES", byte_length.to_string())
+            .env("MANGOO_SYNC_LARGE_TRANSFER_PHASE", phase)
             .env(
-                "MEGLE_SYNC_FAULT_COUNTER",
+                "MANGOO_SYNC_FAULT_COUNTER",
                 root.join(format!("{phase}-durable-bytes")),
             )
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
-        if let Some(bundled) = std::env::var_os("MEGLE_SYNC_BUNDLED_PLUGINS_DIR") {
-            command.env("MEGLE_SYNC_BUNDLED_PLUGINS_DIR", bundled);
+        if let Some(bundled) = std::env::var_os("MANGOO_SYNC_BUNDLED_PLUGINS_DIR") {
+            command.env("MANGOO_SYNC_BUNDLED_PLUGINS_DIR", bundled);
         }
         if stop {
             command
                 .env(
-                    "MEGLE_SYNC_FAULTPOINT",
+                    "MANGOO_SYNC_FAULTPOINT",
                     if phase == "upload" {
                         "media.after-upload-cursor"
                     } else {
@@ -1457,11 +1790,11 @@ mod tests {
                     },
                 )
                 .env(
-                    "MEGLE_SYNC_FAULT_AFTER_BYTES",
+                    "MANGOO_SYNC_FAULT_AFTER_BYTES",
                     (byte_length / 2).to_string(),
                 )
                 .env(
-                    "MEGLE_SYNC_FAULT_MARKER",
+                    "MANGOO_SYNC_FAULT_MARKER",
                     root.join(format!("{phase}-stop.marker")),
                 );
         }
@@ -1548,7 +1881,7 @@ mod tests {
     async fn physical_large_transfer_child() {
         let root = physical_transfer_root();
         let byte_length = physical_transfer_bytes();
-        match std::env::var("MEGLE_SYNC_LARGE_TRANSFER_PHASE").as_deref() {
+        match std::env::var("MANGOO_SYNC_LARGE_TRANSFER_PHASE").as_deref() {
             Ok("upload") => run_physical_upload_child(&root, byte_length).await,
             Ok("download") => run_physical_download_child(&root, byte_length).await,
             phase => panic!("invalid physical transfer phase: {phase:?}"),
@@ -1862,9 +2195,319 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn all_file_scan_publication_checkpoint_and_incremental_restore_without_echo() {
+        use crate::sync::{capture, persistence};
+        let temp = std::env::temp_dir().join(format!(
+            "mangoo-all-file-roundtrip-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let source = temp.join("source");
+        let target = temp.join("target");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let long_name = format!("{}.bin", "x".repeat(246));
+        let long_folder = "d".repeat(250);
+        std::fs::create_dir_all(source.join(&long_folder)).unwrap();
+        let long_path = format!("{long_folder}/{long_name}");
+        let unicode_path = "nested/e\u{301}.txt";
+        let corpus = [
+            ("empty", Vec::new()),
+            ("notes.bin", b"generic bytes".to_vec()),
+            ("nested/a..b.jpg", b"corrupt but classified media".to_vec()),
+            (long_path.as_str(), b"long path".to_vec()),
+            (unicode_path, b"decomposed name".to_vec()),
+            (".mangoo-staging/user.bin", b"user staging content".to_vec()),
+        ];
+        std::fs::create_dir_all(source.join(".mangoo-staging")).unwrap();
+        std::fs::create_dir_all(target.join(".mangoo-staging")).unwrap();
+        std::fs::write(
+            target.join(".mangoo-staging/user.bin"),
+            b"user staging content",
+        )
+        .unwrap();
+        for (name, bytes) in &corpus {
+            std::fs::write(source.join(name), bytes).unwrap();
+        }
+        let library = uuid::Uuid::now_v7();
+        let library_root = uuid::Uuid::now_v7();
+        let root_uuid = uuid::Uuid::now_v7();
+        let root_folder = uuid::Uuid::now_v7();
+        let binding = uuid::Uuid::now_v7();
+        let mut db = crate::db::Database::open(temp.join("source.sqlite")).unwrap();
+        db.apply_migrations().unwrap();
+        db.ensure_selected_sync_root(
+            library,
+            root_uuid,
+            root_folder,
+            library_root,
+            &source.to_string_lossy(),
+            "Files",
+            "Files",
+            [7; 32],
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7(),
+            1,
+            "active",
+            1,
+            false,
+        )
+        .unwrap();
+        db.initialize_sync_identity(library, library_root, uuid::Uuid::now_v7())
+            .unwrap();
+        db.begin_sync_capture(binding, uuid::Uuid::now_v7())
+            .unwrap();
+        let root = db.list_roots().unwrap().remove(0);
+        crate::scan::scan_root(&mut db, &root).unwrap();
+        capture::capture_enrolled_root_identities(db.connection_for_fsops()).unwrap();
+        let writer = DbWriter::spawn(db);
+        let provider = Arc::new(crate::sync::provider::InMemorySyncProvider::default());
+        let context = TransportContext {
+            namespace: library.to_string(),
+            binding_epoch: binding.to_string(),
+            transport_generation: 1,
+        };
+        let publication = MediaPublicationWorker::new(
+            writer.clone(),
+            provider.clone(),
+            temp.join("objects"),
+            context.clone(),
+            MediaWorkLimiter::new(1, 8, 128 * 1024 * 1024).unwrap(),
+        );
+        for _ in 0..10 {
+            if !publication.run_once().await.unwrap() {
+                break;
+            }
+        }
+        crate::sync::coordinator::publish_test_catalog_segments(
+            &writer,
+            provider.as_ref(),
+            &context,
+            temp.join("sync-spool"),
+        )
+        .await
+        .unwrap();
+        let checkpoint_dir = temp.join("sync-spool/checkpoints");
+        let directory = checkpoint_dir.clone();
+        let checkpoint = writer
+            .write_authoritative(move |db| {
+                let fence = persistence::capture_checkpoint_fence(
+                    db.connection_for_fsops(),
+                    Default::default(),
+                    crate::sync::checkpoint::HostMetadataSnapshot {
+                        library_uuid: library.to_string(),
+                        name: "Files".into(),
+                        icon: None,
+                        binding_state: "synchronized".into(),
+                        events: Vec::new(),
+                    },
+                )?;
+                persistence::build_checkpoint(db.connection_for_fsops(), &fence, &directory)?;
+                persistence::load_and_validate_checkpoint(
+                    db.connection_for_fsops(),
+                    fence.checkpoint_uuid,
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(checkpoint.projection.files.len(), 6);
+        assert_eq!(
+            checkpoint
+                .projection
+                .files
+                .iter()
+                .filter(|f| f.media_kind.is_some())
+                .count(),
+            1
+        );
+        let receiver_directory = temp.join("receiver");
+        std::fs::create_dir_all(receiver_directory.join("sync-spool/indexes")).unwrap();
+        for shard in &checkpoint.media_index_shards {
+            let bytes = std::fs::read(
+                temp.join("sync-spool/indexes")
+                    .join(format!("{}.idx", shard.sha256)),
+            )
+            .unwrap();
+            provider
+                .object_put_immutable(
+                    &context,
+                    &shard.object_key,
+                    &bytes,
+                    crate::sync::media::parse_hash(&shard.sha256).unwrap(),
+                )
+                .await
+                .unwrap();
+            let downloaded = provider
+                .object_get(&context, &shard.object_key, shard.byte_length)
+                .await
+                .unwrap();
+            crate::sync::provider::validate_download(&downloaded, shard.byte_length).unwrap();
+            std::fs::copy(
+                &downloaded.path,
+                receiver_directory
+                    .join("sync-spool/indexes")
+                    .join(format!("{}.idx", shard.sha256)),
+            )
+            .unwrap();
+        }
+        let receiver_path = receiver_directory.join("receiver.sqlite");
+        persistence::materialize_staging_catalog_with_roots(
+            &checkpoint,
+            &receiver_path,
+            library_root,
+            uuid::Uuid::now_v7(),
+            &[(root_uuid, target.clone())],
+        )
+        .unwrap();
+        let receiver = crate::db::Database::open(&receiver_path).unwrap();
+        receiver.apply_migrations().unwrap();
+        receiver
+            .ensure_selected_sync_root(
+                library,
+                root_uuid,
+                root_folder,
+                library_root,
+                &target.to_string_lossy(),
+                "Files",
+                "Files",
+                [7; 32],
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                1,
+                "active",
+                1,
+                false,
+            )
+            .unwrap();
+        receiver
+            .begin_restored_sync_capture(binding, uuid::Uuid::now_v7())
+            .unwrap();
+        let marker =
+            crate::sync::file_policy::test_root_marker(receiver.connection_for_fsops(), &target);
+        std::fs::write(
+            target.join(".mangoo-sync-root"),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        let receiver_writer = DbWriter::spawn(receiver);
+        let restore = MediaRestoreWorker::new(
+            receiver_writer.clone(),
+            provider.clone(),
+            temp.join("fresh-range-cache"),
+            context.clone(),
+            MediaWorkLimiter::new(1, 8, 128 * 1024 * 1024).unwrap(),
+        );
+        for _ in 0..10 {
+            if !restore.run_once().await.unwrap() {
+                break;
+            }
+        }
+        for (name, bytes) in &corpus {
+            assert_eq!(
+                std::fs::read(target.join(name))
+                    .unwrap_or_else(|error| panic!("restore corpus {name}: {error}")),
+                *bytes,
+                "{name}"
+            );
+        }
+        // Queue paths are derived from the current Catalog projection each turn.
+        // Exercise an unsupported remote destination through that projection,
+        // so the normal enqueue step cannot erase the intended fault fixture.
+        receiver_writer
+            .write_authoritative(|db| {
+                db.connection_for_fsops().execute(
+                    "UPDATE files SET name='.mangoo-sync-root' WHERE name='notes.bin'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(restore.run_once().await.unwrap());
+        receiver_writer.write(|db| {
+            let row:(String,Option<String>,bool)=db.connection_for_fsops().query_row("SELECT phase,error_code,owner_token IS NULL FROM media_materialization_jobs WHERE asset_uuid=(SELECT asset_uuid FROM files WHERE name='.mangoo-sync-root')",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            assert_eq!(row,("path-conflict".into(),Some("unsupported_destination".into()),true));
+            Ok(())
+        }).await.unwrap();
+        receiver_writer.write_authoritative(|db| {
+            db.connection_for_fsops().execute("UPDATE files SET name='notes.bin' WHERE name='.mangoo-sync-root'",[])?;
+            db.connection_for_fsops().execute("UPDATE media_materialization_jobs SET next_attempt_at=NULL WHERE asset_uuid=(SELECT asset_uuid FROM files WHERE name='notes.bin')",[])?;
+            Ok(())
+        }).await.unwrap();
+        let tiny_limiter =
+            MediaWorkLimiter::new_with_temp_budget(1, 8, 128 * 1024 * 1024, 1).unwrap();
+        let adopt = MediaRestoreWorker::new(
+            receiver_writer.clone(),
+            provider.clone(),
+            temp.join("unused-cache"),
+            context.clone(),
+            tiny_limiter.clone(),
+        );
+        assert!(adopt.run_once().await.unwrap());
+        assert_eq!(tiny_limiter.metrics().disk_rejections, 0);
+        // Receiver remains alive while a new unsupported file is observed and
+        // published; replaying its canonical events must create its local row.
+        std::fs::write(source.join("later.hlsl"), b"new generic file").unwrap();
+        let mut source_db = crate::db::Database::open(temp.join("source.sqlite")).unwrap();
+        crate::scan::scan_root(&mut source_db, &root).unwrap();
+        drop(source_db);
+        writer
+            .write_authoritative(|db| {
+                capture::capture_enrolled_root_identities(db.connection_for_fsops())
+            })
+            .await
+            .unwrap();
+        for _ in 0..6 {
+            if !publication.run_once().await.unwrap() {
+                break;
+            }
+        }
+        let events=writer.write(|db| {
+            let mut query=db.connection_for_fsops().prepare("SELECT payload FROM sync_events ORDER BY device_uuid,stream_uuid,actor_epoch,actor_seq")?;
+            let events=query.query_map([],|r|r.get::<_,Vec<u8>>(0))?.map(|r|crate::sync::codec::decode_event(&r?).map_err(anyhow::Error::from)).collect::<anyhow::Result<Vec<_>>>();
+            events
+        }).await.unwrap();
+        receiver_writer
+            .write_authoritative(move |db| {
+                for chunk in events.chunks(100) {
+                    db.apply_remote_sync_events(chunk)?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        for _ in 0..6 {
+            if !restore.run_once().await.unwrap() {
+                break;
+            }
+        }
+        assert_eq!(
+            std::fs::read(target.join("later.hlsl")).unwrap(),
+            b"new generic file"
+        );
+        let mut receiver_db = crate::db::Database::open(&receiver_path).unwrap();
+        let receiver_root = receiver_db.list_roots().unwrap().remove(0);
+        crate::scan::scan_root(&mut receiver_db, &receiver_root).unwrap();
+        let counts:(i64,i64,i64)=receiver_db.connection_for_fsops().query_row("SELECT (SELECT COUNT(*) FROM sync_publication_intents),(SELECT COUNT(*) FROM files),(SELECT COUNT(*) FROM media_materialization_jobs WHERE phase='complete')",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(counts, (0, 7, 7));
+        let presentation:(i64,i64,i64)=receiver_db.connection_for_fsops().query_row("SELECT (SELECT COUNT(*) FROM media),(SELECT COUNT(*) FROM media_fts),(SELECT COUNT(*) FROM files WHERE browse_visible=0)",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(presentation,(1,7,6),"all restored files must remain searchable while only recognized media carries media presentation");
+        assert!(std::fs::read_dir(&target).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".mangoo-work-")));
+        drop(receiver_db);
+        receiver_writer.shutdown().await.unwrap();
+        writer.shutdown().await.unwrap();
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
     async fn publication_worker_uploads_dependencies_before_releasing_event() {
         let root = std::env::temp_dir().join(format!(
-            "megle-media-publication-{}",
+            "mangoo-media-publication-{}",
             uuid::Uuid::now_v7().simple()
         ));
         std::fs::create_dir_all(&root).unwrap();
@@ -2150,8 +2793,10 @@ mod tests {
                             ctime: None,
                             file_key: Some(String::from_utf8_lossy(&file_identity).into_owned()),
                         },
-                        media_kind: "image".into(),
+                        media_kind: Some("image".into()),
                         external_identity: Some(crate::db::ExternalFileIdentity {
+                            source_stamp: None,
+                            rename_candidates: Default::default(),
                             volume_identity,
                             file_identity,
                             content_fingerprint: Some(content_fingerprint),
@@ -2186,7 +2831,7 @@ mod tests {
     #[tokio::test]
     async fn publication_worker_rejects_source_changed_after_capture() {
         let root = std::env::temp_dir().join(format!(
-            "megle-media-source-race-{}",
+            "mangoo-media-source-race-{}",
             uuid::Uuid::now_v7().simple()
         ));
         std::fs::create_dir_all(&root).unwrap();
@@ -2275,7 +2920,7 @@ mod tests {
     #[tokio::test]
     async fn materialization_disk_full_is_durable_and_never_publishes_target() {
         let root = std::env::temp_dir().join(format!(
-            "megle-media-disk-full-{}",
+            "mangoo-media-disk-full-{}",
             uuid::Uuid::now_v7().simple()
         ));
         std::fs::create_dir_all(&root).unwrap();
@@ -2405,7 +3050,7 @@ mod tests {
             transport,
             MediaWorkLimiter::new(1, 8, 64 * 1024 * 1024).unwrap(),
         );
-        std::fs::write(managed.join(".megle-test-disk-full"), b"fault injection").unwrap();
+        std::fs::write(managed.join(".mangoo-test-disk-full"), b"fault injection").unwrap();
         let outcome = restore.run_once().await;
         assert!(outcome.unwrap());
         let state = writer
@@ -2428,9 +3073,211 @@ mod tests {
     }
 
     #[test]
+    fn owned_staging_restart_preserves_legacy_pending_and_replaced_payloads() {
+        let root =
+            std::env::temp_dir().join(format!("mangoo-staging-restart-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&root).unwrap();
+        let managed = root.join("managed");
+        std::fs::create_dir(&managed).unwrap();
+        std::fs::create_dir(managed.join(".mangoo-staging")).unwrap();
+        let legacy = managed.join(".mangoo-staging/legacy.partial");
+        std::fs::write(&legacy, b"legacy user bytes").unwrap();
+        let db = crate::db::Database::open(root.join("catalog.sqlite")).unwrap();
+        db.apply_migrations().unwrap();
+        let revision = uuid::Uuid::now_v7();
+        let asset = uuid::Uuid::now_v7();
+        db.connection_for_fsops().execute("INSERT INTO asset_content_revisions(content_revision_uuid,asset_uuid,byte_size,local_mutation_generation,created_at) VALUES (?1,?2,0,1,1)",rusqlite::params![revision.as_bytes().as_slice(),asset.as_bytes().as_slice()]).unwrap();
+        db.connection_for_fsops().execute("INSERT INTO media_materialization_jobs(content_revision_uuid,asset_uuid,destination_relpath,phase,expected_length,staging_relpath,owner_token,created_at,updated_at) VALUES (?1,?2,'data.bin','assembling',0,'.mangoo-staging/legacy.partial','owner',1,1)",rusqlite::params![revision.as_bytes().as_slice(),asset.as_bytes().as_slice()]).unwrap();
+        let writer = DbWriter::spawn(db);
+        let mut staging = prepare_owned_staging(&writer, &managed, revision, "owner").unwrap();
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"legacy user bytes");
+        let directory = staging.directory.clone();
+        let partial = directory.join("payload.partial");
+        drop(staging.payload.take());
+        std::fs::rename(&partial, directory.join("original.partial")).unwrap();
+        std::fs::write(&partial, b"replacement").unwrap();
+        drop(staging);
+        assert!(prepare_owned_staging(&writer, &managed, revision, "owner").is_err());
+        assert_eq!(std::fs::read(&partial).unwrap(), b"replacement");
+        writer.write_authoritative_blocking(|db| {
+            db.connection_for_fsops().execute("UPDATE media_materialization_jobs SET staging_directory_identity=NULL,staging_file_identity=NULL",[])?;
+            Ok(())
+        }).unwrap();
+        assert!(prepare_owned_staging(&writer, &managed, revision, "owner")
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("pending"));
+        assert_eq!(std::fs::read(&partial).unwrap(), b"replacement");
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(writer.shutdown())
+            .unwrap();
+        let reopened = crate::db::Database::open(root.join("catalog.sqlite")).unwrap();
+        let pending:(String,bool)=reopened.connection_for_fsops().query_row("SELECT staging_relpath,staging_directory_identity IS NULL FROM media_materialization_jobs",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert!(pending.1);
+        assert!(managed.join(pending.0).exists());
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn all_file_capacity_failure_releases_claim_and_allows_another_root() {
+        let temporary =
+            std::env::temp_dir().join(format!("mangoo-capacity-fairness-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&temporary).unwrap();
+        let database = crate::db::Database::open(temporary.join("catalog.sqlite")).unwrap();
+        database.apply_migrations().unwrap();
+        let binding = uuid::Uuid::now_v7();
+        let mut publications = Vec::new();
+        for (name, size) in [("large", i64::MAX / 2), ("small", 5)] {
+            let root_path = temporary.join(name);
+            std::fs::create_dir_all(&root_path).unwrap();
+            let source = root_path.join("data.bin");
+            if name == "small" {
+                std::fs::write(&source, b"bytes").unwrap();
+            }
+            // Capacity admission consumes captured metadata before opening the
+            // source. The large fixture needs no huge allocation to prove a
+            // rejected captured payload releases its claim for another root.
+            let root = database
+                .add_root(crate::db::NewRoot {
+                    path: root_path.to_string_lossy().into_owned(),
+                    display_name: name.into(),
+                })
+                .unwrap();
+            let folder = database
+                .upsert_folder(crate::db::FolderUpsert {
+                    root_id: root,
+                    parent_id: None,
+                    name: String::new(),
+                    path_hash: name.into(),
+                    mtime: None,
+                })
+                .unwrap();
+            let file = database
+                .upsert_file(crate::db::FileUpsert {
+                    root_id: root,
+                    folder_id: folder,
+                    name: "data.bin".into(),
+                    ext: ".bin".into(),
+                    size,
+                    mtime: 0,
+                    ctime: None,
+                    file_key: None,
+                })
+                .unwrap();
+            publications.push((file, source, size));
+        }
+        database
+            .initialize_sync_identity(
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+            )
+            .unwrap();
+        database
+            .begin_sync_capture(binding, uuid::Uuid::now_v7())
+            .unwrap();
+        let intents = publications
+            .into_iter()
+            .map(|(file, source, size)| {
+                database
+                    .create_sync_publication_intent(file, &source.to_string_lossy(), size)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        database
+            .connection_for_fsops()
+            .execute(
+                "UPDATE media_publication_jobs SET priority=3 WHERE intent_uuid=?1",
+                [intents[0].as_bytes().as_slice()],
+            )
+            .unwrap();
+        let writer = DbWriter::spawn(database);
+        let limiter = MediaWorkLimiter::new(1, 8, 128 * 1024 * 1024).unwrap();
+        let worker = MediaPublicationWorker::new(
+            writer.clone(),
+            Arc::new(crate::sync::provider::InMemorySyncProvider::default()),
+            temporary.join("objects"),
+            TransportContext {
+                namespace: uuid::Uuid::now_v7().to_string(),
+                binding_epoch: binding.to_string(),
+                transport_generation: 1,
+            },
+            limiter.clone(),
+        );
+        assert!(worker.run_once().await.unwrap());
+        let large = intents[0];
+        writer
+            .write(move |db| {
+                let state: (String, Option<String>, bool, bool) =
+                    db.connection_for_fsops().query_row(
+                        "SELECT phase,error_code,owner_token IS NULL,next_attempt_at>updated_at
+                         FROM media_publication_jobs WHERE intent_uuid=?1",
+                        [large.as_bytes().as_slice()],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )?;
+                assert_eq!(
+                    state,
+                    ("failed".into(), Some("disk_capacity".into()), true, true)
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(worker.run_once().await.unwrap());
+        let small = intents[1];
+        writer
+            .write(move |db| {
+                let state: String = db.connection_for_fsops().query_row(
+                    "SELECT phase FROM media_publication_jobs WHERE intent_uuid=?1",
+                    [small.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(state, "canonicalized");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(limiter.metrics().reserved_temp_bytes, 0);
+        writer.shutdown().await.unwrap();
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn all_file_capacity_accounts_for_shared_and_distinct_volumes() {
+        let gib = 1024u64 * 1024 * 1024;
+        let large = 20 * gib;
+        assert!(require_restore_capacity(50 * gib, 50 * gib, large, large, gib, true).is_ok());
+        assert!(require_restore_capacity(25 * gib, 25 * gib, large, large, gib, true).is_err());
+        assert!(require_restore_capacity(25 * gib, 25 * gib, large, large, gib, false).is_ok());
+        assert!(require_restore_capacity(50 * gib, 19 * gib, large, large, gib, false).is_err());
+        // A resumed cache needs only its remaining bytes; the destination still
+        // needs the full payload even on a different volume.
+        assert!(require_restore_capacity(2 * gib, 25 * gib, 0, large, gib, false).is_ok());
+        let root = std::env::temp_dir();
+        let limiter = MediaWorkLimiter::new_with_temp_budget(
+            1,
+            8,
+            128 * 1024 * 1024,
+            DEFAULT_TEMP_DISK_BUDGET,
+        )
+        .unwrap();
+        assert!(require_publication_capacity(25 * gib, large, 128 * 1024 * 1024).is_ok());
+        assert!(require_publication_capacity(19 * gib, large, 128 * 1024 * 1024).is_err());
+        let reservation = limiter
+            .reserve_temporary_disk(&root, 128 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(limiter.metrics().reserved_temp_bytes, 128 * 1024 * 1024);
+        drop(reservation);
+        assert_eq!(limiter.metrics().reserved_temp_bytes, 0);
+    }
+
+    #[test]
     fn materialization_temp_disk_exhaustion_is_fail_closed() {
         let root = std::env::temp_dir().join(format!(
-            "megle-media-temp-full-{}",
+            "mangoo-media-temp-full-{}",
             uuid::Uuid::now_v7().simple()
         ));
         std::fs::create_dir_all(&root).unwrap();

@@ -1,6 +1,6 @@
-import { Heart, SlidersHorizontal, Star, X } from "lucide-react";
+import { Heart, SlidersHorizontal, Star, X } from "../../design/icons";
 import { useRef } from "react";
-import type { TagRecord } from "@megle/core-client";
+import type { TagRecord } from "@mangoo/core-client";
 import {
   AnchoredOverlay,
   OverlayMenuItem,
@@ -122,7 +122,7 @@ export function FilterMenu({
                   role="menuitemcheckbox"
                   type="button"
                 >
-                  <Star aria-hidden="true" size={12} />
+                  <Star aria-hidden="true" size={12} weight={minRating === rating ? "fill" : "regular"} />
                   <span>{rating}+</span>
                 </button>
               ))}
@@ -138,7 +138,7 @@ export function FilterMenu({
               role="menuitemcheckbox"
               type="button"
             >
-              <Heart aria-hidden="true" size={13} />
+              <Heart aria-hidden="true" size={13} weight={favorite === true ? "fill" : "regular"} />
               <span>Favorites</span>
             </button>
           </div>

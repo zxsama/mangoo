@@ -1,0 +1,120 @@
+{
+  "manifestVersion": 2,
+  "id": "com.mangoo.configurable-sync",
+  "name": "Configurable Sync Fixture",
+  "version": "1.0.0",
+  "engine": "process",
+  "entry": {
+    "windowsX64": "bin/configurable-provider.exe",
+    "linuxX64": "bin/configurable-provider"
+  },
+  "rpc": {
+    "wireVersions": [1],
+    "capabilities": ["sync-provider.v1"],
+    "methodVersions": {
+      "describe": 1,
+      "health": 1,
+      "diagnostics": 1,
+      "shutdown": 1,
+      "auth.begin": 1,
+      "auth.complete": 1,
+      "auth.poll": 1,
+      "auth.cancel": 1,
+      "auth.status": 1,
+      "auth.sign_out": 1,
+      "delta.list": 1,
+      "object.head": 1,
+      "object.get": 1,
+      "object.get_range": 1,
+      "object.put_immutable": 1,
+      "upload.begin": 1,
+      "upload.write": 1,
+      "upload.commit": 1,
+      "upload.abort": 1
+    }
+  },
+  "activationEvents": ["sync-enabled", "auth-requested", "diagnostics-requested"],
+  "requestedPermissions": [
+    {
+      "kind": "network",
+      "schemes": ["https"],
+      "hosts": ["auth.storage.example.test", "files.storage.example.test"]
+    },
+    {"kind": "oauth-loopback", "mode": "ephemeral-only"},
+    {"kind": "secret", "namespace": "configurable-sync", "operations": ["read", "write", "delete"]},
+    {"kind": "temp-storage", "maxBytes": 134217728}
+  ],
+  "integrity": {"sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+  "contributions": {
+    "configuration": [
+      {
+        "id": "clientId",
+        "label": "Application ID",
+        "description": "Public application identifier for the test provider.",
+        "format": "uuid",
+        "required": true,
+        "environment": "MANGOO_CONFIGURABLE_TEST_CLIENT_ID",
+        "defaultValue": null,
+        "choices": [],
+        "hidden": false,
+        "debugOnly": false
+      },
+      {
+        "id": "authority",
+        "label": "Authorization service",
+        "description": "",
+        "format": "https-url",
+        "required": false,
+        "environment": "MANGOO_CONFIGURABLE_TEST_AUTHORITY",
+        "defaultValue": "https://auth.storage.example.test/",
+        "choices": [],
+        "hidden": true,
+        "debugOnly": false
+      },
+      {
+        "id": "authMode",
+        "label": "Authorization mode",
+        "description": "",
+        "format": "choice",
+        "required": false,
+        "environment": "MANGOO_CONFIGURABLE_TEST_AUTH_MODE",
+        "defaultValue": "loopback",
+        "choices": ["loopback", "manual-response-uri"],
+        "hidden": true,
+        "debugOnly": false
+      },
+      {
+        "id": "emulatorUrl",
+        "label": "Test service",
+        "description": "",
+        "format": "loopback-url",
+        "required": false,
+        "environment": "MANGOO_CONFIGURABLE_TEST_EMULATOR_URL",
+        "defaultValue": null,
+        "choices": [],
+        "hidden": true,
+        "debugOnly": true
+      }
+    ],
+    "authentication": {
+      "modes": ["loopback", "manual-response-uri"],
+      "authorizationHosts": ["auth.storage.example.test"],
+      "manualRedirectUri": "https://auth.storage.example.test/return",
+      "loopbackRedirectPath": "/storage/callback",
+      "ignoredCallbackFields": ["session_hint"]
+    },
+    "presentation": {
+      "setupLabel": "Configure test storage",
+      "accountLabel": "Test Storage",
+      "icon": "cloud",
+      "helpLinks": [
+        {"id": "registration", "label": "Application registration", "url": "https://docs.storage.example.test/setup"}
+      ],
+      "setupSteps": [
+        {"title": "Register an application", "body": "Create a public application for the test service.", "helpLinkId": "registration"},
+        {"title": "Configure the callback", "body": "Register the callback address displayed for this device.", "helpLinkId": null}
+      ]
+    },
+    "primaryCredential": {"namespace": "configurable-sync", "purpose": "session-v1"}
+  }
+}

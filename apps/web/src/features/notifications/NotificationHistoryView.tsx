@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight, RefreshCw, RotateCcw, Square } from "lucide-react";
+import { ChevronDown, ChevronRight, RefreshCw, RotateCcw, Square } from "../../design/icons";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   useCallback,
@@ -15,7 +15,7 @@ import type {
   DesktopNotificationHistoryQuery,
   DesktopNotificationOperation,
   DesktopNotificationStatus
-} from "@megle/notification-contract";
+} from "@mangoo/notification-contract";
 import { LiquidGlassButton } from "../../design/liquid-glass";
 import { OverlayField, OverlaySelect } from "../../design/overlays";
 import type {

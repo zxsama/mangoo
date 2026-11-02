@@ -9,7 +9,7 @@ import {
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, before, describe, it } from "node:test";
-import { createServer, type ViteDevServer } from "vite";
+import { createServer, type ViteDevServer } from "./viteTestServer.mts";
 
 const read = (path: string) =>
   readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
@@ -760,8 +760,13 @@ async function runRenameScenario() {
   const trigger = await findButton("Open rename");
   await requestNativeClick(trigger);
   const dialog = await waitForDialog("rename-dialog", "rename-dialog-title");
-  await settle(30);
   const input = await findElement("input", dialog) as HTMLInputElement;
+  // Autofocus schedules stem selection on the next animation frame. Wait for
+  // that observable result instead of sampling between those two callbacks.
+  await waitFor(
+    () => document.activeElement === input && input.selectionStart === 0 && input.selectionEnd === 5,
+    "rename autofocus and initial stem selection",
+  );
   const selectedStem =
     document.activeElement === input && input.selectionStart === 0 && input.selectionEnd === 5;
   await act(async () => setInputValue(input, "CON"));

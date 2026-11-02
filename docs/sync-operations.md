@@ -1,6 +1,6 @@
 # Sync Operations Runbook
 
-Megle synchronization moves immutable events, checkpoints, manifests and media
+Mangoo synchronization moves immutable events, checkpoints, manifests and media
 objects. It does not copy a live SQLite database or its WAL, and it is not a
 backup replacement. Keep an independent backup of source media and exported
 metadata.
@@ -21,36 +21,20 @@ Raw data is written to the ignored `.tmp/sync-release/<run-id>/` directory.
 `check:sync-release` archives `HEAD`, hashes the archive, extracts it into an
 ordinary directory and runs the gates there. A dirty diagnostic run can be
 requested with `--allow-dirty`, but it cannot satisfy the immutable-tree row.
-Docker/Linux and Personal/Business Graph canaries are required independent
-rows. Docker qualification includes two separate containers sharing only the
-evidence volume and proving Host, active Library, capture, and Provider object
-persistence. Live Graph qualification covers Delta, immutable object, Range,
-and upload-session behavior. An unavailable daemon or missing token keeps the
-release result nonzero.
+Docker/Linux remains a required independent Host row. Docker qualification
+includes two separate containers sharing only the evidence volume and proving
+Host, active Library, capture, and Provider object persistence. The Host fault
+matrix has 16 generic cases; an unavailable daemon or missing required evidence
+keeps the release result nonzero.
 
-OneDrive onboarding adds four independent product-OAuth evidence inputs. They
-must be captured from the same clean commit without storing any authorization
-code, state, response URI, token, account ID, or drive ID:
-
-```powershell
-$env:MEGLE_ONEDRIVE_PERSONAL_OAUTH_EVIDENCE='C:\evidence\personal.json'
-$env:MEGLE_ONEDRIVE_BUSINESS_OAUTH_EVIDENCE='C:\evidence\business.json'
-$env:MEGLE_ONEDRIVE_DESKTOP_LOOPBACK_EVIDENCE='C:\evidence\desktop-loopback.json'
-$env:MEGLE_ONEDRIVE_DOCKER_MANUAL_EVIDENCE='C:\evidence\docker-manual.json'
-```
-
-Each JSON record has `schemaVersion: 1`, `kind: "onedrive-product-oauth"`, the
-exact `commit`, `capturedAt`, `passed: true`, `sensitiveMaterialPresent: false`,
-`pkceS256: true`, `clientSecretUsed: false`, `secretStorePersisted: true`, and the applicable
-`accountKind`, `platform`, `completionMode`, `redirectUri`, refresh/restart, and
-observed-response-field facts. The release gate validates these facts and the
-strict response-field allowlist. A pre-acquired Graph access token proves only
-transport behavior; it cannot satisfy any Product OAuth row.
-
-Repository-owned emulator rows separately exercise the real Provider child in
-Desktop loopback and Docker manual modes. The Docker release path also runs the
-manual-mode child inside Linux and keeps credential/container persistence as a
-separate row. Missing evidence stays `blocked`.
+OneDrive's four vendor fault groups, emulator process checks, Personal/Business
+Graph canaries and four product OAuth evidence rows moved to its independent
+[authorization and release guide](../../Mangoo_OneDriveSync/docs/authorization-and-release.md).
+Run those gates in the plugin repository for a release that includes its
+artifact. Missing plugin evidence remains `blocked`, and transport tokens or
+local emulators cannot substitute for product authorization evidence. Earlier
+combined reports retain their original scope as described in the
+[extraction note](onedrive-extraction.md).
 
 ## Enable and rollout
 
@@ -59,7 +43,8 @@ Promote one stage at a time:
 1. Deploy schema with synchronization dormant.
 2. Enable local shadow capture and compare event/frontier counts after reopen.
 3. Enable the bundled fake Provider and perform a fresh-root restore.
-4. Enable OneDrive for one device and compare vector, projection and content hashes.
+4. Explicitly include and enable the selected production Provider for one device,
+   then compare vector, projection and content hashes.
 5. Restore a fresh second device and wait for catalog-ready plus complete media.
 6. Enable writes on both devices and verify deterministic conflict convergence.
 7. Enable multiple Libraries only after fairness and browse/search/thumbnail gates pass.

@@ -7,6 +7,7 @@ const source = readFileSync(
   "utf8"
 );
 const appSource = readFileSync(new URL("../src/app/App.tsx", import.meta.url), "utf8");
+const identitySource = readFileSync(new URL("../src/core/useActiveLibraryIdentity.ts", import.meta.url), "utf8");
 const settingsWindowSource = readFileSync(
   new URL("../src/features/settings/SettingsWindow.tsx", import.meta.url),
   "utf8"
@@ -119,7 +120,8 @@ describe("legacy Recent runtime removal", () => {
 
   it("provides captured active-library context from both renderer windows", () => {
     assert.match(appSource, /activeLibraryName,/);
-    assert.match(appSource, /phase === "loading-media"[\s\S]*?setActiveLibraryId\(null\)/);
+    assert.match(appSource, /useActiveLibraryIdentity\(libraryPhase\)/);
+    assert.match(identitySource, /activeLibraryId: phase === "loading-media" \? null/);
     assert.match(settingsWindowSource, /listLibraries/);
     assert.match(settingsWindowSource, /subscribeLibraryPhase/);
     assert.match(settingsWindowSource, /createLibraryContextTracker/);

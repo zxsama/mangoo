@@ -110,20 +110,20 @@ describe("plugin automatic discovery", () => {
 
   it("keeps the current selection when possible and otherwise selects the first plugin", () => {
     const plugins = [
-      { pluginId: "com.megle.fake-sync" },
-      { pluginId: "com.megle.onedrive" }
+      { pluginId: "com.mangoo.fake-sync" },
+      { pluginId: "com.mangoo.configurable-sync" }
     ] as Parameters<typeof pluginDataModule.reconcilePluginSelection>[1];
 
     assert.equal(
-      pluginDataModule.reconcilePluginSelection("com.megle.onedrive", plugins),
-      "com.megle.onedrive"
+      pluginDataModule.reconcilePluginSelection("com.mangoo.configurable-sync", plugins),
+      "com.mangoo.configurable-sync"
     );
     assert.equal(
-      pluginDataModule.reconcilePluginSelection("com.megle.removed", plugins),
-      "com.megle.fake-sync"
+      pluginDataModule.reconcilePluginSelection("com.mangoo.removed", plugins),
+      "com.mangoo.fake-sync"
     );
-    assert.equal(pluginDataModule.reconcilePluginSelection(null, plugins), "com.megle.fake-sync");
-    assert.equal(pluginDataModule.reconcilePluginSelection("com.megle.onedrive", []), null);
+    assert.equal(pluginDataModule.reconcilePluginSelection(null, plugins), "com.mangoo.fake-sync");
+    assert.equal(pluginDataModule.reconcilePluginSelection("com.mangoo.configurable-sync", []), null);
   });
 
   it("keeps discovery separate from the list poll and removes manual scan UI", () => {

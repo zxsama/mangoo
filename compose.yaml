@@ -1,32 +1,27 @@
 services:
-  megle:
-    image: megle:dev
+  mangoo:
+    image: mangoo:dev
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: megle-core
+    container_name: mangoo-core
     ports:
       - "47321:47321"
     environment:
       # Front-of-house auth for browser access. Set to `user:pass` to enable.
       # Development quickstart remains explicitly authenticated. Override this
       # value in production rather than exposing an unauthenticated Core.
-      MEGLE_BASIC_AUTH: ${MEGLE_BASIC_AUTH:-megle:change-me}
+      MANGOO_BASIC_AUTH: ${MANGOO_BASIC_AUTH:-mangoo:change-me}
       # Desktop session-token enforcement. Leave unset when running a browser
       # deployment behind Basic auth; set to a strong token if you also want
-      # the desktop X-Megle-Session check active.
-      MEGLE_SESSION_TOKEN: ${MEGLE_SESSION_TOKEN:-}
+      # the desktop X-Mangoo-Session check active.
+      MANGOO_SESSION_TOKEN: ${MANGOO_SESSION_TOKEN:-}
       RUST_LOG: ${RUST_LOG:-info}
-      MEGLE_ONEDRIVE_CLIENT_ID: ${MEGLE_ONEDRIVE_CLIENT_ID:-}
-      # abraunegg/onedrive-style browser authorization: Megle shows the URL,
-      # then the user pastes the final native-client response URI back into UI.
-      MEGLE_ONEDRIVE_AUTH_MODE: manual-response-uri
-      MEGLE_ONEDRIVE_AUTHORITY: ${MEGLE_ONEDRIVE_AUTHORITY:-https://login.microsoftonline.com/common/}
     volumes:
-      - megle-data:/data
-      - ${MEGLE_LIBRARY_PATH:-./library}:/library:ro
-      - ${MEGLE_SECRET_KEY_FILE:-./secrets/megle_secret_key}:/run/secrets/megle_secret_key:ro
+      - mangoo-data:/data
+      - ${MANGOO_LIBRARY_PATH:-./library}:/library:ro
+      - ${MANGOO_SECRET_KEY_FILE:-./secrets/mangoo_secret_key}:/run/secrets/mangoo_secret_key:ro
     restart: unless-stopped
 
 volumes:
-  megle-data:
+  mangoo-data:

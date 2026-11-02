@@ -7,6 +7,7 @@ import process from "node:process";
 import WebSocket from "ws";
 import { inspectNativeBrowserWindowOptions } from "../../tools/checks/native-browser-window-options.mjs";
 import { managedLibraryHostEnv } from "../../tools/dev/managed-library-harness.mjs";
+import { availableLoopbackPort } from "../../tools/dev/web-dev-url.mjs";
 import { prepareControlledMediaRoot, resolveRepositoryRoot } from "./controlled-media.mjs";
 import {
   finalizeNormalOsDiagnostics,
@@ -20,7 +21,7 @@ import { collectStartupDiagnostics as parseStartupDiagnostics } from "./startup-
 
 const root = await resolveRepositoryRoot(import.meta.url);
 const visualRoot = path.join(root, ".tmp", "visual-check");
-const visualRunId = `megle-visual-${Date.now().toString(36)}-${process.pid}`;
+const visualRunId = `mangoo-visual-${Date.now().toString(36)}-${process.pid}`;
 const controlledMedia = await prepareControlledMediaRoot(visualRoot, visualRunId);
 const mediaDir = controlledMedia.root;
 const screenshotDir = path.join(visualRoot, "screenshots");
@@ -28,16 +29,16 @@ const logDir = path.join(visualRoot, "logs");
 const dataDir = path.join(visualRoot, `data-desktop-ui-${visualRunId}`);
 const managedRoot = path.join(dataDir, "library");
 const electronUserDataDir = path.join(dataDir, "electron-user-data");
-const webUrl = "http://127.0.0.1:5179";
-const debugPort = Number(process.env.MEGLE_VISUAL_DEBUG_PORT ?? process.env.MEGLE_REMOTE_DEBUG_PORT ?? 9500);
+const webUrl = `http://127.0.0.1:${await availableLoopbackPort(0)}`;
+const debugPort = Number(process.env.MANGOO_VISUAL_DEBUG_PORT ?? process.env.MANGOO_REMOTE_DEBUG_PORT ?? await availableLoopbackPort(0));
 const runStartedAt = new Date();
-const osBackdropEvidenceEnabled = process.env.MEGLE_VISUAL_OS_BACKDROP === "1";
-const notificationWindowOnly = process.env.MEGLE_VISUAL_NOTIFICATIONS_ONLY === "1";
+const osBackdropEvidenceEnabled = process.env.MANGOO_VISUAL_OS_BACKDROP === "1";
+const notificationWindowOnly = process.env.MANGOO_VISUAL_NOTIFICATIONS_ONLY === "1";
 const osBackdropEvidenceMode = osBackdropEvidenceEnabled
   ? "required-os-composited"
   : "optional-skipped-static-only";
 const osBackdropRequiredCommand =
-  '$env:MEGLE_VISUAL_OS_BACKDROP="1"; node .tmp\\visual-check\\desktop-ui-regression.mjs; Remove-Item Env:\\MEGLE_VISUAL_OS_BACKDROP';
+  '$env:MANGOO_VISUAL_OS_BACKDROP="1"; node .tmp\\visual-check\\desktop-ui-regression.mjs; Remove-Item Env:\\MANGOO_VISUAL_OS_BACKDROP';
 
 const consoleWarnings = [];
 const consoleErrors = [];
@@ -85,15 +86,15 @@ function startDevApp() {
     cwd: root,
     env: {
       ...process.env,
-      MEGLE_WEB_URL: webUrl,
+      MANGOO_WEB_URL: webUrl,
       ...managedLibraryHostEnv(dataDir),
-      MEGLE_ELECTRON_USER_DATA_DIR: electronUserDataDir,
-      MEGLE_AUTO_ADD_ROOT: mediaDir,
-      MEGLE_AUTO_LIBRARY_ROOT: managedRoot,
-      MEGLE_REMOTE_DEBUG: "1",
-      MEGLE_REMOTE_DEBUG_PORT: String(debugPort),
-      MEGLE_VISUAL_HARNESS: "1",
-      MEGLE_VISUAL_RUN_ID: visualRunId
+      MANGOO_ELECTRON_USER_DATA_DIR: electronUserDataDir,
+      MANGOO_AUTO_ADD_ROOT: mediaDir,
+      MANGOO_AUTO_LIBRARY_ROOT: managedRoot,
+      MANGOO_REMOTE_DEBUG: "1",
+      MANGOO_REMOTE_DEBUG_PORT: String(debugPort),
+      MANGOO_VISUAL_HARNESS: "1",
+      MANGOO_VISUAL_RUN_ID: visualRunId
     },
     shell: process.platform === "win32",
     stdio: ["ignore", "pipe", "pipe"],
@@ -179,6 +180,9 @@ async function waitForTarget(
   const deadline = Date.now() + timeoutMs;
   let lastError;
   while (Date.now() < deadline) {
+    if (child?.exitCode !== null && child?.exitCode !== undefined) {
+      throw new Error(`Desktop launcher exited before CDP became ready (exit ${child.exitCode}); see ${stderrPath}`);
+    }
     try {
       const targets = await httpJson(`http://127.0.0.1:${debugPort}/json/list`);
       const page = targets.find((target) => target.type === "page" && predicate(target));
@@ -320,16 +324,16 @@ async function screenshot(client, name) {
   await client.send("Page.bringToFront").catch(() => undefined);
   const bridgeReady = await evaluate(
     client,
-    `typeof window.megleDesktop?.visual?.capturePage === "function"`
+    `typeof window.mangooDesktop?.visual?.capturePage === "function"`
   );
   if (!bridgeReady) {
     throw new Error(
-      "Desktop visual page capture bridge is unavailable; ensure MEGLE_VISUAL_HARNESS=1 and the preload exposed window.megleDesktop.visual.capturePage"
+      "Desktop visual page capture bridge is unavailable; ensure MANGOO_VISUAL_HARNESS=1 and the preload exposed window.mangooDesktop.visual.capturePage"
     );
   }
   const data = await evaluate(
     client,
-    `window.megleDesktop.visual.capturePage()`
+    `window.mangooDesktop.visual.capturePage()`
   );
   if (typeof data !== "string" || data.length === 0) {
     throw new Error("Desktop visual page capture did not return screenshot data");
@@ -1735,7 +1739,7 @@ async function mutateRealTitlebarPopupMaskToUnclipped(client) {
   const mutation = await evaluate(
     client,
     `(() => {
-      if (window.__megleRealPopupMaskMutation) return { ok: false, reason: 'mutation-already-active' };
+      if (window.__mangooRealPopupMaskMutation) return { ok: false, reason: 'mutation-already-active' };
       const filter = document.querySelector('filter[data-overlay-regional-blur-target="app-root"]');
       if (!filter) return { ok: false, reason: 'filter-missing' };
       const clips = [...filter.querySelectorAll('feComposite[operator="in"]')].filter((node) =>
@@ -1755,7 +1759,7 @@ async function mutateRealTitlebarPopupMaskToUnclipped(client) {
           }
         }
       }
-      window.__megleRealPopupMaskMutation = { filter, changes };
+      window.__mangooRealPopupMaskMutation = { filter, changes };
       return {
         ok: clips.length === 1 && changes.length >= 2,
         filterId: filter.id,
@@ -1780,7 +1784,7 @@ async function restoreRealTitlebarPopupMaskClip(client) {
   const restoration = await evaluate(
     client,
     `(() => {
-      const mutation = window.__megleRealPopupMaskMutation;
+      const mutation = window.__mangooRealPopupMaskMutation;
       if (!mutation) return { restored: 0, active: false };
       let restored = 0;
       for (const change of mutation.changes) {
@@ -1788,7 +1792,7 @@ async function restoreRealTitlebarPopupMaskClip(client) {
         change.node.setAttribute(change.attribute, change.previous);
         restored++;
       }
-      delete window.__megleRealPopupMaskMutation;
+      delete window.__mangooRealPopupMaskMutation;
       return { restored, active: false, filterConnected: mutation.filter?.isConnected === true };
     })()`
   );
@@ -2027,7 +2031,7 @@ async function captureRealTitlebarPopupEdgeEvidence(client, configuredSigma, bas
       );
     }
   } finally {
-    await evaluate(client, `delete window.__megleRealPopupMaskMutation`).catch(() => undefined);
+    await evaluate(client, `delete window.__mangooRealPopupMaskMutation`).catch(() => undefined);
     await removeRealTitlebarPopupDiagnostic(client).catch(() => undefined);
     await restoreRendererDialogBlurOverride(client, previousDialogBlur).catch(() => undefined);
     await clearRendererDeviceScale(client);
@@ -2134,7 +2138,7 @@ async function captureWindowBackdropEvidence(client, name, layout) {
       mode: osBackdropEvidenceMode,
       requiredCommand: osBackdropRequiredCommand,
       reason:
-        "Skipped optional OS-composited acrylic proof; this default run uses static source/options plus renderer screenshot evidence only. Set MEGLE_VISUAL_OS_BACKDROP=1 for required OS backdrop capture."
+        "Skipped optional OS-composited acrylic proof; this default run uses static source/options plus renderer screenshot evidence only. Set MANGOO_VISUAL_OS_BACKDROP=1 for required OS backdrop capture."
     };
   }
   const evidence = await captureWindowBackdropEvidenceViaWindows(name, layout);
@@ -2181,7 +2185,7 @@ function osBackdropVerificationSummary(windowBackdrop) {
     status: pixelEvidencePassed ? "passed" : "failed",
     command: osBackdropRequiredCommand,
     note: pixelEvidencePassed
-      ? "OS screenshot pixel evidence shows transparent passthrough or native acrylic-tinted desktop variation while Megle UI surfaces remain visible over the backdrop."
+      ? "OS screenshot pixel evidence shows transparent passthrough or native acrylic-tinted desktop variation while Mangoo UI surfaces remain visible over the backdrop."
       : "OS screenshot pixel evidence did not satisfy transparent/acrylic backdrop and visible-surface thresholds."
   };
 }
@@ -2368,7 +2372,7 @@ Add-Type -AssemblyName System.Drawing
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
-public class MegleBackdropCapture {
+public class MangooBackdropCapture {
   [StructLayout(LayoutKind.Sequential)]
   public struct RECT {
     public int Left;
@@ -2398,8 +2402,8 @@ $processInfos = Get-CimInstance Win32_Process | Where-Object {
     $_.CommandLine -like '*apps/desktop/dist/main.js*' -or
     $_.CommandLine -like '*apps\\desktop\\dist\\main.js*'
   ) -and
-  $_.CommandLine -like '*--megle-visual-harness=1*' -and
-  $_.CommandLine -like "*--megle-visual-run-id=$runId*" -and
+  $_.CommandLine -like '*--mangoo-visual-harness=1*' -and
+  $_.CommandLine -like "*--mangoo-visual-run-id=$runId*" -and
   $_.CommandLine -notlike '* --type=*' -and
   $_.Name -notin @('powershell.exe', 'pwsh.exe', 'node.exe')
 } | Sort-Object ProcessId
@@ -2411,25 +2415,25 @@ foreach ($processInfo in $processInfos) {
   }
   $window = $null
 }
-if (-not $window) { throw 'Megle Electron window not found for backdrop capture' }
+if (-not $window) { throw 'Mangoo Electron window not found for backdrop capture' }
 $topMost = [IntPtr]::new(-1)
 $notTopMost = [IntPtr]::new(-2)
 $swpNoMove = 0x0002
 $swpNoSize = 0x0001
 $swpShowWindow = 0x0040
-$rect = New-Object MegleBackdropCapture+RECT
+$rect = New-Object MangooBackdropCapture+RECT
 $handle = [IntPtr]::Zero
 $rectReady = $false
 for ($attempt = 0; $attempt -lt 20; $attempt++) {
   $window.Refresh()
   $candidate = $window.MainWindowHandle
-  if ($candidate -ne 0 -and [MegleBackdropCapture]::IsWindow($candidate)) {
+  if ($candidate -ne 0 -and [MangooBackdropCapture]::IsWindow($candidate)) {
     $handle = $candidate
-    [MegleBackdropCapture]::ShowWindow($handle, 9) | Out-Null
-    [MegleBackdropCapture]::SetForegroundWindow($handle) | Out-Null
-    [MegleBackdropCapture]::SetWindowPos($handle, $topMost, 0, 0, 0, 0, ($swpNoMove -bor $swpNoSize -bor $swpShowWindow)) | Out-Null
+    [MangooBackdropCapture]::ShowWindow($handle, 9) | Out-Null
+    [MangooBackdropCapture]::SetForegroundWindow($handle) | Out-Null
+    [MangooBackdropCapture]::SetWindowPos($handle, $topMost, 0, 0, 0, 0, ($swpNoMove -bor $swpNoSize -bor $swpShowWindow)) | Out-Null
     Start-Sleep -Milliseconds 120
-    if ([MegleBackdropCapture]::GetWindowRect($handle, [ref] $rect)) {
+    if ([MangooBackdropCapture]::GetWindowRect($handle, [ref] $rect)) {
       $rectReady = $true
       break
     }
@@ -2437,14 +2441,14 @@ for ($attempt = 0; $attempt -lt 20; $attempt++) {
   Start-Sleep -Milliseconds 100
 }
 if (-not $rectReady) {
-  throw "GetWindowRect failed before backdrop capture: handle=$($handle.ToInt64()) isWindow=$([MegleBackdropCapture]::IsWindow($handle))"
+  throw "GetWindowRect failed before backdrop capture: handle=$($handle.ToInt64()) isWindow=$([MangooBackdropCapture]::IsWindow($handle))"
 }
 $windowWidth = [Math]::Max(1, $rect.Right - $rect.Left)
 $windowHeight = [Math]::Max(1, $rect.Bottom - $rect.Top)
 if ($rect.Left -lt ($margin + 12) -or $rect.Top -lt ($margin + 12)) {
-  [MegleBackdropCapture]::MoveWindow($handle, 72, 72, $windowWidth, $windowHeight, $true) | Out-Null
+  [MangooBackdropCapture]::MoveWindow($handle, 72, 72, $windowWidth, $windowHeight, $true) | Out-Null
   Start-Sleep -Milliseconds 260
-  if (-not [MegleBackdropCapture]::GetWindowRect($handle, [ref] $rect)) {
+  if (-not [MangooBackdropCapture]::GetWindowRect($handle, [ref] $rect)) {
     throw 'GetWindowRect failed after moving window for backdrop capture'
   }
   $windowWidth = [Math]::Max(1, $rect.Right - $rect.Left)
@@ -2456,7 +2460,7 @@ $leftMargin = $rect.Left - $captureX
 $topMargin = $rect.Top - $captureY
 $captureWidth = $windowWidth + $leftMargin + $margin
 $captureHeight = $windowHeight + $topMargin + $margin
-[MegleBackdropCapture]::SetWindowPos($handle, $topMost, 0, 0, 0, 0, ($swpNoMove -bor $swpNoSize -bor $swpShowWindow)) | Out-Null
+[MangooBackdropCapture]::SetWindowPos($handle, $topMost, 0, 0, 0, 0, ($swpNoMove -bor $swpNoSize -bor $swpShowWindow)) | Out-Null
 Start-Sleep -Milliseconds 260
 $bitmap = New-Object System.Drawing.Bitmap $captureWidth, $captureHeight
 $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
@@ -2560,8 +2564,8 @@ try {
     uiSurfaceDelta = MaxDelta $uiSamples
   } | ConvertTo-Json -Depth 8 -Compress
 } finally {
-  if ($handle -ne [IntPtr]::Zero -and [MegleBackdropCapture]::IsWindow($handle)) {
-    [MegleBackdropCapture]::SetWindowPos($handle, $notTopMost, 0, 0, 0, 0, ($swpNoMove -bor $swpNoSize -bor $swpShowWindow)) | Out-Null
+  if ($handle -ne [IntPtr]::Zero -and [MangooBackdropCapture]::IsWindow($handle)) {
+    [MangooBackdropCapture]::SetWindowPos($handle, $notTopMost, 0, 0, 0, 0, ($swpNoMove -bor $swpNoSize -bor $swpShowWindow)) | Out-Null
   }
   if ($graphics) { $graphics.Dispose() }
   if ($bitmap) { $bitmap.Dispose() }
@@ -2794,7 +2798,7 @@ async function titlebarCenterBlankPoint(client) {
 async function desktopMaximizedState(client) {
   return evaluate(
     client,
-    `window.megleDesktop?.windowControls?.isMaximized?.()`
+    `window.mangooDesktop?.windowControls?.isMaximized?.()`
   );
 }
 
@@ -2813,10 +2817,10 @@ async function titlebarDragEvidence(client) {
   const bridge = await evaluate(
     client,
     `(() => ({
-      hasDesktop: Boolean(window.megleDesktop),
-      hasWindowControls: Boolean(window.megleDesktop?.windowControls),
-      hasIsMaximized: typeof window.megleDesktop?.windowControls?.isMaximized === "function",
-      hasMaximize: typeof window.megleDesktop?.windowControls?.maximize === "function"
+      hasDesktop: Boolean(window.mangooDesktop),
+      hasWindowControls: Boolean(window.mangooDesktop?.windowControls),
+      hasIsMaximized: typeof window.mangooDesktop?.windowControls?.isMaximized === "function",
+      hasMaximize: typeof window.mangooDesktop?.windowControls?.maximize === "function"
     }))()`
   );
   if (!bridge.hasIsMaximized || !bridge.hasMaximize) {
@@ -2922,13 +2926,13 @@ async function waitForNotificationAnchorGeometry(client, label, timeoutMs = 1000
 async function notificationMaximizeAnchorEvidence(client) {
   const bridgeAvailable = await evaluate(
     client,
-    `typeof window.megleDesktop?.windowControls?.maximize === "function" &&
-      typeof window.megleDesktop?.windowControls?.isMaximized === "function"`
+    `typeof window.mangooDesktop?.windowControls?.maximize === "function" &&
+      typeof window.mangooDesktop?.windowControls?.isMaximized === "function"`
   );
   if (!bridgeAvailable) return { bridgeAvailable: false };
 
   if (await desktopMaximizedState(client)) {
-    await evaluate(client, `window.megleDesktop.windowControls.maximize()`);
+    await evaluate(client, `window.mangooDesktop.windowControls.maximize()`);
     await waitForMaximizedState(client, false);
   }
   await clickSelector(client, `[data-compact-popover-trigger="notifications"]`);
@@ -2936,12 +2940,12 @@ async function notificationMaximizeAnchorEvidence(client) {
   await waitForNotificationAnchorGeometry(client, "notification anchor before maximize");
   const before = await evaluate(client, compactPopoverEvidenceExpression());
 
-  await evaluate(client, `window.megleDesktop.windowControls.maximize()`);
+  await evaluate(client, `window.mangooDesktop.windowControls.maximize()`);
   const maximizedState = await waitForMaximizedState(client, true);
   await waitForNotificationAnchorGeometry(client, "notification anchor after maximize");
   const maximized = await evaluate(client, compactPopoverEvidenceExpression());
 
-  await evaluate(client, `window.megleDesktop.windowControls.maximize()`);
+  await evaluate(client, `window.mangooDesktop.windowControls.maximize()`);
   const restoredState = await waitForMaximizedState(client, false);
   await waitForNotificationAnchorGeometry(client, "notification anchor after restore");
   const restored = await evaluate(client, compactPopoverEvidenceExpression());
@@ -2990,7 +2994,7 @@ async function compactPopoverDismissalEvidence(client) {
       await notificationClient.send("Runtime.enable");
       await evaluate(
         notificationClient,
-        `(async () => (await window.megleDesktop?.closeNotificationsWindow?.()) ?? false)()`
+        `(async () => (await window.mangooDesktop?.closeNotificationsWindow?.()) ?? false)()`
       );
       notificationClient.close();
       await waitForTargetCount((page) => page.url.includes("#/notifications"), 0, 10000);
@@ -3038,7 +3042,7 @@ async function notificationPopoverFixtureEvidence(client) {
   const fixtureUrl = `${webUrl}/tests/fixtures/notification-popover.html?state=full`;
   const opened = await evaluate(
     client,
-    `Boolean(window.open(${JSON.stringify(fixtureUrl)}, "megle-notification-popover-fixture", "popup=yes,width=1040,height=760,resizable=yes"))`
+    `Boolean(window.open(${JSON.stringify(fixtureUrl)}, "mangoo-notification-popover-fixture", "popup=yes,width=1040,height=760,resizable=yes"))`
   );
   if (!opened) throw new Error("Electron refused to open the notification visual fixture window");
 
@@ -3492,7 +3496,7 @@ async function notificationWindowFixtureEvidence(client) {
   const fixtureUrl = `${webUrl}/tests/fixtures/notification-window.html?state=full`;
   const opened = await evaluate(
     client,
-    `Boolean(window.open(${JSON.stringify(fixtureUrl)}, "megle-notification-window-fixture", "popup=yes,width=1040,height=760,resizable=yes"))`
+    `Boolean(window.open(${JSON.stringify(fixtureUrl)}, "mangoo-notification-window-fixture", "popup=yes,width=1040,height=760,resizable=yes"))`
   );
   if (!opened) throw new Error("Electron refused to open the notification window fixture");
 
@@ -3826,7 +3830,7 @@ async function syncOrchestrationFixtureEvidence(client) {
   const fixtureUrl = `${webUrl}/tests/fixtures/sync-orchestration.html?state=lifecycle`;
   const opened = await evaluate(
     client,
-    `Boolean(window.open(${JSON.stringify(fixtureUrl)}, "megle-sync-orchestration-fixture", "popup=yes,width=1120,height=820,resizable=yes"))`
+    `Boolean(window.open(${JSON.stringify(fixtureUrl)}, "mangoo-sync-orchestration-fixture", "popup=yes,width=1120,height=820,resizable=yes"))`
   );
   if (!opened) throw new Error("Electron refused to open the sync orchestration visual fixture");
   const target = await waitForTarget(
@@ -3909,7 +3913,7 @@ async function openAppearanceMatrixFixture(client) {
   const fixtureUrl = `${webUrl}/tests/fixtures/overlay-appearance.html`;
   const opened = await evaluate(
     client,
-    `Boolean(window.open(${JSON.stringify(fixtureUrl)}, "megle-overlay-appearance-fixture", "popup=yes,width=1120,height=820,resizable=yes"))`
+    `Boolean(window.open(${JSON.stringify(fixtureUrl)}, "mangoo-overlay-appearance-fixture", "popup=yes,width=1120,height=820,resizable=yes"))`
   );
   if (!opened) throw new Error("Electron refused to open the overlay appearance fixture window");
 
@@ -4048,7 +4052,7 @@ function productionAppearanceEvidenceExpression(groupVariables) {
         centerSurface: surface('[data-appearance-surface="center-surface"]'),
         notificationContent: surface('[data-appearance-surface="notification-content"]'),
         fieldControl: surface('[data-appearance-surface="field-control"]'),
-        selectControl: surface('[data-appearance-surface="select-control"]'),
+        selectControl: surface('.overlay-select-control:has([data-appearance-surface="select-element"])'),
         selectElement: surface('[data-appearance-surface="select-element"]'),
         readableInner: surface('[data-appearance-surface="readable-inner"]'),
         selectedFill: surface('[data-appearance-surface="selected-fill"]'),
@@ -4092,11 +4096,26 @@ async function controlledSolidFallbackEvidence(fixtureClient) {
     `document.documentElement.setAttribute("data-overlay-solid-fallback", "forced")`
   );
   await delay(100);
+  await evaluate(fixtureClient, `(() => {
+    window.__fallbackKeyboardEvents = [];
+    window.__fallbackKeyboardListener = (event) => {
+      window.__fallbackKeyboardEvents.push({
+        type: event.type,
+        key: event.key,
+        target: event.target?.getAttribute?.("data-fallback-probe") ?? event.target?.tagName,
+        trusted: event.isTrusted,
+        defaultPrevented: event.defaultPrevented
+      });
+    };
+    for (const type of ["keydown", "keypress", "keyup", "click", "focusin", "focusout"]) {
+      document.addEventListener(type, window.__fallbackKeyboardListener, true);
+    }
+  })()`);
   try {
     const keyboard = {};
     await evaluate(
       fixtureClient,
-      `window.dispatchEvent(new CustomEvent("megle-overlay-fixture-modal", { detail: false }))`
+      `window.dispatchEvent(new CustomEvent("mangoo-overlay-fixture-modal", { detail: false }))`
     );
     await waitFor(
       fixtureClient,
@@ -4129,7 +4148,7 @@ async function controlledSolidFallbackEvidence(fixtureClient) {
     }
     await evaluate(
       fixtureClient,
-      `window.dispatchEvent(new CustomEvent("megle-overlay-fixture-modal", { detail: true }))`
+      `window.dispatchEvent(new CustomEvent("mangoo-overlay-fixture-modal", { detail: true }))`
     );
     await waitFor(
       fixtureClient,
@@ -4246,12 +4265,32 @@ async function controlledSolidFallbackEvidence(fixtureClient) {
         "ui-overlay-solid-fallback-controlled.png"
       )
     };
+  } catch (error) {
+    const diagnostics = await evaluate(fixtureClient, `({
+      documentFocused: document.hasFocus(),
+      activeElement: document.activeElement?.outerHTML,
+      events: window.__fallbackKeyboardEvents,
+      probes: [...document.querySelectorAll("[data-fallback-probe]")].map(element => ({
+        probe: element.dataset.fallbackProbe,
+        activated: element.dataset.fallbackActivated,
+        disabled: element.disabled,
+        inert: Boolean(element.closest("[inert]"))
+      }))
+    })`);
+    await writeFile(path.join(logDir, `solid-fallback-keyboard-${visualRunId}.json`), JSON.stringify(diagnostics, null, 2));
+    await rendererScreenshot(fixtureClient, `solid-fallback-keyboard-${visualRunId}.png`);
+    throw error;
   } finally {
     await evaluate(
       fixtureClient,
       `(() => {
+        for (const type of ["keydown", "keypress", "keyup", "click", "focusin", "focusout"]) {
+          document.removeEventListener(type, window.__fallbackKeyboardListener, true);
+        }
+        delete window.__fallbackKeyboardListener;
+        delete window.__fallbackKeyboardEvents;
         document.documentElement.removeAttribute("data-overlay-solid-fallback");
-        window.dispatchEvent(new CustomEvent("megle-overlay-fixture-modal", { detail: true }));
+        window.dispatchEvent(new CustomEvent("mangoo-overlay-fixture-modal", { detail: true }));
         document.querySelectorAll("[data-fallback-activated]").forEach((element) => {
           element.removeAttribute("data-fallback-activated");
         });
@@ -4641,7 +4680,7 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
         if (id === "dialog-blur") {
           await evaluate(
             appearanceClient,
-            `window.dispatchEvent(new CustomEvent("megle-overlay-fixture-modal", { detail: false }))`
+            `window.dispatchEvent(new CustomEvent("mangoo-overlay-fixture-modal", { detail: false }))`
           );
           await waitFor(
             appearanceClient,
@@ -4726,7 +4765,7 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
           );
           await evaluate(
             appearanceClient,
-            `window.dispatchEvent(new CustomEvent("megle-overlay-fixture-modal", { detail: true }))`
+            `window.dispatchEvent(new CustomEvent("mangoo-overlay-fixture-modal", { detail: true }))`
           );
           await waitFor(
             appearanceClient,
@@ -5108,7 +5147,7 @@ async function settingsInterfaceStyleEvidence(client) {
       })()`
     );
     await delay(350);
-    fireRendererCommand(settingsClient, `void window.megleDesktop?.closeSettingsWindow?.()`);
+    fireRendererCommand(settingsClient, `void window.mangooDesktop?.closeSettingsWindow?.()`);
     await waitForTargetCount((page) => page.url.includes("#/settings"), 0, 10000);
     return {
       screenshotPath,
@@ -5127,7 +5166,7 @@ async function settingsInterfaceStyleEvidence(client) {
       }
     };
   } finally {
-    fireRendererCommand(settingsClient, `void window.megleDesktop?.closeSettingsWindow?.()`);
+    fireRendererCommand(settingsClient, `void window.mangooDesktop?.closeSettingsWindow?.()`);
     settingsClient.close();
   }
 }
@@ -5236,7 +5275,7 @@ async function pluginsSecondaryWindowEvidence(client) {
         const backdrop = owner?.querySelector(":scope > .liquid-glass-backdrop");
         const root = getComputedStyle(document.documentElement);
         return {
-          role: window.megleDesktop?.windowRole,
+          role: window.mangooDesktop?.windowRole,
           title: document.querySelector(".secondary-window-title")?.textContent?.trim(),
           closePresent: Boolean(document.querySelector(".secondary-window-close")),
           pluginSurfacePresent: Boolean(document.querySelector(".plugins-layout")),
@@ -5284,9 +5323,9 @@ async function pluginsSecondaryWindowEvidence(client) {
       })()`
     );
 
-    fireRendererCommand(settingsClient, `void window.megleDesktop?.closeSettingsWindow?.()`);
+    fireRendererCommand(settingsClient, `void window.mangooDesktop?.closeSettingsWindow?.()`);
     await waitForTargetCount((page) => page.url.includes("#/settings"), 0, 10000);
-    fireRendererCommand(pluginsClient, `void window.megleDesktop?.closePluginsWindow?.()`);
+    fireRendererCommand(pluginsClient, `void window.mangooDesktop?.closePluginsWindow?.()`);
     await waitForTargetCount((page) => page.url.includes("#/plugins"), 0, 10000);
 
     return {
@@ -5300,8 +5339,8 @@ async function pluginsSecondaryWindowEvidence(client) {
       coexistence
     };
   } finally {
-    if (settingsClient) fireRendererCommand(settingsClient, `void window.megleDesktop?.closeSettingsWindow?.()`);
-    fireRendererCommand(pluginsClient, `void window.megleDesktop?.closePluginsWindow?.()`);
+    if (settingsClient) fireRendererCommand(settingsClient, `void window.mangooDesktop?.closeSettingsWindow?.()`);
+    fireRendererCommand(pluginsClient, `void window.mangooDesktop?.closePluginsWindow?.()`);
     settingsClient?.close();
     pluginsClient.close();
   }
@@ -5311,7 +5350,7 @@ async function notificationsSecondaryWindowEvidence(client) {
   const open = () =>
     evaluate(
       client,
-      `(async () => (await window.megleDesktop?.openNotificationsWindow?.()) ?? false)()`
+      `(async () => (await window.mangooDesktop?.openNotificationsWindow?.()) ?? false)()`
     );
   await open();
   const firstTarget = await waitForTarget((page) => page.url.includes("#/notifications"), 10000);
@@ -5436,7 +5475,7 @@ async function notificationsSecondaryWindowEvidence(client) {
 
     const initialBounds = await evaluate(
       notificationsClient,
-      `(async () => (await window.megleDesktop?.windowControls?.getBounds?.()) ?? null)()`
+      `(async () => (await window.mangooDesktop?.windowControls?.getBounds?.()) ?? null)()`
     );
     const requestedPosition = initialBounds
       ? { x: initialBounds.x + 18, y: initialBounds.y + 18 }
@@ -5444,13 +5483,13 @@ async function notificationsSecondaryWindowEvidence(client) {
     if (requestedPosition) {
       await evaluate(
         notificationsClient,
-        `(async () => (await window.megleDesktop?.windowControls?.setPosition?.(${requestedPosition.x}, ${requestedPosition.y})) ?? false)()`
+        `(async () => (await window.mangooDesktop?.windowControls?.setPosition?.(${requestedPosition.x}, ${requestedPosition.y})) ?? false)()`
       );
       await delay(250);
     }
     const movedBounds = await evaluate(
       notificationsClient,
-      `(async () => (await window.megleDesktop?.windowControls?.getBounds?.()) ?? null)()`
+      `(async () => (await window.mangooDesktop?.windowControls?.getBounds?.()) ?? null)()`
     );
     const windowEvidence = await evaluate(
       notificationsClient,
@@ -5459,7 +5498,7 @@ async function notificationsSecondaryWindowEvidence(client) {
         const backdrop = owner?.querySelector(":scope > .liquid-glass-backdrop");
         const root = getComputedStyle(document.documentElement);
         return {
-          role: window.megleDesktop?.windowRole,
+          role: window.mangooDesktop?.windowRole,
           title: document.querySelector(".secondary-window-title")?.textContent?.trim(),
           closePresent: Boolean(document.querySelector(".secondary-window-close")),
           rendererReady: owner?.getAttribute("data-secondary-renderer-ready"),
@@ -5483,7 +5522,7 @@ async function notificationsSecondaryWindowEvidence(client) {
 
     fireRendererCommand(
       notificationsClient,
-      `void window.megleDesktop?.closeNotificationsWindow?.()`
+      `void window.mangooDesktop?.closeNotificationsWindow?.()`
     );
     await waitForTargetCount((page) => page.url.includes("#/notifications"), 0, 10000);
     notificationsClient.close();
@@ -5504,11 +5543,11 @@ async function notificationsSecondaryWindowEvidence(client) {
     );
     const restoredBounds = await evaluate(
       reopenedClient,
-      `(async () => (await window.megleDesktop?.windowControls?.getBounds?.()) ?? null)()`
+      `(async () => (await window.mangooDesktop?.windowControls?.getBounds?.()) ?? null)()`
     );
     fireRendererCommand(
       reopenedClient,
-      `void window.megleDesktop?.closeNotificationsWindow?.()`
+      `void window.mangooDesktop?.closeNotificationsWindow?.()`
     );
     await waitForTargetCount((page) => page.url.includes("#/notifications"), 0, 10000);
 
@@ -5527,7 +5566,7 @@ async function notificationsSecondaryWindowEvidence(client) {
   } finally {
     fireRendererCommand(
       reopenedClient ?? notificationsClient,
-      `void window.megleDesktop?.closeNotificationsWindow?.()`
+      `void window.mangooDesktop?.closeNotificationsWindow?.()`
     );
     reopenedClient?.close();
     notificationsClient.close();
@@ -6300,8 +6339,8 @@ function collectRunDiagnostics(scenarioFailures = []) {
   const startupProblems = startup.startupProblems;
   const controlledRootStartup = {
     expectedRoot: mediaDir,
-    added: startupOutput.some((entry) => entry.text.includes(`[megle] auto-added root ${mediaDir}`)),
-    failureLines: startupProblems.filter((problem) => /MEGLE_AUTO_ADD_ROOT|auto-add|auto.?added root/i.test(problem.line))
+    added: startupOutput.some((entry) => entry.text.includes(`[mangoo] auto-added root ${mediaDir}`)),
+    failureLines: startupProblems.filter((problem) => /MANGOO_AUTO_ADD_ROOT|auto-add|auto.?added root/i.test(problem.line))
   };
   const unknownConsoleWarnings = consoleWarnings.filter((warning) => !warning.known);
   const unexpectedConsoleErrors = collectUnexpectedConsoleErrors(consoleErrors);
@@ -7004,10 +7043,10 @@ try {
       typeof windowBackdrop.uiSurfaceDelta !== "number"
     )
   ) {
-    hardFailures.push("MEGLE_VISUAL_OS_BACKDROP=1 did not produce OS-composited window backdrop evidence");
+    hardFailures.push("MANGOO_VISUAL_OS_BACKDROP=1 did not produce OS-composited window backdrop evidence");
   }
   if (!windowBackdrop.skipped && windowBackdrop.uiSurfaceDelta < 18) {
-    hardFailures.push("desktop screenshot did not capture visible Megle UI surfaces for backdrop comparison");
+    hardFailures.push("desktop screenshot did not capture visible Mangoo UI surfaces for backdrop comparison");
   } else if (!windowBackdrop.skipped && !backdropPixelEvidencePassed(windowBackdrop)) {
     hardFailures.push("OS backdrop pixel evidence does not show transparent passthrough or native acrylic-tinted desktop variation");
   }

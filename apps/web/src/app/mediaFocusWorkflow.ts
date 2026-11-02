@@ -1,5 +1,5 @@
-import type { MediaRecord } from "@megle/core-client";
-import type { MediaFocusCommand } from "@megle/notification-contract";
+import type { MediaRecord } from "@mangoo/core-client";
+import type { MediaFocusCommand } from "@mangoo/notification-contract";
 import type {
   LayoutGeometry,
   LayoutPlacement

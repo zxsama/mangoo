@@ -49,7 +49,7 @@ mod tests {
     #[test]
     fn malformed_psd_reports_a_decoder_error() {
         let path = std::env::temp_dir().join(format!(
-            "megle-psd-decoder-{}-{}.psd",
+            "mangoo-psd-decoder-{}-{}.psd",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -74,7 +74,7 @@ mod tests {
     #[test]
     fn decodes_a_minimal_composite_psd_to_rgba() {
         let path = std::env::temp_dir().join(format!(
-            "megle-psd-decoder-valid-{}-{}.psd",
+            "mangoo-psd-decoder-valid-{}-{}.psd",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

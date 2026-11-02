@@ -8,7 +8,7 @@ import {
   type MouseEvent,
   type PointerEvent
 } from "react";
-import type { MediaRecord, ThumbnailResponse } from "@megle/core-client";
+import type { MediaRecord, ThumbnailResponse } from "@mangoo/core-client";
 import {
   matchShortcut,
   useShortcutBindings
@@ -536,8 +536,8 @@ export function CentralPreviewStage({
       );
     }
 
-    window.addEventListener("megle:preview-zoom", handlePreviewZoom);
-    return () => window.removeEventListener("megle:preview-zoom", handlePreviewZoom);
+    window.addEventListener("mangoo:preview-zoom", handlePreviewZoom);
+    return () => window.removeEventListener("mangoo:preview-zoom", handlePreviewZoom);
   }, [scale, zoomAtPoint]);
 
   function actualSizeScale() {

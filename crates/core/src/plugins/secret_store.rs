@@ -80,6 +80,8 @@ impl std::fmt::Display for SecretStoreError {
 impl std::error::Error for SecretStoreError {}
 
 pub trait SecretStore: Send + Sync {
+    // Production reserves the reference durably before creating the secret.
+    #[cfg(test)]
     fn create(&self, scope: &SecretScope, value: &[u8]) -> Result<String, SecretStoreError> {
         let opaque_ref = allocate_secret_ref(scope)?;
         self.create_with_ref(scope, &opaque_ref, value)?;
@@ -130,7 +132,7 @@ pub fn platform_secret_store() -> Result<std::sync::Arc<dyn SecretStore>, Secret
     #[cfg(not(windows))]
     {
         let key = key_file_from_environment()?;
-        let directory = std::env::var_os("MEGLE_SECRETS_DIR")
+        let directory = std::env::var_os("MANGOO_SECRETS_DIR")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/data/secrets"));
@@ -500,11 +502,11 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(not(windows))]
 pub fn key_file_from_environment() -> Result<PathBuf, SecretStoreError> {
-    std::env::var_os("MEGLE_SECRET_KEY_FILE")
+    std::env::var_os("MANGOO_SECRET_KEY_FILE")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| {
-            SecretStoreError::ConfigurationRequired("MEGLE_SECRET_KEY_FILE is not set".into())
+            SecretStoreError::ConfigurationRequired("MANGOO_SECRET_KEY_FILE is not set".into())
         })
 }
 
@@ -536,7 +538,7 @@ impl Default for WindowsCredentialSecretStore {
 impl WindowsCredentialSecretStore {
     fn target(scope: &SecretScope, opaque_ref: &str) -> Result<Vec<u16>, SecretStoreError> {
         let fingerprint = scope_fingerprint(scope)?;
-        Ok(format!("Megle/{fingerprint}/{opaque_ref}\0")
+        Ok(format!("Mangoo/{fingerprint}/{opaque_ref}\0")
             .encode_utf16()
             .collect())
     }
@@ -715,7 +717,7 @@ mod tests {
     use super::*;
     fn scope(account: &str) -> SecretScope {
         SecretScope {
-            plugin_id: "com.megle.fake".into(),
+            plugin_id: "com.mangoo.fake".into(),
             account_uuid: account.into(),
             namespace: "fake-sync".into(),
             purpose: "oauth".into(),
@@ -760,7 +762,7 @@ mod tests {
     }
     #[test]
     fn encrypted_backend_persists_and_authenticates() {
-        let root = std::env::temp_dir().join(format!("megle-secret-{}", uuid::Uuid::now_v7()));
+        let root = std::env::temp_dir().join(format!("mangoo-secret-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&root).unwrap();
         let key = root.join("key");
         std::fs::write(&key, [7u8; 32]).unwrap();

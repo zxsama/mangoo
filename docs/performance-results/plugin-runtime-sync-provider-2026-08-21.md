@@ -1,6 +1,6 @@
 # Plugin runtime and sync Provider baseline — 2026-08-21
 
-This baseline exercises the packaged `com.megle.fake-sync` executable through
+This baseline exercises the packaged `com.mangoo.fake-sync` executable through
 the production framed stdin/stdout protocol. It is not an in-memory provider
 simulation: the harness builds the bundled child, performs the handshake,
 streams a 9 MiB immutable object in both directions with sliding credit,

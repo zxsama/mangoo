@@ -1,7 +1,6 @@
 use super::{CDC_MAX_BYTES, CDC_MIN_BYTES, CDC_TARGET_BYTES, SMALL_FILE_THRESHOLD};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::File,
     io::{BufReader, Read},
     path::{Path, PathBuf},
     sync::{
@@ -71,6 +70,10 @@ where
         observed = observed
             .checked_add(count as u64)
             .ok_or_else(|| anyhow::anyhow!("source length overflow"))?;
+        anyhow::ensure!(
+            observed <= expected_length,
+            "source length changed during read"
+        );
         for byte in &buffer[..count] {
             current.push(*byte);
             rolling = rolling.rotate_left(1);
@@ -113,7 +116,8 @@ pub fn stable_chunk_file<F>(
 where
     F: FnMut(&ChunkDescriptor, &[u8]) -> anyhow::Result<()>,
 {
-    let file = File::open(path)?;
+    crate::sync::file_policy::require_regular_source(path)?;
+    let (file, _directory_guard) = crate::sync::file_policy::open_source(path)?;
     let before = file.metadata()?;
     if !before.is_file() {
         anyhow::bail!("media source is not a regular file");
@@ -133,6 +137,7 @@ where
     let after_handle = file.metadata()?;
     let after_path = std::fs::metadata(path)?;
     let after_identity = crate::library_path::local_file_identity(path).ok();
+    crate::sync::file_policy::require_regular_source(path)?;
     if before.len() != after_handle.len()
         || before.len() != after_path.len()
         || before.modified().ok() != after_handle.modified().ok()
@@ -161,6 +166,10 @@ fn emit_chunk<F>(
 where
     F: FnMut(&ChunkDescriptor, &[u8]) -> anyhow::Result<()>,
 {
+    anyhow::ensure!(
+        chunks.len() < super::MAX_CHUNKS_PER_MANIFEST,
+        "content exceeds supported manifest chunk count"
+    );
     let descriptor = ChunkDescriptor {
         ordinal: u32::try_from(chunks.len())?,
         sha256: Sha256::digest(current.as_slice()).into(),

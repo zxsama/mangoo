@@ -40,11 +40,11 @@ export function imageRenderingForFilter(filter: PreviewRenderFilter): string {
 }
 
 const CHANNEL_FILTER_IDS: Record<Exclude<PreviewChannel, "rgba">, string> = {
-  rgb: "megle-channel-rgb",
-  r: "megle-channel-r",
-  g: "megle-channel-g",
-  b: "megle-channel-b",
-  a: "megle-channel-a"
+  rgb: "mangoo-channel-rgb",
+  r: "mangoo-channel-r",
+  g: "mangoo-channel-g",
+  b: "mangoo-channel-b",
+  a: "mangoo-channel-a"
 };
 
 /**

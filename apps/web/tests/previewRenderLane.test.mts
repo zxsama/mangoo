@@ -9,6 +9,9 @@ const { ANIMATION_CAPABLE_EXTENSIONS, canvasPaintTarget, selectPreviewRenderLane
 );
 
 describe("preview render lane", () => {
+  it("honors static presentation even when legacy kind reports an image", () => {
+    assert.equal(selectPreviewRenderLane({ source: "original", kind: "image", ext: "psd", presentation: { previewKind: "static-thumbnail", thumbnail: "available", generation: 1 } }), "image");
+  });
   it("sends still images to the canvas fast path", () => {
     for (const ext of ["jpg", "jpeg", "png", "bmp", "tif", "tiff", "heic", "psd"]) {
       assert.equal(

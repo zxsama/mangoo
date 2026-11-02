@@ -1,4 +1,4 @@
-import { Maximize2, Minimize2, Minus, X } from "lucide-react";
+import { Maximize2, Minimize2, Minus, X } from "../../design/icons";
 import { useEffect, useState } from "react";
 import { getWindowControls } from "../../core/desktop";
 import { LiquidGlassButton } from "../../design/liquid-glass";

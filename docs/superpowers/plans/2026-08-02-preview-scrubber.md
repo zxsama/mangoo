@@ -206,8 +206,8 @@ describe("scrubber visibility", () => {
 - [ ] **Step 2: Run it to verify it fails**
 
 ```bash
-cd /d/Megle
-npm --workspace @megle/web run test 2>&1 | grep -E "Cannot find module|^# fail" | head -3
+cd /d/Mangoo
+npm --workspace @mangoo/web run test 2>&1 | grep -E "Cannot find module|^# fail" | head -3
 ```
 
 Expected: FAIL — `Cannot find module '../src/features/preview/previewScrubber.ts'`.
@@ -301,9 +301,9 @@ export function shouldShowScrubber(input: {
 - [ ] **Step 4: Run the tests to verify they pass**
 
 ```bash
-cd /d/Megle
-npm --workspace @megle/web run test 2>&1 | grep -E "^# (tests|pass|fail)|not ok" | head -5
-npm --workspace @megle/web run typecheck 2>&1 | tail -2
+cd /d/Mangoo
+npm --workspace @mangoo/web run test 2>&1 | grep -E "^# (tests|pass|fail)|not ok" | head -5
+npm --workspace @mangoo/web run typecheck 2>&1 | tail -2
 ```
 
 Expected: 15 new assertions pass, 0 failing; typecheck clean.
@@ -311,7 +311,7 @@ Expected: 15 new assertions pass, 0 failing; typecheck clean.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /d/Megle
+cd /d/Mangoo
 git add apps/web/src/features/preview/previewScrubber.ts apps/web/tests/previewScrubber.test.mts
 git commit -m "feat(web): add pure preview scrubber mapping and visibility logic"
 ```
@@ -370,8 +370,8 @@ describe("scrubber pin persistence", () => {
 - [ ] **Step 2: Run it to verify it fails**
 
 ```bash
-cd /d/Megle
-npm --workspace @megle/web run test 2>&1 | grep -E "^# fail|not ok" | head -4
+cd /d/Mangoo
+npm --workspace @mangoo/web run test 2>&1 | grep -E "^# fail|not ok" | head -4
 ```
 
 Expected: FAIL — `previewScrubberPinned` is `undefined`.
@@ -403,9 +403,9 @@ Add to the object `normalizePreviewPreferences` returns:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 ```bash
-cd /d/Megle
-npm --workspace @megle/web run test 2>&1 | grep -E "^# (tests|pass|fail)" | head -4
-npm --workspace @megle/web run typecheck 2>&1 | tail -2
+cd /d/Mangoo
+npm --workspace @mangoo/web run test 2>&1 | grep -E "^# (tests|pass|fail)" | head -4
+npm --workspace @mangoo/web run typecheck 2>&1 | tail -2
 npm run check:web 2>&1 | grep -E "^FAIL|^PASS: web" | head -2
 ```
 
@@ -414,7 +414,7 @@ Expected: 4 new assertions pass; typecheck clean; `check:web` PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /d/Megle
+cd /d/Mangoo
 git add apps/web/src/features/preview/previewPreferences.ts apps/web/tests/previewScrubber.test.mts
 git commit -m "feat(web): persist the preview scrubber pin state"
 ```
@@ -696,8 +696,8 @@ Append to `apps/web/src/styles.css`:
 - [ ] **Step 3: Verify it compiles**
 
 ```bash
-cd /d/Megle
-npm --workspace @megle/web run typecheck 2>&1 | tail -3
+cd /d/Mangoo
+npm --workspace @mangoo/web run typecheck 2>&1 | tail -3
 npm run check:ui-design 2>&1 | tail -2
 ```
 
@@ -708,7 +708,7 @@ Expected: typecheck clean, `PASS: UI liquid glass design boundaries`. (It is not
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /d/Megle
+cd /d/Mangoo
 git add apps/web/src/features/preview/PreviewScrubber.tsx apps/web/src/styles.css
 git commit -m "feat(web): add the preview scrubber control bar widget"
 ```
@@ -838,7 +838,7 @@ if (!/requestMediaWindow/.test(app)) {
 - [ ] **Step 5: Verify**
 
 ```bash
-cd /d/Megle
+cd /d/Mangoo
 python -c "
 import subprocess, os
 for f in subprocess.run(['git','diff','--name-only','HEAD'],capture_output=True,text=True).stdout.split():
@@ -847,8 +847,8 @@ for f in subprocess.run(['git','diff','--name-only','HEAD'],capture_output=True,
         if b'\r\n' in d:
             open(f,'wb').write(d.replace(b'\r\n',b'\n')); print('normalised',f)
 "
-npm --workspace @megle/web run typecheck 2>&1 | tail -2
-npm --workspace @megle/web run test 2>&1 | grep -E "^# (tests|pass|fail)" | head -3
+npm --workspace @mangoo/web run typecheck 2>&1 | tail -2
+npm --workspace @mangoo/web run test 2>&1 | grep -E "^# (tests|pass|fail)" | head -3
 npm run check:web 2>&1 | grep -E "^FAIL|^PASS: web" | head -3
 npm run check:ui-design 2>&1 | tail -2
 ```
@@ -860,7 +860,7 @@ Expected: all clean.
 Commit first — `git checkout` on uncommitted work destroys it.
 
 ```bash
-cd /d/Megle
+cd /d/Mangoo
 git add apps/web/src/features/preview/CentralPreviewStage.tsx apps/web/src/features/library/LibraryView.tsx apps/web/src/app/App.tsx tools/checks/validate-web-client.mjs
 git commit -m "feat(web): mount the preview scrubber and wire scrubbing"
 ```
@@ -868,7 +868,7 @@ git commit -m "feat(web): mount the preview scrubber and wire scrubbing"
 Now prove the guard fires:
 
 ```bash
-cd /d/Megle
+cd /d/Mangoo
 python -c "
 import io
 p='apps/web/src/app/App.tsx'
@@ -895,7 +895,7 @@ Expected: the mutated run FAILS with the bypass message; the restored run passes
 - [ ] **Step 1: Full gate**
 
 ```bash
-cd /d/Megle
+cd /d/Mangoo
 export PATH="$HOME/.cargo/bin:$PATH"
 npm test 2>&1 | grep -E "^(PASS|FAIL)|test result:" | head -16
 ```
@@ -905,9 +905,9 @@ Expected: exit 0, every stage PASS.
 - [ ] **Step 2: Launch**
 
 ```bash
-cd /d/Megle
-export MEGLE_AUTO_ADD_ROOT="C:/Users/84460/Pictures/normal"
-export MEGLE_REMOTE_DEBUG=1
+cd /d/Mangoo
+export MANGOO_AUTO_ADD_ROOT="C:/Users/84460/Pictures/normal"
+export MANGOO_REMOTE_DEBUG=1
 nohup npm run dev > /tmp/dev_scrub.log 2>&1 &
 sleep 85
 ```
@@ -930,8 +930,8 @@ Record each of these, including anything that does not work:
 Write `docs/benchmarks/2026-08-02-preview-scrubber-verification.md` with what was observed for each bullet, then:
 
 ```bash
-cd /d/Megle
-taskkill //F //IM megle-core.exe 2>/dev/null | head -1
+cd /d/Mangoo
+taskkill //F //IM mangoo-core.exe 2>/dev/null | head -1
 taskkill //F //IM electron.exe 2>/dev/null | head -1
 git status --short
 ```
@@ -939,7 +939,7 @@ git status --short
 `git status` must show only the user's own eight pre-existing files.
 
 ```bash
-cd /d/Megle
+cd /d/Mangoo
 git add docs/benchmarks/2026-08-02-preview-scrubber-verification.md
 git commit -m "docs: record preview scrubber verification"
 ```

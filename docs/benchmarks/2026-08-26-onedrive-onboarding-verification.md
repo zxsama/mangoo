@@ -1,5 +1,9 @@
 # OneDrive Account Onboarding Verification — 2026-08-26
 
+> Repository extraction note (2026-09-22): OneDrive source and current provider
+> release requirements now live independently. This report remains historical
+> evidence; see the [extraction note](../onedrive-extraction.md).
+
 > Historical evidence note: the publisher-owned application identity described
 > below was superseded on 2026-08-29 by the self-managed Client ID workflow.
 > Retain these results only as evidence for the OAuth/runtime implementation;

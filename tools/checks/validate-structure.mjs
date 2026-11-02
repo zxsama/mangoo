@@ -648,19 +648,20 @@ const requiredDirs = [
   "apps/web/src/design/overlays",
   "contracts/core-api",
   "contracts/plugins",
-  "bundled-plugins/com.megle.fake-sync",
-  "bundled-plugins/com.megle.onedrive",
+  "bundled-plugins/com.mangoo.fake-sync",
+  "bundled-plugins/com.mangoo.ppm-decoder",
+  "crates/ppm-decoder/src",
+  "crates/ppm-decoder/tests",
   "crates/core/src",
   "crates/core/tests",
   "crates/core/migrations",
   "crates/core/host_migrations",
   "crates/fake-provider/src",
   "crates/fake-provider/tests",
-  "crates/onedrive-provider/src",
-  "crates/onedrive-provider/tests",
   "docs/performance-results/raw/2026-05-16",
   "packages/core-client",
   "packages/notification-contract",
+  "packages/plugin-sdk",
   "tests",
   "tools/bench",
   "tools/build",
@@ -699,17 +700,27 @@ const requiredFiles = [
   "packages/core-client/src/client.ts",
   "packages/notification-contract/package.json",
   "packages/notification-contract/src/index.ts",
+  "packages/plugin-sdk/package.json",
+  "packages/plugin-sdk/src/index.ts",
+  "packages/plugin-sdk/src/core-methods.ts",
+  "packages/plugin-sdk/README.md",
   "contracts/core-api/openapi.yaml",
   "contracts/plugins/manifest.schema.json",
   "contracts/plugins/fixtures/valid-sync-provider-v2.json",
   "contracts/plugins/fixtures/invalid-v1-manifest.json",
   "contracts/plugins/fixtures/invalid-entry-traversal.json",
   "contracts/plugins/fixtures/invalid-permission-field.json",
-  "bundled-plugins/com.megle.fake-sync/plugin.template.json",
-  "bundled-plugins/com.megle.onedrive/plugin.template.json",
+  "bundled-plugins/com.mangoo.fake-sync/plugin.template.json",
+  "bundled-plugins/com.mangoo.ppm-decoder/plugin.template.json",
+  "contracts/plugins/fixtures/valid-file-decoder-v2.json",
+  "crates/ppm-decoder/Cargo.toml",
+  "crates/ppm-decoder/src/main.rs",
+  "crates/ppm-decoder/src/lib.rs",
+  "crates/ppm-decoder/tests/process_conformance.rs",
   "crates/core/Cargo.toml",
   "crates/core/migrations/0001_initial.sql",
   "crates/core/host_migrations/0001_host_registry.sql",
+  "crates/core/host_migrations/0021_library_registration_visibility.sql",
   "crates/core/host_migrations/0003_plugin_runtime.sql",
   "crates/core/host_migrations/0004_provider_root_discovery.sql",
   "crates/core/host_migrations/0005_sync_orchestration.sql",
@@ -735,9 +746,6 @@ const requiredFiles = [
   "crates/fake-provider/Cargo.toml",
   "crates/fake-provider/src/main.rs",
   "crates/fake-provider/tests/process_conformance.rs",
-  "crates/onedrive-provider/Cargo.toml",
-  "crates/onedrive-provider/src/main.rs",
-  "crates/onedrive-provider/tests/process_conformance.rs",
   "docs/project-structure.md",
   "docs/performance-results/managed-library-lifecycle-2026-08-16.md",
   "docs/performance-results/plugin-runtime-sync-provider-2026-08-21.md",
@@ -750,6 +758,8 @@ const requiredFiles = [
   "tools/checks/desktop-harness-lib.mjs",
   "tools/checks/desktop-os-backdrop.mjs",
   "tools/build/build-bundled-plugins.mjs",
+  "tools/build/plugin-artifacts.mjs",
+  "tools/build/plugin-artifacts.test.mjs",
   "tools/build/generate-desktop-icon.mjs",
   "tools/build/package-desktop.mjs",
   "tools/checks/sync-integration.mjs",
@@ -792,10 +802,14 @@ const packageJson = readJson("package.json");
 if (!packageJson.workspaces?.includes("packages/notification-contract")) {
   fail("root workspaces must include packages/notification-contract");
 }
+if (!packageJson.workspaces?.includes("packages/plugin-sdk")) {
+  fail("root workspaces must include packages/plugin-sdk");
+}
 for (const scriptName of [
   "check:structure",
   "check:core-api",
   "check:notification-contract",
+  "check:plugin-sdk",
   "check:schema",
   "check:rust",
   "check:sync-integration",
@@ -804,6 +818,7 @@ for (const scriptName of [
   "bench:sync-integration",
   "bench:renderer-sync",
   "check:sync-release",
+  "check:plugin-artifacts",
   "test"
 ]) {
   if (!packageJson.scripts?.[scriptName]) {
@@ -818,9 +833,10 @@ if (!rootCargo.includes('"crates/core"')) {
 if (!rootCargo.includes('"crates/fake-provider"')) {
   fail("Cargo workspace must include the portable fake Provider conformance crate");
 }
-if (!rootCargo.includes('"crates/onedrive-provider"')) {
-  fail("Cargo workspace must include the bundled OneDrive Provider crate");
+if (rootCargo.includes('"crates/onedrive-provider"')) {
+  fail("provider implementations must remain outside the Host Cargo workspace");
 }
+for (const retired of ["crates/onedrive-provider", "bundled-plugins/com.mangoo.onedrive"]) forbidLegacyPath(retired);
 if (rootCargo.includes('"crates/indexer"') || rootCargo.includes('"crates/thumbnails"')) {
   fail("Phase 1 should not pre-split indexer/thumbnails into workspace crates");
 }
@@ -840,8 +856,9 @@ for (const pathFragment of [
 }
 
 const pluginManifest = readJson("contracts/plugins/manifest.schema.json");
-const capabilities = pluginManifest.$defs?.rpc?.properties?.capabilities?.items?.enum ?? [];
-for (const capability of ["sync-provider.v1"]) {
+const capabilities = (pluginManifest.$defs?.rpc?.oneOf ?? []).flatMap((branch) =>
+  branch.properties?.capabilities?.const ?? branch.properties?.capabilities?.items?.enum ?? []);
+for (const capability of ["sync-provider.v1", "file-decoder.v1"]) {
   if (!capabilities.includes(capability)) {
     fail(`plugin manifest missing capability ${capability}`);
   }
@@ -855,24 +872,39 @@ if (pluginManifest.additionalProperties !== false) {
 
 const dockerfile = readText("Dockerfile");
 for (const marker of [
-  "cargo test --release -p megle-fake-provider --test process_conformance",
-  "cargo test --release -p megle-onedrive-provider",
-  "cargo test --release -p megle-core --test plugin_runtime_process",
-  "MEGLE_PLUGINS_DIR=/opt/megle/plugins",
-  "MEGLE_ONEDRIVE_AUTH_MODE=manual-response-uri"
+  "cargo test --release -p mangoo-fake-provider --test process_conformance",
+  "cargo test --release -p mangoo-ppm-decoder --test process_conformance",
+  "cargo test --release -p mangoo-core --test plugin_runtime_process",
+  "MANGOO_PLUGINS_DIR=/opt/mangoo/plugins",
+  "GENERATED_PLUGIN_TRUST",
+  "Platform::LinuxX64",
+  "[u8; 32], [u8; 32]",
+  "MANIFEST_HASH",
+  "/opt/mangoo/plugins/com.mangoo.ppm-decoder/bin/mangoo-ppm-decoder"
 ]) {
   if (!dockerfile.includes(marker)) {
     fail(`Docker plugin runtime contract missing ${marker}`);
   }
 }
 const compose = readText("compose.yaml");
-if (!compose.includes("MEGLE_ONEDRIVE_AUTH_MODE: manual-response-uri")) {
-  fail("Docker Compose must select OneDrive manual response-URI authorization");
+for (const [name, text] of [["Dockerfile", dockerfile], ["compose.yaml", compose]]) {
+  if (["MANGOO_ONEDRIVE_", "mangoo-onedrive-provider", "com.mangoo.onedrive"].some((marker) => text.includes(marker))) fail(`${name} must not bundle a vendor-specific Provider`);
 }
-if (compose.includes("MEGLE_PUBLIC_URL:")) {
+if (compose.includes("MANGOO_PUBLIC_URL:")) {
   fail("Docker Compose must not configure the retired OneDrive inbound OAuth callback");
 }
-const retiredBundledClientIdVariable = ["MEGLE", "BUNDLED", "ONEDRIVE", "CLIENT", "ID"].join("_");
+const artifactBuilder = readText("tools/build/build-bundled-plugins.mjs");
+const artifactRules = readText("tools/build/plugin-artifacts.mjs");
+for (const marker of ["validateArtifact", "validateSelection", "stageArtifacts", "renderTrust"]) {
+  if (!artifactBuilder.includes(marker)) fail(`bundled build missing explicit artifact boundary: ${marker}`);
+}
+for (const marker of ["--external-plugin", "assertNoLinks", "manifestSha256", "assertSelectedInventory"]) {
+  if (!artifactRules.includes(marker)) fail(`artifact validation missing ${marker}`);
+}
+for (const source of [artifactBuilder, readText("tools/checks/sync-release.mjs")]) {
+  if (["mangoo-onedrive-provider", "com.mangoo.onedrive", "MANGOO_ONEDRIVE_"].some((marker) => source.includes(marker))) fail("Host build/release tooling must not depend on a vendor-specific Provider");
+}
+const retiredBundledClientIdVariable = ["MANGOO", "BUNDLED", "ONEDRIVE", "CLIENT", "ID"].join("_");
 for (const sourcePath of [
   "Dockerfile",
   "compose.yaml",
@@ -932,7 +964,7 @@ requireDocumentSection(
 requireDocumentSection(
   "docs/architecture.md",
   ["Unified Notification Center", "统一通知中心"],
-  ["notification_operation_heads", "notification_outbox", "notifications.sqlite", "@megle/notification-contract"]
+  ["notification_operation_heads", "notification_outbox", "notifications.sqlite", "@mangoo/notification-contract"]
 );
 requireDocumentSection(
   "CLAUDE.md",

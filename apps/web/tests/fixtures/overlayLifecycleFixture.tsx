@@ -14,6 +14,7 @@ import {
   OverlayMenuList,
   OverlayProvider,
   useOverlayStack,
+  useOverlayFocusTrap,
   type OverlayLayerRegistration,
   type OverlayStackApi
 } from "../../src/design/overlays";
@@ -51,6 +52,12 @@ interface OverlayLifecycleResult {
   ok: boolean;
   error?: string;
   basicFocusWorks?: boolean;
+  standaloneFocusTrap?: {
+    initialFocus: string;
+    backwardWrap: string;
+    forwardWrap: string;
+    restoredFocus: string;
+  };
   reentrancy?: {
     closeDismissals: number;
     closeRootId: string | null;
@@ -1464,6 +1471,39 @@ async function runTitlebarControlsScenario() {
   return result;
 }
 
+function StandaloneFocusTrapScenario() {
+  const [open, setOpen] = useState(true);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const launcherRef = useRef<HTMLButtonElement>(null);
+  useOverlayFocusTrap(open, containerRef, { restoreFocusRef: launcherRef });
+  return <>
+    <button id="standalone-trap-launcher" ref={launcherRef} onClick={() => setOpen(true)}>Open</button>
+    {open ? <div ref={containerRef}>
+      <button id="standalone-trap-skipped-first" tabIndex={-1}>Roving choice</button>
+      <button id="standalone-trap-first">First</button>
+      <button id="standalone-trap-last" onClick={() => setOpen(false)}>Close</button>
+      <button id="standalone-trap-skipped-last" tabIndex={-1}>Roving choice</button>
+    </div> : null}
+  </>;
+}
+
+async function runStandaloneFocusTrapScenario() {
+  // No OverlayProvider: the exported hook also supports standalone surfaces.
+  const mounted = await mountScenario(<StandaloneFocusTrapScenario />);
+  const initialFocus = document.activeElement?.id ?? "";
+  await requestNativeInput({ type: "key", keyCode: "Tab", modifiers: ["shift"] });
+  await settle(20);
+  const backwardWrap = document.activeElement?.id ?? "";
+  await requestNativeKey("Tab");
+  await settle(20);
+  const forwardWrap = document.activeElement?.id ?? "";
+  await act(async () => document.getElementById("standalone-trap-last")?.click());
+  await settle(20);
+  const restoredFocus = document.activeElement?.id ?? "";
+  await unmountScenario(mounted);
+  return { initialFocus, backwardWrap, forwardWrap, restoredFocus };
+}
+
 async function run(): Promise<void> {
   try {
     const focusProbe = document.createElement("button");
@@ -1474,6 +1514,7 @@ async function run(): Promise<void> {
     window.__overlayLifecycleResult = {
       ok: true,
       basicFocusWorks,
+      standaloneFocusTrap: await runStandaloneFocusTrapScenario(),
       reentrancy: await runReentrancyScenarios(),
       autofocus: await runAutoFocusScenarios(),
       controlledFocus: await runControlledFocusScenarios(),

@@ -1,4 +1,4 @@
-# Megle Core
+# Mangoo Core
 
 Rust Core service.
 

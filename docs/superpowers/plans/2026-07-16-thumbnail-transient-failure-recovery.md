@@ -10,8 +10,8 @@
 
 ## Global Constraints
 
-- MSVC 工具链。cargo 不在 PATH 时:`export PATH="$HOME/.cargo/bin:$PATH"`。megle-core 是 BIN 不是 lib:用 `cargo test -p megle-core <filter>`,`--lib` 无效。
-- 每个任务结束 `cargo test -p megle-core`(或指定测试)绿;`cargo fmt --all` 后再提交,仓库强制 `cargo fmt --all --check`。
+- MSVC 工具链。cargo 不在 PATH 时:`export PATH="$HOME/.cargo/bin:$PATH"`。mangoo-core 是 BIN 不是 lib:用 `cargo test -p mangoo-core <filter>`,`--lib` 无效。
+- 每个任务结束 `cargo test -p mangoo-core`(或指定测试)绿;`cargo fmt --all` 后再提交,仓库强制 `cargo fmt --all --check`。
 - 新 migration 必须:(1) 建 SQL 文件 `crates/core/migrations/0018_thumb_failure_kind.sql`;(2) 在 `crates/core/src/db/migrations.rs` 声明 `pub const`;(3) 在 `Database::apply_migrations`(`db/mod.rs`)以 `if !self.migration_applied(18)?` 门控;(4) 在 `tools/checks/validate_sqlite_schema.py`(`MIGRATIONS` + 列/表断言)断言。
 - 契约优先:改 `RootRecord` DTO 必须同步 `contracts/core-api/openapi.yaml`、`packages/core-client/src/generated-contract.ts`,并让 `npm run check:core-api` / `check:core-client` 通过。
 - 分类只在纯函数 `classify_thumbnail_failure(error: &str) -> ThumbnailFailureKind` 一处;transient = error 含 `os error 53` 或 中文 `找不到网络路径` 或 `网络` 或 `network path` 或 `database is locked` 或 `Memory limit exceeded`;其余 permanent。
@@ -82,7 +82,7 @@ fn classify_thumbnail_failure_splits_transient_and_permanent() {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p megle-core classify_thumbnail_failure -- --nocapture`
+Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p mangoo-core classify_thumbnail_failure -- --nocapture`
 Expected: FAIL — `classify_thumbnail_failure` / `ThumbnailFailureKind` 未定义。
 
 - [ ] **Step 3: 实现枚举 + 分类函数**
@@ -127,7 +127,7 @@ pub fn classify_thumbnail_failure(error: &str) -> ThumbnailFailureKind {
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cargo test -p megle-core classify_thumbnail_failure -- --nocapture`
+Run: `cargo test -p mangoo-core classify_thumbnail_failure -- --nocapture`
 Expected: PASS。
 
 - [ ] **Step 5: 建 migration 文件**
@@ -192,7 +192,7 @@ pub const THUMB_FAILURE_KIND_MIGRATION: &str =
 export PATH="$HOME/.cargo/bin:$PATH"
 npm run check:schema
 cargo fmt --all
-cargo test -p megle-core thumbnails:: && cargo test -p megle-core db::tests
+cargo test -p mangoo-core thumbnails:: && cargo test -p mangoo-core db::tests
 git add crates/core/migrations/0018_thumb_failure_kind.sql crates/core/src/db/migrations.rs crates/core/src/db/mod.rs crates/core/src/thumbnails/mod.rs crates/core/src/tasks.rs tools/checks/validate_sqlite_schema.py
 git commit -m "feat(core): classify thumbnail failures transient vs permanent (failure_kind)"
 ```
@@ -240,7 +240,7 @@ fn migration_0018_backfills_failure_kind_from_error_text() {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test -p megle-core migration_0018_backfills -- --nocapture`
+Run: `cargo test -p mangoo-core migration_0018_backfills -- --nocapture`
 Expected: FAIL — `backfill_thumbnail_failure_kind` 未定义。
 
 - [ ] **Step 3: 实现回填函数 + 在 migration 门控内调用**
@@ -273,14 +273,14 @@ pub fn backfill_thumbnail_failure_kind(&self) -> anyhow::Result<()> {
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cargo test -p megle-core migration_0018_backfills -- --nocapture`
+Run: `cargo test -p mangoo-core migration_0018_backfills -- --nocapture`
 Expected: PASS。
 
 - [ ] **Step 5: fmt,提交**
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo fmt --all && cargo test -p megle-core db::tests
+cargo fmt --all && cargo test -p mangoo-core db::tests
 git add crates/core/src/db/mod.rs
 git commit -m "feat(core): backfill failure_kind for existing failed thumbnails (migration 0018)"
 ```
@@ -313,7 +313,7 @@ fn probe_root_reachable_true_for_existing_dir_false_for_missing() {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p megle-core probe_root_reachable -- --nocapture`
+Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p mangoo-core probe_root_reachable -- --nocapture`
 Expected: FAIL — 未定义。
 
 - [ ] **Step 3: 实现探针 + 刷新**
@@ -349,14 +349,14 @@ pub fn refresh_root_reachability(reach: &RootReachability, roots: &[(i64, String
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cargo test -p megle-core probe_root_reachable reachability -- --nocapture`
+Run: `cargo test -p mangoo-core probe_root_reachable reachability -- --nocapture`
 Expected: PASS(含一个刷新测试:构造 map、放一个存在路径 + 一个不存在路径,`refresh_root_reachability` 后断言值)。加该刷新测试。
 
 - [ ] **Step 5: fmt,提交**
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo fmt --all && cargo test -p megle-core reachability
+cargo fmt --all && cargo test -p mangoo-core reachability
 git add crates/core/src/roots/
 git commit -m "feat(core): per-root reachability probe + in-memory cache"
 ```
@@ -384,7 +384,7 @@ git commit -m "feat(core): per-root reachability probe + in-memory cache"
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p megle-core roots -- --nocapture`
+Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p mangoo-core roots -- --nocapture`
 Expected: FAIL(字段缺失/未覆盖)。
 
 - [ ] **Step 3: AppState 持缓存 + list_roots 覆盖**
@@ -412,7 +412,7 @@ async fn list_roots(State(state): State<AppState>) -> ApiResult<Json<ListRespons
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo test -p megle-core roots
+cargo test -p mangoo-core roots
 npm run check:core-api && npm run check:core-client
 ```
 Expected: PASS。
@@ -443,7 +443,7 @@ git commit -m "feat(core): expose per-root reachable + background probe"
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p megle-core retry_failed -- --nocapture`
+Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p mangoo-core retry_failed -- --nocapture`
 Expected: FAIL(当前 permanent 也被重试)。
 
 - [ ] **Step 3: 在候选查询加门**
@@ -452,14 +452,14 @@ Expected: FAIL(当前 permanent 也被重试)。
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cargo test -p megle-core retry_failed -- --nocapture`
+Run: `cargo test -p mangoo-core retry_failed -- --nocapture`
 Expected: PASS(transient 重试,permanent 不动,手动 retry 仍能重试 permanent——补一个手动 retry permanent 的测试断言不被门挡)。
 
 - [ ] **Step 5: fmt,提交**
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo fmt --all && cargo test -p megle-core db::tests
+cargo fmt --all && cargo test -p mangoo-core db::tests
 git add crates/core/src/db/mod.rs
 git commit -m "feat(core): auto retry candidate gate = failed AND failure_kind=transient"
 ```
@@ -482,7 +482,7 @@ git commit -m "feat(core): auto retry candidate gate = failed AND failure_kind=t
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p megle-core transient_retry_sweep -- --nocapture`
+Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p mangoo-core transient_retry_sweep -- --nocapture`
 Expected: FAIL — 未定义。
 
 - [ ] **Step 3: 实现扫描 + 启动**
@@ -491,14 +491,14 @@ Expected: FAIL — 未定义。
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cargo test -p megle-core transient_retry_sweep -- --nocapture`
+Run: `cargo test -p mangoo-core transient_retry_sweep -- --nocapture`
 Expected: PASS。
 
 - [ ] **Step 5: fmt,提交**
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo fmt --all && cargo test -p megle-core
+cargo fmt --all && cargo test -p mangoo-core
 git add crates/core/src/api/mod.rs
 git commit -m "feat(core): background transient-retry sweep gated by root reachability"
 ```
@@ -535,8 +535,8 @@ git commit -m "feat(core): background transient-retry sweep gated by root reacha
 - [ ] **Step 2: typecheck + web/ui 检查**
 
 ```bash
-cd /d/Megle
-npm --workspace @megle/web run typecheck
+cd /d/Mangoo
+npm --workspace @mangoo/web run typecheck
 npm run check:web && npm run check:ui-design
 ```
 Expected: PASS。

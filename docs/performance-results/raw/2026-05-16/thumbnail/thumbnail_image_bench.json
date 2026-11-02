@@ -37,7 +37,7 @@
   },
   "samples": [
     {
-      "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0000.jpg",
+      "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0000.jpg",
       "skipped": false,
       "width": 480,
       "height": 320,
@@ -46,7 +46,7 @@
       "ms": 30.6629
     },
     {
-      "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0003.jpg",
+      "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0003.jpg",
       "skipped": false,
       "width": 480,
       "height": 320,
@@ -55,7 +55,7 @@
       "ms": 29.809399999999997
     },
     {
-      "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0002.jpg",
+      "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0002.jpg",
       "skipped": false,
       "width": 480,
       "height": 320,
@@ -64,7 +64,7 @@
       "ms": 29.894500000000008
     },
     {
-      "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0001.jpg",
+      "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0001.jpg",
       "skipped": false,
       "width": 480,
       "height": 320,
@@ -73,7 +73,7 @@
       "ms": 31.015500000000003
     },
     {
-      "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0007.jpg",
+      "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0007.jpg",
       "skipped": false,
       "width": 480,
       "height": 320,
@@ -82,7 +82,7 @@
       "ms": 30.8072
     },
     {
-      "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0004.jpg",
+      "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0004.jpg",
       "skipped": false,
       "width": 480,
       "height": 320,
@@ -91,7 +91,7 @@
       "ms": 32.1638
     },
     {
-      "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0006.jpg",
+      "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0006.jpg",
       "skipped": false,
       "width": 480,
       "height": 320,
@@ -100,7 +100,7 @@
       "ms": 44.35679999999999
     },
     {
-      "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0005.jpg",
+      "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0005.jpg",
       "skipped": false,
       "width": 480,
       "height": 320,

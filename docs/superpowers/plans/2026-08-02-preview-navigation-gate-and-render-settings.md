@@ -61,9 +61,9 @@
 - [ ] **Step 1: Launch the app**
 
 ```bash
-cd /d/Megle
-export MEGLE_AUTO_ADD_ROOT="C:/Users/84460/Pictures/normal"
-export MEGLE_REMOTE_DEBUG=1
+cd /d/Mangoo
+export MANGOO_AUTO_ADD_ROOT="C:/Users/84460/Pictures/normal"
+export MANGOO_REMOTE_DEBUG=1
 nohup npm run dev > /tmp/dev_probe.log 2>&1 &
 sleep 85
 grep -E "Core ready|renderer ready" /tmp/dev_probe.log | head -3
@@ -111,7 +111,7 @@ ws.on("open", async () => {
       svg.style.position = "fixed"; svg.style.opacity = "0"; svg.style.pointerEvents = "none";
       const defs = document.createElementNS(svgns, "defs");
       const filter = document.createElementNS(svgns, "filter");
-      filter.setAttribute("id", "megle-probe-rgb");
+      filter.setAttribute("id", "mangoo-probe-rgb");
       filter.setAttribute("color-interpolation-filters", "sRGB");
       const fe = document.createElementNS(svgns, "feColorMatrix");
       fe.setAttribute("type", "matrix");
@@ -128,7 +128,7 @@ ws.on("open", async () => {
       const out = document.createElement("canvas");
       out.width = 1; out.height = 1;
       const octx = out.getContext("2d");
-      octx.filter = "url(#megle-probe-rgb)";
+      octx.filter = "url(#mangoo-probe-rgb)";
       octx.drawImage(src, 0, 0);
       const px = octx.getImageData(0, 0, 1, 1).data;
 
@@ -149,7 +149,7 @@ ws.on("open", async () => {
 - [ ] **Step 3: Run it**
 
 ```bash
-cd /d/Megle
+cd /d/Mangoo
 WS=$(curl -sS http://127.0.0.1:9500/json | python -c "
 import json,sys
 p=[x for x in json.load(sys.stdin) if x.get('type')=='page' and 'omnibox' not in x.get('url','')]
@@ -178,8 +178,8 @@ Near **128** means it does not.
 Write `docs/benchmarks/2026-08-02-preview-render-browser-checks.md` containing the raw probe output, the date, the Electron/Chromium version (`process.versions.chrome` via the same CDP eval), and the resulting decision for each check in one sentence.
 
 ```bash
-cd /d/Megle
-taskkill //F //IM megle-core.exe 2>/dev/null | head -1
+cd /d/Mangoo
+taskkill //F //IM mangoo-core.exe 2>/dev/null | head -1
 taskkill //F //IM electron.exe 2>/dev/null | head -1
 rm -f tools/dev/_render_probe.mjs
 git add docs/benchmarks/2026-08-02-preview-render-browser-checks.md
@@ -285,8 +285,8 @@ const { canNavigatePreview, canStartPreviewNavigation } = await import(
 - [ ] **Step 2: Run the tests to verify they fail**
 
 ```bash
-cd /d/Megle
-npm --workspace @megle/web run test 2>&1 | grep -E "^# (pass|fail)|not ok" | head -5
+cd /d/Mangoo
+npm --workspace @mangoo/web run test 2>&1 | grep -E "^# (pass|fail)|not ok" | head -5
 ```
 
 Expected: FAIL — `canStartPreviewNavigation is not a function`.
@@ -344,9 +344,9 @@ export function canStartPreviewNavigation(input: {
 - [ ] **Step 4: Run the tests to verify they pass**
 
 ```bash
-cd /d/Megle
-npm --workspace @megle/web run test 2>&1 | grep -E "^# (tests|pass|fail)" | head -4
-npm --workspace @megle/web run typecheck 2>&1 | tail -2
+cd /d/Mangoo
+npm --workspace @mangoo/web run test 2>&1 | grep -E "^# (tests|pass|fail)" | head -4
+npm --workspace @mangoo/web run typecheck 2>&1 | tail -2
 ```
 
 Expected: 7 new assertions pass, 0 failing; typecheck clean.
@@ -354,7 +354,7 @@ Expected: 7 new assertions pass, 0 failing; typecheck clean.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /d/Megle
+cd /d/Mangoo
 git add apps/web/src/app/previewNavigationGate.ts apps/web/tests/previewNavigationGate.test.mts
 git commit -m "feat(web): add a first-paint preview navigation gate"
 ```
@@ -473,8 +473,8 @@ if (
 - [ ] **Step 6: Verify**
 
 ```bash
-cd /d/Megle
-npm --workspace @megle/web run typecheck 2>&1 | tail -2
+cd /d/Mangoo
+npm --workspace @mangoo/web run typecheck 2>&1 | tail -2
 npm run check:web 2>&1 | grep -E "^FAIL|^PASS: web" | head -3
 ```
 
@@ -485,7 +485,7 @@ Expected: typecheck clean, `PASS: web client boundaries`.
 Commit first. `git checkout` on a file carrying uncommitted work destroys it — that mistake cost a full redo twice on the previous plan.
 
 ```bash
-cd /d/Megle
+cd /d/Mangoo
 git add apps/web/src/app/App.tsx tools/checks/validate-web-client.mjs
 git commit -m "feat(web): gate preview steps on the first paint of the current image"
 ```
@@ -493,7 +493,7 @@ git commit -m "feat(web): gate preview steps on the first paint of the current i
 Now prove the guard can fail:
 
 ```bash
-cd /d/Megle
+cd /d/Mangoo
 python -c "
 import io
 p='apps/web/src/app/App.tsx'
@@ -619,8 +619,8 @@ describe("preview channel isolation", () => {
 - [ ] **Step 2: Run it to verify it fails**
 
 ```bash
-cd /d/Megle
-npm --workspace @megle/web run test 2>&1 | grep -E "Cannot find module|^# fail" | head -3
+cd /d/Mangoo
+npm --workspace @mangoo/web run test 2>&1 | grep -E "Cannot find module|^# fail" | head -3
 ```
 
 Expected: FAIL — `Cannot find module '../src/features/preview/previewRenderSettings.ts'`.
@@ -671,11 +671,11 @@ export function imageRenderingForFilter(filter: PreviewRenderFilter): string {
 }
 
 const CHANNEL_FILTER_IDS: Record<Exclude<PreviewChannel, "rgba">, string> = {
-  rgb: "megle-channel-rgb",
-  r: "megle-channel-r",
-  g: "megle-channel-g",
-  b: "megle-channel-b",
-  a: "megle-channel-a"
+  rgb: "mangoo-channel-rgb",
+  r: "mangoo-channel-r",
+  g: "mangoo-channel-g",
+  b: "mangoo-channel-b",
+  a: "mangoo-channel-a"
 };
 
 /**
@@ -709,9 +709,9 @@ export const CHANNEL_MATRICES: ReadonlyArray<{ id: string; values: string }> = [
 - [ ] **Step 4: Run the tests to verify they pass**
 
 ```bash
-cd /d/Megle
-npm --workspace @megle/web run test 2>&1 | grep -E "^# (tests|pass|fail)" | head -4
-npm --workspace @megle/web run typecheck 2>&1 | tail -2
+cd /d/Mangoo
+npm --workspace @mangoo/web run test 2>&1 | grep -E "^# (tests|pass|fail)" | head -4
+npm --workspace @mangoo/web run typecheck 2>&1 | tail -2
 ```
 
 Expected: 6 new assertions pass; typecheck clean.
@@ -719,7 +719,7 @@ Expected: 6 new assertions pass; typecheck clean.
 - [ ] **Step 5: Commit**
 
 ```bash
-cd /d/Megle
+cd /d/Mangoo
 git add apps/web/src/features/preview/previewRenderSettings.ts apps/web/tests/previewRenderSettings.test.mts
 git commit -m "feat(web): add pure preview render settings mapping"
 ```
@@ -786,8 +786,8 @@ describe("render settings persistence", () => {
 - [ ] **Step 2: Run it to verify it fails**
 
 ```bash
-cd /d/Megle
-npm --workspace @megle/web run test 2>&1 | grep -E "^# fail|not ok" | head -4
+cd /d/Mangoo
+npm --workspace @mangoo/web run test 2>&1 | grep -E "^# fail|not ok" | head -4
 ```
 
 Expected: FAIL — the new fields are `undefined`.
@@ -851,9 +851,9 @@ In `tools/checks/validate-web-client.mjs`, inside the existing preview-preferenc
 - [ ] **Step 5: Verify and commit**
 
 ```bash
-cd /d/Megle
-npm --workspace @megle/web run test 2>&1 | grep -E "^# (tests|pass|fail)" | head -4
-npm --workspace @megle/web run typecheck 2>&1 | tail -2
+cd /d/Mangoo
+npm --workspace @mangoo/web run test 2>&1 | grep -E "^# (tests|pass|fail)" | head -4
+npm --workspace @mangoo/web run typecheck 2>&1 | tail -2
 npm run check:web 2>&1 | grep -E "^FAIL|^PASS: web" | head -3
 git add apps/web/src/features/preview/previewPreferences.ts apps/web/tests/previewRenderSettings.test.mts tools/checks/validate-web-client.mjs
 git commit -m "feat(web): persist the preview render filter and channel"
@@ -1036,8 +1036,8 @@ Note: unlike `SortMenu`, selecting an option does **not** close the popover. The
 - [ ] **Step 3: Verify it compiles**
 
 ```bash
-cd /d/Megle
-npm --workspace @megle/web run typecheck 2>&1 | tail -3
+cd /d/Mangoo
+npm --workspace @mangoo/web run typecheck 2>&1 | tail -3
 ```
 
 Expected: clean. (It is not rendered yet; Task 7 mounts it.)
@@ -1045,7 +1045,7 @@ Expected: clean. (It is not rendered yet; Task 7 mounts it.)
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /d/Megle
+cd /d/Mangoo
 git add apps/web/src/features/preview/PreviewRenderMenu.tsx apps/web/src/design/overlays/overlayTypes.ts
 git commit -m "feat(web): add the preview render settings popover"
 ```
@@ -1171,19 +1171,19 @@ In `apps/web/src/styles.css`, next to the existing `.preview-image` rule:
 
 /* No rule for data-preview-channel="rgba": the default must apply no filter. */
 .central-preview-stage[data-preview-channel="rgb"] .preview-image {
-  filter: url(#megle-channel-rgb);
+  filter: url(#mangoo-channel-rgb);
 }
 .central-preview-stage[data-preview-channel="r"] .preview-image {
-  filter: url(#megle-channel-r);
+  filter: url(#mangoo-channel-r);
 }
 .central-preview-stage[data-preview-channel="g"] .preview-image {
-  filter: url(#megle-channel-g);
+  filter: url(#mangoo-channel-g);
 }
 .central-preview-stage[data-preview-channel="b"] .preview-image {
-  filter: url(#megle-channel-b);
+  filter: url(#mangoo-channel-b);
 }
 .central-preview-stage[data-preview-channel="a"] .preview-image {
-  filter: url(#megle-channel-a);
+  filter: url(#mangoo-channel-a);
 }
 ```
 
@@ -1206,9 +1206,9 @@ In `apps/web/src/styles.css`, next to the existing `.preview-image` rule:
 - [ ] **Step 7: Verify and commit**
 
 ```bash
-cd /d/Megle
-npm --workspace @megle/web run typecheck 2>&1 | tail -2
-npm --workspace @megle/web run test 2>&1 | grep -E "^# (tests|pass|fail)" | head -4
+cd /d/Mangoo
+npm --workspace @mangoo/web run typecheck 2>&1 | tail -2
+npm --workspace @mangoo/web run test 2>&1 | grep -E "^# (tests|pass|fail)" | head -4
 npm run check:web 2>&1 | grep -E "^FAIL|^PASS: web" | head -3
 npm run check:ui-design 2>&1 | tail -2
 ```
@@ -1216,7 +1216,7 @@ npm run check:ui-design 2>&1 | tail -2
 If any scripted edit was used, normalise line endings before gating — a CRLF conversion breaks `check:ui-design`:
 
 ```bash
-cd /d/Megle
+cd /d/Mangoo
 python -c "
 import subprocess, os
 for f in subprocess.run(['git','diff','--name-only','HEAD'],capture_output=True,text=True).stdout.split():
@@ -1228,7 +1228,7 @@ for f in subprocess.run(['git','diff','--name-only','HEAD'],capture_output=True,
 ```
 
 ```bash
-cd /d/Megle
+cd /d/Mangoo
 git add apps/web/src/app-shell/ShellTopBar.tsx apps/web/src/app-shell/AppShell.tsx apps/web/src/app/App.tsx apps/web/src/features/preview/CentralPreviewStage.tsx apps/web/src/styles.css
 git commit -m "feat(web): apply the preview render settings from the titlebar"
 ```
@@ -1245,7 +1245,7 @@ git commit -m "feat(web): apply the preview render settings from the titlebar"
 - [ ] **Step 1: Full gate**
 
 ```bash
-cd /d/Megle
+cd /d/Mangoo
 export PATH="$HOME/.cargo/bin:$PATH"
 npm test 2>&1 | grep -E "^(PASS|FAIL)|test result:" | head -16
 ```
@@ -1255,9 +1255,9 @@ Expected: exit 0, every stage PASS. Fix anything red before continuing.
 - [ ] **Step 2: Launch against the benchmark folder**
 
 ```bash
-cd /d/Megle
-export MEGLE_AUTO_ADD_ROOT="C:/Users/84460/Pictures/normal"
-export MEGLE_REMOTE_DEBUG=1
+cd /d/Mangoo
+export MANGOO_AUTO_ADD_ROOT="C:/Users/84460/Pictures/normal"
+export MANGOO_REMOTE_DEBUG=1
 nohup npm run dev > /tmp/dev_verify.log 2>&1 &
 sleep 85
 ```
@@ -1284,8 +1284,8 @@ Record each of these:
 Append a "Results" section to `docs/benchmarks/2026-08-02-preview-render-browser-checks.md` with what you observed for each bullet above — including anything that did **not** work. Then:
 
 ```bash
-cd /d/Megle
-taskkill //F //IM megle-core.exe 2>/dev/null | head -1
+cd /d/Mangoo
+taskkill //F //IM mangoo-core.exe 2>/dev/null | head -1
 taskkill //F //IM electron.exe 2>/dev/null | head -1
 rm -f "C:/Users/84460/Pictures/normal/broken_test.png"
 git status --short
@@ -1294,7 +1294,7 @@ git status --short
 `git status` must show only the user's own eight pre-existing files.
 
 ```bash
-cd /d/Megle
+cd /d/Mangoo
 git add docs/benchmarks/2026-08-02-preview-render-browser-checks.md
 git commit -m "docs: record preview gate and render settings verification"
 ```

@@ -1,4 +1,4 @@
-import { useMemo, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import {
   AnchoredOverlay,
   OverlayMenuItem,
@@ -14,6 +14,7 @@ export interface ContextMenuItem {
   disabled?: boolean;
   danger?: boolean;
   onSelect?: () => void;
+  renderSubmenu?: (anchor: HTMLElement, onClose: () => void) => ReactNode;
 }
 
 interface ContextMenuProps {
@@ -35,9 +36,10 @@ export function ContextMenu({
   ariaLabel = "Item actions",
 }: ContextMenuProps) {
   const anchor = useMemo(() => pointOverlayAnchor(x, y), [x, y]);
+  const [submenu, setSubmenu] = useState<{ item: ContextMenuItem; anchor: HTMLElement } | null>(null);
 
   return (
-    <AnchoredOverlay
+    <><AnchoredOverlay
       anchor={anchor}
       ariaLabel={ariaLabel}
       className="context-menu"
@@ -60,7 +62,19 @@ export function ContextMenu({
               disabled={item.disabled}
               icon={item.icon}
               key={item.id}
-              onClick={item.onSelect}
+              submenu={Boolean(item.renderSubmenu)}
+              onClick={(event) => {
+                if (item.renderSubmenu) {
+                  event.currentTarget.focus();
+                  setSubmenu({ item, anchor: event.currentTarget });
+                } else item.onSelect?.();
+              }}
+              onKeyDown={(event) => {
+                if (item.renderSubmenu && event.key === "ArrowRight") {
+                  event.preventDefault(); event.stopPropagation();
+                  setSubmenu({ item, anchor: event.currentTarget });
+                }
+              }}
               role="menuitem"
             >
               {item.label}
@@ -69,5 +83,6 @@ export function ContextMenu({
         )}
       </OverlayMenuList>
     </AnchoredOverlay>
+    {submenu?.item.renderSubmenu?.(submenu.anchor, () => setSubmenu(null))}</>
   );
 }

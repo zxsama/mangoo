@@ -28,6 +28,7 @@ pub enum ScanPriority {
 pub struct ScanSummary {
     pub folders_seen: usize,
     pub media_files_seen: usize,
+    pub files_seen: usize,
     pub skipped_files: usize,
 }
 
@@ -118,17 +119,29 @@ pub fn scan_root_with_options(
     root: &RootRecord,
     mut options: ScanOptions<'_>,
 ) -> anyhow::Result<ScanSummary> {
+    database.begin_storage_traversal();
     let root_path = PathBuf::from(&root.path);
+    let all_files = database.captures_all_files(root.id)?;
+    if database.is_internal_storage_path(&root_path, &root_path)? {
+        anyhow::bail!("database-content-overlap");
+    }
+    crate::sync::file_policy::require_no_links(&root_path, &root_path)?;
     check_scan_cancelled(&mut options)?;
     ensure_root_enabled(database, root.id)?;
     ensure_root_binding_current(database, &options)?;
-    let scan_generation = match options.task_attempt_guard {
+    let root_id = root.id;
+    let guard = options.task_attempt_guard;
+    let begin_scan = move |database: &mut Database| match guard {
         Some(guard) => database.begin_root_scan_reconciliation_for_task_attempt(
-            root.id,
+            root_id,
             guard.task_id,
             guard.attempt_generation,
-        )?,
-        None => database.begin_root_scan_reconciliation(root.id)?,
+        ),
+        None => database.begin_root_scan_reconciliation(root_id),
+    };
+    let scan_generation = match options.writer.as_ref() {
+        Some(writer) => writer.write_authoritative_blocking(begin_scan)?,
+        None => begin_scan(database)?,
     };
     let root_batch = ScanWriteBatch {
         folders: vec![FolderUpsert {
@@ -156,6 +169,7 @@ pub fn scan_root_with_options(
     let mut summary = ScanSummary {
         folders_seen: 1,
         media_files_seen: 0,
+        files_seen: 0,
         skipped_files: 0,
     };
     let mut items_seen = 0_i64;
@@ -197,7 +211,10 @@ pub fn scan_root_with_options(
                     Ok(file_type) => file_type,
                     Err(_) => continue,
                 };
-                if file_type.is_dir() {
+                if file_type.is_dir()
+                    && !database.is_owned_collection_path(&root_path, &entry.path())?
+                    && !crate::sync::file_policy::is_link(&entry.metadata()?)
+                {
                     child_dirs.push(entry.path());
                 }
             }
@@ -225,7 +242,7 @@ pub fn scan_root_with_options(
                     FolderUpsert {
                         root_id: root.id,
                         parent_id: Some(parent_id),
-                        name: file_name(&path),
+                        name: crate::sync::file_policy::unicode_name(&path)?,
                         path_hash: hash_path(&path),
                         mtime: metadata_time(metadata.as_ref(), TimeField::Modified),
                     },
@@ -259,11 +276,23 @@ pub fn scan_root_with_options(
         }
     }
 
-    for entry in WalkDir::new(&root_path).min_depth(1) {
+    let mut entries = WalkDir::new(&root_path)
+        .follow_root_links(false)
+        .min_depth(1)
+        .into_iter();
+    while let Some(entry) = entries.next() {
         check_scan_cancelled(&mut options)?;
         let entry = entry?;
         let path = entry.path();
         let metadata = entry.metadata()?;
+        if database.is_owned_collection_path(&root_path, path)?
+            || crate::sync::file_policy::is_link(&metadata)
+        {
+            if entry.file_type().is_dir() {
+                entries.skip_current_dir();
+            }
+            continue;
+        }
         items_seen += 1;
 
         if metadata.is_dir() {
@@ -276,7 +305,7 @@ pub fn scan_root_with_options(
                     folders: vec![FolderUpsert {
                         root_id: root.id,
                         parent_id: Some(parent_id),
-                        name: file_name(path),
+                        name: crate::sync::file_policy::unicode_name(path)?,
                         path_hash: hash_path(path),
                         mtime: metadata_time(Some(&metadata), TimeField::Modified),
                     }],
@@ -307,37 +336,55 @@ pub fn scan_root_with_options(
         // the stored `files.ext` are the same string. This runs once per file on
         // multi-million-file libraries.
         let ext = extension(path);
-        let Some(kind) = media_kind_for_extension(ext.as_str()) else {
+        let kind = media_kind_for_extension(ext.as_str());
+        if kind.is_none() && !all_files {
             summary.skipped_files += 1;
             emit_progress(&mut options, items_seen, &summary);
             check_scan_cancelled(&mut options)?;
             continue;
-        };
+        }
 
         let folder_id = parent_folder_id(path, &folder_ids)?;
-        let file_identity = crate::library_path::local_file_identity(path).unwrap_or_default();
+        crate::sync::file_policy::require_no_links(&root_path, path)?;
+        let file_identity = crate::library_path::local_file_identity(path)?;
+        let volume_identity = crate::library_path::local_file_identity(&root_path)?.into_bytes();
+        let (fingerprint, source_stamp) = crate::sync::identity::observed_fingerprint(
+            database,
+            path,
+            &volume_identity,
+            file_identity.as_bytes(),
+            || check_scan_cancelled(&mut options).map_err(std::io::Error::other),
+        )?;
+        let rename_candidates = database.absent_external_identity_candidates(
+            root.id,
+            &volume_identity,
+            file_identity.as_bytes(),
+            Some(&fingerprint),
+            path,
+        )?;
         pending_files.push(ScanFileUpsert {
             file: FileUpsert {
                 root_id: root.id,
                 folder_id,
-                name: file_name(path),
+                name: crate::sync::file_policy::unicode_name(path)?,
                 ext,
-                size: metadata.len() as i64,
+                size: i64::try_from(metadata.len())?,
                 mtime: metadata_time(Some(&metadata), TimeField::Modified).unwrap_or(0),
                 ctime: metadata_time(Some(&metadata), TimeField::Created),
                 file_key: (!file_identity.is_empty()).then(|| file_identity.clone()),
             },
-            media_kind: kind.to_string(),
+            media_kind: kind.map(ToOwned::to_owned),
             external_identity: Some(ExternalFileIdentity {
-                volume_identity: crate::library_path::local_file_identity(&root_path)
-                    .unwrap_or_else(|_| root.path.clone())
-                    .into_bytes(),
+                volume_identity,
+                rename_candidates,
                 file_identity: file_identity.into_bytes(),
-                content_fingerprint: crate::sync::identity::stable_content_fingerprint(path).ok(),
+                content_fingerprint: Some(fingerprint),
+                source_stamp: Some(source_stamp),
                 path: path.to_path_buf(),
             }),
         });
-        summary.media_files_seen += 1;
+        summary.media_files_seen += usize::from(kind.is_some());
+        summary.files_seen += 1;
         emit_progress(&mut options, items_seen, &summary);
         check_scan_cancelled(&mut options)?;
 
@@ -387,7 +434,7 @@ fn reconcile_scan_completion_with_optional_writer(
     );
     let guard = options.task_attempt_guard;
     match options.writer.as_ref() {
-        Some(writer) => writer.write_blocking(move |db| {
+        Some(writer) => writer.write_authoritative_blocking(move |db| {
             reconcile_scan_completion(db, root_id, scan_generation, guard)
         }),
         None => reconcile_scan_completion(database, root_id, scan_generation, guard),
@@ -453,7 +500,7 @@ fn ensure_folder_chain_with_optional_writer(
             let root_path = root_path.to_path_buf();
             let folder_path = folder_path.to_path_buf();
             let guard = options.task_attempt_guard;
-            writer.write_blocking(move |db| match guard {
+            writer.write_authoritative_blocking(move |db| match guard {
                 Some(guard) => db.ensure_folder_chain_for_path_for_task_attempt(
                     root_id,
                     &root_path,
@@ -484,10 +531,49 @@ pub fn scan_folder_with_options(
     folder_path: &Path,
     mut options: ScanOptions<'_>,
 ) -> anyhow::Result<ScanSummary> {
+    database.begin_storage_traversal();
     let root_path = PathBuf::from(&root.path);
+    let all_files = database.captures_all_files(root.id)?;
+    if database.is_internal_storage_path(&root_path, &root_path)? {
+        anyhow::bail!("database-content-overlap");
+    }
+    crate::sync::file_policy::require_no_links(&root_path, &root_path)?;
     check_scan_cancelled(&mut options)?;
     ensure_root_enabled(database, root.id)?;
     ensure_root_binding_current(database, &options)?;
+    if let Some(directory) = database.internal_storage_directory(&root_path, folder_path)? {
+        let root_id = root.id;
+        let owned_root_path = root_path.clone();
+        let token = options.root_binding_guard.clone();
+        let retire = move |database: &mut Database| {
+            if let Some(token) = token {
+                database.mark_folder_subtree_missing_by_path_for_root_token(
+                    &token,
+                    root_id,
+                    &owned_root_path,
+                    &directory,
+                )?;
+            } else {
+                database.mark_folder_subtree_missing_by_path(
+                    root_id,
+                    &owned_root_path,
+                    &directory,
+                )?;
+            }
+            Ok(())
+        };
+        if let Some(writer) = &options.writer {
+            writer.write_blocking(retire)?;
+        } else {
+            retire(database)?;
+        }
+        return Ok(ScanSummary {
+            folders_seen: 0,
+            media_files_seen: 0,
+            files_seen: 0,
+            skipped_files: 0,
+        });
+    }
     let selected_folder_id = ensure_folder_chain_with_optional_writer(
         database,
         root.id,
@@ -509,17 +595,30 @@ pub fn scan_folder_with_options(
     let mut summary = ScanSummary {
         folders_seen: 1,
         media_files_seen: 0,
+        files_seen: 0,
         skipped_files: 0,
     };
     let mut items_seen = 0_i64;
     emit_progress(&mut options, items_seen, &summary);
     check_scan_cancelled(&mut options)?;
 
-    for entry in WalkDir::new(folder_path).min_depth(1) {
+    let mut entries = WalkDir::new(folder_path)
+        .follow_root_links(false)
+        .min_depth(1)
+        .into_iter();
+    while let Some(entry) = entries.next() {
         check_scan_cancelled(&mut options)?;
         let entry = entry?;
         let path = entry.path();
         let metadata = entry.metadata()?;
+        if database.is_owned_collection_path(&root_path, path)?
+            || crate::sync::file_policy::is_link(&metadata)
+        {
+            if entry.file_type().is_dir() {
+                entries.skip_current_dir();
+            }
+            continue;
+        }
         items_seen += 1;
 
         if metadata.is_dir() {
@@ -528,7 +627,7 @@ pub fn scan_folder_with_options(
                 folders: vec![FolderUpsert {
                     root_id: root.id,
                     parent_id: Some(parent_id),
-                    name: file_name(path),
+                    name: crate::sync::file_policy::unicode_name(path)?,
                     path_hash: hash_path(path),
                     mtime: metadata_time(Some(&metadata), TimeField::Modified),
                 }],
@@ -558,37 +657,55 @@ pub fn scan_folder_with_options(
         // the stored `files.ext` are the same string. This runs once per file on
         // multi-million-file libraries.
         let ext = extension(path);
-        let Some(kind) = media_kind_for_extension(ext.as_str()) else {
+        let kind = media_kind_for_extension(ext.as_str());
+        if kind.is_none() && !all_files {
             summary.skipped_files += 1;
             emit_progress(&mut options, items_seen, &summary);
             check_scan_cancelled(&mut options)?;
             continue;
-        };
+        }
 
         let parent_id = parent_folder_id(path, &folder_ids)?;
-        let file_identity = crate::library_path::local_file_identity(path).unwrap_or_default();
+        crate::sync::file_policy::require_no_links(&root_path, path)?;
+        let file_identity = crate::library_path::local_file_identity(path)?;
+        let volume_identity = crate::library_path::local_file_identity(&root_path)?.into_bytes();
+        let (fingerprint, source_stamp) = crate::sync::identity::observed_fingerprint(
+            database,
+            path,
+            &volume_identity,
+            file_identity.as_bytes(),
+            || check_scan_cancelled(&mut options).map_err(std::io::Error::other),
+        )?;
+        let rename_candidates = database.absent_external_identity_candidates(
+            root.id,
+            &volume_identity,
+            file_identity.as_bytes(),
+            Some(&fingerprint),
+            path,
+        )?;
         pending_files.push(ScanFileUpsert {
             file: FileUpsert {
                 root_id: root.id,
                 folder_id: parent_id,
-                name: file_name(path),
+                name: crate::sync::file_policy::unicode_name(path)?,
                 ext,
-                size: metadata.len() as i64,
+                size: i64::try_from(metadata.len())?,
                 mtime: metadata_time(Some(&metadata), TimeField::Modified).unwrap_or(0),
                 ctime: metadata_time(Some(&metadata), TimeField::Created),
                 file_key: (!file_identity.is_empty()).then(|| file_identity.clone()),
             },
-            media_kind: kind.to_string(),
+            media_kind: kind.map(ToOwned::to_owned),
             external_identity: Some(ExternalFileIdentity {
-                volume_identity: crate::library_path::local_file_identity(&root_path)
-                    .unwrap_or_else(|_| root.path.clone())
-                    .into_bytes(),
+                volume_identity,
+                rename_candidates,
                 file_identity: file_identity.into_bytes(),
-                content_fingerprint: crate::sync::identity::stable_content_fingerprint(path).ok(),
+                content_fingerprint: Some(fingerprint),
+                source_stamp: Some(source_stamp),
                 path: path.to_path_buf(),
             }),
         });
-        summary.media_files_seen += 1;
+        summary.media_files_seen += usize::from(kind.is_some());
+        summary.files_seen += 1;
         emit_progress(&mut options, items_seen, &summary);
         check_scan_cancelled(&mut options)?;
 
@@ -620,7 +737,9 @@ fn commit_scan_batch_with_optional_task_guard(
     );
     let guard = options.task_attempt_guard;
     match options.writer.as_ref() {
-        Some(writer) => writer.write_blocking(move |db| commit_scan_batch(db, batch, guard)),
+        Some(writer) => {
+            writer.write_authoritative_blocking(move |db| commit_scan_batch(db, batch, guard))
+        }
         None => commit_scan_batch(database, batch, guard),
     }
 }
@@ -762,16 +881,10 @@ fn emit_progress(options: &mut ScanOptions<'_>, items_seen: i64, summary: &ScanS
             items_total: None,
             folders_seen: summary.folders_seen as i64,
             media_files_seen: summary.media_files_seen as i64,
+            files_seen: summary.files_seen as i64,
             skipped_files: summary.skipped_files as i64,
         });
     }
-}
-
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_string()
 }
 
 fn hash_path(path: &Path) -> String {
@@ -811,6 +924,87 @@ mod tests {
     }
 
     #[test]
+    fn separated_storage_scan_prunes_marked_storage_and_preserves_lookalikes() {
+        let base = tempfile::tempdir().unwrap();
+        let content = base.path().join("content");
+        fs::create_dir_all(content.join("ordinary/Database")).unwrap();
+        fs::create_dir_all(content.join("private")).unwrap();
+        fs::write(
+            content.join("ordinary/Database/catalog.sqlite"),
+            b"user database",
+        )
+        .unwrap();
+        fs::write(
+            content.join("ordinary/.mangoo-library"),
+            b"malformed marker",
+        )
+        .unwrap();
+        fs::write(content.join("private/catalog.sqlite"), b"internal").unwrap();
+        let mut db = Database::open_in_memory().unwrap();
+        db.apply_migrations().unwrap();
+        let root_id = db
+            .add_root(NewRoot {
+                path: content.to_string_lossy().into_owned(),
+                display_name: "Content".into(),
+            })
+            .unwrap();
+        let root = db.list_roots().unwrap().remove(0);
+        scan_root(&mut db, &root).unwrap();
+        let folder_id = db
+            .get_folder_id_by_path(root_id, &content, &content.join("private"))
+            .unwrap()
+            .unwrap();
+        let marker = crate::library_path::LibraryMarker {
+            format_version: 2,
+            library_uuid: uuid::Uuid::now_v7().to_string(),
+            root_uuid: uuid::Uuid::now_v7().to_string(),
+            creation_txn_uuid: uuid::Uuid::now_v7().to_string(),
+            state: crate::library_path::MarkerState::Committed,
+        };
+        fs::write(
+            content.join("private/.mangoo-library"),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        scan_folder_with_options(
+            &mut db,
+            &root,
+            folder_id,
+            &content.join("private"),
+            ScanOptions::default(),
+        )
+        .unwrap();
+        let active: i64 = db
+            .connection_for_fsops()
+            .query_row(
+                "SELECT count(*) FROM folders WHERE id=?1 AND status='active'",
+                [folder_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 0);
+        scan_root(&mut db, &root).unwrap();
+        let active_files: i64 = db
+            .connection_for_fsops()
+            .query_row(
+                "SELECT count(*) FROM files WHERE status='active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            active_files, 2,
+            "ordinary SQLite and malformed marker remain visible"
+        );
+        let events: i64 = db
+            .connection_for_fsops()
+            .query_row("SELECT count(*) FROM sync_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events, 0, "storage pruning is local derived state");
+        assert!(content.join("private/catalog.sqlite").exists());
+    }
+
+    #[test]
     fn scan_options_interactive_profile_uses_single_file_write_batch() {
         assert_eq!(ScanOptions::interactive().write_batch_size, 1);
     }
@@ -841,7 +1035,8 @@ mod tests {
         let summary = scan_root(&mut database, &root).expect("scan root");
         assert_eq!(summary.folders_seen, 2);
         assert_eq!(summary.media_files_seen, 2);
-        assert_eq!(summary.skipped_files, 1);
+        assert_eq!(summary.files_seen, 3);
+        assert_eq!(summary.skipped_files, 0);
 
         let page = database
             .list_media_page(MediaPageQuery {
@@ -855,7 +1050,7 @@ mod tests {
                 kind: None,
             })
             .expect("list media");
-        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items.len(), 3);
 
         fs::remove_dir_all(temp_root).expect("cleanup temp root");
     }
@@ -960,7 +1155,8 @@ mod tests {
         .expect("scan root");
         assert_eq!(summary.folders_seen, 3);
         assert_eq!(summary.media_files_seen, 3);
-        assert_eq!(summary.skipped_files, 1);
+        assert_eq!(summary.files_seen, 4);
+        assert_eq!(summary.skipped_files, 0);
 
         let root = database
             .get_root(root_id)
@@ -980,7 +1176,7 @@ mod tests {
                 kind: None,
             })
             .expect("list media");
-        assert_eq!(page.items.len(), 3);
+        assert_eq!(page.items.len(), 4);
 
         fs::remove_dir_all(temp_root).expect("cleanup temp root");
     }
@@ -1785,6 +1981,32 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn all_file_scan_generation_and_batches_use_only_the_writer() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root_path = temporary.path().join("files");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(root_path.join("README"), b"ordinary file").unwrap();
+        let seed = Database::open(temporary.path().join("catalog.sqlite")).unwrap();
+        seed.apply_migrations().unwrap();
+        let root_id = add_test_root(&seed, &root_path, "writer-only-scan");
+        let root = test_root(&seed, root_id);
+        let reader = seed.reopen().unwrap().unwrap();
+        // The worker may read freely but cannot acquire the WAL write lock.
+        // This catches scan-generation writes before the first routed batch.
+        reader
+            .connection_for_fsops()
+            .pragma_update(None, "query_only", true)
+            .unwrap();
+        let writer = crate::db::DbWriter::spawn(seed);
+        let (reader, result) = scan_root_via_writer_for_test(reader, writer.clone(), root).await;
+        let summary = result.unwrap();
+        assert_eq!((summary.files_seen, summary.media_files_seen), (1, 0));
+        assert_eq!(reader.get_root(root_id).unwrap().unwrap().file_count, 1);
+        drop(reader);
+        writer.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn scan_commits_through_writer_keep_wal_bounded() {
         use crate::db::DbWriter;
 
@@ -1941,7 +2163,7 @@ mod tests {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
         std::env::temp_dir().join(format!(
-            "megle_scan_test_{}_{}_{}",
+            "mangoo_scan_test_{}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1958,5 +2180,635 @@ mod tests {
         image::DynamicImage::ImageRgb8(buffer)
             .save(path)
             .expect("write test image");
+    }
+    fn enroll_all_file_root(database: &Database, path: &Path) -> RootRecord {
+        let library = uuid::Uuid::now_v7();
+        let root_uuid = uuid::Uuid::now_v7();
+        database
+            .ensure_selected_sync_root(
+                library,
+                root_uuid,
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                &path.to_string_lossy(),
+                "Files",
+                "Files",
+                [7; 32],
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                1,
+                "active",
+                1,
+                false,
+            )
+            .unwrap();
+        database
+            .list_roots()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.path == path.to_string_lossy())
+            .unwrap()
+    }
+
+    #[test]
+    fn all_file_scan_does_not_reuse_one_absent_identity_twice_in_a_batch() {
+        let temp = unique_temp_dir();
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(temp.join("before.bin"), b"shared bytes").unwrap();
+        let mut database = Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        let root = enroll_all_file_root(&database, &temp);
+        scan_root(&mut database, &root).unwrap();
+        let original: Vec<u8> = database
+            .connection_for_fsops()
+            .query_row("SELECT asset_uuid FROM files", [], |row| row.get(0))
+            .unwrap();
+
+        fs::rename(temp.join("before.bin"), temp.join("after.bin")).unwrap();
+        fs::hard_link(temp.join("after.bin"), temp.join("linked.bin")).unwrap();
+        scan_root(&mut database, &root).unwrap();
+        let observed = database
+            .connection_for_fsops()
+            .prepare("SELECT name,asset_uuid FROM files WHERE status='active' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(observed.len(), 2, "each live hardlink must keep a file row");
+        assert_eq!(observed[0].0, "after.bin");
+        assert_eq!(observed[1].0, "linked.bin");
+        assert_ne!(observed[0].1, observed[1].1);
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|(_, asset)| *asset == original)
+                .count(),
+            1
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn all_file_scan_preserves_rename_beyond_three_live_hardlinks() {
+        let temp = unique_temp_dir();
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(temp.join("entry-0.bin"), b"shared bytes").unwrap();
+        for index in 1..4 {
+            fs::hard_link(
+                temp.join("entry-0.bin"),
+                temp.join(format!("entry-{index}.bin")),
+            )
+            .unwrap();
+        }
+        let mut database = Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        let root = enroll_all_file_root(&database, &temp);
+        scan_root(&mut database, &root).unwrap();
+        let (name, original): (String, Vec<u8>) = database.connection_for_fsops().query_row(
+            "SELECT f.name,f.asset_uuid FROM sync_local_file_identities i JOIN files f ON f.asset_uuid=i.asset_uuid ORDER BY i.rowid DESC LIMIT 1",
+            [], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        fs::rename(temp.join(name), temp.join("renamed.bin")).unwrap();
+        scan_root(&mut database, &root).unwrap();
+        let renamed: Vec<u8> = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT asset_uuid FROM files WHERE name='renamed.bin' AND status='active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(renamed, original);
+        let count: i64 = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT COUNT(DISTINCT asset_uuid) FROM files WHERE status='active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 4);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn all_file_scan_does_not_infer_unique_fingerprint_from_three_row_prefix() {
+        let temp = unique_temp_dir();
+        fs::create_dir_all(&temp).unwrap();
+        for index in 0..4 {
+            fs::write(temp.join(format!("entry-{index}.bin")), b"same bytes").unwrap();
+        }
+        let mut database = Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        let root = enroll_all_file_root(&database, &temp);
+        scan_root(&mut database, &root).unwrap();
+        let previous = database.connection_for_fsops().prepare(
+            "SELECT f.name,f.asset_uuid FROM sync_local_file_identities i JOIN files f ON f.asset_uuid=i.asset_uuid ORDER BY i.rowid",
+        ).unwrap().query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,Vec<u8>>(1)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+        // Create the new OS identity while both old entries still exist, so
+        // immediate filesystem ID reuse cannot turn this into an exact match.
+        fs::write(temp.join("incoming.bin"), b"same bytes").unwrap();
+        for (name, _) in &previous[2..] {
+            fs::remove_file(temp.join(name)).unwrap();
+        }
+        scan_root(&mut database, &root).unwrap();
+        let incoming: Vec<u8> = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT asset_uuid FROM files WHERE name='incoming.bin'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(previous.iter().all(|(_, asset)| *asset != incoming));
+        let conflicts: i64 = database.connection_for_fsops().query_row(
+            "SELECT COUNT(*) FROM sync_identity_conflicts WHERE new_asset_uuid=?1 AND reason='ambiguous-fingerprint'", [&incoming], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(conflicts, 2);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn all_file_scan_keeps_identity_separate_when_rename_candidates_are_incomplete() {
+        let temp = unique_temp_dir();
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(temp.join("entry-0.bin"), b"shared bytes").unwrap();
+        // One more than the fixed identity evidence window.
+        for index in 1..33 {
+            fs::hard_link(
+                temp.join("entry-0.bin"),
+                temp.join(format!("entry-{index}.bin")),
+            )
+            .unwrap();
+        }
+        let mut database = Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        let root = enroll_all_file_root(&database, &temp);
+        scan_root(&mut database, &root).unwrap();
+        let (name, original): (String, Vec<u8>) = database.connection_for_fsops().query_row(
+            "SELECT f.name,f.asset_uuid FROM sync_local_file_identities i JOIN files f ON f.asset_uuid=i.asset_uuid ORDER BY i.rowid DESC LIMIT 1",
+            [], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        fs::rename(temp.join(name), temp.join("renamed.bin")).unwrap();
+        scan_root(&mut database, &root).unwrap();
+        let renamed: Vec<u8> = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT asset_uuid FROM files WHERE name='renamed.bin' AND status='active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(
+            renamed, original,
+            "a truncated candidate set cannot establish rename lineage"
+        );
+        scan_root(&mut database, &root).unwrap();
+        let (files, conflicts): (i64,i64) = database.connection_for_fsops().query_row(
+            "SELECT (SELECT COUNT(DISTINCT asset_uuid) FROM files WHERE status='active'),(SELECT COUNT(*) FROM sync_identity_conflicts WHERE new_asset_uuid=?1 AND reason='incomplete-rename-candidates')", [&renamed], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert_eq!((files, conflicts), (33, 1));
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn all_file_owned_work_container_has_no_folder_echo_until_user_content_exists() {
+        let temp = unique_temp_dir();
+        fs::create_dir(&temp).unwrap();
+        fs::write(temp.join("data.bin"), b"data").unwrap();
+        let mut database = Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        let root = enroll_all_file_root(&database, &temp);
+        let marker =
+            crate::sync::file_policy::test_root_marker(database.connection_for_fsops(), &temp);
+        database
+            .initialize_sync_identity(
+                uuid::Uuid::parse_str(&marker.library_uuid).unwrap(),
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+            )
+            .unwrap();
+        database
+            .begin_sync_capture(uuid::Uuid::now_v7(), uuid::Uuid::now_v7())
+            .unwrap();
+        scan_root(&mut database, &root).unwrap();
+        crate::sync::capture::capture_enrolled_root_identities(database.connection_for_fsops())
+            .unwrap();
+        let asset: Vec<u8> = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT asset_uuid FROM files WHERE name='data.bin'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let revision = uuid::Uuid::now_v7();
+        let name = format!(
+            ".mangoo-work-{}-{}",
+            revision.simple(),
+            uuid::Uuid::now_v7().simple()
+        );
+        let directory = temp.join(&name);
+        fs::create_dir(&directory).unwrap();
+        let partial = directory.join("payload.partial");
+        fs::write(&partial, b"partial").unwrap();
+        database.connection_for_fsops().execute("INSERT INTO asset_content_revisions(content_revision_uuid,asset_uuid,byte_size,local_mutation_generation,created_at) VALUES (?1,?2,4,1,1)",rusqlite::params![revision.as_bytes().as_slice(),asset]).unwrap();
+        database.connection_for_fsops().execute("INSERT INTO media_materialization_jobs(content_revision_uuid,asset_uuid,destination_relpath,phase,expected_length,staging_relpath,staging_directory_identity,staging_file_identity,created_at,updated_at) VALUES (?1,?2,'data.bin','assembling',4,?3,?4,?5,1,1)",rusqlite::params![revision.as_bytes().as_slice(),asset,format!("{name}/payload.partial"),crate::library_path::local_file_identity(&directory).unwrap(),crate::library_path::local_file_identity(&partial).unwrap()]).unwrap();
+        let counts = |db: &Database| -> (i64, i64) {
+            db.connection_for_fsops()
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM sync_events),(SELECT COUNT(*) FROM sync_outbox)",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        let before = counts(&database);
+        scan_root(&mut database, &root).unwrap();
+        crate::sync::capture::capture_enrolled_root_identities(database.connection_for_fsops())
+            .unwrap();
+        assert_eq!(
+            counts(&database),
+            before,
+            "owned-only directory must not emit a portable folder event"
+        );
+        let count: i64 = database
+            .connection_for_fsops()
+            .query_row("SELECT COUNT(*) FROM folders WHERE name=?1", [&name], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+        fs::remove_file(&partial).unwrap();
+        scan_root(&mut database, &root).unwrap();
+        crate::sync::capture::capture_enrolled_root_identities(database.connection_for_fsops())
+            .unwrap();
+        assert_eq!(
+            counts(&database),
+            before,
+            "owned empty directory must not echo either"
+        );
+        fs::write(directory.join("user.bin"), b"user").unwrap();
+        scan_root(&mut database, &root).unwrap();
+        crate::sync::capture::capture_enrolled_root_identities(database.connection_for_fsops())
+            .unwrap();
+        let count: i64 = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE name='user.bin'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let count: i64 = database
+            .connection_for_fsops()
+            .query_row("SELECT COUNT(*) FROM folders WHERE name=?1", [&name], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        let after = counts(&database);
+        assert!(
+            after.0 > before.0 && after.1 > before.1,
+            "user content requires its canonical parent path"
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn enrolled_scan_captures_all_files_and_preserves_duplicate_and_hardlink_entries() {
+        let temp = unique_temp_dir();
+        fs::create_dir_all(temp.join("nested")).unwrap();
+        let names = [
+            "unknown.bin",
+            "empty",
+            ".config",
+            "Thumbs.db",
+            "archive.zip",
+            "shader.hlsl",
+            "scene.blend",
+            "user.tmp",
+            ".mangoo-user",
+            "broken.jpg",
+            "nested/a..b.jpg",
+        ];
+        for name in names {
+            fs::write(
+                temp.join(name),
+                if name == "empty" {
+                    &b""[..]
+                } else {
+                    &b"same bytes"[..]
+                },
+            )
+            .unwrap();
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use std::os::windows::fs::MetadataExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM,
+            };
+            let attributes = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
+            let path: Vec<u16> = temp
+                .join("Thumbs.db")
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            assert_ne!(unsafe { SetFileAttributesW(path.as_ptr(), attributes) }, 0);
+            assert_eq!(
+                fs::metadata(temp.join("Thumbs.db"))
+                    .unwrap()
+                    .file_attributes()
+                    & attributes,
+                attributes
+            );
+        }
+        fs::hard_link(temp.join("unknown.bin"), temp.join("linked.bin")).unwrap();
+        fs::create_dir_all(temp.join(".mangoo-staging")).unwrap();
+        fs::write(temp.join(".mangoo-staging/partial.bin"), b"partial").unwrap();
+        fs::write(
+            temp.join(".mangoo-recycle-00000000-0000-0000-0000-000000000001"),
+            b"user",
+        )
+        .unwrap();
+        fs::write(temp.join(".mangoo-library"), b"user").unwrap();
+        let mut database = Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        let root = enroll_all_file_root(&database, &temp);
+        let mut marker =
+            crate::sync::file_policy::test_root_marker(database.connection_for_fsops(), &temp);
+        fs::write(
+            temp.join(".mangoo-sync-root"),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        marker.local_binding_uuid = uuid::Uuid::now_v7().to_string();
+        fs::write(
+            temp.join(".mangoo-sync-root.00000000-0000-0000-0000-000000000001.tmp"),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        scan_root(&mut database, &root).unwrap();
+        let counts: (i64,i64,i64)=database.connection_for_fsops().query_row("SELECT (SELECT COUNT(*) FROM files),(SELECT COUNT(DISTINCT asset_uuid) FROM sync_local_file_identities),(SELECT COUNT(*) FROM media)",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(counts, (15, 15, 2));
+        let ids = database
+            .connection_for_fsops()
+            .prepare("SELECT name,asset_uuid FROM files ORDER BY name")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        scan_root(&mut database, &root).unwrap();
+        let again = database
+            .connection_for_fsops()
+            .prepare("SELECT name,asset_uuid FROM files ORDER BY name")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(ids, again);
+        let page = database
+            .list_media_page(MediaPageQuery {
+                root_id: Some(root.id),
+                folder_id: None,
+                include_descendants: false,
+                limit: 10,
+                offset: None,
+                cursor: None,
+                sort: "name_asc".into(),
+                kind: None,
+            })
+            .unwrap();
+        assert_eq!(page.total_count, Some(15));
+        assert_eq!(page.items.len(), 10);
+        assert_eq!(database.list_roots().unwrap()[0].media_count, 2);
+        assert_eq!(database.list_roots().unwrap()[0].file_count, 15);
+        let generic: i64 = database
+            .connection_for_fsops()
+            .query_row("SELECT id FROM files WHERE name='unknown.bin'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            database
+                .get_media(generic)
+                .unwrap()
+                .unwrap()
+                .presentation
+                .preview_kind,
+            "static-thumbnail"
+        );
+        let fts_count: i64 = database
+            .connection_for_fsops()
+            .query_row("SELECT COUNT(*) FROM media_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_count, 15);
+
+        fs::write(temp.join("nested/new-generic"), b"").unwrap();
+        let nested_id: i64 = database
+            .connection_for_fsops()
+            .query_row("SELECT id FROM folders WHERE name='nested'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        scan_folder_with_options(
+            &mut database,
+            &root,
+            nested_id,
+            &temp.join("nested"),
+            ScanOptions::interactive(),
+        )
+        .unwrap();
+        let subtree_asset: Vec<u8> = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT asset_uuid FROM files WHERE name='new-generic' AND size=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        scan_root(&mut database, &root).unwrap();
+        let (full_scan_asset, media_count): (Vec<u8>, i64) = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT asset_uuid,(SELECT COUNT(*) FROM media) FROM files
+                 WHERE name='new-generic' AND status='active'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(full_scan_asset, subtree_asset);
+        assert_eq!(media_count, 2);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn all_file_initial_seed_advances_bounded_pages_across_reopen() {
+        let temp = unique_temp_dir();
+        let root_path = temp.join("root");
+        fs::create_dir_all(&root_path).unwrap();
+        for i in 0..251 {
+            fs::write(root_path.join(format!("{i:04}.bin")), []).unwrap();
+        }
+        let db_path = temp.join("catalog.sqlite");
+        let mut db = Database::open(&db_path).unwrap();
+        db.apply_migrations().unwrap();
+        let root = enroll_all_file_root(&db, &root_path);
+        scan_root(&mut db, &root).unwrap();
+        db.initialize_sync_identity(
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7(),
+        )
+        .unwrap();
+        db.begin_sync_capture(uuid::Uuid::now_v7(), uuid::Uuid::now_v7())
+            .unwrap();
+        let count = |db: &Database| {
+            db.connection_for_fsops()
+                .query_row("SELECT COUNT(*) FROM sync_publication_intents", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(count(&db), 100);
+        drop(db);
+        let db = Database::open(&db_path).unwrap();
+        db.apply_migrations().unwrap();
+        assert_eq!(db.seed_pending_file_publications().unwrap(), 100);
+        assert_eq!(count(&db), 200);
+        assert_eq!(db.seed_pending_file_publications().unwrap(), 51);
+        assert_eq!(count(&db), 251);
+        assert_eq!(db.seed_pending_file_publications().unwrap(), 0);
+        assert_eq!(count(&db), 251);
+        let pending: bool = db
+            .connection_for_fsops()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_file_seed_progress)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!pending);
+        drop(db);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn all_file_unchanged_fingerprint_is_cached_and_same_timestamp_rewrite_is_detected() {
+        let temp = unique_temp_dir();
+        fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("data.bin");
+        fs::write(&path, vec![1; 1024 * 1024]).unwrap();
+        let mut db = Database::open_in_memory().unwrap();
+        db.apply_migrations().unwrap();
+        let root = enroll_all_file_root(&db, &temp);
+        scan_root(&mut db, &root).unwrap();
+        let identity = crate::library_path::local_file_identity(&path).unwrap();
+        let volume = crate::library_path::local_file_identity(&temp).unwrap();
+        let mut checks = 0;
+        let (first, stamp) = crate::sync::identity::observed_fingerprint(
+            &db,
+            &path,
+            volume.as_bytes(),
+            identity.as_bytes(),
+            || {
+                checks += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(checks, 1, "unchanged file must not read the payload");
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(&path, vec![2; 1024 * 1024]).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let mut checks = 0;
+        let (next, next_stamp) = crate::sync::identity::observed_fingerprint(
+            &db,
+            &path,
+            volume.as_bytes(),
+            identity.as_bytes(),
+            || {
+                checks += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(checks > 1);
+        assert_ne!(first, next);
+        assert_ne!(stamp, next_stamp);
+        let mut checks = 0;
+        let error = crate::sync::identity::observed_fingerprint(
+            &db,
+            &path,
+            volume.as_bytes(),
+            identity.as_bytes(),
+            || {
+                checks += 1;
+                if checks > 2 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "cancelled",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn enrolled_generic_media_generic_rename_retains_asset_and_clears_presentation() {
+        let temp = unique_temp_dir();
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(temp.join("item.bin"), b"not decoded").unwrap();
+        let mut database = Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        let root = enroll_all_file_root(&database, &temp);
+        scan_root(&mut database, &root).unwrap();
+        let asset: Vec<u8> = database
+            .connection_for_fsops()
+            .query_row("SELECT asset_uuid FROM files", [], |r| r.get(0))
+            .unwrap();
+        for (from, to, visible) in [("item.bin", "item.jpg", 1), ("item.jpg", "item", 0)] {
+            fs::rename(temp.join(from), temp.join(to)).unwrap();
+            scan_root(&mut database, &root).unwrap();
+            let row: (Vec<u8>, String, i64) = database
+                .connection_for_fsops()
+                .query_row(
+                    "SELECT asset_uuid,name,browse_visible FROM files WHERE status='active'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(row, (asset.clone(), to.into(), visible));
+            let count: i64 = database
+                .connection_for_fsops()
+                .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+        fs::remove_dir_all(temp).unwrap();
     }
 }

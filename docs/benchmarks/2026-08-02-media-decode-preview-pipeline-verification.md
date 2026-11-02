@@ -29,7 +29,7 @@ Web unit tests: 301 passed / 0 failed (baseline before this plan: 253).
 
 ## 2. Continuous navigation — the headline result
 
-Setup: `MEGLE_AUTO_ADD_ROOT="C:/Users/84460/Pictures/normal"` (31 multi-megabyte
+Setup: `MANGOO_AUTO_ADD_ROOT="C:/Users/84460/Pictures/normal"` (31 multi-megabyte
 illustrations), preview opened on the first image, then N synthetic `ArrowRight`
 key events dispatched through CDP `Input.dispatchKeyEvent` at a fixed interval.
 "Frames painted" counts distinct `data-preview-media-id` values committed to the
@@ -81,7 +81,7 @@ canvas CSS box       : 10240px x 5760px
 
 ## 4. Preview tier resolution
 
-`x-megle-preview-tier` values actually observed on the wire during one 31-image
+`x-mangoo-preview-tier` values actually observed on the wire during one 31-image
 walk (CDP `Network.responseReceived`):
 
 ```
@@ -98,7 +98,7 @@ Both were invisible to the entire unit-test suite.
 
 The renderer runs at `http://127.0.0.1:5173` and Core at a dynamic loopback port
 (`http://127.0.0.1:6274` in this run) — **cross-origin**. Only CORS-safelisted
-response headers are readable from JS, so `x-megle-preview-tier` was invisible:
+response headers are readable from JS, so `x-mangoo-preview-tier` was invisible:
 
 ```
 readableHeaders: ["cache-control", "content-length", "content-type"]
@@ -111,7 +111,7 @@ at tier resolution no matter how far you zoomed. Evidence: `original` requests
 across a walk were **6** before the fix and **32** after (one per image), and
 the canvas backing store went from a permanent 2048×1152 to the full 10240×5760.
 
-Fix: `.expose_headers([x-megle-preview-tier])` on the CORS layer, plus an
+Fix: `.expose_headers([x-mangoo-preview-tier])` on the CORS layer, plus an
 assertion in `configured_cors_allows_only_the_exact_development_origin`. That
 assertion is mutation-proofed: removing the `expose_headers` call fails it.
 

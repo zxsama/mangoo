@@ -1,5 +1,10 @@
 # Sync integration and release verification — 2026-08-24
 
+> Repository extraction note (2026-09-22): this report preserves the combined
+> Host/OneDrive tree and evidence from its recorded date. Current source and
+> release ownership are described in the [extraction note](../onedrive-extraction.md).
+> The split does not close outstanding restore or performance verification.
+
 ## Scope
 
 The final verification layer composes the production Library lifecycle,

@@ -1,4 +1,4 @@
-import type { FolderRecord } from "@megle/core-client";
+import type { FolderRecord } from "@mangoo/core-client";
 
 export type SubfolderSiblingPosition = "single" | "first" | "middle" | "last";
 

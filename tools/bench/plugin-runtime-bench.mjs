@@ -15,7 +15,7 @@ if (built.status !== 0) process.exit(built.status ?? 1);
 const targetRoot = process.env.CARGO_TARGET_DIR
   ? path.resolve(root, process.env.CARGO_TARGET_DIR)
   : path.join(root, "target");
-const binary = path.join(targetRoot, "debug", "bundled-plugins", "com.megle.fake-sync", "bin", process.platform === "win32" ? "megle-fake-provider.exe" : "megle-fake-provider");
+const binary = path.join(targetRoot, "debug", "bundled-plugins", "com.mangoo.fake-sync", "bin", process.platform === "win32" ? "mangoo-fake-provider.exe" : "mangoo-fake-provider");
 const child = spawn(binary, [], { cwd: path.dirname(binary), stdio: ["pipe", "pipe", "inherit"], windowsHide: true });
 let buffered = Buffer.alloc(0);
 let nextStreamId = 1;
@@ -85,7 +85,7 @@ async function callWithBytes(method, payload, bytes, epoch, generation) {
 }
 
 const started = performance.now();
-await call("runtime.hello", { nonce:[...crypto.randomBytes(32)], wireVersions:[1], pluginId:"com.megle.fake-sync", version:"1.0.0" });
+await call("runtime.hello", { nonce:[...crypto.randomBytes(32)], wireVersions:[1], pluginId:"com.mangoo.fake-sync", version:"1.0.0" });
 await call("describe", null);
 const payload = crypto.randomBytes(9 * 1024 * 1024);
 const hash = crypto.createHash("sha256").update(payload).digest("hex");

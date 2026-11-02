@@ -1,3 +1,4 @@
+import { useActiveLibraryIdentity } from "../core/useActiveLibraryIdentity";
 import {
   Copy,
   ExternalLink,
@@ -7,10 +8,10 @@ import {
   Pencil,
   RefreshCw,
   Trash2
-} from "lucide-react";
+} from "../design/icons";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { FolderRecord, MediaRecord, RootRecord } from "@megle/core-client";
-import type { MediaFocusCommand, NotificationWindowIntent } from "@megle/notification-contract";
+import type { FolderRecord, MediaRecord, RootRecord } from "@mangoo/core-client";
+import type { MediaFocusCommand, NotificationWindowIntent } from "@mangoo/notification-contract";
 import { AppShell } from "../app-shell/AppShell";
 import { useOverlayScrollbars } from "../app-shell/useOverlayScrollbars";
 import { useShellNotificationOverlay } from "../app-shell/useShellNotificationOverlay";
@@ -29,7 +30,6 @@ import {
   copyText,
   getDesktopBridge,
   getDesktopShellActions,
-  listLibraries,
   notifyDesktopShellReady,
   openNotificationsWindow,
   openPluginsWindow,
@@ -52,12 +52,15 @@ import {
   useFileOpsController,
   type FileOpsController
 } from "../features/file-ops/useFileOps";
+import { FolderAppearanceEditor } from "../features/library/FolderAppearanceEditor";
+import { DirectorySortMenu } from "../features/library/DirectorySortMenu";
 import { LibraryLoadingOverlay } from "../features/library/LibraryLoadingOverlay";
 import {
   LibrarySidebar,
   type LibrarySidebarLocateRequest
 } from "../features/library/LibrarySidebar";
 import { LibrarySwitcher } from "../features/library/LibrarySwitcher";
+import { usePluginContributionViews, usePluginViewLauncher } from "../features/plugins/PluginContributionsSlot";
 import {
   LibraryCenterPane,
   LibraryInspectorPane
@@ -119,10 +122,12 @@ const DEFAULT_PREVIEW_VIEW_STATE: PreviewViewState = {
   mode: "fit-long-edge",
   scale: 1
 };
-const LIBRARY_LAYOUT_STORAGE_KEY = "megle.library.layout-mode";
+const LIBRARY_LAYOUT_STORAGE_KEY = "mangoo.library.layout-mode";
 
 export function App() {
   useOverlayScrollbars();
+  const rootContributions = usePluginContributionViews("root-menu");
+  const pluginView = usePluginViewLauncher();
   const overlays = useOverlayStack();
   useEffect(() => {
     emitRendererStartupLog();
@@ -171,10 +176,15 @@ export function App() {
   const [librarySwitcherSource, setLibrarySwitcherSource] =
     useState<HTMLButtonElement | null>(null);
   const [librarySwitcherAutoFocus, setLibrarySwitcherAutoFocus] = useState(false);
-  const [activeLibraryId, setActiveLibraryId] = useState<string | null>(null);
-  const [activeLibraryName, setActiveLibraryName] = useState<string>("Library");
-  const [activeLibraryIcon, setActiveLibraryIcon] = useState<string | undefined>(undefined);
-  const [activeLibraryColor, setActiveLibraryColor] = useState<string | undefined>(undefined);
+  const { activeLibraryId, activeLibraryName, activeLibraryIcon, activeLibraryColor } = useActiveLibraryIdentity(libraryPhase);
+  const [folderAppearance, setFolderAppearance] = useState<{
+    folder: Pick<FolderRecord, "id" | "name" | "icon" | "color">; x: number; y: number; apply: LibraryState["updateFolderAppearance"];
+  } | null>(null);
+  const folderAppearanceFocusRef = useRef<HTMLElement | null>(null);
+  useEffect(() => { setFolderAppearance(null); }, [activeLibraryId]);
+  useEffect(() => {
+    if (libraryPhase === "starting-core" || libraryPhase === "opening-library") setFolderAppearance(null);
+  }, [libraryPhase]);
   const [pendingMediaFocus, setPendingMediaFocus] = useState<MediaFocusCommand | null>(null);
   const pendingMediaFocusRef = useRef<MediaFocusCommand | null>(null);
   const mediaFocusAbortRef = useRef<{
@@ -186,7 +196,6 @@ export function App() {
   const mediaGridLocateRequestRef = useRef<MediaGridLocateRequest | null>(null);
   const mediaFocusSwitchKeyRef = useRef<string | null>(null);
   const mediaFocusLocateKeyRef = useRef<string | null>(null);
-  const hasLoadedActiveLibraryNameRef = useRef(false);
   const library = useLibraryData({
     activeLibraryId,
     activeLibraryName,
@@ -273,7 +282,8 @@ export function App() {
         selectPreviewRenderLane({
           source: "original",
           kind: neighbor.kind,
-          ext: neighbor.ext
+          ext: neighbor.ext,
+          presentation: neighbor.presentation
         }) === "canvas"
       ) {
         prefetchPreviewBitmap(neighbor, { signal: controller.signal, viewportLongPx });
@@ -473,35 +483,9 @@ export function App() {
     () =>
       subscribeLibraryPhase((phase) => {
         setLibraryPhase(phase);
-        if (phase === "loading-media") {
-          setActiveLibraryId(null);
-        }
       }),
     []
   );
-
-  // Derive the sidebar's displayed library name from the registry: fetch it on
-  // mount (the initial render may predate any "ready" transition) and again
-  // whenever the library phase settles to "ready" (create/switch/open all land
-  // there), so the name follows the active library across switches.
-  useEffect(() => {
-    if (hasLoadedActiveLibraryNameRef.current && libraryPhase !== "ready") {
-      return;
-    }
-    hasLoadedActiveLibraryNameRef.current = true;
-    let cancelled = false;
-    void listLibraries().then((libraries) => {
-      if (cancelled) return;
-      const active = libraries.find((entry) => entry.active);
-      setActiveLibraryId(active?.libraryUuid ?? null);
-      setActiveLibraryName(active?.name ?? "Library");
-      setActiveLibraryIcon(active?.icon ?? undefined);
-      setActiveLibraryColor(active?.color ?? undefined);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [libraryPhase]);
 
   useEffect(() => {
     if (!library.loading && library.roots.length >= 0) {
@@ -859,6 +843,13 @@ export function App() {
           library,
           shiftKey,
           fileOps,
+          onEditAppearance: (target) => {
+            folderAppearanceFocusRef.current = contextMenuReturnFocusRef.current;
+            closeContextMenu();
+            setFolderAppearance({ folder: target, x, y, apply: library.updateFolderAppearance });
+          },
+          sortMenu: { id: "folder-sort", label: "排序", renderSubmenu: (anchor, onClose) =>
+            <DirectorySortMenu anchor={anchor} onClose={onClose} library={library} target={{ kind: "folder", id: folder.id }} /> },
           onOpenFolder: (target) => {
             library.setSelectedFolder(target);
           },
@@ -891,8 +882,15 @@ export function App() {
       openContextMenu({
         x,
         y,
-        items: buildRootItems({
+        items: [...buildRootItems({
           root,
+          onEditAppearance: (target) => {
+            folderAppearanceFocusRef.current = contextMenuReturnFocusRef.current;
+            closeContextMenu();
+            setFolderAppearance({ folder: { id: target.id, name: target.displayName, icon: target.icon, color: target.color }, x, y, apply: library.updateRootAppearance });
+          },
+          sortMenu: { id: "root-sort", label: "排序", renderSubmenu: (anchor, onClose) =>
+            <DirectorySortMenu anchor={anchor} onClose={onClose} library={library} target={{ kind: "root", id: root.id }} /> },
           onOpenRoot: (target) => {
             library.setSelectedRootId(target.id);
           },
@@ -901,10 +899,10 @@ export function App() {
             void library.rescanRoot(rootId);
           },
           closeMenu: closeContextMenu,
-        })
+        }), ...rootContributions.map(({ plugin, view }) => ({ id: `plugin:${plugin.pluginId}:${view.id}`, label: view.title, onSelect: () => { pluginView.open({ plugin, viewId: view.id, libraryUuid: activeLibraryId, rootId: root.id, rootUuid: null }); } }))]
       });
     },
-    [closeContextMenu, library, openContextMenu]
+    [closeContextMenu, library, openContextMenu, rootContributions, pluginView, activeLibraryId]
   );
 
   function renderCenterTitlebar() {
@@ -1070,6 +1068,12 @@ export function App() {
   function renderOverlays() {
     return (
       <>
+        {folderAppearance ? <FolderAppearanceEditor
+          anchor={{ getBoundingClientRect: () => ({ left: folderAppearance.x, top: folderAppearance.y, right: folderAppearance.x, bottom: folderAppearance.y, width: 0, height: 0 }) }}
+          folder={folderAppearance.folder} id="folder-appearance-editor" open rootId="context-menu" restoreFocusRef={folderAppearanceFocusRef}
+          onApply={(icon, color) => folderAppearance.apply(folderAppearance.folder.id, { icon, color })}
+          onClose={() => setFolderAppearance(null)}
+        /> : null}
         <ShellOverlayHost
           contextMenu={menu}
           contextMenuReturnFocusRef={contextMenuReturnFocusRef}
@@ -1128,7 +1132,7 @@ export function App() {
           </>
         }
         rightPane={renderRightPane()}
-        overlays={renderOverlays()}
+        overlays={<>{renderOverlays()}{pluginView.view}</>}
       />
     </LiquidGlassLayer>
   );
@@ -1174,6 +1178,8 @@ interface BuildFolderItemsArgs {
   library: LibraryState;
   shiftKey: boolean;
   fileOps: FileOpsController;
+  onEditAppearance: (folder: FolderRecord) => void;
+  sortMenu: ContextMenuItem;
   onOpenFolder: (folder: FolderRecord) => void;
   onRefreshFolder: (folder: FolderRecord) => void;
   onRescanRoot: (rootId: number) => void;
@@ -1183,6 +1189,8 @@ interface BuildFolderItemsArgs {
 
 interface BuildRootItemsArgs {
   root: RootRecord;
+  onEditAppearance: (root: RootRecord) => void;
+  sortMenu: ContextMenuItem;
   onOpenRoot: (root: RootRecord) => void;
   onRefresh: () => void;
   onRescanRoot: (rootId: number) => void;
@@ -1284,6 +1292,8 @@ function buildFolderItems({
   shiftKey,
   fileOps,
   onOpenFolder,
+  onEditAppearance,
+  sortMenu,
   onRefreshFolder,
   onRescanRoot,
   beginFileOperation,
@@ -1300,6 +1310,16 @@ function buildFolderItems({
         closeMenu();
         onOpenFolder(folder);
       }
+    },
+    {
+      id: "folder-appearance",
+      label: "图标与颜色…",
+      icon: <Pencil size={14} />,
+      disabled: folder.parentId === null,
+      onSelect: () => onEditAppearance(folder)
+    },
+    {
+      ...sortMenu
     },
     {
       id: "refresh-folder",
@@ -1379,6 +1399,8 @@ function buildFolderItems({
 
 function buildRootItems({
   root,
+  onEditAppearance,
+  sortMenu,
   onOpenRoot,
   onRefresh,
   onRescanRoot,
@@ -1395,6 +1417,13 @@ function buildRootItems({
         onOpenRoot(root);
       }
     },
+    {
+      id: "root-appearance",
+      label: "图标与颜色…",
+      icon: <Pencil size={14} />,
+      onSelect: () => onEditAppearance(root)
+    },
+    sortMenu,
     {
       id: "refresh-root",
       label: "Refresh folder",

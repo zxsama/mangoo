@@ -1,8 +1,10 @@
 use super::format::ContentManifestV1;
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::fs;
 use std::{
     collections::BTreeMap,
-    fs::{self, File, OpenOptions},
+    fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
@@ -66,8 +68,15 @@ pub fn windows_safe_component(name: &str, stable_suffix: &str) -> String {
     if reserved {
         value.insert(0, '_');
     }
-    if value.encode_utf16().count() > 180 {
-        let mut shortened = value.chars().take(150).collect::<String>();
+    if value.encode_utf16().count() > 255 {
+        let mut units = 0;
+        let mut shortened = value
+            .chars()
+            .take_while(|character| {
+                units += character.len_utf16();
+                units <= 242
+            })
+            .collect::<String>();
         shortened.push('~');
         shortened.push_str(&stable_suffix.chars().take(12).collect::<String>());
         value = shortened;
@@ -102,16 +111,12 @@ pub fn materialize_from_chunks(
 ) -> anyhow::Result<MaterializationResult> {
     inventory_path(destination_relative)?;
     manifest.validate()?;
-    let staging_directory = managed_root.join(".megle-staging");
-    fs::create_dir_all(&staging_directory)?;
-    let staging = staging_directory.join(format!("{}.partial", job_id.simple()));
-    if staging.exists() {
-        fs::remove_file(&staging)?;
-    }
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&staging)?;
+    let mut owned_staging = create_unregistered_staging(managed_root, job_id)?;
+    crate::sync::file_policy::require_no_links(
+        managed_root,
+        &managed_root.join(destination_relative),
+    )?;
+    let mut output = owned_staging.payload.take().expect("owned staging file");
     let mut full = Sha256::new();
     let mut written = 0u64;
     for chunk in &manifest.chunks {
@@ -134,56 +139,14 @@ pub fn materialize_from_chunks(
         anyhow::bail!("materialized file failed final verification");
     }
     output.sync_all()?;
-    drop(output);
-    if let Some(value) = source_mtime_ms.and_then(|value| u64::try_from(value).ok()) {
-        let timestamp = filetime::FileTime::from_unix_time(
-            (value / 1000) as i64,
-            ((value % 1000) * 1_000_000) as u32,
-        );
-        let _ = filetime::set_file_mtime(&staging, timestamp);
-    }
-    let target = managed_root.join(destination_relative);
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    if target.exists() {
-        if verified_matches(
-            &target,
-            manifest.byte_length,
-            super::parse_hash(&manifest.content_sha256)?,
-        )? {
-            fs::remove_file(&staging)?;
-            return Ok(MaterializationResult::AdoptedIdentical(target));
-        }
-        return Ok(MaterializationResult::PathConflict(target));
-    }
-    #[cfg(windows)]
-    let publish = fs::rename(&staging, &target);
-    #[cfg(not(windows))]
-    let publish = fs::hard_link(&staging, &target);
-    match publish {
-        Ok(()) => {
-            #[cfg(not(windows))]
-            fs::remove_file(&staging)?;
-            if let Some(parent) = target.parent().and_then(|path| File::open(path).ok()) {
-                let _ = parent.sync_all();
-            }
-            Ok(MaterializationResult::Published(target))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if verified_matches(
-                &target,
-                manifest.byte_length,
-                super::parse_hash(&manifest.content_sha256)?,
-            )? {
-                fs::remove_file(&staging)?;
-                Ok(MaterializationResult::AdoptedIdentical(target))
-            } else {
-                Ok(MaterializationResult::PathConflict(target))
-            }
-        }
-        Err(error) => Err(error.into()),
-    }
+    finish_materialization(
+        managed_root,
+        destination_relative,
+        &owned_staging,
+        &output,
+        manifest,
+        source_mtime_ms,
+    )
 }
 
 pub fn materialize_from_verified_ranges(
@@ -214,22 +177,106 @@ pub fn materialize_from_verified_ranges_with_pre_publish(
     source_mtime_ms: Option<i64>,
     pre_publish: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<MaterializationResult> {
+    materialize_from_verified_ranges_with_checks(
+        managed_root,
+        destination_relative,
+        job_id,
+        manifest,
+        chunks,
+        source_mtime_ms,
+        None,
+        || Ok(()),
+        pre_publish,
+    )
+}
+
+pub(crate) struct OwnedMaterializationStaging {
+    pub directory: PathBuf,
+    pub identity: String,
+    pub guard: Option<crate::library_path::MarkerDirectoryGuard>,
+    pub payload_identity: Option<String>,
+    pub payload: Option<File>,
+}
+
+impl Drop for OwnedMaterializationStaging {
+    fn drop(&mut self) {
+        drop(self.payload.take());
+        if self.guard.as_ref().is_some_and(|guard| {
+            guard.identity() == self.identity && guard.verify_unchanged().is_ok()
+        }) {
+            if let Some(expected) = self.payload_identity.as_deref() {
+                let _ = self
+                    .guard
+                    .as_ref()
+                    .unwrap()
+                    .delete_file_child_expected(std::ffi::OsStr::new("payload.partial"), expected);
+            }
+            drop(self.guard.take());
+            // Never remove user additions or a replaced directory recursively.
+            let _ = crate::library_path::safe_remove_empty_directory_expected(
+                &self.directory,
+                &self.identity,
+            );
+        }
+    }
+}
+
+fn create_unregistered_staging(
+    root: &Path,
+    job_id: uuid::Uuid,
+) -> anyhow::Result<OwnedMaterializationStaging> {
+    let leaf = format!(
+        ".mangoo-work-{}-{}",
+        job_id.simple(),
+        uuid::Uuid::now_v7().simple()
+    );
+    let parent = crate::library_path::MarkerDirectoryGuard::open(root)?;
+    let guard = parent.create_directory_child(std::ffi::OsStr::new(&leaf))?;
+    let payload = guard.open_temporary(std::ffi::OsStr::new("payload.partial"), true)?;
+    let payload_identity = Some(guard.file_identity(&payload)?);
+    Ok(OwnedMaterializationStaging {
+        directory: root.join(leaf),
+        identity: guard.identity().to_owned(),
+        guard: Some(guard),
+        payload_identity,
+        payload: Some(payload),
+    })
+}
+
+pub fn materialize_from_verified_ranges_with_checks(
+    managed_root: &Path,
+    destination_relative: &Path,
+    job_id: uuid::Uuid,
+    manifest: &ContentManifestV1,
+    chunks: &BTreeMap<[u8; 32], super::recovery::VerifiedChunkSource>,
+    source_mtime_ms: Option<i64>,
+    owned_staging: Option<OwnedMaterializationStaging>,
+    mut check_progress: impl FnMut() -> anyhow::Result<()>,
+    pre_publish: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<MaterializationResult> {
     #[cfg(test)]
-    if managed_root.join(".megle-test-disk-full").exists() {
+    if managed_root.join(".mangoo-test-disk-full").exists() {
         return Err(std::io::Error::from(std::io::ErrorKind::StorageFull).into());
     }
     inventory_path(destination_relative)?;
     manifest.validate()?;
-    let staging_directory = managed_root.join(".megle-staging");
-    fs::create_dir_all(&staging_directory)?;
-    let staging = staging_directory.join(format!("{}.partial", job_id.simple()));
-    if staging.exists() {
-        fs::remove_file(&staging)?;
-    }
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&staging)?;
+    check_progress()?;
+    let _destination_guards = crate::sync::file_policy::pin_destination_parents(
+        managed_root,
+        &managed_root.join(destination_relative),
+    )?;
+    let mut owned_staging = match owned_staging {
+        Some(staging) => staging,
+        None => create_unregistered_staging(managed_root, job_id)?,
+    };
+    crate::sync::file_policy::require_no_links(managed_root, &owned_staging.directory)?;
+    crate::sync::file_policy::require_no_links(
+        managed_root,
+        &managed_root.join(destination_relative),
+    )?;
+    let _staging_guard = owned_staging.guard.as_ref().expect("owned staging guard");
+    _staging_guard.verify_unchanged()?;
+    let mut output = owned_staging.payload.take().expect("owned staging file");
     let mut full = Sha256::new();
     let mut written = 0u64;
     let mut buffer = vec![0u8; 1024 * 1024];
@@ -246,6 +293,7 @@ pub fn materialize_from_verified_ranges_with_pre_publish(
         let mut remaining = source.length;
         let mut chunk_hash = Sha256::new();
         while remaining > 0 {
+            check_progress()?;
             let requested = usize::try_from(remaining.min(buffer.len() as u64))?;
             let count = input.read(&mut buffer[..requested])?;
             if count == 0 {
@@ -269,75 +317,120 @@ pub fn materialize_from_verified_ranges_with_pre_publish(
         anyhow::bail!("materialized file failed final verification");
     }
     output.sync_all()?;
-    drop(output);
     crate::sync::fault::hit("media.after-materialization-sync");
-    if let Err(error) = pre_publish() {
-        let _ = fs::remove_file(&staging);
-        return Err(error);
-    }
+    check_progress()?;
+    pre_publish()?;
     finish_materialization(
         managed_root,
         destination_relative,
-        &staging,
+        &owned_staging,
+        &output,
         manifest,
         source_mtime_ms,
     )
 }
 
+#[cfg(test)]
+fn publish_without_replacement(staging: &Path, target: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+        // Rust's filesystem APIs accept long paths, but the raw Win32 call
+        // needs the extended-length prefix. Canonicalize only existing paths;
+        // the final target must remain absent and is never opened/replaced.
+        let source = fs::canonicalize(staging)?;
+        let target_parent = target.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "materialization target has no parent",
+            )
+        })?;
+        let target_leaf = target.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "materialization target has no leaf",
+            )
+        })?;
+        let target = fs::canonicalize(target_parent)?.join(target_leaf);
+        let source = source
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let target = target
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::hard_link(staging, target)
+    }
+}
+
 fn finish_materialization(
     managed_root: &Path,
     destination_relative: &Path,
-    staging: &Path,
+    staging: &OwnedMaterializationStaging,
+    output: &File,
     manifest: &ContentManifestV1,
     source_mtime_ms: Option<i64>,
 ) -> anyhow::Result<MaterializationResult> {
+    let target = managed_root.join(destination_relative);
+    let _parents = crate::sync::file_policy::pin_destination_parents(managed_root, &target)?;
+    crate::sync::file_policy::require_no_links(managed_root, &target)?;
+    let source_guard = staging.guard.as_ref().expect("owned staging guard");
+    source_guard.verify_unchanged()?;
+    anyhow::ensure!(
+        staging.payload_identity.as_deref() == Some(source_guard.file_identity(output)?.as_str()),
+        "materialization payload identity changed"
+    );
     if let Some(value) = source_mtime_ms.and_then(|value| u64::try_from(value).ok()) {
         let timestamp = filetime::FileTime::from_unix_time(
             (value / 1000) as i64,
             ((value % 1000) * 1_000_000) as u32,
         );
-        let _ = filetime::set_file_mtime(staging, timestamp);
-    }
-    let target = managed_root.join(destination_relative);
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
+        let _ = filetime::set_file_handle_times(output, None, Some(timestamp));
     }
     if target.exists() {
-        if verified_matches(
-            &target,
-            manifest.byte_length,
-            super::parse_hash(&manifest.content_sha256)?,
-        )? {
-            fs::remove_file(staging)?;
-            return Ok(MaterializationResult::AdoptedIdentical(target));
-        }
-        return Ok(MaterializationResult::PathConflict(target));
-    }
-    #[cfg(windows)]
-    let publish = fs::rename(staging, &target);
-    #[cfg(not(windows))]
-    let publish = fs::hard_link(staging, &target);
-    match publish {
-        Ok(()) => {
-            #[cfg(not(windows))]
-            fs::remove_file(staging)?;
-            if let Some(parent) = target.parent().and_then(|path| File::open(path).ok()) {
-                let _ = parent.sync_all();
-            }
-            Ok(MaterializationResult::Published(target))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+        return Ok(
             if verified_matches(
                 &target,
                 manifest.byte_length,
                 super::parse_hash(&manifest.content_sha256)?,
             )? {
-                fs::remove_file(staging)?;
-                Ok(MaterializationResult::AdoptedIdentical(target))
+                MaterializationResult::AdoptedIdentical(target)
             } else {
-                Ok(MaterializationResult::PathConflict(target))
-            }
-        }
+                MaterializationResult::PathConflict(target)
+            },
+        );
+    }
+    let parent =
+        crate::library_path::MarkerDirectoryGuard::open(target.parent().expect("target parent"))?;
+    match source_guard.publish_to(
+        output,
+        std::ffi::OsStr::new("payload.partial"),
+        &parent,
+        target.file_name().expect("target leaf"),
+    ) {
+        Ok(()) => Ok(MaterializationResult::Published(target)),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(
+            if verified_matches(
+                &target,
+                manifest.byte_length,
+                super::parse_hash(&manifest.content_sha256)?,
+            )? {
+                MaterializationResult::AdoptedIdentical(target)
+            } else {
+                MaterializationResult::PathConflict(target)
+            },
+        ),
         Err(error) => Err(error.into()),
     }
 }
@@ -347,7 +440,7 @@ pub(crate) fn verified_matches(
     expected_length: u64,
     expected_hash: [u8; 32],
 ) -> anyhow::Result<bool> {
-    let mut file = File::open(path)?;
+    let (mut file, _guard) = crate::sync::file_policy::open_source(path)?;
     if file.metadata()?.len() != expected_length {
         return Ok(false);
     }
@@ -401,10 +494,37 @@ mod tests {
     }
 
     #[test]
+    fn owned_staging_cleanup_preserves_replacement_and_user_addition() {
+        let root =
+            std::env::temp_dir().join(format!("mangoo-staging-cleanup-{}", uuid::Uuid::now_v7()));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join(".mangoo-staging"), b"user staging name").unwrap();
+        let mut staging = create_unregistered_staging(&root, uuid::Uuid::now_v7()).unwrap();
+        let directory = staging.directory.clone();
+        let partial = directory.join("payload.partial");
+        drop(staging.payload.take());
+        fs::rename(&partial, directory.join("original.partial")).unwrap();
+        fs::write(&partial, b"replacement").unwrap();
+        fs::write(directory.join("user.bin"), b"user addition").unwrap();
+        drop(staging);
+        assert_eq!(fs::read(&partial).unwrap(), b"replacement");
+        assert_eq!(
+            fs::read(directory.join("user.bin")).unwrap(),
+            b"user addition"
+        );
+        assert_eq!(
+            fs::read(root.join(".mangoo-staging")).unwrap(),
+            b"user staging name"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn reserved_names_and_conflicts_are_safe() {
         assert_eq!(windows_safe_component("CON.jpg", "abcd"), "_CON.jpg");
         assert_eq!(windows_safe_component("bad. ", "abcd"), "bad");
-        let root = std::env::temp_dir().join(format!("megle-materialize-{}", uuid::Uuid::now_v7()));
+        let root =
+            std::env::temp_dir().join(format!("mangoo-materialize-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&root).unwrap();
         let (manifest, chunks) = manifest();
         let first = materialize_from_chunks(
@@ -444,7 +564,7 @@ mod tests {
     #[test]
     fn verified_ranges_stream_into_materialization() {
         let root =
-            std::env::temp_dir().join(format!("megle-range-materialize-{}", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("mangoo-range-materialize-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&root).unwrap();
         let (manifest, chunks) = manifest();
         let hash = *chunks.keys().next().unwrap();
@@ -475,7 +595,7 @@ mod tests {
     #[test]
     fn stale_root_fence_removes_staging_without_publishing() {
         let root = std::env::temp_dir().join(format!(
-            "megle-stale-range-materialize-{}",
+            "mangoo-stale-range-materialize-{}",
             uuid::Uuid::now_v7()
         ));
         std::fs::create_dir_all(&root).unwrap();
@@ -503,11 +623,65 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(!root.join("streamed.jpg").exists());
-        assert!(!root
-            .join(".megle-staging")
-            .join(format!("{}.partial", job_id.simple()))
-            .exists());
+        assert!(fs::read_dir(&root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".mangoo-work-")));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn all_file_cancelled_assembly_cleans_staging_and_no_replace_preserves_target() {
+        let root = std::env::temp_dir().join(format!(
+            "mangoo-materialize-cancel-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let (manifest, chunks) = manifest();
+        let hash = *chunks.keys().next().unwrap();
+        let range = root.join("input.range");
+        fs::write(&range, b"hello").unwrap();
+        let sources = BTreeMap::from([(
+            hash,
+            super::super::recovery::VerifiedChunkSource {
+                path: range,
+                offset: 0,
+                length: 5,
+            },
+        )]);
+        let job = uuid::Uuid::now_v7();
+        let mut checks = 0;
+        let result = materialize_from_verified_ranges_with_checks(
+            &root,
+            Path::new("out.bin"),
+            job,
+            &manifest,
+            &sources,
+            None,
+            None,
+            || {
+                checks += 1;
+                anyhow::ensure!(checks < 2, "cancelled");
+                Ok(())
+            },
+            || Ok(()),
+        );
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert!(!root.join("out.bin").exists());
+        assert!(fs::read_dir(&root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".mangoo-work-")));
+        let staged = root.join("staged");
+        let target = root.join("target");
+        fs::write(&staged, b"new").unwrap();
+        fs::write(&target, b"existing").unwrap();
+        assert!(publish_without_replacement(&staged, &target).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"existing");
+        assert_eq!(fs::read(&staged).unwrap(), b"new");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -515,10 +689,15 @@ mod tests {
         assert_eq!(windows_safe_component("bad?.jpg", "first"), "bad_.jpg");
         assert_eq!(windows_safe_component("bad*.jpg", "second"), "bad_.jpg");
         assert_eq!(windows_safe_component("con.txt", "first"), "_con.txt");
-        let long = "x".repeat(220);
+        // Legal components are kept verbatim; only components beyond the OS
+        // limit need deterministic legalization.
+        let legal = "x".repeat(220);
+        assert_eq!(windows_safe_component(&legal, "abcdef0123456789"), legal);
+        let long = "x".repeat(300);
         let first = windows_safe_component(&long, "abcdef0123456789");
         let second = windows_safe_component(&long, "abcdef0123456789");
         assert_eq!(first, second);
-        assert!(first.encode_utf16().count() <= 163);
+        assert_eq!(first.encode_utf16().count(), 255);
+        assert!(first.ends_with("~abcdef012345"));
     }
 }

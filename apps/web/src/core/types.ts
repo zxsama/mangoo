@@ -9,4 +9,4 @@ export type {
   ScanSummary,
   TaskRecord,
   ThumbnailResponse
-} from "@megle/core-client";
+} from "@mangoo/core-client";

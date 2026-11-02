@@ -165,7 +165,7 @@ export function startCoreProcess(
   session: CoreSession,
   onLog: CoreProcessLogHandler = defaultCoreProcessLogHandler
 ): CoreProcessHandle {
-  if (process.env.MEGLE_CORE_EXTERNAL === "1") {
+  if (process.env.MANGOO_CORE_EXTERNAL === "1") {
     const waitForExit = Promise.resolve();
     return {
       process: null,
@@ -176,26 +176,26 @@ export function startCoreProcess(
 
   const binaryPath = coreBinaryPath();
   if (!fs.existsSync(binaryPath)) {
-    const recovery = process.env.MEGLE_CORE_BINARY
+    const recovery = process.env.MANGOO_CORE_BINARY
       ? "Rebuild the packaged desktop application before launching it."
-      : 'Run "cargo build -p megle-core" before starting internal desktop Core.';
+      : 'Run "cargo build -p mangoo-core" before starting internal desktop Core.';
     throw new Error(`Core binary is missing at ${binaryPath}. ${recovery}`);
   }
 
   const child = spawn(binaryPath, [], {
-    cwd: process.env.MEGLE_CORE_BINARY ? path.dirname(binaryPath) : repoRoot(),
+    cwd: process.env.MANGOO_CORE_BINARY ? path.dirname(binaryPath) : repoRoot(),
     env: {
       ...process.env,
-      MEGLE_CORE_ADDR: session.bindAddress,
+      MANGOO_CORE_ADDR: session.bindAddress,
       ...(session.hostDbPath
         ? {
-            MEGLE_HOST_DB_PATH: session.hostDbPath,
-            MEGLE_LIBRARIES_DIR: session.librariesDir
+            MANGOO_HOST_DB_PATH: session.hostDbPath,
+            MANGOO_LIBRARIES_DIR: session.librariesDir
           }
         : {}),
-      MEGLE_SESSION_TOKEN: session.sessionToken,
-      MEGLE_ALLOWED_ORIGIN: session.allowedOrigin,
-      MEGLE_PLUGINS_DIR: process.env.MEGLE_PLUGINS_DIR ?? bundledPluginsDir()
+      MANGOO_SESSION_TOKEN: session.sessionToken,
+      MANGOO_ALLOWED_ORIGIN: session.allowedOrigin,
+      MANGOO_PLUGINS_DIR: process.env.MANGOO_PLUGINS_DIR ?? bundledPluginsDir()
     },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true
@@ -437,7 +437,7 @@ export async function waitForCoreHealth(
     try {
       const response = await fetch(new URL("health", ensureTrailingSlash(baseUrl)), {
         headers: {
-          "x-megle-session": sessionToken
+          "x-mangoo-session": sessionToken
         },
         signal: requestAbort.signal
       });
@@ -516,17 +516,17 @@ function repoRoot(): string {
 }
 
 function coreBinaryPath(): string {
-  const configuredBinary = process.env.MEGLE_CORE_BINARY?.trim();
+  const configuredBinary = process.env.MANGOO_CORE_BINARY?.trim();
   if (configuredBinary) return path.resolve(configuredBinary);
-  const binaryName = process.platform === "win32" ? "megle-core.exe" : "megle-core";
-  // MEGLE_CORE_PROFILE selects the cargo build profile directory. Defaults to
+  const binaryName = process.platform === "win32" ? "mangoo-core.exe" : "mangoo-core";
+  // MANGOO_CORE_PROFILE selects the cargo build profile directory. Defaults to
   // "debug" (the `npm run dev` flow). The production launcher sets "release".
-  const profile = process.env.MEGLE_CORE_PROFILE === "release" ? "release" : "debug";
+  const profile = process.env.MANGOO_CORE_PROFILE === "release" ? "release" : "debug";
   return path.join(repoRoot(), "target", profile, binaryName);
 }
 
 function bundledPluginsDir(): string {
-  const profile = process.env.MEGLE_CORE_PROFILE === "release" ? "release" : "debug";
+  const profile = process.env.MANGOO_CORE_PROFILE === "release" ? "release" : "debug";
   return path.join(repoRoot(), "target", profile, "bundled-plugins");
 }
 

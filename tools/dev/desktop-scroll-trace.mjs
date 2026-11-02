@@ -2,7 +2,7 @@
 // the virtual grid, and asserts render-thread health (no long tasks over budget,
 // no tiles stuck loading/failed, no console errors).
 //
-// Terminal 1: MEGLE_REMOTE_DEBUG=1 MEGLE_AUTO_ADD_ROOT="Y:/Repository/Billfish/Artists" npm run dev
+// Terminal 1: MANGOO_REMOTE_DEBUG=1 MANGOO_AUTO_ADD_ROOT="Y:/Repository/Billfish/Artists" npm run dev
 // Terminal 2:
 //   WS=$(curl -sS http://127.0.0.1:9222/json | python -c "import json,sys; print([p for p in json.load(sys.stdin) if p['type']=='page'][0]['webSocketDebuggerUrl'])")
 //   node tools/dev/desktop-scroll-trace.mjs "$WS"
@@ -50,9 +50,9 @@ ws.on("open", async () => {
 
   await send("Runtime.evaluate", {
     expression: `
-      window.__megleLongTasks = [];
+      window.__mangooLongTasks = [];
       new PerformanceObserver((list) => {
-        for (const entry of list.getEntries()) window.__megleLongTasks.push(entry.duration);
+        for (const entry of list.getEntries()) window.__mangooLongTasks.push(entry.duration);
       }).observe({ entryTypes: ["longtask"] });
       true;
     `,
@@ -70,7 +70,7 @@ ws.on("open", async () => {
   await new Promise((r) => setTimeout(r, 2000));
 
   const evalSnippet = `JSON.stringify({
-    longTasks: window.__megleLongTasks || [],
+    longTasks: window.__mangooLongTasks || [],
     finalTiles: {
       ready: document.querySelectorAll(".tile-thumb-ready").length,
       loading: document.querySelectorAll(".tile-thumb-loading").length,
@@ -94,7 +94,7 @@ ws.on("open", async () => {
 
   const trace = { ...parsed, consoleErrors };
 
-  const budget = { maxLongTaskMs: Number(process.env.MEGLE_TRACE_MAX_LONGTASK_MS ?? 100) };
+  const budget = { maxLongTaskMs: Number(process.env.MANGOO_TRACE_MAX_LONGTASK_MS ?? 100) };
   const verdict = assessScrollTrace(trace, budget);
   console.log("[scroll-trace] trace:", JSON.stringify(trace));
   console.log("[scroll-trace] verdict:", JSON.stringify(verdict));

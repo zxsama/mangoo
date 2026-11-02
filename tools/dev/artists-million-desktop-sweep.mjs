@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { createWriteStream, readdirSync, statSync } from "node:fs";
+import { createWriteStream, statSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
@@ -8,29 +8,29 @@ import process from "node:process";
 import WebSocket from "ws";
 import { managedLibraryHostEnv } from "./managed-library-harness.mjs";
 
-const root = "D:\\Megle";
+const root = "D:\\Mangoo";
 const visualRoot = path.join(root, ".tmp", "visual-check");
 const logDir = path.join(visualRoot, "logs");
 const dataDir =
-  process.env.MEGLE_ARTISTS_SWEEP_DATA_DIR ?? path.join(visualRoot, "data-artists-million");
+  process.env.MANGOO_ARTISTS_SWEEP_DATA_DIR ?? path.join(visualRoot, "data-artists-million");
 const managedRoot = path.join(dataDir, "library");
 const electronUserDataDir = path.join(dataDir, "electron-user-data");
 const startDesktopCommand = path.join(root, "start-desktop.cmd");
-const autoRoot = process.env.MEGLE_ARTISTS_SWEEP_ROOT ?? "Y:\\Repository\\Billfish\\Artists";
-const webUrl = process.env.MEGLE_ARTISTS_SWEEP_WEB_URL ?? "http://127.0.0.1:5181";
-let debugPort = Number(process.env.MEGLE_ARTISTS_SWEEP_DEBUG_PORT ?? 9251);
-const targetOperationCount = Number(process.env.MEGLE_ARTISTS_SWEEP_OPERATION_COUNT ?? 500);
-const resetData = process.env.MEGLE_ARTISTS_SWEEP_RESET_DB !== "0";
-const failOnSlow = process.env.MEGLE_ARTISTS_SWEEP_FAIL_ON_SLOW === "1";
-const allowPartialCoverage = process.env.MEGLE_ARTISTS_SWEEP_ALLOW_PARTIAL_COVERAGE === "1";
-const thumbnailCacheMode = process.env.MEGLE_ARTISTS_SWEEP_THUMBNAIL_CACHE_MODE ?? "none";
+const autoRoot = process.env.MANGOO_ARTISTS_SWEEP_ROOT ?? "Y:\\Repository\\Billfish\\Artists";
+const webUrl = process.env.MANGOO_ARTISTS_SWEEP_WEB_URL ?? "http://127.0.0.1:5181";
+let debugPort = Number(process.env.MANGOO_ARTISTS_SWEEP_DEBUG_PORT ?? 9251);
+const targetOperationCount = Number(process.env.MANGOO_ARTISTS_SWEEP_OPERATION_COUNT ?? 500);
+const resetData = process.env.MANGOO_ARTISTS_SWEEP_RESET_DB !== "0";
+const failOnSlow = process.env.MANGOO_ARTISTS_SWEEP_FAIL_ON_SLOW === "1";
+const allowPartialCoverage = process.env.MANGOO_ARTISTS_SWEEP_ALLOW_PARTIAL_COVERAGE === "1";
+const thumbnailCacheMode = process.env.MANGOO_ARTISTS_SWEEP_THUMBNAIL_CACHE_MODE ?? "none";
 const thumbnailCacheBatchLimit = Number(
-  process.env.MEGLE_ARTISTS_SWEEP_THUMBNAIL_CACHE_LIMIT ?? 256
+  process.env.MANGOO_ARTISTS_SWEEP_THUMBNAIL_CACHE_LIMIT ?? 256
 );
-const waitForBulkIdleBeforeSweep = process.env.MEGLE_ARTISTS_SWEEP_WAIT_FOR_BULK_IDLE_BEFORE_SWEEP === "1";
+const waitForBulkIdleBeforeSweep = process.env.MANGOO_ARTISTS_SWEEP_WAIT_FOR_BULK_IDLE_BEFORE_SWEEP === "1";
 const waitForThumbnailTaskDrainAfterSweep =
-  process.env.MEGLE_ARTISTS_SWEEP_WAIT_FOR_THUMBNAIL_TASK_DRAIN_AFTER_SWEEP === "1";
-const warmSeenFileIdsPath = process.env.MEGLE_ARTISTS_SWEEP_WARM_FILE_IDS_PATH ?? "";
+  process.env.MANGOO_ARTISTS_SWEEP_WAIT_FOR_THUMBNAIL_TASK_DRAIN_AFTER_SWEEP === "1";
+const warmSeenFileIdsPath = process.env.MANGOO_ARTISTS_SWEEP_WARM_FILE_IDS_PATH ?? "";
 const FETCH_REPORT_LIMIT = 20;
 const TILE_READY_SELECTOR = ".tile-thumb-ready, .tile-thumb-image, .tile-thumb-failed, img";
 const MEDIA_TILE_SELECTOR = '.media-tile[role="button"][data-media-id]';
@@ -98,16 +98,7 @@ function fileStats(filePath) {
 }
 
 function collectDatabaseFileStats() {
-  const librariesDir = path.join(dataDir, "host", "libraries");
-  let libraryDirs = [];
-  try {
-    libraryDirs = readdirSync(librariesDir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && !entry.name.includes(".staging."))
-      .map((entry) => path.join(librariesDir, entry.name));
-  } catch {
-    // The summary below reports an empty catalog list when Host creation did
-    // not reach the local-data phase; startup diagnostics retain the cause.
-  }
+  const libraryDirs = [path.join(managedRoot, "Database")];
   return {
     host: fileStats(path.join(dataDir, "host", "host.sqlite")),
     catalogs: libraryDirs.map((libraryDir) => ({
@@ -127,13 +118,13 @@ function startDevApp() {
     cwd: root,
     env: {
       ...process.env,
-      MEGLE_WEB_URL: webUrl,
+      MANGOO_WEB_URL: webUrl,
       ...managedLibraryHostEnv(dataDir),
-      MEGLE_ELECTRON_USER_DATA_DIR: electronUserDataDir,
-      MEGLE_AUTO_ADD_ROOT: autoRoot,
-      MEGLE_AUTO_LIBRARY_ROOT: managedRoot,
-      MEGLE_REMOTE_DEBUG: "1",
-      MEGLE_REMOTE_DEBUG_PORT: String(debugPort)
+      MANGOO_ELECTRON_USER_DATA_DIR: electronUserDataDir,
+      MANGOO_AUTO_ADD_ROOT: autoRoot,
+      MANGOO_AUTO_LIBRARY_BASE: managedRoot,
+      MANGOO_REMOTE_DEBUG: "1",
+      MANGOO_REMOTE_DEBUG_PORT: String(debugPort)
     },
     shell: process.platform === "win32",
     stdio: ["ignore", "pipe", "pipe"],
@@ -553,7 +544,7 @@ async function desktopApiJson(client, pathname, init = {}) {
     client,
     `(() => {
       const input = ${payload};
-      const bridge = window.megleDesktop;
+      const bridge = window.mangooDesktop;
       if (!bridge?.coreUrl || !bridge?.sessionToken) {
         throw new Error("desktop bridge core/session not ready");
       }
@@ -562,7 +553,7 @@ async function desktopApiJson(client, pathname, init = {}) {
         method: input.method,
         headers: {
           "content-type": "application/json",
-          "x-megle-session": bridge.sessionToken,
+          "x-mangoo-session": bridge.sessionToken,
           ...input.headers
         },
         body: input.body
@@ -1507,7 +1498,7 @@ async function dragOverlayScrollbar(client, scrollableSelector, dragRatio = 0.62
   const thumb = await evaluate(
     client,
     `(() => {
-      const thumb = document.querySelector('.megle-overlay-scrollbar-vertical[data-scrollbar-visible="true"] .megle-overlay-scrollbar-thumb');
+      const thumb = document.querySelector('.mangoo-overlay-scrollbar-vertical[data-scrollbar-visible="true"] .mangoo-overlay-scrollbar-thumb');
       if (!(thumb instanceof HTMLElement)) return null;
       const rect = thumb.getBoundingClientRect();
       return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, height: rect.height };
@@ -2757,19 +2748,19 @@ try {
   await client.send("Network.enable");
   await waitFor(
     client,
-    "Boolean(window.megleDesktop?.coreUrl && window.megleDesktop?.sessionToken)",
+    "Boolean(window.mangooDesktop?.coreUrl && window.mangooDesktop?.sessionToken)",
     90_000,
     "desktop bridge core session"
   );
   await waitFor(
     client,
     `(async () => {
-      const bridge = window.megleDesktop;
+      const bridge = window.mangooDesktop;
       if (!bridge?.coreUrl || !bridge?.sessionToken) return false;
       try {
         const url = new URL("health", bridge.coreUrl.endsWith("/") ? bridge.coreUrl : bridge.coreUrl + "/").toString();
         const response = await fetch(url, {
-          headers: { "x-megle-session": bridge.sessionToken }
+          headers: { "x-mangoo-session": bridge.sessionToken }
         });
         return response.ok;
       } catch {

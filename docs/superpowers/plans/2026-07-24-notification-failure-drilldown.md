@@ -6,7 +6,7 @@
 
 **Architecture:** Core remains the authority for task identity, folder-relative paths, and thumbnail failure context. Core emits structured JSON tracing events; Desktop parses them into the existing bounded process-log buffer, enriches Core entries with the active library id, and owns launch/focus IPC between secondary windows and Main. Web consumes typed launch intents and structured log metadata, aggregates only the active `interactive_folder_scan` presentation while retaining independent underlying task operations, and reuses the existing library/media navigation state to locate a failed file.
 
-**Tech Stack:** Rust + Axum + SQLite, Electron IPC/preload, React + TypeScript, `@megle/core-client`, `@megle/notification-contract`, TanStack Virtual, Node test runner.
+**Tech Stack:** Rust + Axum + SQLite, Electron IPC/preload, React + TypeScript, `@mangoo/core-client`, `@mangoo/notification-contract`, TanStack Virtual, Node test runner.
 
 ---
 
@@ -41,14 +41,14 @@
 Test a JSON tracing line such as:
 
 ```json
-{"timestamp":"2026-07-24T12:00:00.000Z","level":"ERROR","fields":{"message":"thumbnail generation failed","eventKind":"thumbnail_failure","fileId":42,"folderId":7,"rootId":3,"relativePath":"Artists\\Portraits\\a.jpg","failureKind":"permanent","error":"decode failed"},"target":"megle_core::tasks"}
+{"timestamp":"2026-07-24T12:00:00.000Z","level":"ERROR","fields":{"message":"thumbnail generation failed","eventKind":"thumbnail_failure","fileId":42,"folderId":7,"rootId":3,"relativePath":"Artists\\Portraits\\a.jpg","failureKind":"permanent","error":"decode failed"},"target":"mangoo_core::tasks"}
 ```
 
 Assert Desktop maps it to an error log with those metadata fields, adds the launch-time `libraryId`, and `ProcessLogBuffer.page({ eventKind: "thumbnail_failure", libraryId: "lib-a" })` returns it while excluding unrelated errors.
 
 - [ ] **Step 2: Verify the focused tests fail before implementation**
 
-Run: `npm --workspace @megle/desktop run test -- --test-name-pattern="structured Core|metadata filter"`
+Run: `npm --workspace @mangoo/desktop run test -- --test-name-pattern="structured Core|metadata filter"`
 
 - [ ] **Step 3: Initialize Core tracing and emit one structured failure event**
 
@@ -64,9 +64,9 @@ Extend `ProcessLogFilter` with optional `eventKind` and `libraryId`. Validate bo
 
 - [ ] **Step 6: Run focused tests**
 
-Run: `cargo test -p megle-core thumbnail_error_handler_records_failed_with_attempt_fingerprint_when_source_matches -- --nocapture`
+Run: `cargo test -p mangoo-core thumbnail_error_handler_records_failed_with_attempt_fingerprint_when_source_matches -- --nocapture`
 
-Run: `npm --workspace @megle/desktop run test`
+Run: `npm --workspace @mangoo/desktop run test`
 
 ## Task 2: Add Notification Launch Intent And Main Media Focus IPC
 
@@ -106,7 +106,7 @@ Test opening a new notification window and reusing an existing one both deliver 
 
 - [ ] **Step 2: Verify the focused tests fail**
 
-Run: `npm --workspace @megle/desktop run test -- --test-name-pattern="notification intent|media focus"`
+Run: `npm --workspace @mangoo/desktop run test -- --test-name-pattern="notification intent|media focus"`
 
 - [ ] **Step 3: Implement typed open/reuse intent delivery**
 
@@ -194,7 +194,7 @@ Render each active path immediately above the progress track. Use `overflow: hid
 
 - [ ] **Step 6: Run focused Core/Web tests**
 
-Run: `cargo test -p megle-core notification -- --nocapture`
+Run: `cargo test -p mangoo-core notification -- --nocapture`
 
 Run: `npm run check:web`
 
@@ -231,7 +231,7 @@ Run: `npm test`
 Run:
 
 ```powershell
-$env:MEGLE_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-regression.mjs; Remove-Item Env:\MEGLE_VISUAL_OS_BACKDROP
+$env:MANGOO_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-regression.mjs; Remove-Item Env:\MANGOO_VISUAL_OS_BACKDROP
 ```
 
 - [ ] **Step 4: Perform a real desktop interaction pass**

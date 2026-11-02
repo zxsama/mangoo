@@ -11,32 +11,37 @@ RUN apt-get update \
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY bundled-plugins ./bundled-plugins
+COPY contracts/plugins/fixtures ./contracts/plugins/fixtures
 
-RUN cargo test --release -p megle-fake-provider --test process_conformance \
-    && cargo test --release -p megle-onedrive-provider --features graph-emulator \
-    && cargo build --release -p megle-fake-provider -p megle-onedrive-provider \
-    && strip target/release/megle-fake-provider \
-    && strip target/release/megle-onedrive-provider \
-    && FAKE_HASH=$(sha256sum target/release/megle-fake-provider | cut -d' ' -f1) \
-    && ONEDRIVE_HASH=$(sha256sum target/release/megle-onedrive-provider | cut -d' ' -f1) \
-    && FAKE_BYTES=$(echo "$FAKE_HASH" | sed 's/../0x&,/g') \
-    && ONEDRIVE_BYTES=$(echo "$ONEDRIVE_HASH" | sed 's/../0x&,/g') \
-    && printf '// Generated during Docker build.\npub const GENERATED_FAKE_PROVIDER_SHA256: [u8; 32] = [%s];\npub const GENERATED_ONEDRIVE_PROVIDER_SHA256: [u8; 32] = [%s];\n' "$FAKE_BYTES" "$ONEDRIVE_BYTES" > crates/core/src/plugins/runtime/generated_trust.rs \
-    && mkdir -p target/release/bundled-plugins/com.megle.fake-sync/bin target/release/bundled-plugins/com.megle.onedrive/bin \
-    && cp target/release/megle-fake-provider target/release/bundled-plugins/com.megle.fake-sync/bin/megle-fake-provider \
-    && cp target/release/megle-onedrive-provider target/release/bundled-plugins/com.megle.onedrive/bin/megle-onedrive-provider \
-    && sed "s/__SHA256__/$FAKE_HASH/g" bundled-plugins/com.megle.fake-sync/plugin.template.json > target/release/bundled-plugins/com.megle.fake-sync/plugin.json \
-    && sed "s/__SHA256__/$ONEDRIVE_HASH/g" bundled-plugins/com.megle.onedrive/plugin.template.json > target/release/bundled-plugins/com.megle.onedrive/plugin.json \
-    && cargo build --release -p megle-core \
-    && cargo test --release -p megle-core --test plugin_runtime_process \
-    && strip target/release/megle-core
+RUN cargo test --release -p mangoo-fake-provider --test process_conformance \
+    && cargo test --release -p mangoo-ppm-decoder --test process_conformance \
+    && cargo build --release -p mangoo-fake-provider -p mangoo-ppm-decoder \
+    && strip target/release/mangoo-fake-provider target/release/mangoo-ppm-decoder \
+    && printf '// Generated during Docker build.\nuse crate::plugins::manifest::Platform;\npub const GENERATED_PLUGIN_TRUST: &[(&str, &str, Platform, [u8; 32], [u8; 32])] = &[\n' > crates/core/src/plugins/runtime/generated_trust.rs \
+    && for plugin in 'com.mangoo.fake-sync:mangoo-fake-provider:1.0.0' 'com.mangoo.ppm-decoder:mangoo-ppm-decoder:0.1.0'; do \
+        PLUGIN_ID=${plugin%%:*}; PLUGIN_REST=${plugin#*:}; PLUGIN_BIN=${PLUGIN_REST%%:*}; PLUGIN_VERSION=${PLUGIN_REST#*:}; \
+        PLUGIN_DIR=target/release/bundled-plugins/$PLUGIN_ID; \
+        mkdir -p "$PLUGIN_DIR/bin" \
+        && cp "target/release/$PLUGIN_BIN" "$PLUGIN_DIR/bin/$PLUGIN_BIN" \
+        && PLUGIN_HASH=$(sha256sum "$PLUGIN_DIR/bin/$PLUGIN_BIN" | cut -d' ' -f1) \
+        && sed "s/__SHA256__/$PLUGIN_HASH/g" "bundled-plugins/$PLUGIN_ID/plugin.template.json" > "$PLUGIN_DIR/plugin.json" \
+        && MANIFEST_HASH=$(sha256sum "$PLUGIN_DIR/plugin.json" | cut -d' ' -f1) \
+        && PLUGIN_BYTES=$(echo "$PLUGIN_HASH" | sed 's/../0x&,/g') \
+        && MANIFEST_BYTES=$(echo "$MANIFEST_HASH" | sed 's/../0x&,/g') \
+        && printf '    ("%s", "%s", Platform::LinuxX64, [%s], [%s]),\n' "$PLUGIN_ID" "$PLUGIN_VERSION" "$PLUGIN_BYTES" "$MANIFEST_BYTES" >> crates/core/src/plugins/runtime/generated_trust.rs \
+        || exit 1; \
+    done \
+    && printf '];\n' >> crates/core/src/plugins/runtime/generated_trust.rs \
+    && cargo build --release -p mangoo-core \
+    && cargo test --release -p mangoo-core --test plugin_runtime_process \
+    && strip target/release/mangoo-core
 
 # Release-only Linux verifier. The final runtime image remains minimal; this
 # target retains Cargo/test artifacts so the exact archived tree can execute
 # production sync bootstrap, convergence, restore, fault and physical-transfer
 # probes inside Linux.
 FROM core-builder AS sync-verifier
-CMD ["cargo", "test", "--release", "-p", "megle-core"]
+CMD ["cargo", "test", "--release", "-p", "mangoo-core"]
 
 # ---- Stage 2: Web UI builder -------------------------------------------------
 FROM node:22-slim AS web-builder
@@ -45,10 +50,11 @@ WORKDIR /web
 COPY package.json package-lock.json tsconfig.base.json ./
 COPY apps/web ./apps/web
 COPY packages/core-client ./packages/core-client
+COPY packages/notification-contract ./packages/notification-contract
 COPY contracts ./contracts
 
 RUN npm ci --no-audit --no-fund
-RUN npm --workspace @megle/web run build
+RUN npm --workspace @mangoo/web run build
 
 # ---- Stage 3: Runtime --------------------------------------------------------
 FROM debian:trixie-slim AS runtime
@@ -57,43 +63,35 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg ca-certificates wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Drop privileges: run Megle as a non-root system user. `/data` (the volume
+# Drop privileges: run Mangoo as a non-root system user. `/data` (the volume
 # mountpoint for the SQLite DB, generated thumbnails, and plugin state) needs
 # to be writable by this user. `/library` is mounted by the operator at run
 # time, so its ownership is the operator's responsibility (the read-only
-# default in compose keeps Megle from needing write access there).
-RUN groupadd --system --gid 10001 megle \
-    && useradd --system --uid 10001 --gid 10001 --home /home/megle --create-home megle \
-    && mkdir -p /data/plugin-state /data/secrets /opt/megle/plugins \
-    && chown -R megle:megle /data \
-    && chown -R root:root /opt/megle/plugins \
-    && chmod 0555 /opt/megle/plugins
+# default in compose keeps Mangoo from needing write access there).
+RUN groupadd --system --gid 10001 mangoo \
+    && useradd --system --uid 10001 --gid 10001 --home /home/mangoo --create-home mangoo \
+    && mkdir -p /data/plugin-state /data/secrets /opt/mangoo/plugins \
+    && chown -R mangoo:mangoo /data \
+    && chown -R root:root /opt/mangoo/plugins \
+    && chmod 0555 /opt/mangoo/plugins
 
-COPY --from=core-builder /src/target/release/megle-core /usr/local/bin/megle-core
-COPY --from=core-builder /src/target/release/megle-fake-provider /opt/megle/plugins/com.megle.fake-sync/bin/megle-fake-provider
-COPY bundled-plugins/com.megle.fake-sync/plugin.template.json /opt/megle/plugins/com.megle.fake-sync/plugin.template.json
-COPY --from=core-builder /src/target/release/megle-onedrive-provider /opt/megle/plugins/com.megle.onedrive/bin/megle-onedrive-provider
-COPY bundled-plugins/com.megle.onedrive/plugin.template.json /opt/megle/plugins/com.megle.onedrive/plugin.template.json
-COPY --from=web-builder  /web/apps/web/dist             /opt/megle/web
+COPY --from=core-builder /src/target/release/mangoo-core /usr/local/bin/mangoo-core
+COPY --from=core-builder /src/target/release/bundled-plugins /opt/mangoo/plugins
+COPY --from=web-builder  /web/apps/web/dist             /opt/mangoo/web
 
-RUN sha256sum /opt/megle/plugins/com.megle.fake-sync/bin/megle-fake-provider | cut -d' ' -f1 > /tmp/provider.sha \
-    && sed "s/__SHA256__/$(cat /tmp/provider.sha)/g" /opt/megle/plugins/com.megle.fake-sync/plugin.template.json > /opt/megle/plugins/com.megle.fake-sync/plugin.json \
-    && sha256sum /opt/megle/plugins/com.megle.onedrive/bin/megle-onedrive-provider | cut -d' ' -f1 > /tmp/onedrive.sha \
-    && sed "s/__SHA256__/$(cat /tmp/onedrive.sha)/g" /opt/megle/plugins/com.megle.onedrive/plugin.template.json > /opt/megle/plugins/com.megle.onedrive/plugin.json \
-    && rm /tmp/provider.sha /tmp/onedrive.sha /opt/megle/plugins/com.megle.fake-sync/plugin.template.json /opt/megle/plugins/com.megle.onedrive/plugin.template.json \
-    && chown -R root:root /opt/megle/plugins && chmod -R a-w /opt/megle/plugins \
-    && chmod 0555 /opt/megle/plugins/com.megle.fake-sync/bin/megle-fake-provider /opt/megle/plugins/com.megle.onedrive/bin/megle-onedrive-provider
+RUN chown -R root:root /opt/mangoo/plugins && chmod -R a-w /opt/mangoo/plugins \
+    && chmod 0555 /opt/mangoo/plugins/com.mangoo.fake-sync/bin/mangoo-fake-provider \
+        /opt/mangoo/plugins/com.mangoo.ppm-decoder/bin/mangoo-ppm-decoder
 
-ENV MEGLE_HOST_DB_PATH=/data/host/host.sqlite \
-    MEGLE_LIBRARIES_DIR=/data/host/libraries \
-    MEGLE_PLUGINS_DIR=/opt/megle/plugins \
-    MEGLE_PLUGIN_STATE_DIR=/data/plugin-state \
-    MEGLE_SECRETS_DIR=/data/secrets \
-    MEGLE_SECRET_KEY_FILE=/run/secrets/megle_secret_key \
-    MEGLE_ONEDRIVE_AUTH_MODE=manual-response-uri \
-    MEGLE_WEB_DIR=/opt/megle/web \
-    MEGLE_SERVE_WEB=1 \
-    MEGLE_CORE_ADDR=0.0.0.0:47321 \
+ENV MANGOO_HOST_DB_PATH=/data/host/host.sqlite \
+    MANGOO_LIBRARIES_DIR=/data/host/libraries \
+    MANGOO_PLUGINS_DIR=/opt/mangoo/plugins \
+    MANGOO_PLUGIN_STATE_DIR=/data/plugin-state \
+    MANGOO_SECRETS_DIR=/data/secrets \
+    MANGOO_SECRET_KEY_FILE=/run/secrets/mangoo_secret_key \
+    MANGOO_WEB_DIR=/opt/mangoo/web \
+    MANGOO_SERVE_WEB=1 \
+    MANGOO_CORE_ADDR=0.0.0.0:47321 \
     RUST_LOG=info
 
 EXPOSE 47321
@@ -102,6 +100,6 @@ VOLUME ["/data", "/library"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
     CMD wget -qO- http://127.0.0.1:47321/api/health >/dev/null 2>&1 || exit 1
 
-USER megle
+USER mangoo
 
-CMD ["/usr/local/bin/megle-core"]
+CMD ["/usr/local/bin/mangoo-core"]

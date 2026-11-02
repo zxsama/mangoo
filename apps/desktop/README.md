@@ -1,4 +1,4 @@
-# Megle Desktop
+# Mangoo Desktop
 
 Electron shell for Windows desktop.
 

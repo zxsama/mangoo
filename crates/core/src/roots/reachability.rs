@@ -35,7 +35,7 @@ mod tests {
     fn probe_root_reachable_true_for_existing_dir_false_for_missing() {
         let dir = std::env::temp_dir();
         assert!(probe_root_reachable(dir.to_str().unwrap()));
-        let missing = std::env::temp_dir().join("megle-reachability-nonexistent-zzz");
+        let missing = std::env::temp_dir().join("mangoo-reachability-nonexistent-zzz");
         assert!(!probe_root_reachable(missing.to_str().unwrap()));
         assert!(!probe_root_reachable(""));
     }
@@ -45,7 +45,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let existing_path = dir.to_str().unwrap().to_string();
         let missing_path = std::env::temp_dir()
-            .join("megle-reachability-nonexistent-zzz")
+            .join("mangoo-reachability-nonexistent-zzz")
             .to_str()
             .unwrap()
             .to_string();

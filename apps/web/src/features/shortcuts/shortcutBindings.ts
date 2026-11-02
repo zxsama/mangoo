@@ -20,8 +20,8 @@ export interface ShortcutActionDefinition {
 
 export type ShortcutBindings = Record<ShortcutActionId, string>;
 
-export const SHORTCUT_STORAGE_KEY = "megle.shortcutBindings.v1";
-export const SHORTCUT_BINDINGS_CHANGED_EVENT = "megle:shortcut-bindings-changed";
+export const SHORTCUT_STORAGE_KEY = "mangoo.shortcutBindings.v1";
+export const SHORTCUT_BINDINGS_CHANGED_EVENT = "mangoo:shortcut-bindings-changed";
 
 export const DEFAULT_SHORTCUT_ACTIONS: ShortcutActionDefinition[] = [
   { id: "focusSearch", label: "Focus search", defaultBinding: "Ctrl+F" },

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { assertNoLinks, INVENTORY_FILE, readInventory, renderTrust } from "./plugin-artifacts.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const desktopDir = path.join(root, "apps", "desktop");
@@ -24,19 +25,16 @@ function assertFile(filePath, label) {
 }
 
 assertFile(path.join(root, "apps", "web", "dist", "index.html"), "web build");
-assertFile(path.join(root, "target", "release", "megle-core.exe"), "release Core");
-for (const [pluginId, executableName] of [
-  ["com.megle.fake-sync", "megle-fake-provider.exe"],
-  ["com.megle.onedrive", "megle-onedrive-provider.exe"]
-]) {
-  const pluginRoot = path.join(root, "target", "release", "bundled-plugins", pluginId);
-  assertFile(path.join(pluginRoot, "plugin.json"), `${pluginId} manifest`);
-  assertFile(path.join(pluginRoot, "bin", executableName), `${pluginId} executable`);
-}
+assertFile(path.join(root, "target", "release", "mangoo-core.exe"), "release Core");
+const bundledRoot = path.join(root, "target", "release", "bundled-plugins");
+const inventory = readInventory(bundledRoot);
+const generatedTrust = fs.readFileSync(path.join(root, "crates", "core", "src", "plugins", "runtime", "generated_trust.rs"), "utf8");
+if (generatedTrust !== renderTrust(inventory.plugins)) throw new Error("release inventory does not match Core compile-time trust input; rebuild release artifacts");
 assertFile(iconIco, "Windows icon");
 assertFile(iconPng, "window icon");
 assertFile(path.join(electronDist, "electron.exe"), "local Electron distribution");
 
+assertNoLinks(stageDir, { allowMissing: true });
 fs.rmSync(stageDir, { recursive: true, force: true });
 fs.mkdirSync(stageDir, { recursive: true });
 const stagedDist = path.join(stageDir, "dist");
@@ -65,11 +63,11 @@ fs.writeFileSync(
   path.join(stageDir, "package.json"),
   `${JSON.stringify(
     {
-      name: "megle-desktop",
-      productName: "Megle",
+      name: "mangoo-desktop",
+      productName: "Mangoo",
       version: rootPackage.version,
       description: "Windows-first local media browser.",
-      author: "Megle",
+      author: "Mangoo",
       type: "module",
       main: "dist/main.js"
     },
@@ -82,9 +80,9 @@ await buildElectron({
   projectDir: root,
   targets: Platform.WINDOWS.createTarget(["dir"]),
   config: {
-    appId: "com.megle.desktop",
-    productName: "Megle",
-    executableName: "Megle",
+    appId: "com.mangoo.desktop",
+    productName: "Mangoo",
+    executableName: "Mangoo",
     electronVersion: "43.1.0",
     electronDist,
     directories: {
@@ -100,13 +98,18 @@ await buildElectron({
         to: "web"
       },
       {
-        from: path.join(root, "target", "release", "megle-core.exe"),
-        to: "core/megle-core.exe"
+        from: path.join(root, "target", "release", "mangoo-core.exe"),
+        to: "core/mangoo-core.exe"
       },
       {
-        from: path.join(root, "target", "release", "bundled-plugins"),
-        to: "core/bundled-plugins"
+        from: path.join(bundledRoot, INVENTORY_FILE),
+        to: `core/bundled-plugins/${INVENTORY_FILE}`
       },
+      ...inventory.plugins.flatMap((plugin) => [
+        { from: path.join(bundledRoot, plugin.id, "plugin.json"), to: `core/bundled-plugins/${plugin.id}/plugin.json` },
+        { from: path.join(bundledRoot, plugin.id, plugin.entry), to: `core/bundled-plugins/${plugin.id}/${plugin.entry}` },
+        ...(plugin.ui ? [{ from: path.join(bundledRoot, plugin.id, plugin.ui.entry), to: `core/bundled-plugins/${plugin.id}/${plugin.ui.entry}` }] : [])
+      ]),
       {
         from: iconPng,
         to: "icon.png"
@@ -121,18 +124,16 @@ await buildElectron({
   }
 });
 
-const executable = path.join(outputDir, "win-unpacked", "Megle.exe");
-assertFile(executable, "packaged Megle executable");
+const executable = path.join(outputDir, "win-unpacked", "Mangoo.exe");
+assertFile(executable, "packaged Mangoo executable");
 for (const [relativePath, label] of [
   ["resources/app.asar", "packaged application archive"],
   ["resources/icon.png", "packaged window icon"],
   ["resources/web/index.html", "packaged web entry"],
-  ["resources/core/megle-core.exe", "packaged Core"],
-  ["resources/core/bundled-plugins/com.megle.fake-sync/plugin.json", "packaged fake Provider manifest"],
-  ["resources/core/bundled-plugins/com.megle.fake-sync/bin/megle-fake-provider.exe", "packaged fake Provider executable"],
-  ["resources/core/bundled-plugins/com.megle.onedrive/plugin.json", "packaged OneDrive manifest"],
-  ["resources/core/bundled-plugins/com.megle.onedrive/bin/megle-onedrive-provider.exe", "packaged OneDrive executable"]
+  ["resources/core/mangoo-core.exe", "packaged Core"]
 ]) {
   assertFile(path.join(outputDir, "win-unpacked", ...relativePath.split("/")), label);
 }
+const packagedInventory = readInventory(path.join(outputDir, "win-unpacked", "resources", "core", "bundled-plugins"));
+if (JSON.stringify(packagedInventory) !== JSON.stringify(inventory)) throw new Error("packaged plugin inventory differs from release build");
 console.log(`[desktop-package] ready: ${executable}`);

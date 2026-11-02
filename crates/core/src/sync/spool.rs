@@ -243,7 +243,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn fixture() -> (PathBuf, Vec<u8>, SealedSegment) {
-        let directory = std::env::temp_dir().join(format!("megle-spool-{}", uuid::Uuid::now_v7()));
+        let directory = std::env::temp_dir().join(format!("mangoo-spool-{}", uuid::Uuid::now_v7()));
         fs::create_dir_all(&directory).unwrap();
         let segment = seal_segment(
             vec![event(
@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn reordered_segments_wait_for_their_predecessor_and_then_converge() {
         let directory =
-            std::env::temp_dir().join(format!("megle-spool-reordered-{}", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("mangoo-spool-reordered-{}", uuid::Uuid::now_v7()));
         fs::create_dir_all(&directory).unwrap();
         let first = seal_segment(
             vec![event(

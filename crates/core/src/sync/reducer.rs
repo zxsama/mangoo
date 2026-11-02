@@ -18,6 +18,8 @@ pub struct Versioned<T> {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LocationRevision {
+    #[serde(default, skip_serializing_if = "is_legacy_component_policy")]
+    pub preserve_legal_name: bool,
     pub revision_uuid: RevisionUuid,
     pub parent_uuid: Option<EntityUuid>,
     pub name: String,
@@ -212,6 +214,7 @@ impl ProtocolState {
                         revision_uuid: *revision_uuid,
                         parent_uuid: *parent_uuid,
                         name: name.clone(),
+                        preserve_legal_name: event.reducer_version >= 3,
                         version,
                     });
                 if !entity.location_superseded.contains(revision_uuid) {
@@ -312,7 +315,19 @@ fn truncate_utf16(value: &str, limit: usize) -> String {
 /// Portable component legalization. It deliberately uses no platform locale
 /// or filesystem API, so replay on Windows and Linux produces identical names.
 pub fn canonicalize_materialized_component(requested: &str, suffix: Option<&str>) -> String {
-    let normalized: String = requested.nfc().collect();
+    canonicalize_component(requested, suffix, false)
+}
+
+fn is_legacy_component_policy(preserve: &bool) -> bool {
+    !preserve
+}
+
+fn canonicalize_component(requested: &str, suffix: Option<&str>, preserve: bool) -> String {
+    let normalized: String = if preserve {
+        requested.to_owned()
+    } else {
+        requested.nfc().collect()
+    };
     let mut value: String = normalized
         .chars()
         .map(|character| {
@@ -341,9 +356,13 @@ pub fn canonicalize_materialized_component(requested: &str, suffix: Option<&str>
         .map(|value| format!(" ({value})"))
         .unwrap_or_default();
     let suffix_units = suffix.encode_utf16().count();
-    let base_budget = MAX_COMPONENT_UTF16_UNITS
-        .saturating_sub(suffix_units)
-        .max(1);
+    let base_budget = (if preserve {
+        255usize
+    } else {
+        MAX_COMPONENT_UTF16_UNITS
+    })
+    .saturating_sub(suffix_units)
+    .max(1);
     let mut base = truncate_utf16(&value, base_budget);
     while base.ends_with([' ', '.']) {
         base.pop();
@@ -410,7 +429,7 @@ pub fn legalize_locations(
     }
     let mut groups: HashMap<(Option<EntityUuid>, String), Vec<EntityUuid>> = HashMap::new();
     for (id, loc) in &selected {
-        let canonical = canonicalize_materialized_component(&loc.name, None);
+        let canonical = canonicalize_component(&loc.name, None, loc.preserve_legal_name);
         groups
             .entry((loc.parent_uuid, materialized_name_compare_key(&canonical)))
             .or_default()
@@ -425,16 +444,19 @@ pub fn legalize_locations(
         for (index, id) in ids.into_iter().enumerate() {
             let loc = &selected[&id];
             let used = used_by_parent.entry(parent).or_default();
-            let mut display_name = canonicalize_materialized_component(&loc.name, None);
+            let mut display_name = canonicalize_component(&loc.name, None, loc.preserve_legal_name);
             if index != 0 || used.contains(&materialized_name_compare_key(&display_name)) {
                 display_name = suffix_candidates(id)
                     .into_iter()
-                    .map(|suffix| canonicalize_materialized_component(&loc.name, Some(&suffix)))
+                    .map(|suffix| {
+                        canonicalize_component(&loc.name, Some(&suffix), loc.preserve_legal_name)
+                    })
                     .find(|candidate| !used.contains(&materialized_name_compare_key(candidate)))
                     .unwrap_or_else(|| {
-                        canonicalize_materialized_component(
+                        canonicalize_component(
                             &loc.name,
                             Some(&id.0.hyphenated().to_string()),
+                            loc.preserve_legal_name,
                         )
                     });
             }

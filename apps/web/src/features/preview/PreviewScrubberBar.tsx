@@ -1,4 +1,4 @@
-import { Pin } from "lucide-react";
+import { Pin } from "../../design/icons";
 import { useCallback, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 

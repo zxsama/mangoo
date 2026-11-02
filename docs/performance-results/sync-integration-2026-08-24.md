@@ -1,5 +1,10 @@
 # Sync integration performance result — 2026-08-24
 
+> Repository extraction note (2026-09-22): this dated result retains its original
+> combined Host/Provider scope. Current ownership is documented in the
+> [extraction note](../onedrive-extraction.md); repository separation supplies
+> no new performance or independent restore evidence.
+
 ## Reproduce
 
 ```powershell
@@ -10,7 +15,7 @@ node tools/bench/sync-integration-bench.mjs --renderer-evidence .tmp/sync-releas
 The renderer row consumes JSON produced by the committed production desktop
 collector (`npm run bench:renderer-sync`). When selecting the evidence path,
 run `node tools/bench/renderer-sync-performance.mjs --output <file>`. Pass it through
-`--renderer-evidence <file>` or `MEGLE_SYNC_RENDERER_EVIDENCE`. The file must
+`--renderer-evidence <file>` or `MANGOO_SYNC_RENDERER_EVIDENCE`. The file must
 contain numeric `baselineLongFramePercent`, `stressLongFramePercent`,
 `baselineDroppedFramePercent`, `stressDroppedFramePercent`, and
 `inputSyncIpcCalls` fields. Omitting it is a required blocked row.

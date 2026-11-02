@@ -5,7 +5,7 @@ import {
   Play,
   Radio,
   Trash2
-} from "lucide-react";
+} from "../../design/icons";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   useCallback,
@@ -28,7 +28,7 @@ import type {
   MediaFocusRequest,
   ThumbnailFailureSnapshot,
   ThumbnailFailureDetail
-} from "@megle/notification-contract";
+} from "@mangoo/notification-contract";
 import { LiquidGlassButton } from "../../design/liquid-glass";
 import { OverlayField, OverlaySelect } from "../../design/overlays";
 import { copyText, getDesktopBridge } from "../../core/desktop";

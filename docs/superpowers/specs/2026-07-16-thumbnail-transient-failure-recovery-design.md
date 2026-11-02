@@ -8,7 +8,7 @@
 
 一次全量缩略图生成期间,NAS(`\\?\UNC\192.168.50.77\NAS_Repository_H\...`,root 1)发生**瞬态网络中断**,导致 **18,807** 个 NAS 文件缩略图以 `找不到网络路径 (os error 53)` 失败,被记为 `thumb_state='failed'`。加上 `database is locked`(312)、`Memory limit exceeded`(8),共 **19,127** 个**瞬态**失败。
 
-**核心缺陷:** `failed` 缩略图是**终态,永不自动重试**(只能靠用户手动 `retry_task` 或 `retryFailedAndStale` 模式)。Megle **不区分瞬态失败(网络抖动、锁、内存,源恢复后可成功)与永久失败(格式不支持、文件损坏)**。所以 NAS 恢复后(现已可达,已用 `os.path.exists` 验证失败文件 `005.jpg`/id 180545 存在且 2.8MB 可读),这些瓦片仍永久显示 `tile-thumb-failed`。
+**核心缺陷:** `failed` 缩略图是**终态,永不自动重试**(只能靠用户手动 `retry_task` 或 `retryFailedAndStale` 模式)。Mangoo **不区分瞬态失败(网络抖动、锁、内存,源恢复后可成功)与永久失败(格式不支持、文件损坏)**。所以 NAS 恢复后(现已可达,已用 `os.path.exists` 验证失败文件 `005.jpg`/id 180545 存在且 2.8MB 可读),这些瓦片仍永久显示 `tile-thumb-failed`。
 
 **为何"点开能看到图":** 预览走**实时读原图**的独立路径(NAS 已回来,成功);网格瓦片信任陈旧的终态 `failed`,从不重读。这解释了"非必现"——取决于所浏览文件夹的文件是否在 NAS 掉线期间失败过。
 

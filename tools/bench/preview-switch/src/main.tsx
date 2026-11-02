@@ -25,7 +25,7 @@ type BenchResult = {
 
 declare global {
   interface Window {
-    __meglePreviewReady?: boolean;
+    __mangooPreviewReady?: boolean;
     __lastCommittedId?: number;
     runPreviewSwitchBenchmark?: (options?: {
       mode?: "cached" | "prefetch";
@@ -126,7 +126,7 @@ function App() {
 
   useEffect(() => {
     if (!assets.length) return;
-    window.__meglePreviewReady = true;
+    window.__mangooPreviewReady = true;
     window.runPreviewSwitchBenchmark = async (options = {}) => {
       const mode = options.mode ?? "cached";
       const iterations = options.iterations ?? 1000;

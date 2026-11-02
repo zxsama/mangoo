@@ -2,12 +2,18 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { after, before, describe, it } from "node:test";
-import { createServer, type ViteDevServer } from "vite";
+import { createServer, type ViteDevServer } from "./viteTestServer.mts";
 
 interface OverlayLifecycleResult {
   ok: boolean;
   error?: string;
   basicFocusWorks: boolean;
+  standaloneFocusTrap: {
+    initialFocus: string;
+    backwardWrap: string;
+    forwardWrap: string;
+    restoredFocus: string;
+  };
   reentrancy: {
     closeDismissals: number;
     closeRootId: string | null;
@@ -197,6 +203,14 @@ after(async () => {
 });
 
 describe("mounted overlay lifecycle", () => {
+  it("preserves standalone focus trapping and skips negative tab indices", () => {
+    assert.deepEqual(result.standaloneFocusTrap, {
+      initialFocus: "standalone-trap-first",
+      backwardWrap: "standalone-trap-last",
+      forwardWrap: "standalone-trap-first",
+      restoredFocus: "standalone-trap-launcher"
+    });
+  });
   it("runs in a focus-capable renderer", () => {
     assert.equal(result.basicFocusWorks, true);
   });

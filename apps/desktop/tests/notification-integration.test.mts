@@ -545,7 +545,7 @@ test("Task 10 source contract exposes one notifications window and typed preload
   assert.match(main, /quiesceNotifications: quiesceNotificationRuntime[\s\S]*stopCore: stopDesktopCoreProcesses[\s\S]*closeNotifications: closeNotificationRuntime/);
   assert.match(preload, /notifications:\s*notificationsBridge/);
   assert.match(preload, /return \(\) => ipcRenderer\.removeListener/);
-  assert.match(desktop, /DesktopNotificationsBridge[\s\S]*from "@megle\/notification-contract"/);
+  assert.match(desktop, /DesktopNotificationsBridge[\s\S]*from "@mangoo\/notification-contract"/);
   assert.match(desktop, /windowRole\?: "main" \| DesktopSecondaryWindowRole/);
   assert.match(webMain, /windowRole === "notifications"/);
   assert.match(webMain, /import\("\.\/features\/notifications\/NotificationWindow"\)/);
@@ -587,7 +587,7 @@ test("preload bridge removes exact listeners and buffers log batches until snaps
   };
   vm.runInNewContext(source, {
     module: { exports: {} },
-    process: { argv: ["--megle-window=notifications"] },
+    process: { argv: ["--mangoo-window=notifications"] },
     require(id: string) {
       if (id === "electron") {
         return {

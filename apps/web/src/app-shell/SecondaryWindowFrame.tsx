@@ -1,4 +1,4 @@
-import { X } from "lucide-react";
+import { X } from "../design/icons";
 import {
   useEffect,
   useLayoutEffect,
@@ -47,7 +47,7 @@ export function SecondaryWindowFrame({
       const frame = frameRef.current;
       if (!frame) return;
       frame.dataset.secondaryRendererReady = "true";
-      performance.mark(`megle-secondary-${role}-renderer-ready`);
+      performance.mark(`mangoo-secondary-${role}-renderer-ready`);
       void notifySecondaryWindowReady(role).then((result) => {
         const currentFrame = frameRef.current;
         if (!result || !currentFrame) return;
@@ -64,13 +64,13 @@ export function SecondaryWindowFrame({
           String(result.fallback)
         );
         currentFrame.dataset.secondaryWindowVisible = "true";
-        performance.mark(`megle-secondary-${role}-native-window-revealed`);
+        performance.mark(`mangoo-secondary-${role}-native-window-revealed`);
         contentRevealFrame = window.requestAnimationFrame(() => {
           const revealFrame = frameRef.current;
           if (!revealFrame) return;
           revealFrame.setAttribute("data-secondary-content-visible", "true");
           revealFrame.setAttribute("data-secondary-content-visible-at", String(Date.now()));
-          performance.mark(`megle-secondary-${role}-content-visible`);
+          performance.mark(`mangoo-secondary-${role}-content-visible`);
         });
       });
     });

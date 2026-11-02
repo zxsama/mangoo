@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert";
 import { afterEach, beforeEach, describe, test } from "node:test";
 
 import { createCoreClient } from "../src/client.ts";
-import type { FileOperationRecord, HostPluginProjection } from "../src/generated-contract.ts";
+import type { FileOperationRecord, HostPluginProjection, LibraryPreflightRequest, LibraryPreflightResponse, LibrarySummary } from "../src/generated-contract.ts";
 
 interface RecordedRequest {
   url: string;
@@ -224,11 +224,133 @@ afterEach(() => {
 });
 
 describe("createCoreClient", () => {
+  test("directory preferences preserve root identity, captured revisions and server ordering state", async () => {
+    const sortState = { rootId: 9, folderId: null, explicitRule: { order: "name_desc", recursive: true }, effectiveOrder: "name_desc", source: { rootId: 9, folderId: null }, revision: "opaque-revision" };
+    const saved = { state: sortState, invalidateDescendants: true };
+    const api = createCoreClient({ baseUrl: BASE_URL, sessionToken: "fixture-session" });
+    mockFetch(saved);
+    assert.deepEqual(await api.updateRootSort(9, { order: "name_desc", recursive: true }, { contextRevision: 7 }), saved);
+    assert.deepEqual(await api.updateFolderSort(42, { order: "name_asc", recursive: false }, { contextRevision: 7 }), saved);
+    assert.deepEqual(await api.resetRootSort(9, { contextRevision: 7 }), saved);
+    assert.deepEqual(await api.resetFolderSort(42, { contextRevision: 7 }), saved);
+    assert.deepEqual(recorded.slice(0, 4).map(r => [r.method, r.url.replace(BASE_URL, ""), r.headers["x-mangoo-context-revision"]]), [
+      ["PATCH", "/roots/9/sort", "7"], ["PATCH", "/folders/42/sort", "7"],
+      ["DELETE", "/roots/9/sort", "7"], ["DELETE", "/folders/42/sort", "7"]
+    ]);
+    assert.ok(recorded.every(r => r.headers["x-mangoo-session"] === "fixture-session"));
+    mockFetch(sortState);
+    assert.deepEqual(await api.getRootSort(9), sortState);
+    assert.deepEqual(await api.getFolderSort(42), sortState);
+    const page = { items: [], nextCursor: "opaque:cursor", totalCount: null, sortState };
+    mockFetch(page);
+    assert.deepEqual(await api.listFolderChildren(42, { cursor: "opaque:old", limit: 500 }), page);
+    assert.match(recorded.at(-1)!.url, /cursor=opaque%3Aold/);
+    const root = { id: 9, icon: "archive", color: "#abc", rootFolderId: null, reachable: false };
+    mockFetch(root);
+    assert.deepEqual(await api.updateRootAppearance(9, { icon: "archive", color: "#abc" }, { contextRevision: 7 }), root);
+    assert.equal(recorded.at(-1)!.url, `${BASE_URL}/roots/9/appearance`);
+    assert.equal(recorded.at(-1)!.headers["x-mangoo-context-revision"], "7");
+  });
+  test("folder appearance sends a complete pair with the captured context revision", async () => {
+    const saved = { id: 42, rootId: 1, parentId: 2, name: "Folder", status: "active", hasChildren: false, mediaCount: 0, fileCount: 0, icon: "future-icon", color: "#abc" };
+    mockFetch(saved, 200, { "x-mangoo-context-revision": "99" });
+    const client = createCoreClient({ baseUrl: BASE_URL, sessionToken: "fixture-session" });
+    const result = await client.updateFolderAppearance(42, { icon: "future-icon", color: "#abc" }, { contextRevision: 7 });
+    assert.deepEqual(result, saved);
+    assert.equal(recorded[0].url, `${BASE_URL}/folders/42/appearance`);
+    assert.equal(recorded[0].method, "PATCH");
+    assert.equal(recorded[0].headers["x-mangoo-context-revision"], "7");
+    assert.equal(recorded[0].headers["x-mangoo-session"], "fixture-session");
+    assert.deepEqual(JSON.parse(recorded[0].body!), { icon: "future-icon", color: "#abc" });
+  });
+  test("generic file presentation and unavailable thumbnail are preserved without retry", async () => {
+    const file = { id: 7, rootId: 1, folderId: 2, name: "README", ext: "", size: 0, mtime: 3, kind: null, presentation: { previewKind: "static-thumbnail", thumbnail: "unavailable", generation: 2 } };
+    const page = { items: [file], nextCursor: null, totalCount: 1 };
+    mockFetch(page);
+    assert.deepEqual(await client().listMedia({ kind: "other" }), page);
+    assert.match(recorded[0].url, /kind=other/);
+    const unavailable = { fileId: 7, target: "grid_320", state: "unavailable", shortSidePx: 320, outputFormat: "image/webp", width: null, height: null, byteSize: null, servedBy: null, asset: null, error: null, updatedAt: null };
+    mockFetch(unavailable);
+    assert.deepEqual(await client().getThumbnail(7), unavailable);
+    assert.equal(recorded.length, 2);
+  });
+  test("plugin view document encodes identifiers and preserves verified response and error status", async () => {
+    const document = { pluginId: "com.example.ui", lifecycleEpoch: 7, version: "1.0.0", viewId: "setup", title: "Setup", document: "<!doctype html><p>Example</p>" };
+    mockFetch(document);
+    const client = createCoreClient({ baseUrl: BASE_URL, sessionToken: "fixture" });
+    assert.deepEqual(await client.getPluginViewDocument("com.example/ui", "view/id"), document);
+    assert.equal(recorded[0].url, `${BASE_URL}/plugins/com.example%2Fui/views/view%2Fid`);
+    assert.equal(recorded[0].headers["x-mangoo-session"], "fixture");
+    mockFetch({ code: "plugin-ui-unavailable" }, 409);
+    await assert.rejects(client.getPluginViewDocument("com.example.ui", "setup"), { status: 409, body: { code: "plugin-ui-unavailable" } });
+  });
+
+  test("client lifetime signal aborts active and queued plugin calls without affecting another client", async () => {
+    const requests = mockDeferredFetch();
+    const lifetime = new AbortController();
+    const caller = new AbortController();
+    const client = createCoreClient({ baseUrl: BASE_URL, signal: lifetime.signal });
+    const pending = [client.getPluginViewDocument("com.example.ui", "setup", { signal: caller.signal }), client.beginPluginAuth("com.example.ui"),
+      ...Array.from({ length: CORE_RESOURCE_SLOT_COUNT + 2 }, () => client.getPluginConfiguration("com.example.ui"))];
+    assert.ok(requests.length < pending.length, "some calls must be queued before cancellation");
+    const settled = Promise.allSettled(pending);
+    lifetime.abort();
+    assert.ok((await settled).every((result) => result.status === "rejected" && result.reason.name === "AbortError"));
+    assert.ok(requests.every((request) => request.signal?.aborted));
+    const before = requests.length;
+    await assert.rejects(client.getPluginConfiguration("com.example.ui"), { name: "AbortError" });
+    assert.equal(requests.length, before);
+    const other = createCoreClient({ baseUrl: BASE_URL }).getPluginConfiguration("com.example.ui");
+    requests.at(-1)!.resolveJson({ configured: false });
+    await other;
+  });
+
+  test("per-call abort still cancels a client with a live lifetime signal", async () => {
+    mockDeferredFetch();
+    const lifetime = new AbortController();
+    const caller = new AbortController();
+    const client = createCoreClient({ baseUrl: BASE_URL, signal: lifetime.signal });
+    const pending = client.getPluginViewDocument("com.example.ui", "setup", { signal: caller.signal });
+    caller.abort();
+    await assert.rejects(pending, { name: "AbortError" });
+    assert.equal(lifetime.signal.aborted, false);
+  });
+
+  test("plugin UI transport pins lifecycle headers for reads and self mutations", async () => {
+    mockFetch({});
+    const session = { pluginId: "com.example.ui", lifecycleEpoch: 7 };
+    const client = createCoreClient({ baseUrl: BASE_URL, pluginUiSession: session });
+    session.lifecycleEpoch = 9;
+    await client.getPluginConfiguration("com.example.ui");
+    await client.beginPluginAuth("com.example.ui");
+    await client.commitPluginConfiguration("com.example.ui", { planUuid: "plan", expectedRevision: 1, confirmed: true });
+    assert.equal(recorded.length, 3);
+    assert.ok(recorded.every((r) => r.headers["x-mangoo-plugin-ui-id"] === "com.example.ui"
+      && r.headers["x-mangoo-plugin-ui-epoch"] === "7"));
+    assert.throws(() => createCoreClient({ baseUrl: BASE_URL, pluginUiSession: { pluginId: "../other", lifecycleEpoch: 1 } }), TypeError);
+    assert.throws(() => createCoreClient({ baseUrl: BASE_URL, pluginUiSession: { pluginId: "com.example.ui", lifecycleEpoch: 0 } }), TypeError);
+  });
+  test("generic provider configuration and exact links preserve plugin identity and session", async () => {
+    mockFetch({});
+    const client = createCoreClient({ baseUrl: BASE_URL, sessionToken: "fixture-session" });
+    const pluginId = "org.example.storage/second";
+    await client.getPluginConfiguration(pluginId);
+    await client.planPluginConfiguration(pluginId, { values: { workspace: "second", region: null }, expectedRevision: 7 });
+    await client.commitPluginConfiguration(pluginId, { planUuid: "plan", expectedRevision: 7, confirmed: true });
+    await client.resolvePluginExternalLink(pluginId, { kind: "authorization", id: "flow" });
+    await client.resolvePluginExternalLink(pluginId, { kind: "help", id: "guide" });
+    assert.deepEqual(recorded.map((r) => r.method), ["GET", "POST", "PUT", "POST", "POST"]);
+    assert.ok(recorded.every((r) => r.url.startsWith(`${BASE_URL}/plugins/org.example.storage%2Fsecond/`)));
+    assert.ok(recorded.every((r) => r.headers["x-mangoo-session"] === "fixture-session"));
+    assert.deepEqual(JSON.parse(recorded[1]!.body!), { values: { workspace: "second", region: null }, expectedRevision: 7 });
+    assert.deepEqual(JSON.parse(recorded[3]!.body!), { kind: "authorization", id: "flow" });
+    assert.deepEqual(JSON.parse(recorded[4]!.body!), { kind: "help", id: "guide" });
+  });
   test("session token is sent on every request", async () => {
     mockFetch({ items: [] });
     await client().listRoots();
     assert.equal(recorded.length, 1);
-    assert.equal(recorded[0].headers["x-megle-session"], "secret");
+    assert.equal(recorded[0].headers["x-mangoo-session"], "secret");
   });
 
   test("listTasks forwards abort signal", async () => {
@@ -473,6 +595,28 @@ describe("createCoreClient", () => {
     assert.equal(recorded[0].signal?.aborted, false);
   });
 
+  test("getMedia cancels an obsolete presentation read", async () => {
+    const requests = mockDeferredFetch();
+    const controller = new AbortController();
+    const pending = client().getMedia(42, { signal: controller.signal });
+    await waitForRequestCount(requests, 1);
+    const rejected = assert.rejects(pending, { name: "AbortError" });
+    controller.abort();
+    await rejected;
+    assert.equal(requests[0].signal?.aborted, true);
+  });
+
+  test("listPlugins cancels a stopped capability monitor", async () => {
+    const requests = mockDeferredFetch();
+    const controller = new AbortController();
+    const pending = client().listPlugins({ signal: controller.signal });
+    await waitForRequestCount(requests, 1);
+    const rejected = assert.rejects(pending, { name: "AbortError" });
+    controller.abort();
+    await rejected;
+    assert.equal(requests[0].signal?.aborted, true);
+  });
+
   test("listMedia aborts its bounded network response with the caller", async () => {
     const requests = mockDeferredFetch();
     const controller = new AbortController();
@@ -705,7 +849,7 @@ describe("createCoreClient", () => {
     );
     const url = new URL(recorded[0].url);
     assert.equal(recorded[0].method, "GET");
-    assert.equal(recorded[0].headers["x-megle-session"], "secret");
+    assert.equal(recorded[0].headers["x-mangoo-session"], "secret");
     assert.equal(url.pathname, "/api/notifications/outbox");
     assert.equal(url.searchParams.get("afterSequence"), "41");
     assert.equal(url.searchParams.get("limit"), "100");
@@ -718,7 +862,7 @@ describe("createCoreClient", () => {
     await client().ackNotificationOutbox({ maxSequence: 57 });
     assert.equal(recorded[0].method, "POST");
     assert.equal(recorded[0].url, `${BASE_URL}/notifications/outbox/ack`);
-    assert.equal(recorded[0].headers["x-megle-session"], "secret");
+    assert.equal(recorded[0].headers["x-mangoo-session"], "secret");
     assert.equal(recorded[0].headers["content-type"], "application/json");
     assert.deepEqual(JSON.parse(recorded[0].body!), { maxSequence: 57 });
   });
@@ -768,19 +912,122 @@ describe("createCoreClient", () => {
     await client().removeLocalLibrary("alpha/library", 9);
 
     assert.deepEqual(recorded.map((request) => request.method), ["POST", "PATCH", "DELETE"]);
-    assert.deepEqual(recorded.map((request) => request.headers["x-megle-context-revision"]), ["7", "8", "9"]);
+    assert.deepEqual(recorded.map((request) => request.headers["x-mangoo-context-revision"]), ["7", "8", "9"]);
     assert.ok(recorded.every((request) => request.url.includes("alpha%2Flibrary")));
     assert.deepEqual(JSON.parse(recorded[1].body!), { name: "Renamed" });
   });
 
+  test("safe Library open and forget use distinct fenced endpoints and preserve partial activation results", async () => {
+    const result = { library: { libraryUuid: "retained" }, activated: false, activationError: "library-runtime-busy" };
+    mockFetch(result);
+    assert.deepEqual(await client().openLibrary({ databasePath: "D:/Existing Library/Database" }, 12), result);
+    assert.equal(recorded[0].url, `${BASE_URL}/libraries/open`);
+    assert.equal(recorded[0].method, "POST");
+    assert.equal(recorded[0].headers["x-mangoo-context-revision"], "12");
+    assert.deepEqual(JSON.parse(recorded[0].body!), { databasePath: "D:/Existing Library/Database" });
+
+    const active = { library: null, contextRevision: 13, runtimeGeneration: 4 };
+    mockFetch(active);
+    assert.deepEqual(await client().forgetLibrary("retained/library", 12), active);
+    assert.equal(recorded[1].url, `${BASE_URL}/libraries/retained%2Flibrary/registration`);
+    assert.equal(recorded[1].method, "DELETE");
+    assert.equal(recorded[1].headers["x-mangoo-context-revision"], "12");
+    assert.equal(recorded[1].body, null);
+    assert.ok(recorded.every((request) => request.headers["x-mangoo-session"]));
+
+    mockFetch({ code: "library_identity_conflict", error: "library-identity-conflict" }, 409);
+    await assert.rejects(client().openLibrary({ databasePath: "D:/Conflict/Database" }, 13), { status: 409, body: { code: "library_identity_conflict", error: "library-identity-conflict" } });
+    mockFetch({ code: "stale_library_context", error: "stale-library-context" }, 409);
+    await assert.rejects(client().forgetLibrary("retained/library", 12), { status: 409, body: { code: "stale_library_context", error: "stale-library-context" } });
+  });
+
+  test("Library preflight and creation preserve the ordered all-path plan and partial activation", async () => {
+    const draft: LibraryPreflightRequest = {
+      name: "Example",
+      databasePath: "D:/Libraries/Example/Database",
+      contentRoots: [
+        { path: "E:/Existing Photos", createIfMissing: false },
+        { path: "D:/Libraries/Example/Files", createIfMissing: true }
+      ]
+    };
+    const preflight: LibraryPreflightResponse = {
+      ok: true, reason: "ok", pathRole: null, rootIndex: null,
+      normalizedDatabasePath: draft.databasePath,
+      normalizedContentRoots: draft.contentRoots,
+      preflightToken: "all-path-plan", availableBytes: null
+    };
+    const core = client();
+    mockFetch(preflight, 200, { "x-mangoo-context-revision": "42" });
+    assert.deepEqual(await core.preflightLibrary(draft), preflight);
+    assert.equal(recorded[0].url, `${BASE_URL}/libraries/preflight`);
+    assert.equal(recorded[0].method, "POST");
+    assert.deepEqual(JSON.parse(recorded[0].body!), draft);
+    assert.equal(recorded[0].headers["x-mangoo-context-revision"], undefined);
+
+    const library: LibrarySummary = {
+      libraryUuid: "complete-library", rootUuid: "virtual-library-root", name: draft.name,
+      databasePath: draft.databasePath, active: false, availability: "available",
+      lifecycleState: "ready", bindingState: "local-only", contextRevision: 42
+    };
+    const result = { library, activated: false, activationError: "library-runtime-busy" };
+    const creation = { ...draft, initialMode: "local-only" as const, preflightToken: preflight.preflightToken, activate: true, icon: null, color: "blue" };
+    mockFetch(result);
+    assert.deepEqual(await core.createLibrary(creation), result);
+    assert.equal(recorded[1].url, `${BASE_URL}/libraries`);
+    assert.deepEqual(JSON.parse(recorded[1].body!), creation);
+    assert.equal(recorded[1].headers["x-mangoo-context-revision"], "42");
+    assert.ok(recorded.every((request) => request.headers["x-mangoo-session"] === "secret"));
+  });
+
+  test("Library preflight failures preserve field indices and null normalized plans", async () => {
+    for (const [reason, pathRole, rootIndex] of [
+      ["content-roots-required", "content-root", null],
+      ["content-roots-overlap", "content-root", 1],
+      ["database-content-overlap", "database", null],
+      ["invalid-path", "content-root", 2],
+      ["invalid-name", null, null]
+    ] as const) {
+      const result: LibraryPreflightResponse = {
+        ok: false, reason, pathRole, rootIndex,
+        normalizedDatabasePath: null, normalizedContentRoots: null, preflightToken: null
+      };
+      mockFetch(result);
+      assert.deepEqual(await client().preflightLibrary({ name: "Draft", databasePath: "D:/Draft/Database", contentRoots: [] }), result);
+    }
+    const failure = { code: "path-changed", message: "The inspected content folder changed", pathRole: "content-root", rootIndex: 1 };
+    mockFetch(failure, 409);
+    await assert.rejects(client().createLibrary({
+      name: "Draft", databasePath: "D:/Draft/Database", initialMode: "local-only",
+      contentRoots: [{ path: "E:/Existing", createIfMissing: false }]
+    }), { status: 409, body: failure });
+  });
+
+  test("Library preflight and create forward caller cancellation without retry", async () => {
+    const requests = mockDeferredFetch();
+    const core = client();
+    const draft = { name: "Draft", databasePath: "D:/Draft/Database", contentRoots: [{ path: "D:/Draft/Files", createIfMissing: true }] };
+    for (const method of ["preflight", "create"] as const) {
+      const controller = new AbortController();
+      const pending = method === "preflight"
+        ? core.preflightLibrary(draft, { signal: controller.signal })
+        : core.createLibrary({ ...draft, initialMode: "local-only" }, { signal: controller.signal });
+      const rejected = assert.rejects(pending, { name: "AbortError" });
+      await waitForRequestCount(requests, method === "preflight" ? 1 : 2);
+      controller.abort();
+      await rejected;
+      assert.equal(requests.at(-1)?.signal?.aborted, true);
+    }
+    assert.equal(requests.length, 2);
+  });
+
   test("ordinary active-library mutations reuse the latest response revision fence", async () => {
-    mockFetch({ items: [] }, 200, { "x-megle-context-revision": "42" });
+    mockFetch({ items: [] }, 200, { "x-mangoo-context-revision": "42" });
     const core = client();
     await core.listTags();
     await core.createTag({ name: "fenced", color: null });
 
-    assert.equal(recorded[0].headers["x-megle-context-revision"], undefined);
-    assert.equal(recorded[1].headers["x-megle-context-revision"], "42");
+    assert.equal(recorded[0].headers["x-mangoo-context-revision"], undefined);
+    assert.equal(recorded[1].headers["x-mangoo-context-revision"], "42");
   });
 
   test("plugin endpoints encode the id", async () => {
@@ -793,8 +1040,10 @@ describe("createCoreClient", () => {
 
   test("plugin list preserves the manifest display name projection", async () => {
     const plugin = {
-      pluginId: "com.megle.onedrive",
-      name: "Megle OneDrive Sync Provider",
+      pluginId: "com.mangoo.onedrive",
+      lifecycleEpoch: 1,
+      contributions: null,
+      name: "Mangoo OneDrive Sync Provider",
       selectedVersion: "1.0.0",
       knownGoodVersion: null,
       enabledIntent: false,
@@ -817,7 +1066,7 @@ describe("createCoreClient", () => {
 
     const response = await client().listPlugins();
 
-    assert.equal(response.items[0]?.name, "Megle OneDrive Sync Provider");
+    assert.equal(response.items[0]?.name, "Mangoo OneDrive Sync Provider");
   });
 
   test("getPreviewBlob requests original media bytes", async () => {
@@ -825,7 +1074,7 @@ describe("createCoreClient", () => {
     const blob = await client().getPreviewBlob(42);
     assert.equal(recorded[0].method, "GET");
     assert.equal(recorded[0].url, `${BASE_URL}/media/42/preview`);
-    assert.equal(recorded[0].headers["x-megle-session"], "secret");
+    assert.equal(recorded[0].headers["x-mangoo-session"], "secret");
     assert.equal(await blob.text(), JSON.stringify("original bytes"));
   });
 
@@ -846,7 +1095,7 @@ describe("createCoreClient", () => {
     mockFetch("tier bytes");
     const resource = await client().getPreviewResource(42, { viewportLongPx: 1366.4 });
     assert.equal(recorded[0].url, `${BASE_URL}/media/42/preview?viewportLongPx=1366`);
-    // No x-megle-preview-tier on the mock response, so the client falls back to
+    // No x-mangoo-preview-tier on the mock response, so the client falls back to
     // "original" rather than reporting an undefined tier.
     assert.equal(resource.tier, "original");
   });
@@ -1142,13 +1391,13 @@ describe("createCoreClient", () => {
     await core.pauseLibrarySync("library/one", 17, { operationUuid: "op-1" });
     assert.equal(recorded[0].method, "POST");
     assert.match(recorded[0].url, /\/libraries\/library%2Fone\/sync\/pause$/);
-    assert.equal(recorded[0].headers["x-megle-context-revision"], "17");
+    assert.equal(recorded[0].headers["x-mangoo-context-revision"], "17");
     assert.deepEqual(JSON.parse(recorded[0].body!), { operationUuid: "op-1" });
 
     recorded.length = 0;
     mockFetch({ preflightToken: "00000000-0000-7000-8000-000000000001", expiresAt: 2, totalItems: 1, totalBytes: 42 });
     await core.preflightSyncRestore({
-      items: [{ accountUuid: "account", libraryUuid: "remote", name: "Remote", managedRoot: "D:/Remote" }]
+      items: [{ accountUuid: "account", libraryUuid: "remote", name: "Remote", placementBase: "D:/Remote" }]
     });
     assert.match(recorded[0].url, /\/sync\/restores\/preflight$/);
 
@@ -1157,11 +1406,31 @@ describe("createCoreClient", () => {
     await core.startSyncRestore({
       operationUuid: "restore-op",
       preflightToken: "00000000-0000-7000-8000-000000000001",
-      items: [{ accountUuid: "account", libraryUuid: "remote", name: "Remote", managedRoot: "D:/Remote" }]
+      items: [{ accountUuid: "account", libraryUuid: "remote", name: "Remote", placementBase: "D:/Remote" }]
     });
     assert.equal(recorded[0].method, "POST");
     assert.match(recorded[0].url, /\/sync\/restores$/);
-    assert.equal(JSON.parse(recorded[0].body!).items[0].managedRoot, "D:/Remote");
+    assert.equal(JSON.parse(recorded[0].body!).items[0].placementBase, "D:/Remote");
+  });
+
+  test("restore plans keep Database, placement base and content destinations distinct", async () => {
+    const core = client();
+    const item = {
+      restoreMode: "root-aware" as const, accountUuid: "account", libraryUuid: "remote",
+      placementBase: "D:/Restored", inventoryFence: "inventory", roots: []
+    };
+    const plan = {
+      restoreUuid: "restore", operationUuid: "operation", accountUuid: "account", libraryUuid: "remote",
+      name: "Restored", databasePath: "D:/Restored/Database", placementBase: "D:/Restored", contentPaths: [],
+      state: "running", phase: "catalog-restore", catalogReady: false, mediaItemsDone: 0, mediaBytesDone: 0, updatedAt: 1
+    };
+    mockFetch({ items: [plan] });
+    assert.deepEqual(await core.startSyncRestore({ operationUuid: "operation", preflightToken: "token", items: [item] }), { items: [plan] });
+    assert.deepEqual(JSON.parse(recorded[0].body!).items, [item]);
+    mockFetch({ ...plan, contentPaths: ["E:/Chosen Photos", "F:/Chosen Videos"] });
+    const restored = await core.getSyncRestore("restore");
+    assert.equal(restored.databasePath, "D:/Restored/Database");
+    assert.deepEqual(restored.contentPaths, ["E:/Chosen Photos", "F:/Chosen Videos"]);
   });
 
   test("managed-root-v2 endpoints encode identities and preserve revision fences", async () => {
@@ -1177,7 +1446,7 @@ describe("createCoreClient", () => {
       planUuid: "00000000-0000-7000-8000-000000000012"
     });
     assert.match(recorded[0].url, /\/libraries\/library%2Fone\/sync-folders\/root%2Fone\/rename\/commit$/);
-    assert.equal(recorded[0].headers["x-megle-context-revision"], "19");
+    assert.equal(recorded[0].headers["x-mangoo-context-revision"], "19");
     assert.deepEqual(JSON.parse(recorded[0].body!).expectedLocationHeads, ["00000000-0000-7000-8000-000000000011"]);
     assert.deepEqual(JSON.parse(recorded[0].body!).supersedes, ["00000000-0000-7000-8000-000000000011"]);
 
@@ -1216,7 +1485,7 @@ describe("createCoreClient", () => {
 
     mockFetch({ libraryUuid: "lib", libraryRootUuid: "00000000-0000-7000-8000-000000000021", defaultPlacementBase: "D:/Library", operationRevision: 3 });
     await core.updateSyncFolderSettings("lib", 41, { ...mutation, defaultPlacementBase: "D:/Library" });
-    assert.equal(recorded[0].headers["x-megle-context-revision"], "41");
+    assert.equal(recorded[0].headers["x-mangoo-context-revision"], "41");
 
     recorded.length = 0;
     mockFetch({ operationUuid, libraryUuid: "lib", rootUuid: "root", kind: "stop-sync", state: "running", phase: "fencing", operationRevision: 3, cutoverCommitted: false, createdAt: 1, updatedAt: 1 });
@@ -1224,7 +1493,7 @@ describe("createCoreClient", () => {
       ...mutation,
       expectedBindingGeneration: 5
     });
-    assert.equal(recorded[0].headers["x-megle-context-revision"], "42");
+    assert.equal(recorded[0].headers["x-mangoo-context-revision"], "42");
 
     recorded.length = 0;
     mockFetch({
@@ -1267,7 +1536,7 @@ describe("createCoreClient", () => {
       expectedBindingGeneration: 5,
       planUuid: "00000000-0000-7000-8000-000000000023"
     });
-    assert.equal(recorded[0].headers["x-megle-context-revision"], "43");
+    assert.equal(recorded[0].headers["x-mangoo-context-revision"], "43");
     assert.match(recorded[0].url, /\/sync-folders\/root\/stop\/commit$/);
 
     recorded.length = 0;
@@ -1277,7 +1546,7 @@ describe("createCoreClient", () => {
       expectedBindingGeneration: 5
     });
 
-    assert.equal(recorded[0].headers["x-megle-context-revision"], "43");
+    assert.equal(recorded[0].headers["x-mangoo-context-revision"], "43");
     assert.match(recorded[0].url, /\/relocations\/00000000-0000-7000-8000-000000000020\/retry$/);
   });
 

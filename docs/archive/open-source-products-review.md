@@ -4,9 +4,9 @@ Updated: 2026-05-16
 
 ## 目标
 
-这份文档抛开 Eagle 的技术路线，只评估现有开源产品或半成品能否作为 Megle 的基础、分支、参考实现或替代方案。
+这份文档抛开 Eagle 的技术路线，只评估现有开源产品或半成品能否作为 Mangoo 的基础、分支、参考实现或替代方案。
 
-Megle 的硬约束：
+Mangoo 的硬约束：
 
 - Windows 首发。
 - 索引已有目录，不导入到私有库。
@@ -37,7 +37,7 @@ Megle 的硬约束：
 3. **digiKam**
    - 功能最成熟的开源桌面照片管理器。
    - 适合学习数据库、目录/相册、元数据、缩略图和批处理设计。
-   - 不适合作为 Megle 的直接基础，C++/Qt/GPL/KDE 体系改造成本高，UI 目标也不一致。
+   - 不适合作为 Mangoo 的直接基础，C++/Qt/GPL/KDE 体系改造成本高，UI 目标也不一致。
 
 4. **Immich / PhotoPrism / PiGallery2 / Photoview**
    - 更适合 Web/Docker 或自托管相册。
@@ -47,13 +47,13 @@ Megle 的硬约束：
 
 - 如果项目必须闭源或商业友好：不要 fork GPL/AGPL 项目，继续自研 Core，但大量参考 Photofield 的 Web/Docker 与高性能浏览思路。
 - 如果项目可以 GPL-3.0 开源：可以认真评估 fork Lap 作为桌面端起点，但仍要重做百万级索引、缩略图队列和文件操作一致性。
-- 不建议 fork Immich/PhotoPrism/digiKam 作为 Megle 主线，它们会把项目拖进完全不同的产品形态和技术栈。
+- 不建议 fork Immich/PhotoPrism/digiKam 作为 Mangoo 主线，它们会把项目拖进完全不同的产品形态和技术栈。
 
 ## 候选项目对比
 
-| 项目 | 类型 | 技术倾向 | 许可风险 | 与 Megle 匹配度 | 结论 |
+| 项目 | 类型 | 技术倾向 | 许可风险 | 与 Mangoo 匹配度 | 结论 |
 | --- | --- | --- | --- | --- | --- |
-| Lap | 桌面本地照片管理器 | Tauri/Vue/Rust/SQLite | GPL-3.0 | 高 | 最像 Megle，可参考或 GPL fork |
+| Lap | 桌面本地照片管理器 | Tauri/Vue/Rust/SQLite | GPL-3.0 | 高 | 最像 Mangoo，可参考或 GPL fork |
 | Photofield | Web/Docker 图片浏览器 | Go/Vue/SQLite | MIT | 中高 | 最值得借鉴高性能浏览和 Web 路线 |
 | digiKam | 成熟桌面照片管理器 | C++/Qt/KDE | GPL | 中 | 功能参考，不建议 fork |
 | Immich | 自托管照片/视频平台 | Server/Web/Mobile/Postgres | AGPL | 中 | Web/Docker 参考，不适合桌面主线 |
@@ -77,7 +77,7 @@ Megle 的硬约束：
 
 优点：
 
-- 产品形态非常接近 Megle。
+- 产品形态非常接近 Mangoo。
 - 已经是桌面本地应用，而不是纯 Web 相册。
 - 从公开说明看，强调不把照片上传云端。
 - 对“已有文件夹 + 本地索引 + 标签”的方向较贴近。
@@ -85,7 +85,7 @@ Megle 的硬约束：
 
 风险：
 
-- GPL-3.0：如果直接复用或 fork，Megle 基本也需要 GPL-3.0 开源。
+- GPL-3.0：如果直接复用或 fork，Mangoo 基本也需要 GPL-3.0 开源。
 - 目标数据规模公开描述更偏 10 万级，不足以证明几百万级。
 - UI/交互不一定符合你想要的 Eagle 式高密度资产管理体验。
 - 若已有 AI/地图/相册等功能耦合较深，删减和重构成本可能不低。
@@ -117,7 +117,7 @@ Megle 的硬约束：
 
 - 更像只读/轻管理图片浏览器，不是完整 Windows 桌面文件管理器。
 - 标签、评分、真实文件移动/删除不是核心能力。
-- 视频和长尾格式能力未必覆盖 Megle 目标。
+- 视频和长尾格式能力未必覆盖 Mangoo 目标。
 - UI 风格是 Web gallery，不是本地高密度资产管理工具。
 
 建议：
@@ -144,7 +144,7 @@ Megle 的硬约束：
 
 - C++/Qt/KDE 体系庞大，学习和改造成本高。
 - GPL/KDE 生态约束明显。
-- UI 和 Megle 目标差异较大。
+- UI 和 Mangoo 目标差异较大。
 - 作为 fork 改成液态玻璃、Web/Docker 复用几乎等于重做。
 - 公开性能目标常见描述是 100K+ 级照片，不等于几百万级媒体库。
 
@@ -177,7 +177,7 @@ Megle 的硬约束：
 
 建议：
 
-- 不建议作为 Megle 主线基础。
+- 不建议作为 Mangoo 主线基础。
 - 可以参考其 Web/Docker、缩略图任务、后台 job、外部库体验。
 
 ### 5. PhotoPrism
@@ -199,7 +199,7 @@ Megle 的硬约束：
 - 产品不是 Windows 桌面工具。
 - UI 不以真实目录树和本地文件操作为核心。
 - 授权和商业功能边界要仔细审查。
-- 如果 Megle 直接采用，会继承大量不需要的云相册/AI/账户模型复杂度。
+- 如果 Mangoo 直接采用，会继承大量不需要的云相册/AI/账户模型复杂度。
 
 建议：
 
@@ -274,7 +274,7 @@ Megle 的硬约束：
 建议：
 
 - 参考标签数据模型。
-- 不建议作为 Megle 基础。
+- 不建议作为 Mangoo 基础。
 
 ### 9. Oculante
 
@@ -287,7 +287,7 @@ Megle 的硬约束：
 
 - MIT 许可，授权友好。
 - 对“快速切图”和“预览缓存”的实现思路值得参考。
-- Rust 技术方向与 Megle Core 有一定重合。
+- Rust 技术方向与 Mangoo Core 有一定重合。
 
 风险：
 
@@ -343,7 +343,7 @@ Electron + React + Rust Core + SQLite + libvips/FFmpeg + plugins
 
 适用条件：
 
-- Megle 可以 GPL-3.0 开源。
+- Mangoo 可以 GPL-3.0 开源。
 - 你希望最快做出桌面可用版本。
 
 ### Fork Photofield
@@ -357,7 +357,7 @@ Electron + React + Rust Core + SQLite + libvips/FFmpeg + plugins
 缺点：
 
 - 桌面文件管理、标签评分、真实文件操作缺口大。
-- UI 产品形态和 Megle 差异明显。
+- UI 产品形态和 Mangoo 差异明显。
 
 适用条件：
 
@@ -368,9 +368,9 @@ Electron + React + Rust Core + SQLite + libvips/FFmpeg + plugins
 
 结论：
 
-- 不推荐作为 Megle 主线。
+- 不推荐作为 Mangoo 主线。
 - 它们都足够强，但强在另一个方向。
-- fork 后为了适配 Megle 的约束，改造成本可能超过自研。
+- fork 后为了适配 Mangoo 的约束，改造成本可能超过自研。
 
 ## 更新后的推荐方案
 

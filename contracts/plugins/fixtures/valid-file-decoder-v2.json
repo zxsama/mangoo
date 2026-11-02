@@ -1,0 +1,48 @@
+{
+  "manifestVersion": 2,
+  "id": "com.mangoo.ppm-decoder",
+  "name": "PPM Decoder",
+  "version": "0.1.0",
+  "engine": "process",
+  "entry": {
+    "windowsX64": "bin/mangoo-ppm-decoder.exe",
+    "linuxX64": "bin/mangoo-ppm-decoder"
+  },
+  "rpc": {
+    "wireVersions": [
+      1
+    ],
+    "capabilities": [
+      "file-decoder.v1"
+    ],
+    "methodVersions": {
+      "health": 1,
+      "diagnostics": 1,
+      "shutdown": 1,
+      "decoder.decode": 1
+    },
+    "decoder": {
+      "implementationVersion": "1.0.0",
+      "extensions": [
+        "ppm"
+      ],
+      "purposes": [
+        "thumbnail",
+        "preview"
+      ]
+    }
+  },
+  "activationEvents": [
+    "file-decode-requested",
+    "diagnostics-requested"
+  ],
+  "requestedPermissions": [
+    {
+      "kind": "temp-storage",
+      "maxBytes": 67108864
+    }
+  ],
+  "integrity": {
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}

@@ -12,6 +12,7 @@ pub struct TrustEntry {
     pub version: String,
     pub platform: Platform,
     pub binary_sha256: [u8; 32],
+    pub manifest_sha256: [u8; 32],
 }
 
 /// Build-time trust root. Provider packaging adds exact entries here; an empty
@@ -20,36 +21,19 @@ pub struct TrustEntry {
 pub fn embedded_trust_registry() -> &'static [TrustEntry] {
     static REGISTRY: std::sync::OnceLock<Vec<TrustEntry>> = std::sync::OnceLock::new();
     REGISTRY.get_or_init(|| {
-        let fake_hash = super::generated_trust::GENERATED_FAKE_PROVIDER_SHA256;
-        let onedrive_hash = super::generated_trust::GENERATED_ONEDRIVE_PROVIDER_SHA256;
-        let mut entries = vec![
-            TrustEntry {
-                plugin_id: "com.megle.fake-sync".into(),
-                version: "1.0.0".into(),
-                platform: Platform::WindowsX64,
-                binary_sha256: fake_hash,
-            },
-            TrustEntry {
-                plugin_id: "com.megle.fake-sync".into(),
-                version: "1.0.0".into(),
-                platform: Platform::LinuxX64,
-                binary_sha256: fake_hash,
-            },
-            TrustEntry {
-                plugin_id: "com.megle.onedrive".into(),
-                version: "1.0.0".into(),
-                platform: Platform::WindowsX64,
-                binary_sha256: onedrive_hash,
-            },
-            TrustEntry {
-                plugin_id: "com.megle.onedrive".into(),
-                version: "1.0.0".into(),
-                platform: Platform::LinuxX64,
-                binary_sha256: onedrive_hash,
-            },
-        ];
-        entries.retain(|entry| entry.binary_sha256 != [0; 32]);
-        entries
+        super::generated_trust::GENERATED_PLUGIN_TRUST
+            .iter()
+            .filter(|(_, _, _, hash, manifest_hash)| *hash != [0; 32] && *manifest_hash != [0; 32])
+            .map(
+                |(plugin_id, version, platform, binary_sha256, manifest_sha256)| TrustEntry {
+                    plugin_id: (*plugin_id).into(),
+                    version: (*version).into(),
+                    platform: *platform,
+                    binary_sha256: *binary_sha256,
+                    manifest_sha256: *manifest_sha256,
+                },
+            )
+            .collect()
     })
 }
 
@@ -62,6 +46,7 @@ pub enum TrustError {
     UnsafeOwnership,
     HashMismatch,
     IdentityMismatch,
+    InvalidDocument,
     Io(std::io::Error),
 }
 
@@ -78,6 +63,7 @@ impl std::fmt::Display for TrustError {
             Self::UnsafeOwnership => write!(formatter, "trusted executable ownership is unsafe"),
             Self::HashMismatch => write!(formatter, "trusted executable hash does not match"),
             Self::IdentityMismatch => write!(formatter, "trusted executable identity changed"),
+            Self::InvalidDocument => write!(formatter, "trusted plugin document is invalid"),
             Self::Io(error) => write!(formatter, "trusted executable I/O failed: {error}"),
         }
     }
@@ -151,6 +137,10 @@ pub fn verify_bundled_entry(
     platform: Platform,
     allowlist: &[TrustEntry],
 ) -> Result<VerifiedExecutable, TrustError> {
+    verify_manifest(manifest, bundled_root, platform, allowlist)?;
+    if let Some(ui) = manifest.contributions.as_ref().and_then(|c| c.ui.as_ref()) {
+        read_ui_document(bundled_root, ui)?;
+    }
     let relative = manifest
         .entry_for(platform)
         .ok_or(TrustError::MissingEntry)?;
@@ -178,6 +168,75 @@ pub fn verify_bundled_entry(
     }
 
     verified_from_path(&canonical, cfg!(unix), Some(expected.binary_sha256))
+}
+
+pub const MAX_UI_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Read from a pinned no-follow handle. On Windows the complete parent chain
+/// also stays pinned against replacement; Unix packages require safe ownership.
+fn read_bounded_document(root: &Path, relative: &str, limit: usize) -> Result<Vec<u8>, TrustError> {
+    let path = root.join(relative);
+    #[cfg(unix)]
+    validate_unix_components(&path)?;
+    let parent = path.parent().ok_or(TrustError::EntryEscapesRoot)?;
+    let leaf = path.file_name().ok_or(TrustError::EntryEscapesRoot)?;
+    let directory = crate::library_path::MarkerDirectoryGuard::open_readonly(parent)?;
+    let file = directory.open_marker(leaf, false)?;
+    if file.metadata()?.len() > limit as u64 {
+        return Err(TrustError::InvalidDocument);
+    }
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(TrustError::InvalidDocument);
+    }
+    directory.verify_unchanged()?;
+    Ok(bytes)
+}
+
+pub fn verify_manifest(
+    manifest: &ManifestRecord,
+    root: &Path,
+    platform: Platform,
+    allowlist: &[TrustEntry],
+) -> Result<(), TrustError> {
+    let expected = allowlist
+        .iter()
+        .find(|entry| {
+            entry.plugin_id == manifest.id
+                && entry.version == manifest.version
+                && entry.platform == platform
+        })
+        .ok_or(TrustError::MissingEntry)?;
+    let path = root.join("plugin.json");
+    let bytes = read_bounded_document(root, "plugin.json", 256 * 1024)?;
+    let hash: [u8; 32] = Sha256::digest(&bytes).into();
+    if hash != expected.manifest_sha256 {
+        return Err(TrustError::HashMismatch);
+    }
+    let mut actual = super::super::manifest::parse_manifest_bytes(&bytes, &path)
+        .map_err(|_| TrustError::InvalidDocument)?;
+    let mut selected = manifest.clone();
+    actual.manifest_path = PathBuf::new();
+    selected.manifest_path = PathBuf::new();
+    if actual != selected {
+        return Err(TrustError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+pub fn read_ui_document(
+    root: &Path,
+    ui: &super::super::contributions::PluginUiContribution,
+) -> Result<String, TrustError> {
+    if !super::super::contributions::valid_ui_entry(&ui.entry) {
+        return Err(TrustError::EntryEscapesRoot);
+    }
+    let bytes = read_bounded_document(root, &ui.entry, MAX_UI_DOCUMENT_BYTES)?;
+    if format!("{:x}", Sha256::digest(&bytes)) != ui.sha256 {
+        return Err(TrustError::HashMismatch);
+    }
+    String::from_utf8(bytes).map_err(|_| TrustError::InvalidDocument)
 }
 
 fn verified_from_path(
@@ -296,7 +355,7 @@ mod tests {
     #[test]
     fn exact_allowlist_hash_is_required() {
         let root = std::env::temp_dir().join(format!(
-            "megle_trust_{}_{}",
+            "mangoo_trust_{}_{}",
             std::process::id(),
             uuid::Uuid::now_v7()
         ));
@@ -304,7 +363,7 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(bin.join("provider"), b"trusted").unwrap();
         let json = format!(
-            r#"{{"manifestVersion":2,"id":"com.megle.test","name":"Test","version":"1.0.0","engine":"process","entry":{{"linuxX64":"bin/provider"}},"rpc":{{"wireVersions":[1],"capabilities":["sync-provider.v1"],"methodVersions":{{"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.poll":1,"auth.cancel":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.get_range":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1}}}},"activationEvents":["sync-enabled"],"requestedPermissions":[],"integrity":{{"sha256":"{}"}}}}"#,
+            r#"{{"manifestVersion":2,"id":"com.mangoo.test","name":"Test","version":"1.0.0","engine":"process","entry":{{"linuxX64":"bin/provider"}},"rpc":{{"wireVersions":[1],"capabilities":["sync-provider.v1"],"methodVersions":{{"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.poll":1,"auth.cancel":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.get_range":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1}}}},"activationEvents":["sync-enabled"],"requestedPermissions":[],"integrity":{{"sha256":"{}"}}}}"#,
             "0".repeat(64)
         );
         let manifest_path = root.join("plugin.json");
@@ -316,7 +375,31 @@ mod tests {
             version: manifest.version.clone(),
             platform: Platform::LinuxX64,
             binary_sha256: hash,
+            manifest_sha256: Sha256::digest(std::fs::read(&manifest_path).unwrap()).into(),
         }];
+
+        // The manifest's self-declared digest is never an executable trust root.
+        assert!(matches!(
+            verify_bundled_entry(&manifest, &root, Platform::LinuxX64, &[]),
+            Err(TrustError::MissingEntry)
+        ));
+        for (plugin_id, version, platform) in [
+            ("com.mangoo.other", "1.0.0", Platform::LinuxX64),
+            ("com.mangoo.test", "2.0.0", Platform::LinuxX64),
+            ("com.mangoo.test", "1.0.0", Platform::WindowsX64),
+        ] {
+            let unrelated = [TrustEntry {
+                plugin_id: plugin_id.into(),
+                version: version.into(),
+                platform,
+                binary_sha256: hash,
+                manifest_sha256: allowlist[0].manifest_sha256,
+            }];
+            assert!(matches!(
+                verify_bundled_entry(&manifest, &root, Platform::LinuxX64, &unrelated),
+                Err(TrustError::MissingEntry)
+            ));
+        }
 
         #[cfg(windows)]
         assert!(verify_bundled_entry(&manifest, &root, Platform::LinuxX64, &allowlist).is_ok());
@@ -335,7 +418,7 @@ mod tests {
     #[test]
     fn path_replacement_does_not_change_verified_handle() {
         let root = std::env::temp_dir().join(format!(
-            "megle_trust_swap_{}_{}",
+            "mangoo_trust_swap_{}_{}",
             std::process::id(),
             uuid::Uuid::now_v7()
         ));
@@ -353,5 +436,68 @@ mod tests {
             verified.expected_sha256()
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ui_document_reads_are_bounded_utf8_and_pin_the_selected_manifest() {
+        let root = std::env::temp_dir().join(format!("mangoo-ui-trust-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(root.join("ui")).unwrap();
+        let mut raw: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../contracts/plugins/fixtures/valid-ui-provider-v2.json"
+        ))
+        .unwrap();
+        let document = b"<html>fixture</html>";
+        raw["contributions"]["ui"]["sha256"] =
+            serde_json::json!(format!("{:x}", Sha256::digest(document)));
+        let bytes = serde_json::to_vec(&raw).unwrap();
+        let manifest_path = root.join("plugin.json");
+        std::fs::write(&manifest_path, &bytes).unwrap();
+        std::fs::write(root.join("ui/index.html"), document).unwrap();
+        let manifest = crate::plugins::manifest::parse_manifest(&manifest_path).unwrap();
+        let trust = [TrustEntry {
+            plugin_id: manifest.id.clone(),
+            version: manifest.version.clone(),
+            platform: Platform::WindowsX64,
+            binary_sha256: [1; 32],
+            manifest_sha256: Sha256::digest(&bytes).into(),
+        }];
+        verify_manifest(&manifest, &root, Platform::WindowsX64, &trust).unwrap();
+        let mut altered = manifest.clone();
+        altered
+            .contributions
+            .as_mut()
+            .unwrap()
+            .ui
+            .as_mut()
+            .unwrap()
+            .views[0]
+            .title = "Changed".into();
+        assert!(matches!(
+            verify_manifest(&altered, &root, Platform::WindowsX64, &trust),
+            Err(TrustError::IdentityMismatch)
+        ));
+        let mut ui = manifest.contributions.unwrap().ui.unwrap();
+        assert_eq!(read_ui_document(&root, &ui).unwrap().as_bytes(), document);
+        let invalid = [0xff];
+        std::fs::write(root.join("ui/index.html"), invalid).unwrap();
+        ui.sha256 = format!("{:x}", Sha256::digest(invalid));
+        assert!(matches!(
+            read_ui_document(&root, &ui),
+            Err(TrustError::InvalidDocument)
+        ));
+        let oversized = std::fs::File::create(root.join("ui/index.html")).unwrap();
+        oversized.set_len(MAX_UI_DOCUMENT_BYTES as u64 + 1).unwrap();
+        drop(oversized);
+        assert!(matches!(
+            read_ui_document(&root, &ui),
+            Err(TrustError::InvalidDocument)
+        ));
+        ui.entry = "../outside.html".into();
+        assert!(matches!(
+            read_ui_document(&root, &ui),
+            Err(TrustError::EntryEscapesRoot)
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

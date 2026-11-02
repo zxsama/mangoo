@@ -1,4 +1,4 @@
-# Megle Web UI
+# Mangoo Web UI
 
 React UI shared by Electron desktop and future Web/Docker.
 

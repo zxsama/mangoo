@@ -1,8 +1,7 @@
-import type { HostPluginProjection } from "@megle/core-client";
-import { Cloud, Plug } from "lucide-react";
+import type { HostPluginProjection } from "@mangoo/core-client";
+import { Cloud, Database, Plug } from "../../design/icons";
 import type { KeyboardEvent } from "react";
 import { StatusPill } from "./StatusPill";
-import { ONEDRIVE_PLUGIN_ID } from "./pluginAuthModel";
 
 interface PluginCardProps {
   plugin: HostPluginProjection;
@@ -42,7 +41,8 @@ export function PluginCard({
   onSelect
 }: PluginCardProps) {
   const errorTooltip = plugin.lastErrorDetail ?? undefined;
-  const PluginIcon = plugin.pluginId === ONEDRIVE_PLUGIN_ID ? Cloud : Plug;
+  const icon = plugin.contributions?.presentation?.icon;
+  const PluginIcon = icon === "cloud" ? Cloud : icon === "storage" ? Database : Plug;
 
   return (
     <div
@@ -64,7 +64,7 @@ export function PluginCard({
         title={plugin.name}
       >
         <span className="plugin-card-icon" data-direct-contact-content>
-          <PluginIcon aria-hidden="true" size={16} strokeWidth={1.8} />
+          <PluginIcon aria-hidden="true" size={16} weight="regular" />
         </span>
         <span className="plugin-card-identity" data-direct-contact-content>
           <span className="plugin-card-name">{plugin.name}</span>

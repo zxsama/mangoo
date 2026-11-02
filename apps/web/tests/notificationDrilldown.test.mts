@@ -6,7 +6,7 @@ import type {
   DesktopNotificationOperation,
   DesktopProcessLogLine,
   DesktopThumbnailCacheSummary
-} from "@megle/notification-contract";
+} from "@mangoo/notification-contract";
 import {
   activateThumbnailFailureLogs,
   buildCompactNotificationModel,

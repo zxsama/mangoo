@@ -1,5 +1,16 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <rect width="64" height="64" rx="14" fill="#090d11"/>
-  <path d="M14 45V19h8l10 16 10-16h8v26h-8V31L35 43h-6l-7-12v14h-8z" fill="#97dbe2"/>
-  <path d="M18 15h28" stroke="#e7b66b" stroke-width="4" stroke-linecap="round" opacity=".9"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="fruit" x1="17" y1="17" x2="47" y2="55" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFD66B"/>
+      <stop offset=".52" stop-color="#FFB638"/>
+      <stop offset="1" stop-color="#F18A26"/>
+    </linearGradient>
+    <linearGradient id="leaf" x1="33" y1="6" x2="47" y2="17" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A9D977"/>
+      <stop offset="1" stop-color="#4EAB76"/>
+    </linearGradient>
+  </defs>
+  <path d="M34 15C34 7 42 3 54 5C52 14 45 19 34 17Z" fill="url(#leaf)"/>
+  <path d="M35 14C49 14 57 24 54 38C51 52 38 60 24 56C12 53 7 44 10 33C13 21 23 14 35 14Z" fill="url(#fruit)"/>
+  <path d="M17 43V27C17 25.9 17.9 25 19 25H22.2L30 35L37.8 25H41C42.1 25 43 25.9 43 27V43H37V34L30 42L23 34V43H17Z" fill="#442D23"/>
 </svg>

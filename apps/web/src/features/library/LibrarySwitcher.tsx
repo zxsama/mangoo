@@ -1,11 +1,16 @@
 import { useEffect, useReducer, useRef, useState } from "react";
-import { Check, FolderMinus, FolderPlus, Search, X } from "lucide-react";
+import { Check, FolderMinus, FolderOpen, FolderPlus, Library, Minus, MoreHorizontal, Palette, Search, X } from "../../design/icons";
 import { createCoreClient } from "../../core/client";
 import {
   listLibraries,
+  forgetLibraryEntry,
+  getDesktopBridge,
+  getDesktopShellActions,
+  openPath,
   pickNativeFolder,
   setLibraryIcon,
   switchLibrary,
+  subscribeLibraryRegistry,
 } from "../../core/desktop";
 import type { LibrarySummary } from "../../core/libraryTypes";
 import {
@@ -20,7 +25,9 @@ import {
   AnchoredOverlay,
   ModalSurface,
   OverlayDialogActions,
+  OverlayDialogBody,
   OverlayDialogHeader,
+  OverlayInlineStatus,
   OverlayMenuItem,
   OverlayMenuList,
   OVERLAY_VIEWPORT_GUTTER_PX,
@@ -31,14 +38,12 @@ import {
   DEFAULT_LIBRARY_COLOR,
   DEFAULT_LIBRARY_ICON,
   LibraryGlyph,
-  LibraryIconPicker,
 } from "./libraryGlyph";
+import { LibraryAppearanceEditor } from "./LibraryAppearanceEditor";
 import { ManagedLibraryWizard } from "./ManagedLibraryWizard";
-import {
-  enrollExistingSyncFolder,
-  useSyncOrchestration,
-} from "../sync/useSyncOrchestration";
-import { syncStatusLabel } from "../sync/syncModel";
+import { OpenLibraryDialog } from "./OpenLibraryDialog";
+import { libraryOperationError } from "./libraryOperationError";
+import { PluginContributionsSlot } from "../plugins/PluginContributionsSlot";
 import {
   INITIAL_LIBRARY_SWITCHER_INTERACTION_STATE,
   librarySwitcherInteractionReducer,
@@ -60,8 +65,7 @@ export interface LibrarySwitcherProps {
 }
 
 function failureMessage(cause: unknown): string {
-  if (cause instanceof Error && cause.message) return cause.message;
-  return typeof cause === "string" ? cause : String(cause);
+  return libraryOperationError(cause);
 }
 
 function ensureDesktopMutationSucceeded(
@@ -81,18 +85,25 @@ export function LibrarySwitcher({
   restoreFocusTarget,
 }: LibrarySwitcherProps) {
   const overlays = useOverlayStack();
-  const sync = useSyncOrchestration();
   const [libs, setLibs] = useState<LibrarySummary[]>([]);
   const [query, setQuery] = useState("");
   const [wizardOpen, setWizardOpen] = useState(false);
-  const [wizardMode, setWizardMode] = useState<"create" | "restore">("create");
   const [firstRun, setFirstRun] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [menu, setMenu] = useState<{ libraryId: string; anchor: HTMLButtonElement } | null>(null);
+  const [appearanceTarget, setAppearanceTarget] = useState<LibrarySummary | null>(null);
+  const appearanceRestoreFocusRef = useRef<HTMLElement | null>(null);
+  const [forgetTarget, setForgetTarget] = useState<LibrarySummary | null>(null);
+  const [forgetPending, setForgetPending] = useState(false);
+  const [forgetError, setForgetError] = useState<string | null>(null);
+  const [openDialog, setOpenDialog] = useState(false);
   const [interaction, dispatch] = useReducer(
     librarySwitcherInteractionReducer,
     INITIAL_LIBRARY_SWITCHER_INTERACTION_STATE,
   );
   const cancelRef = useRef<HTMLButtonElement>(null);
-  const removeTriggerRef = useRef<HTMLButtonElement>(null);
+  const removeTriggerRef = useRef<HTMLButtonElement | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const mountedRef = useRef(false);
   const previousOpenRef = useRef(open);
@@ -100,6 +111,9 @@ export function LibrarySwitcher({
   const sessionGenerationRef = useRef(0);
   const removePendingRef = useRef<number | null>(null);
   const wizardRestoreFocusRef = useRef<HTMLElement | null>(null);
+  const forgetPendingRef = useRef(false);
+  const forgetCancelRef = useRef<HTMLButtonElement>(null);
+  const forgetTriggerRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -110,6 +124,10 @@ export function LibrarySwitcher({
       sessionGenerationRef.current += 1;
     };
   }, []);
+
+  useEffect(() => subscribeLibraryRegistry(() => {
+    if (mountedRef.current) void reload();
+  }), []);
 
   useEffect(() => {
     const wasOpen = previousOpenRef.current;
@@ -122,6 +140,9 @@ export function LibrarySwitcher({
     if (wasOpen) {
       reloadGenerationRef.current += 1;
       removePendingRef.current = null;
+      setMenu(null);
+      setAppearanceTarget(null);
+      setForgetTarget(null);
       dispatch({ type: "close-root" });
     }
   }, [open]);
@@ -142,10 +163,13 @@ export function LibrarySwitcher({
 
   async function reload(detectFirstRun = false): Promise<void> {
     const generation = ++reloadGenerationRef.current;
+    setLoading(true);
+    setError(null);
     try {
       const nextLibraries = await listLibraries();
       if (!mountedRef.current || generation !== reloadGenerationRef.current) return;
       setLibs(nextLibraries);
+      setLoading(false);
       if (detectFirstRun && nextLibraries.length === 0) {
         setFirstRun(true);
         wizardRestoreFocusRef.current = restoreFocusTarget;
@@ -154,6 +178,8 @@ export function LibrarySwitcher({
       }
     } catch (cause) {
       if (!mountedRef.current || generation !== reloadGenerationRef.current) return;
+      setLoading(false);
+      setError(failureMessage(cause));
       await reportFailure("library-list", "library-registry", cause);
     }
   }
@@ -163,10 +189,13 @@ export function LibrarySwitcher({
     target: string,
     operation: () => Promise<void>,
   ): Promise<boolean> {
+    const session = sessionGenerationRef.current;
+    setError(null);
     try {
       await operation();
       return true;
     } catch (cause) {
+      if (ownsSession(session)) setError(failureMessage(cause));
       await reportFailure(source, target, cause);
       return false;
     }
@@ -174,8 +203,8 @@ export function LibrarySwitcher({
 
   const filtered = libs.filter(
     (item) =>
-      item.name.toLowerCase().includes(query.toLowerCase()) ||
-      item.managedRoot.toLowerCase().includes(query.toLowerCase()),
+      item.name.toLowerCase().includes(query.trim().toLowerCase()) ||
+      item.databasePath.toLowerCase().includes(query.trim().toLowerCase()),
   );
   const removeTarget = interaction.remove.kind === "closed" ? null : interaction.remove;
   const removePending = interaction.remove.kind === "pending";
@@ -188,9 +217,8 @@ export function LibrarySwitcher({
     });
   }
 
-  function openManagedLibraryWizard(mode: "create" | "restore") {
+  function openManagedLibraryWizard() {
     wizardRestoreFocusRef.current = restoreFocusTarget;
-    setWizardMode(mode);
     setFirstRun(false);
     overlays.openRoot("managed-library");
     setWizardOpen(true);
@@ -199,6 +227,35 @@ export function LibrarySwitcher({
   function closeManagedLibraryWizard() {
     setWizardOpen(false);
     overlays.closeRoot("managed-library");
+  }
+
+  function openExistingLibraryDialog() {
+    wizardRestoreFocusRef.current = restoreFocusTarget;
+    overlays.openRoot("managed-library");
+    setOpenDialog(true);
+  }
+
+  async function confirmForget() {
+    if (!forgetTarget || forgetPendingRef.current) return;
+    const session = sessionGenerationRef.current;
+    forgetPendingRef.current = true;
+    setForgetPending(true);
+    setForgetError(null);
+    try {
+      await forgetLibraryEntry(forgetTarget.libraryUuid);
+      if (ownsSession(session)) {
+        setForgetTarget(null);
+        setMenu(null);
+        dispatch({ type: "close-root" });
+        void reload();
+      }
+    } catch (cause) {
+      if (ownsSession(session)) setForgetError(failureMessage(cause));
+      await reportFailure("library-forget", forgetTarget.libraryUuid, cause);
+    } finally {
+      forgetPendingRef.current = false;
+      if (mountedRef.current) setForgetPending(false);
+    }
   }
 
   async function onAddFolder() {
@@ -212,36 +269,18 @@ export function LibrarySwitcher({
     }
     if (!folder) return;
     const activeLibrary = libs.find((item) => item.active);
-    const activeSyncStatus = (sync.snapshot?.libraries ?? []).find(
-      (item) => item.libraryUuid === activeLibrary?.libraryUuid,
-    );
-    const shouldEnroll = Boolean(
-      activeLibrary &&
-        (activeLibrary.bindingState !== "local-only" ||
-          (activeSyncStatus !== undefined && activeSyncStatus.lifecycle !== "local-only")),
-    );
     const succeeded = await runMutation(
-      shouldEnroll ? "sync-folder-enroll" : "library-add-root",
+      "library-add-root",
       folder,
       async () => {
         const active = await createCoreClient().getActiveLibrary();
         if (!activeLibrary || active.library?.libraryUuid !== activeLibrary.libraryUuid) {
           throw new Error("活动资源库已改变，请重新选择文件夹。");
         }
-        if (shouldEnroll && activeLibrary) {
-          await enrollExistingSyncFolder(activeLibrary.libraryUuid, folder);
-          return;
-        }
         await library.addRoot(folder);
       },
     );
     if (succeeded) {
-      if (shouldEnroll) {
-        void library.refresh().catch((cause) => {
-          void reportFailure("sync-folder-refresh", folder, cause);
-        });
-        void sync.refresh();
-      }
       if (ownsSession(session)) void reload();
     }
   }
@@ -271,24 +310,13 @@ export function LibrarySwitcher({
     void reload();
   }
 
-  async function applyIcon(item: LibrarySummary, icon: string, color: string) {
-    const session = sessionGenerationRef.current;
-    const succeeded = await runMutation("library-set-icon", item.libraryUuid, async () => {
-      ensureDesktopMutationSucceeded(
-        await setLibraryIcon(item.libraryUuid, icon, color),
-        "Library icon update failed",
-      );
-    });
-    if (succeeded && ownsSession(session)) void reload();
-  }
-
   const searchField = (
     <div className="library-switcher-search">
       <Search size={14} aria-hidden="true" />
       <input
         aria-label="搜索资源库"
-        onChange={(event) => setQuery(event.target.value)}
-        placeholder="搜索…"
+        onChange={(event) => { setQuery(event.target.value); setMenu(null); dispatch({ type: "close-root" }); }}
+        placeholder="搜索资源库"
         ref={searchRef}
         value={query}
       />
@@ -297,7 +325,7 @@ export function LibrarySwitcher({
 
   const closeButton = (
     <button
-      aria-label="Close"
+      aria-label="关闭资源库面板"
       className="library-switcher-close"
       data-interactive-pointer-target="true"
       onClick={onClose}
@@ -308,163 +336,82 @@ export function LibrarySwitcher({
   );
 
   const libraryRows = filtered.map((item) => {
-    const syncStatus = (sync.snapshot?.libraries ?? []).find((status) => status.libraryUuid === item.libraryUuid);
     const icon = item.icon ?? DEFAULT_LIBRARY_ICON;
     const color = item.color ?? DEFAULT_LIBRARY_COLOR;
-    const iconMenuOpen =
-      interaction.nested.kind === "icon" && interaction.nested.libraryId === item.libraryUuid;
-    const removeMenuOpen =
-      item.active &&
-      interaction.nested.kind === "remove" &&
-      interaction.nested.libraryId === item.libraryUuid;
-    const iconMenuAnchor =
-      interaction.nested.kind === "icon" && interaction.nested.libraryId === item.libraryUuid
-        ? interaction.nested.anchor
-        : null;
-    const removeMenuAnchor =
-      interaction.nested.kind === "remove" && interaction.nested.libraryId === item.libraryUuid
-        ? interaction.nested.anchor
-        : null;
+    const menuOpen = menu?.libraryId === item.libraryUuid;
+    const nested = interaction.nested;
+    const removeMenuOpen = menuOpen && item.active && nested.kind === "remove" && nested.libraryId === item.libraryUuid;
+    const removeMenuAnchor = nested.kind === "remove" && nested.libraryId === item.libraryUuid ? nested.anchor : null;
+    const menuId = `library-actions-${item.libraryUuid}`;
     return (
       <li
-        className={`library-switcher-row${item.active ? " active" : ""}${item.availability === "available" ? "" : " unavailable"}`}
+        aria-disabled={forgetPending || undefined}
+        className={`library-switcher-row${item.active ? " active" : ""}`}
+        data-interactive-pointer-owner="true"
         key={item.libraryUuid}
       >
-        <div className="library-switcher-icon-anchor">
-          <button
-            aria-controls={`library-icon-${item.libraryUuid}`}
-            aria-expanded={iconMenuOpen}
-            aria-haspopup="menu"
-            aria-label="更改图标"
-            className="library-switcher-icon"
-            data-interactive-pointer-target="true"
-            onClick={(event) =>
-              dispatch({
-                anchor: event.currentTarget,
-                kind: "icon",
-                libraryId: item.libraryUuid,
-                type: "toggle-nested",
-              })
-            }
-            type="button"
-          >
-            <LibraryGlyph icon={item.icon ?? undefined} color={item.color ?? undefined} size={16} />
-          </button>
-          <AnchoredOverlay
-            anchor={iconMenuAnchor}
-            ariaLabel="选择资源库图标"
-            id={`library-icon-${item.libraryUuid}`}
-            onDismiss={() => dispatch({ kind: "icon", type: "dismiss-nested" })}
-            open={iconMenuOpen}
-            parentId="library-root"
-            placement="right-start"
-            preferredWidth={208}
-            role="group"
-            rootId="library"
-            surfaceRole="nested"
-          >
-            <LibraryIconPicker
-              color={color}
-              icon={icon}
-              onPick={(nextIcon, nextColor) => void applyIcon(item, nextIcon, nextColor)}
-              presentation="overlay"
-            />
-          </AnchoredOverlay>
-        </div>
         <button
+          aria-current={item.active ? "true" : undefined}
           className="library-switcher-main"
-          data-interactive-pointer-target={!item.active && item.availability === "available" ? "true" : undefined}
+          disabled={item.availability !== "available" || forgetPending}
           onClick={() => void onSwitch(item)}
+          title={`${item.name}\n${item.databasePath}${item.availability === "available" ? "" : "\n资源库暂不可用"}`}
           type="button"
         >
-          <span className="library-switcher-name">{item.name}</span>
-          <span className={`library-switcher-sync-state ${syncStatus?.lifecycle ?? "local-only"}`}>{syncStatusLabel(syncStatus)}</span>
-          <span className="library-switcher-path">{item.managedRoot}</span>
+          <LibraryGlyph color={color} icon={icon} selected={item.active} size={24} />
+          <span className="library-switcher-identity">
+            <span className="library-switcher-name">{item.name}</span>
+            <span className="library-switcher-path">{item.databasePath}</span>
+          </span>
+          {item.active ? <Check aria-label="当前资源库" className="library-switcher-check" size={16} /> : null}
         </button>
-        {item.active ? (
-          <Check aria-hidden="true" className="library-switcher-check" size={14} />
-        ) : null}
-        <div className="library-switcher-actions">
-          <button
-            aria-label="Add folder"
-            data-interactive-pointer-target={item.active ? "true" : undefined}
-            disabled={!item.active}
-            onClick={() => void onAddFolder()}
-            type="button"
-          >
-            <FolderPlus aria-hidden="true" size={14} />
-          </button>
-          <div className="library-switcher-remove-menu-anchor">
-            <button
-              aria-controls="library-remove-folders"
-              aria-expanded={removeMenuOpen}
-              aria-haspopup="menu"
-              aria-label="Remove folder"
-              data-interactive-pointer-target={item.active ? "true" : undefined}
-              disabled={!item.active}
-              onClick={(event) =>
-                dispatch({
-                  anchor: event.currentTarget,
-                  kind: "remove",
-                  libraryId: item.libraryUuid,
-                  type: "toggle-nested",
-                })
-              }
-              ref={item.active ? removeTriggerRef : undefined}
-              type="button"
-            >
-              <FolderMinus aria-hidden="true" size={14} />
-            </button>
-            <AnchoredOverlay
-              anchor={removeMenuAnchor}
-              ariaLabel="移除文件夹"
-              id="library-remove-folders"
-              onDismiss={() => dispatch({ kind: "remove", type: "dismiss-nested" })}
-              open={removeMenuOpen}
-              parentId="library-root"
-              placement="right-start"
-              preferredWidth={220}
-              role="menu"
-              rootId="library"
-              surfaceRole="nested"
-            >
-              <OverlayMenuList ariaLabel="移除文件夹" className="library-switcher-remove-menu">
-                {library.roots.length === 0 ? (
-                  <div className="library-switcher-remove-menu-empty">No folders</div>
-                ) : (
-                  library.roots.map((root) => (
-                    <OverlayMenuItem
-                      className="library-switcher-remove-menu-item"
-                      icon={<FolderMinus size={12} />}
-                      key={root.id}
-                      onClick={() =>
-                        dispatch({
-                          name: root.displayName,
-                          rootId: root.id,
-                          type: "open-remove-confirmation",
-                        })
-                      }
-                    >
-                      {root.displayName}
-                    </OverlayMenuItem>
-                  ))
-                )}
-              </OverlayMenuList>
-            </AnchoredOverlay>
-          </div>
-        </div>
+        <button
+          aria-controls={menuId}
+          aria-expanded={menuOpen}
+          aria-haspopup="menu"
+          aria-label={`${item.name} 的更多操作`}
+          className="library-switcher-more"
+          disabled={forgetPending}
+          onClick={(event) => {
+            dispatch({ type: "close-root" });
+            setMenu(menuOpen ? null : { libraryId: item.libraryUuid, anchor: event.currentTarget });
+          }}
+          type="button"
+        ><MoreHorizontal aria-hidden="true" size={20} /></button>
+        <AnchoredOverlay anchor={menuOpen ? menu.anchor : null} ariaLabel={`${item.name} 的操作`} className="library-switcher-action-menu" id={menuId} onDismiss={() => { setMenu(null); dispatch({ type: "close-root" }); }} open={menuOpen} parentId="library-root" placement="right-start" preferredWidth={232} role="group" rootId="library" surfaceRole="nested">
+          <OverlayMenuList ariaLabel="资源库操作" className="overlay-titlebar-menu">
+            <OverlayMenuItem aria-haspopup="dialog" aria-label="更改图标" icon={<Palette size={16} />} onClick={() => {
+              appearanceRestoreFocusRef.current = menu?.anchor ?? restoreFocusTarget;
+              overlays.dismissTop();
+              setAppearanceTarget(item);
+              setMenu(null);
+              dispatch({ type: "close-root" });
+            }}>图标与颜色…</OverlayMenuItem>
+            {getDesktopShellActions()?.openPath ? <OverlayMenuItem icon={<FolderOpen size={16} />} onClick={() => void runMutation("library-open-location", item.libraryUuid, async () => { if (!await openPath(item.databasePath)) throw new Error("无法打开此文件夹，请检查位置是否可用。"); })}>在文件资源管理器中打开</OverlayMenuItem> : null}
+            {item.active ? <>
+              <div className="library-switcher-menu-separator" role="separator" />
+              {getDesktopBridge()?.pickFolder ? <OverlayMenuItem aria-label="Add folder" icon={<FolderPlus size={16} />} onClick={() => void onAddFolder()}>添加文件夹…</OverlayMenuItem> : null}
+              <OverlayMenuItem aria-controls="library-remove-folders" aria-expanded={removeMenuOpen} aria-label="Remove folder" icon={<FolderMinus size={16} />} onClick={(event) => { removeTriggerRef.current = event.currentTarget; dispatch({ anchor: event.currentTarget, kind: "remove", libraryId: item.libraryUuid, type: "toggle-nested" }); }} submenu>移除文件夹…</OverlayMenuItem>
+            </> : null}
+            <div className="library-switcher-menu-separator" role="separator" />
+            <OverlayMenuItem icon={<Minus size={16} />} onClick={(event) => { forgetTriggerRef.current = event.currentTarget; setForgetError(null); setForgetTarget(item); }}>从列表移除…</OverlayMenuItem>
+          </OverlayMenuList>
+          {error ? <div className="library-switcher-status" role="alert">{error}</div> : null}
+        </AnchoredOverlay>
+        {item.active ? <AnchoredOverlay anchor={removeMenuAnchor} ariaLabel="移除文件夹" id="library-remove-folders" onDismiss={() => dispatch({ kind: "remove", type: "dismiss-nested" })} open={removeMenuOpen} parentId={menuId} placement="right-start" preferredWidth={232} role="menu" rootId="library" surfaceRole="nested">
+          <OverlayMenuList ariaLabel="移除文件夹" className="library-switcher-remove-menu">
+            {library.roots.length === 0 ? <div className="library-switcher-remove-menu-empty">没有可移除的文件夹</div> : library.roots.map((root) => <OverlayMenuItem className="library-switcher-remove-menu-item" icon={<FolderMinus size={16} />} key={root.id} onClick={() => dispatch({ name: root.displayName, rootId: root.id, type: "open-remove-confirmation" })} title={root.displayName}>{root.displayName}</OverlayMenuItem>)}
+          </OverlayMenuList>
+        </AnchoredOverlay> : null}
       </li>
     );
   });
 
   const footerActions = (
     <>
-      <LiquidGlassButton onClick={() => openManagedLibraryWizard("create")} type="button">
-        创建资源库…
-      </LiquidGlassButton>
-      <LiquidGlassButton onClick={() => openManagedLibraryWizard("restore")} type="button">
-        从 OneDrive 恢复…
-      </LiquidGlassButton>
+      <button className="library-switcher-footer-action" data-interactive-pointer-target="true" onClick={openManagedLibraryWizard} type="button"><Library aria-hidden="true" size={18} />创建资源库…</button>
+      <button className="library-switcher-footer-action" data-interactive-pointer-target="true" onClick={openExistingLibraryDialog} type="button"><FolderOpen aria-hidden="true" size={18} />打开其它资源库…</button>
+      <PluginContributionsSlot slot="library-menu" libraryUuid={libs.find((item) => item.active)?.libraryUuid ?? null} />
     </>
   );
 
@@ -480,7 +427,7 @@ export function LibrarySwitcher({
         onDismiss={onClose}
         open={open}
         placement="bottom-start"
-        preferredWidth={460}
+        preferredWidth={400}
         restoreFocusTarget={restoreFocusTarget}
         role="dialog"
         rootId="library"
@@ -489,9 +436,19 @@ export function LibrarySwitcher({
           {searchField}
           {closeButton}
         </div>
-        <ul className="library-switcher-list">{libraryRows}</ul>
+        <ul aria-busy={loading} aria-label="资源库列表" className="library-switcher-list">{libraryRows}</ul>
+        {loading && libs.length === 0 ? <div className="library-switcher-status" role="status">正在加载资源库…</div> : !loading && filtered.length === 0 ? <div className="library-switcher-status" role="status">{query.trim() ? "未找到匹配的资源库" : "还没有资源库"}</div> : null}
+        {error && !menu ? <div className="library-switcher-status" role="alert">{error}<button data-interactive-pointer-target="true" onClick={() => void reload()} type="button">重试</button></div> : null}
         <footer className="library-switcher-footer">{footerActions}</footer>
       </AnchoredOverlay>
+      {appearanceTarget ? <LibraryAppearanceEditor
+        anchor={appearanceRestoreFocusRef.current} color={appearanceTarget.color} icon={appearanceTarget.icon} id="library-appearance-editor" name={appearanceTarget.name} parentId="library-root"
+        onApply={async (icon, color) => {
+          ensureDesktopMutationSucceeded(await setLibraryIcon(appearanceTarget.libraryUuid, icon, color), "外观保存失败，请重试。");
+        }}
+        onClose={() => setAppearanceTarget(null)} onFailure={(cause) => reportFailure("library-set-icon", appearanceTarget.libraryUuid, cause)}
+        open={open} restoreFocusRef={appearanceRestoreFocusRef} rootId="library"
+      /> : null}
       <ModalSurface
         ariaDescribedBy="library-remove-confirm-description"
         ariaLabelledBy="library-remove-confirm-title"
@@ -531,9 +488,23 @@ export function LibrarySwitcher({
           </LiquidGlassButton>
         </OverlayDialogActions>
       </ModalSurface>
+      <ModalSurface ariaDescribedBy="library-forget-description" ariaLabelledBy="library-forget-title" busy={forgetPending} className="library-operation-dialog library-forget-dialog" id="library-forget-confirm" initialFocusRef={forgetCancelRef} onDismiss={() => { if (!forgetPendingRef.current) setForgetTarget(null); }} open={forgetTarget !== null} restoreFocusRef={forgetTriggerRef} role="alertdialog" rootId="library">
+        <OverlayDialogHeader title="从列表移除资源库？" titleId="library-forget-title" />
+        <OverlayDialogBody data-overlay-scroll-container>
+          <p className="library-operation-name" title={forgetTarget?.name}>{forgetTarget?.name}</p>
+          <p id="library-forget-description">仅从列表移除，资源库中的文件和数据会保留。以后可通过“打开其它资源库”重新打开。{forgetTarget?.bindingState !== "local-only" ? "已启用的同步仍会继续。" : ""}</p>
+          {forgetTarget?.active ? <p>当前资源库将关闭。</p> : null}
+          {forgetError ? <OverlayInlineStatus tone="error">{forgetError}</OverlayInlineStatus> : null}
+        </OverlayDialogBody>
+        <OverlayDialogActions>
+          <LiquidGlassButton disabled={forgetPending} onClick={() => setForgetTarget(null)} ref={forgetCancelRef} type="button">取消</LiquidGlassButton>
+          <LiquidGlassButton disabled={forgetPending} onClick={() => void confirmForget()} tone="primary" type="button">{forgetPending ? "正在移除…" : "从列表移除"}</LiquidGlassButton>
+        </OverlayDialogActions>
+      </ModalSurface>
+      <OpenLibraryDialog onClose={() => { setOpenDialog(false); overlays.closeRoot("managed-library"); }} onFailure={(cause) => void reportFailure("library-open", "managed-root", cause)} onOpened={() => { setFirstRun(false); void reload(); }} open={openDialog} restoreFocusRef={wizardRestoreFocusRef} />
       <ManagedLibraryWizard
         firstRun={firstRun}
-        initialMode={wizardMode}
+        onOpenExisting={() => { setWizardOpen(false); setOpenDialog(true); }}
         onClose={closeManagedLibraryWizard}
         onCreated={() => {
           setFirstRun(false);

@@ -73,14 +73,14 @@
 ### Verification record
 
 - `node --experimental-strip-types --test apps/web/tests/overlayRegionalBlurLifecycle.test.mts` — exit `0`, `12/12` passed.
-- `npm --workspace @megle/web run test` — exit `0`, `398/398` passed; `npm --workspace @megle/web run typecheck` — exit `0`.
+- `npm --workspace @mangoo/web run test` — exit `0`, `398/398` passed; `npm --workspace @mangoo/web run typecheck` — exit `0`.
 - `npm run check:ui-design` — exit `0`; `npm run check:web` — exit `0`, including `398/398`; `npm run check:desktop` — exit `0`, including `222/222`.
-- `$env:MEGLE_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-regression.mjs` — exit `0`, run `megle-visual-msmfm6a1-66048`, `run.ok=true`, `hardFailures=[]`, popup/modal scale gates passed at `1`, `1.25`, and `1.5`.
+- `$env:MANGOO_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-regression.mjs` — exit `0`, run `mangoo-visual-msmfm6a1-66048`, `run.ok=true`, `hardFailures=[]`, popup/modal scale gates passed at `1`, `1.25`, and `1.5`.
 - At 100%, Library-left normal/legacy/restored outside counts were `[0,0,0,0]`, `[155,155,427,427]`, `[0,0,0,0]`; Notifications-right were `[0,0,0,0]`, `[151,151,327,327]`, `[0,0,0,0]`. Both source-flood equality, invariant snapshots, configured-blur mutation frames, zero controls, and cleanup gates passed.
 - The retained real-content gate passed over six real images and three DOM text rectangles: image boundary energy `40.3865 -> 0.3793 -> 0.0887`, text edge energy `19.2672 -> 0.3324 -> 0.1271`, reference deltas `0/0`.
 - `npm test` — exit `0`; Rust `472 passed, 0 failed, 2 ignored`. `git diff --check` — exit `0`.
 - Harness startup/finalization recorded child close and closed stdout/stderr streams. Ports `5179` and `9500` had zero listeners afterward; the only matching worktree Node processes were the same three pre-existing editor TypeScript servers, so no Electron/Core/Vite process was terminated.
-- Full command logs: `.tmp/task4-verification-20260810-072452/`; harness summary: `.tmp/visual-check/logs/desktop-ui-regression-summary.json`; harness stdout/stderr: `.tmp/visual-check/logs/desktop-ui-regression-megle-visual-msmfm6a1-66048.stdout.log` and `.tmp/visual-check/logs/desktop-ui-regression-megle-visual-msmfm6a1-66048.stderr.log`.
+- Full command logs: `.tmp/task4-verification-20260810-072452/`; harness summary: `.tmp/visual-check/logs/desktop-ui-regression-summary.json`; harness stdout/stderr: `.tmp/visual-check/logs/desktop-ui-regression-mangoo-visual-msmfm6a1-66048.stdout.log` and `.tmp/visual-check/logs/desktop-ui-regression-mangoo-visual-msmfm6a1-66048.stderr.log`.
 
 ## Task 5: Commit and hand off safely
 

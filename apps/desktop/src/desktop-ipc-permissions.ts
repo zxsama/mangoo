@@ -12,35 +12,36 @@ const PRIVILEGED_WINDOW_ROLES = new Set<DesktopIpcWindowRole>([
   "plugins"
 ]);
 const MAIN_WINDOW_ONLY = new Set<DesktopIpcWindowRole>(["main"]);
+const NOTIFICATION_PLUGIN_CHANNELS = new Set(["mangoo:notification-plugin-entries", "mangoo:open-notification-plugin-view"]);
 
 const COMMON_WINDOW_CHANNELS = new Set([
-  "megle:window-minimize",
-  "megle:window-maximize",
-  "megle:window-close",
-  "megle:window-is-maximized",
-  "megle:window-get-bounds",
-  "megle:window-set-position",
-  "megle:window-begin-drag",
-  "megle:window-drag-move",
-  "megle:window-end-drag"
+  "mangoo:window-minimize",
+  "mangoo:window-maximize",
+  "mangoo:window-close",
+  "mangoo:window-is-maximized",
+  "mangoo:window-get-bounds",
+  "mangoo:window-set-position",
+  "mangoo:window-begin-drag",
+  "mangoo:window-drag-move",
+  "mangoo:window-end-drag"
 ]);
-const MAIN_ONLY_CHANNELS = new Set(["megle:shell-ready"]);
+const MAIN_ONLY_CHANNELS = new Set(["mangoo:shell-ready"]);
+const LIBRARY_CREATION_CHANNELS = new Set(["mangoo:resolve-library-creation-paths"]);
 const PRIVILEGED_CHANNELS = new Set([
-  "megle:pick-folder",
-  "megle:diagnostics",
-  "megle:shell-reveal-path",
-  "megle:shell-open-path",
-  "megle:open-external-authorization-url",
-  "megle:open-entra-app-registration-page",
-  "megle:request-oauth-return-focus",
-  "megle:clipboard-write-text",
-  "megle:open-settings-window",
-  "megle:close-settings-window",
-  "megle:open-plugins-window",
-  "megle:close-plugins-window",
-  "megle:get-library-load-phase",
-  "megle:retry-library-load",
-  "megle:pick-new-library-path"
+  "mangoo:pick-folder",
+  "mangoo:diagnostics",
+  "mangoo:shell-reveal-path",
+  "mangoo:shell-open-path",
+  "mangoo:open-plugin-external-link",
+  "mangoo:request-oauth-return-focus",
+  "mangoo:clipboard-write-text",
+  "mangoo:open-settings-window",
+  "mangoo:close-settings-window",
+  "mangoo:open-plugins-window",
+  "mangoo:close-plugins-window",
+  "mangoo:get-library-load-phase",
+  "mangoo:retry-library-load",
+  "mangoo:pick-new-library-path"
 ]);
 
 export function canAccessDesktopIpc(
@@ -48,8 +49,10 @@ export function canAccessDesktopIpc(
   channel: string
 ): boolean {
   if (!role) return false;
+  if (NOTIFICATION_PLUGIN_CHANNELS.has(channel)) return role === "notifications";
   if (COMMON_WINDOW_CHANNELS.has(channel)) return ALL_WINDOW_ROLES.has(role);
   if (MAIN_ONLY_CHANNELS.has(channel)) return MAIN_WINDOW_ONLY.has(role);
+  if (LIBRARY_CREATION_CHANNELS.has(channel)) return role === "main" || role === "settings";
   if (PRIVILEGED_CHANNELS.has(channel)) return PRIVILEGED_WINDOW_ROLES.has(role);
   return false;
 }

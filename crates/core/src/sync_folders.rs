@@ -14,7 +14,7 @@ use crate::library_path::{
     MarkerDirectoryGuard, SafeDirectory,
 };
 
-pub const ROOT_MARKER_FILE_NAME: &str = ".megle-sync-root";
+pub const ROOT_MARKER_FILE_NAME: &str = ".mangoo-sync-root";
 const MAX_ROOT_MARKER_BYTES: u64 = 16 * 1024;
 pub const PLAN_TTL_MILLIS: i64 = 15 * 60 * 1_000;
 
@@ -298,7 +298,7 @@ pub fn transfer_relocation_tree(
         });
     }
     let staging = target.with_file_name(format!(
-        ".{}.megle-relocation-{}",
+        ".{}.mangoo-relocation-{}",
         target
             .file_name()
             .and_then(|value| value.to_str())
@@ -1579,7 +1579,7 @@ mod tests {
 
     #[test]
     fn marker_replacement_is_atomic_and_changes_generation() {
-        let directory = std::env::temp_dir().join(format!("megle-root-marker-{}", Uuid::now_v7()));
+        let directory = std::env::temp_dir().join(format!("mangoo-root-marker-{}", Uuid::now_v7()));
         fs::create_dir_all(&directory).unwrap();
         write_root_marker(&directory, &marker(1)).unwrap();
         replace_root_marker(&directory, &marker(2)).unwrap();
@@ -1590,7 +1590,7 @@ mod tests {
 
     #[test]
     fn relocation_preflight_rejects_overlap_and_preserves_source_identity() {
-        let base = std::env::temp_dir().join(format!("megle-relocation-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-relocation-{}", Uuid::now_v7()));
         let source = base.join("Photos");
         let target = base.join("Moved");
         fs::create_dir_all(source.join("nested")).unwrap();
@@ -1616,7 +1616,7 @@ mod tests {
 
     #[test]
     fn same_volume_relocation_moves_one_tree_without_changing_marker_identity_fields() {
-        let base = std::env::temp_dir().join(format!("megle-relocation-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-relocation-{}", Uuid::now_v7()));
         let source = base.join("Photos");
         let target = base.join("Renamed");
         fs::create_dir_all(source.join("nested")).unwrap();
@@ -1644,7 +1644,7 @@ mod tests {
 
     #[test]
     fn same_volume_resume_rejects_a_replaced_target_with_a_copied_marker() {
-        let base = std::env::temp_dir().join(format!("megle-relocation-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-relocation-{}", Uuid::now_v7()));
         let source = base.join("Photos");
         let target = base.join("Renamed");
         let displaced = base.join("Displaced");
@@ -1675,7 +1675,7 @@ mod tests {
 
     #[test]
     fn relocation_rejects_source_content_changed_after_preflight() {
-        let base = std::env::temp_dir().join(format!("megle-relocation-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-relocation-{}", Uuid::now_v7()));
         let source = base.join("Photos");
         let target = base.join("Renamed");
         fs::create_dir_all(&source).unwrap();
@@ -1712,7 +1712,7 @@ mod tests {
 
     #[test]
     fn relocation_cleanup_preserves_source_with_unexpected_content() {
-        let base = std::env::temp_dir().join(format!("megle-cleanup-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-cleanup-{}", Uuid::now_v7()));
         let source = base.join("Photos");
         fs::create_dir_all(&source).unwrap();
         fs::write(source.join("one.txt"), b"one").unwrap();
@@ -1733,7 +1733,7 @@ mod tests {
 
     #[test]
     fn cross_volume_resume_claims_an_empty_operation_staging_directory() {
-        let base = std::env::temp_dir().join(format!("megle-relocation-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-relocation-{}", Uuid::now_v7()));
         let source = base.join("Photos");
         let target = base.join("Moved");
         fs::create_dir_all(&source).unwrap();
@@ -1747,7 +1747,7 @@ mod tests {
         evidence.source_bytes = directory_evidence_size(&source).unwrap();
         let operation_uuid = Uuid::now_v7().to_string();
         let staging = target.with_file_name(format!(
-            ".{}.megle-relocation-{operation_uuid}",
+            ".{}.mangoo-relocation-{operation_uuid}",
             target.file_name().unwrap().to_string_lossy()
         ));
         fs::create_dir(&staging).unwrap();
@@ -1776,7 +1776,7 @@ mod tests {
 
     #[test]
     fn directory_evidence_detects_same_size_content_changes() {
-        let base = std::env::temp_dir().join(format!("megle-evidence-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-evidence-{}", Uuid::now_v7()));
         fs::create_dir_all(&base).unwrap();
         let file = base.join("one.txt");
         fs::write(&file, b"good").unwrap();
@@ -1789,7 +1789,7 @@ mod tests {
 
     #[test]
     fn resumable_copy_repairs_same_size_corruption() {
-        let base = std::env::temp_dir().join(format!("megle-copy-resume-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-copy-resume-{}", Uuid::now_v7()));
         let source = base.join("source");
         let target = base.join("target");
         fs::create_dir_all(&source).unwrap();
@@ -1811,7 +1811,7 @@ mod tests {
 
     #[test]
     fn resumable_copy_is_bounded_and_advances_on_retry() {
-        let base = std::env::temp_dir().join(format!("megle-copy-bounded-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-copy-bounded-{}", Uuid::now_v7()));
         let source = base.join("source");
         let target = base.join("target");
         fs::create_dir_all(&source).unwrap();
@@ -1846,7 +1846,7 @@ mod tests {
 
     #[test]
     fn resumable_copy_recopies_a_completed_entry_lost_after_checkpoint() {
-        let base = std::env::temp_dir().join(format!("megle-copy-lost-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-copy-lost-{}", Uuid::now_v7()));
         let source = base.join("source");
         let target = base.join("target");
         fs::create_dir_all(&source).unwrap();
@@ -1871,7 +1871,7 @@ mod tests {
 
     #[test]
     fn relocation_resets_corrupt_operation_staging_instead_of_retry_looping() {
-        let base = std::env::temp_dir().join(format!("megle-copy-reset-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-copy-reset-{}", Uuid::now_v7()));
         let source = base.join("source");
         let target = base.join("target");
         fs::create_dir_all(&source).unwrap();
@@ -1919,7 +1919,7 @@ mod tests {
 
     #[test]
     fn resumable_copy_persists_a_large_file_offset() {
-        let base = std::env::temp_dir().join(format!("megle-copy-cursor-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-copy-cursor-{}", Uuid::now_v7()));
         let source = base.join("source");
         let target = base.join("target");
         fs::create_dir_all(&source).unwrap();
@@ -1966,7 +1966,7 @@ mod tests {
         let direct = std::env::current_dir()
             .unwrap()
             .join(".tmp")
-            .join(format!("megle-unc-marker-{}", Uuid::now_v7()));
+            .join(format!("mangoo-unc-marker-{}", Uuid::now_v7()));
         fs::create_dir_all(&direct).unwrap();
         let direct_text = direct.to_string_lossy();
         let drive = direct_text.chars().next().expect("drive letter");
@@ -1989,7 +1989,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     #[test]
     fn root_marker_native_publication_supports_fresh_and_exact_operation_replay() {
-        let base = std::env::temp_dir().join(format!("megle-native-marker-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-native-marker-{}", Uuid::now_v7()));
         fs::create_dir(&base).unwrap();
         for resumed in [false, true] {
             let root = base.join(if resumed { "resumed" } else { "fresh" });
@@ -2013,10 +2013,10 @@ mod tests {
     /// below the supplied existing base, then removes that owned directory.
     #[cfg(windows)]
     #[test]
-    #[ignore = "requires explicit MEGLE_MARKER_TEST_BASE on the target filesystem"]
+    #[ignore = "requires explicit MANGOO_MARKER_TEST_BASE on the target filesystem"]
     fn root_marker_publication_on_explicit_test_base() {
         let base =
-            PathBuf::from(std::env::var_os("MEGLE_MARKER_TEST_BASE").expect("explicit test base"));
+            PathBuf::from(std::env::var_os("MANGOO_MARKER_TEST_BASE").expect("explicit test base"));
         assert!(
             base.is_absolute() && base.is_dir(),
             "test base must be an existing absolute directory"
@@ -2102,7 +2102,7 @@ mod tests {
 
     #[cfg(windows)]
     fn run_windows_marker_publication_probe(base: &Path) {
-        let owned = base.join(format!("megle-marker-probe-{}", Uuid::now_v7()));
+        let owned = base.join(format!("mangoo-marker-probe-{}", Uuid::now_v7()));
         fs::create_dir(&owned).expect("create unique marker test directory");
         let parent = owned.join("ancestor");
         let fresh = parent.join("fresh");
@@ -2174,7 +2174,8 @@ mod tests {
 
     #[test]
     fn root_marker_write_rejects_a_replaced_root_before_publishing() {
-        let base = std::env::temp_dir().join(format!("megle-root-marker-fence-{}", Uuid::now_v7()));
+        let base =
+            std::env::temp_dir().join(format!("mangoo-root-marker-fence-{}", Uuid::now_v7()));
         let root = base.join("root");
         let replacement = base.join("replacement");
         fs::create_dir_all(&root).unwrap();
@@ -2217,7 +2218,8 @@ mod tests {
 
     #[test]
     fn root_marker_publish_failure_preserves_the_operation_temporary_marker() {
-        let root = std::env::temp_dir().join(format!("megle-root-marker-retry-{}", Uuid::now_v7()));
+        let root =
+            std::env::temp_dir().join(format!("mangoo-root-marker-retry-{}", Uuid::now_v7()));
         fs::create_dir_all(&root).unwrap();
         let expected = marker(11);
         let operation_uuid = Uuid::now_v7();
@@ -2274,7 +2276,7 @@ mod tests {
     #[test]
     fn root_marker_publication_never_overwrites_a_racing_matching_target() {
         let root =
-            std::env::temp_dir().join(format!("megle-marker-target-race-{}", Uuid::now_v7()));
+            std::env::temp_dir().join(format!("mangoo-marker-target-race-{}", Uuid::now_v7()));
         fs::create_dir(&root).unwrap();
         let expected = marker(12);
         let operation_uuid = Uuid::now_v7();
@@ -2313,7 +2315,7 @@ mod tests {
 
     #[test]
     fn root_marker_publication_rejects_foreign_and_oversized_markers_without_changes() {
-        let base = std::env::temp_dir().join(format!("megle-marker-content-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-marker-content-{}", Uuid::now_v7()));
         fs::create_dir(&base).unwrap();
         for final_marker in [false, true] {
             for bytes in [
@@ -2355,7 +2357,7 @@ mod tests {
     #[test]
     fn root_marker_publication_refuses_preexisting_conflicting_handles() {
         let base =
-            std::env::temp_dir().join(format!("megle-marker-preexisting-{}", Uuid::now_v7()));
+            std::env::temp_dir().join(format!("mangoo-marker-preexisting-{}", Uuid::now_v7()));
         let ancestor = base.join("ancestor");
         let root = ancestor.join("root");
         fs::create_dir_all(&root).unwrap();
@@ -2415,7 +2417,7 @@ mod tests {
 
     #[test]
     fn materialization_preflight_accepts_only_its_own_marker_on_retry() {
-        let base = std::env::temp_dir().join(format!("megle-root-preflight-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-root-preflight-{}", Uuid::now_v7()));
         fs::create_dir_all(&base).unwrap();
         let target = base.join("Photos");
         let planned =
@@ -2441,7 +2443,7 @@ mod tests {
 
     #[test]
     fn enrollment_refuses_a_directory_already_claimed_by_a_sync_marker() {
-        let base = std::env::temp_dir().join(format!("megle-root-enroll-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-root-enroll-{}", Uuid::now_v7()));
         let target = base.join("Photos");
         fs::create_dir_all(&target).unwrap();
         write_root_marker(&target, &marker(1)).unwrap();
@@ -2499,6 +2501,7 @@ mod tests {
         asset.locations.insert(
             location_revision,
             LocationRevision {
+                preserve_legal_name: false,
                 revision_uuid: location_revision,
                 parent_uuid: Some(root_folder_uuid),
                 name: "photo.jpg".into(),

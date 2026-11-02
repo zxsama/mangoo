@@ -16,11 +16,11 @@
 
 ## Conventions used by every task
 
-- Real drive path default: `Y:/Repository/Billfish/Artists`, overridable via `MEGLE_REAL_LOAD_ROOT`.
+- Real drive path default: `Y:/Repository/Billfish/Artists`, overridable via `MANGOO_REAL_LOAD_ROOT`.
 - Session token for tests: `real-load-test-token` (matches existing `real-load-test.mts`).
-- Core address default: `127.0.0.1:47391`, overridable via `MEGLE_REAL_LOAD_CORE_ADDR`.
+- Core address default: `127.0.0.1:47391`, overridable via `MANGOO_REAL_LOAD_CORE_ADDR`.
 - Run a single web unit test file: `node --experimental-strip-types --test <file>`.
-- Run Rust single test: `export PATH="$HOME/.cargo/bin:$PATH"; cargo test -p megle-core <name>`.
+- Run Rust single test: `export PATH="$HOME/.cargo/bin:$PATH"; cargo test -p mangoo-core <name>`.
 - Commit after each task with the message shown in its final step.
 
 ---
@@ -290,9 +290,9 @@ This driver is an integration harness; it is validated by running it against the
 - [ ] **Step 1: Create the driver skeleton (process + HTTP + index wait)**
 
 Create `tools/dev/real-hot-loop-test.mts` with:
-- Constants: `TOKEN = "real-load-test-token"`, `ADDR = process.env.MEGLE_REAL_LOAD_CORE_ADDR ?? "127.0.0.1:47391"`, `BASE = http://${ADDR}/api`, `ROOT_PATH = (process.env.MEGLE_REAL_LOAD_ROOT ?? "Y:/Repository/Billfish/Artists").replace(/\\/g,"/")`, `TOTAL_OPERATIONS = Number(process.env.MEGLE_HOTLOOP_OPS ?? 100)`, `INDEX_THRESHOLD = Number(process.env.MEGLE_HOTLOOP_INDEX_THRESHOLD ?? 20000)`, `INDEX_WAIT_TIMEOUT_MS = Number(process.env.MEGLE_HOTLOOP_INDEX_TIMEOUT_MS ?? 600_000)`.
+- Constants: `TOKEN = "real-load-test-token"`, `ADDR = process.env.MANGOO_REAL_LOAD_CORE_ADDR ?? "127.0.0.1:47391"`, `BASE = http://${ADDR}/api`, `ROOT_PATH = (process.env.MANGOO_REAL_LOAD_ROOT ?? "Y:/Repository/Billfish/Artists").replace(/\\/g,"/")`, `TOTAL_OPERATIONS = Number(process.env.MANGOO_HOTLOOP_OPS ?? 100)`, `INDEX_THRESHOLD = Number(process.env.MANGOO_HOTLOOP_INDEX_THRESHOLD ?? 20000)`, `INDEX_WAIT_TIMEOUT_MS = Number(process.env.MANGOO_HOTLOOP_INDEX_TIMEOUT_MS ?? 600_000)`.
 - Copy `spawnManaged`, `terminateProcessTree`, `waitForClose`, `runTaskkill`, `isExited`, `fetchJson`, `fetchResponse`, `waitForHealth`, `getTask` from `real-load-test.mts` (verbatim — the engineer may read tasks out of order, so these must be present in this file).
-- `spawn("cargo", ["run","--release","-q","-p","megle-core"], { env: { ...process.env, MEGLE_SESSION_TOKEN: TOKEN, MEGLE_CORE_ADDR: ADDR, MEGLE_DB_PATH: <temp>, RUST_LOG: "warn" }})`.
+- `spawn("cargo", ["run","--release","-q","-p","mangoo-core"], { env: { ...process.env, MANGOO_SESSION_TOKEN: TOKEN, MANGOO_CORE_ADDR: ADDR, MANGOO_DB_PATH: <temp>, RUST_LOG: "warn" }})`.
 - `addRoot`: `POST /roots {path: ROOT_PATH}` → `{accepted, taskId, rootId}`.
 - `waitForIndexThreshold(rootId, scanTaskId)`: poll `GET /media?rootId=..&limit=1&sort=mtime_desc` reading `totalCount`; resolve when `totalCount >= INDEX_THRESHOLD` OR scan task reaches a terminal status; throw on `INDEX_WAIT_TIMEOUT_MS`.
 
@@ -380,7 +380,7 @@ Correctness assertions (throw on violation) — implemented in Task 4. Budget vi
 
 - [ ] **Step 5: Run to verify the harness starts (short smoke, low threshold)**
 
-Run: `MEGLE_HOTLOOP_INDEX_THRESHOLD=200 MEGLE_HOTLOOP_OPS=20 node --experimental-strip-types tools/dev/real-hot-loop-test.mts`
+Run: `MANGOO_HOTLOOP_INDEX_THRESHOLD=200 MANGOO_HOTLOOP_OPS=20 node --experimental-strip-types tools/dev/real-hot-loop-test.mts`
 Expected: Core builds+starts, root added, ≥200 media indexed, 20 ops run, a `[hotloop] summary:` JSON prints, process exits 0 (no budgets.json yet → report-only). If `Y:` is not mounted, expect a clear "Test directory does not exist" error — that is acceptable for this step; note it and continue.
 
 - [ ] **Step 6: Commit**
@@ -420,7 +420,7 @@ if (lockedFailures.length > 0) {
 
 - [ ] **Step 3: Run the short smoke again**
 
-Run: `MEGLE_HOTLOOP_INDEX_THRESHOLD=200 MEGLE_HOTLOOP_OPS=20 node --experimental-strip-types tools/dev/real-hot-loop-test.mts`
+Run: `MANGOO_HOTLOOP_INDEX_THRESHOLD=200 MANGOO_HOTLOOP_OPS=20 node --experimental-strip-types tools/dev/real-hot-loop-test.mts`
 Expected: completes; prints summary; either passes or throws a specific correctness error (that is a real finding, not a harness bug).
 
 - [ ] **Step 4: Commit**
@@ -529,27 +529,27 @@ git commit -m "test(perf): add desktop scroll-trace assessment module"
 
 - Take the page ws URL as `process.argv[2]` (same as `cdp-inspect.mjs`); document the wire-up one-liner in a header comment (resolve via `http://127.0.0.1:9222/json`).
 - `Runtime.enable`, `Log.enable`.
-- Inject a `PerformanceObserver` for `longtask` into the page that pushes durations onto `window.__megleLongTasks`:
+- Inject a `PerformanceObserver` for `longtask` into the page that pushes durations onto `window.__mangooLongTasks`:
 
 ```js
 await send("Runtime.evaluate", { expression: `
-  window.__megleLongTasks = [];
+  window.__mangooLongTasks = [];
   new PerformanceObserver((list) => {
-    for (const entry of list.getEntries()) window.__megleLongTasks.push(entry.duration);
+    for (const entry of list.getEntries()) window.__mangooLongTasks.push(entry.duration);
   }).observe({ entryTypes: ["longtask"] });
   true;
 ` });
 ```
 
 - Scroll loop: 30 iterations of `document.querySelector(".virtual-grid").scrollTop += 2000` via `Runtime.evaluate`, `await` ~120ms between steps (`Emulation`/timer). After each, no assertion.
-- After settling (~2s), read `window.__megleLongTasks` and tile counts using the exact selectors from `cdp-inspect.mjs:56-60` (`.tile-thumb-ready` / `.tile-thumb-loading` / `.tile-thumb-failed`), and collect console errors from captured `Runtime.consoleAPICalled` / `Log.entryAdded` events with level `error`.
-- Build `{ longTasks, finalTiles: { ready, loading, failed }, consoleErrors }`, call `assessScrollTrace(trace, { maxLongTaskMs: Number(process.env.MEGLE_TRACE_MAX_LONGTASK_MS ?? 100) })`, print the result, `process.exit(result.ok ? 0 : 1)`.
+- After settling (~2s), read `window.__mangooLongTasks` and tile counts using the exact selectors from `cdp-inspect.mjs:56-60` (`.tile-thumb-ready` / `.tile-thumb-loading` / `.tile-thumb-failed`), and collect console errors from captured `Runtime.consoleAPICalled` / `Log.entryAdded` events with level `error`.
+- Build `{ longTasks, finalTiles: { ready, loading, failed }, consoleErrors }`, call `assessScrollTrace(trace, { maxLongTaskMs: Number(process.env.MANGOO_TRACE_MAX_LONGTASK_MS ?? 100) })`, print the result, `process.exit(result.ok ? 0 : 1)`.
 
 - [ ] **Step 2: Manual smoke (documented, not auto-run)**
 
 Add a header comment with the run recipe:
 ```
-# Terminal 1: MEGLE_REMOTE_DEBUG=1 MEGLE_AUTO_ADD_ROOT="Y:/Repository/Billfish/Artists" npm run dev
+# Terminal 1: MANGOO_REMOTE_DEBUG=1 MANGOO_AUTO_ADD_ROOT="Y:/Repository/Billfish/Artists" npm run dev
 # Terminal 2:
 WS=$(curl -sS http://127.0.0.1:9222/json | python -c "import json,sys; print([p for p in json.load(sys.stdin) if p['type']=='page'][0]['webSocketDebuggerUrl'])")
 node tools/dev/desktop-scroll-trace.mjs "$WS"
@@ -575,7 +575,7 @@ git commit -m "test(perf): add desktop CDP scroll-trace smoke driver"
 
 - [ ] **Step 1: Run the full 100-op test against the real drive (report-only, no budgets yet)**
 
-Run: `MEGLE_KEEP_DATA=1 node --experimental-strip-types tools/dev/real-hot-loop-test.mts`
+Run: `MANGOO_KEEP_DATA=1 node --experimental-strip-types tools/dev/real-hot-loop-test.mts`
 Expected: prints `[hotloop] summary:` with per-category `count/p50/p95/max`, plus any correctness errors. Record the summary JSON and any errors (esp. `database is locked` failures and stuck tiles) into Appendix A.
 
 - [ ] **Step 2: Run the desktop scroll-trace baseline**
@@ -645,7 +645,7 @@ fn file_database_sets_busy_timeout() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH"; cargo test -p megle-core file_database_sets_busy_timeout`
+Run: `export PATH="$HOME/.cargo/bin:$PATH"; cargo test -p mangoo-core file_database_sets_busy_timeout`
 Expected: FAIL — `SQLITE_BUSY_TIMEOUT_MS` not defined / timeout is 0.
 
 - [ ] **Step 3: Implement**
@@ -667,12 +667,12 @@ In `configure_file_database_wal`, after the `temp_store` line:
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH"; cargo test -p megle-core file_database_sets_busy_timeout`
+Run: `export PATH="$HOME/.cargo/bin:$PATH"; cargo test -p mangoo-core file_database_sets_busy_timeout`
 Expected: PASS.
 
 - [ ] **Step 5: Full crate tests + schema check**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH"; cargo test -p megle-core`
+Run: `export PATH="$HOME/.cargo/bin:$PATH"; cargo test -p mangoo-core`
 Expected: all pass (no regressions).
 
 - [ ] **Step 6: Re-run the hot-loop; confirm zero "database is locked"**
@@ -726,7 +726,7 @@ const THUMBNAIL_BACKGROUND_WORKER_CONCURRENCY: usize = 1;
 
 - [ ] **Step 3: Run worker tests**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH"; cargo test -p megle-core tasks`
+Run: `export PATH="$HOME/.cargo/bin:$PATH"; cargo test -p mangoo-core tasks`
 Expected: PASS (the drain-order / priority tests still hold).
 
 - [ ] **Step 4: Re-measure the hot-loop; record before/after in Appendix A**
@@ -752,7 +752,7 @@ Change `WAL_AUTOCHECKPOINT_PAGES` from `4096` to `1000` (smaller, more frequent,
 
 - [ ] **Step 2: Run crate tests + hot-loop; record in Appendix A**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH"; cargo test -p megle-core` then `node --experimental-strip-types tools/dev/real-hot-loop-test.mts`
+Run: `export PATH="$HOME/.cargo/bin:$PATH"; cargo test -p mangoo-core` then `node --experimental-strip-types tools/dev/real-hot-loop-test.mts`
 Expected: priorityScope max/p99 stalls shrink; p95 under budget.
 
 - [ ] **Step 3: Commit**
@@ -820,7 +820,7 @@ Expected: PASS.
 
 - [ ] **Step 5: Typecheck the web workspace**
 
-Run: `npm --workspace @megle/web run typecheck`
+Run: `npm --workspace @mangoo/web run typecheck`
 Expected: no errors.
 
 - [ ] **Step 6: Re-run Test B; confirm `finalTiles.loading` reaches 0**
@@ -886,12 +886,12 @@ Expected: PASS.
 
 - [ ] **Step 5: Typecheck**
 
-Run: `npm --workspace @megle/web run typecheck`
+Run: `npm --workspace @mangoo/web run typecheck`
 Expected: no errors.
 
 - [ ] **Step 6: Re-run Test B; confirm long-task budget met**
 
-Run the Task-6 recipe. Expected: worst long task under `MEGLE_TRACE_MAX_LONGTASK_MS` (100). Record in Appendix A.
+Run the Task-6 recipe. Expected: worst long task under `MANGOO_TRACE_MAX_LONGTASK_MS` (100). Record in Appendix A.
 
 - [ ] **Step 7: Commit**
 
@@ -915,7 +915,7 @@ Change `SEEN_THUMBNAIL_PERSIST_DEBOUNCE_MS` from `500` to `1000` and `SEEN_THUMB
 
 - [ ] **Step 3: Typecheck + re-run Test A**
 
-Run: `npm --workspace @megle/web run typecheck` then `node --experimental-strip-types tools/dev/real-hot-loop-test.mts`
+Run: `npm --workspace @mangoo/web run typecheck` then `node --experimental-strip-types tools/dev/real-hot-loop-test.mts`
 Expected: budgets green.
 
 - [ ] **Step 4: Commit (only if changed)**
@@ -942,7 +942,7 @@ Run the Task-6 recipe. Expected: `{ ok: true, violations: [] }`.
 
 - [ ] **Step 3: Run the repo web unit tests + Rust tests**
 
-Run: `npm --workspace @megle/web run test` and `export PATH="$HOME/.cargo/bin:$PATH"; cargo test -p megle-core`
+Run: `npm --workspace @mangoo/web run test` and `export PATH="$HOME/.cargo/bin:$PATH"; cargo test -p mangoo-core`
 Expected: all pass.
 
 - [ ] **Step 4: Run the full check suite**
@@ -1037,7 +1037,7 @@ _(Post-fix numbers appended after Phase 4.)_
 
 ### Deferred to runtime verification
 
-- Test B (desktop CDP scroll-trace, `tools/dev/desktop-scroll-trace.mjs`) needs a live Electron GUI; run the recipe in the driver's header against `MEGLE_AUTO_ADD_ROOT` to confirm render-thread health (no long tasks, no stuck tiles, no console errors) in the actual app.
+- Test B (desktop CDP scroll-trace, `tools/dev/desktop-scroll-trace.mjs`) needs a live Electron GUI; run the recipe in the driver's header against `MANGOO_AUTO_ADD_ROOT` to confirm render-thread health (no long tasks, no stuck tiles, no console errors) in the actual app.
 
 ---
 
@@ -1047,7 +1047,7 @@ After the API-layer perf work, driving the **actual Electron window** (not just 
 
 **New durable test infrastructure** (replaces the throwaway `_repro.mjs`-style harnesses):
 - `tools/dev/cdp-client.mjs` — reusable CDP-over-WebSocket client (evalJson / run / screenshot / console-error capture).
-- `tools/dev/desktop-interaction-test.mjs` — launches the real desktop app against the real library, BFS-discovers a diverse folder catalog across tree levels, then drives 30 folder switches covering **cold / hot / out-and-back / rapid** navigation across depths 0–2, interleaved with grid deep-scroll and preview open/close and sidebar-tree scroll. Asserts on the **live rendered `.tile-thumb-image` / `.subfolder-card-cover-image` count** (not the stale `data-thumb-state` row attribute), per-op latency, hangs, error strip, console errors. Run: `node tools/dev/desktop-interaction-test.mjs` (env `MEGLE_INTERACTION_ROOT`, `MEGLE_INTERACTION_OPS`, `MEGLE_KEEP_DATA=1`).
+- `tools/dev/desktop-interaction-test.mjs` — launches the real desktop app against the real library, BFS-discovers a diverse folder catalog across tree levels, then drives 30 folder switches covering **cold / hot / out-and-back / rapid** navigation across depths 0–2, interleaved with grid deep-scroll and preview open/close and sidebar-tree scroll. Asserts on the **live rendered `.tile-thumb-image` / `.subfolder-card-cover-image` count** (not the stale `data-thumb-state` row attribute), per-op latency, hangs, error strip, console errors. Run: `node tools/dev/desktop-interaction-test.mjs` (env `MANGOO_INTERACTION_ROOT`, `MANGOO_INTERACTION_OPS`, `MANGOO_KEEP_DATA=1`).
 
 **Bugs fixed (each real-window verified):**
 

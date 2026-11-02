@@ -24,23 +24,31 @@ import {
   type OverlayRootId
 } from "./overlayTypes";
 import { useOverlayPresence } from "./useOverlayPresence";
+import { useOverlayFocusTrap } from "./useOverlayFocusTrap";
 
 export interface AnchoredOverlayProps {
   anchor: OverlayAnchor | null;
   ariaLabel: string;
   autoFocus?: boolean;
+  busy?: boolean;
+  isDismissLocked?: () => boolean;
+  trapFocus?: boolean;
   children: ReactNode;
   className?: string;
   id: string;
   initialFocusRef?: RefObject<HTMLElement | null>;
+  integratedHeader?: ReactNode;
+  interactivePointerOwner?: boolean;
   minWidth?: number;
   onDismiss: () => void;
+  onPresenceChange?: (present: boolean) => void;
   open: boolean;
   parentId?: string;
   placement?: OverlayPlacement;
   preferredWidth?: number;
   role?: "menu" | "listbox" | "dialog" | "group" | "status";
   restoreFocusTarget?: HTMLElement | null;
+  restoreFocus?: boolean;
   rootId: OverlayRootId;
   surfaceRole?: "popover" | "nested";
 }
@@ -57,6 +65,7 @@ function layoutUnchanged(
     current.maxHeight === next.maxHeight &&
     current.placement === next.placement &&
     current.width === next.width
+    && current.anchorHeight === next.anchorHeight
   );
 }
 
@@ -64,18 +73,25 @@ export function AnchoredOverlay({
   anchor,
   ariaLabel,
   autoFocus = false,
+  busy = false,
+  isDismissLocked,
+  trapFocus = false,
   children,
   className,
   id,
   initialFocusRef,
+  integratedHeader,
+  interactivePointerOwner = false,
   minWidth,
   onDismiss,
+  onPresenceChange,
   open,
   parentId,
   placement = "bottom-start",
   preferredWidth,
   role = "menu",
   restoreFocusTarget,
+  restoreFocus = true,
   rootId,
   surfaceRole
 }: AnchoredOverlayProps): ReactPortal | null {
@@ -89,6 +105,13 @@ export function AnchoredOverlay({
   const presence = useOverlayPresence(open, kind);
   if (anchor) retainedAnchorRef.current = anchor;
   const renderedAnchor = anchor ?? retainedAnchorRef.current;
+  const integratedAnchor = integratedHeader !== undefined;
+
+  useLayoutEffect(() => {
+    // The integrated header replaces the trigger. Keep that trigger painted
+    // until the portal has a measured, visible surface to take its place.
+    onPresenceChange?.(presence.present && (!integratedAnchor || layout !== null));
+  }, [integratedAnchor, layout, onPresenceChange, presence.present]);
 
   useLayoutEffect(() => {
     surfaceRef.current = presence.present ? document.getElementById(id) : null;
@@ -101,6 +124,8 @@ export function AnchoredOverlay({
       surfaceRef.current = null;
     };
   }, [id, presence.present]);
+
+  useOverlayFocusTrap(open && presence.present && layout !== null && trapFocus, surfaceRef, { initialFocusRef });
 
   useLayoutEffect(() => {
     if (!open || !presence.present || !autoFocus) {
@@ -164,15 +189,18 @@ export function AnchoredOverlay({
       kind,
       trigger,
       surface,
-      dismissOnEscape: true,
-      dismissOnFocusOutside: true,
-      dismissOnOutsidePointer: true,
-      dismissOnWindowBlur: true,
-      restoreFocus: trigger !== null,
+      dismissOnEscape: !busy,
+      dismissOnFocusOutside: !busy,
+      dismissOnOutsidePointer: !busy,
+      dismissOnWindowBlur: !busy,
+      isDismissLocked,
+      restoreFocus: restoreFocus && trigger !== null,
       onDismiss
     });
   }, [
     anchor,
+    busy,
+    isDismissLocked,
     id,
     kind,
     onDismiss,
@@ -181,6 +209,7 @@ export function AnchoredOverlay({
     parentId,
     presence.present,
     registerLayer,
+    restoreFocus,
     restoreFocusTarget,
     rootId
   ]);
@@ -196,6 +225,10 @@ export function AnchoredOverlay({
       const triggerRect = anchor.getBoundingClientRect();
       const intrinsicWidth = measureOverlayIntrinsicWidth(surface);
       const surfaceRect = surface.getBoundingClientRect();
+      const optionsViewport = surface.querySelector<HTMLElement>(".overlay-scroll-viewport");
+      const measuredHeight = integratedAnchor && optionsViewport
+        ? triggerRect.height + Math.min(320, optionsViewport.scrollHeight)
+        : surfaceRect.height;
       const viewport = { width: window.innerWidth, height: window.innerHeight };
       const viewportMaxWidth = Math.max(
         0,
@@ -203,7 +236,8 @@ export function AnchoredOverlay({
       );
       const next = resolveAnchoredOverlayLayout({
         trigger: triggerRect,
-        overlay: { measuredWidth: intrinsicWidth, height: surfaceRect.height },
+        overlay: { measuredWidth: intrinsicWidth, height: measuredHeight },
+        integratedAnchor,
         viewport,
         preferredPlacement: placement,
         preferredWidth,
@@ -225,6 +259,10 @@ export function AnchoredOverlay({
 
     const resizeObserver = new ResizeObserver(scheduleMeasure);
     resizeObserver.observe(surface);
+    if (integratedAnchor) {
+      const content = surface.querySelector(".overlay-scroll-viewport")?.firstElementChild;
+      if (content) resizeObserver.observe(content);
+    }
     if (typeof HTMLElement !== "undefined" && anchor instanceof HTMLElement) {
       resizeObserver.observe(anchor);
     }
@@ -238,7 +276,7 @@ export function AnchoredOverlay({
       window.removeEventListener("resize", scheduleMeasure);
       window.removeEventListener("scroll", handleScroll, true);
     };
-  }, [anchor, kind, minWidth, open, placement, preferredWidth, presence.present]);
+  }, [anchor, integratedAnchor, kind, minWidth, open, placement, preferredWidth, presence.present]);
 
   if (!presence.present || !renderedAnchor) return null;
 
@@ -251,26 +289,33 @@ export function AnchoredOverlay({
     maxWidth: layout?.maxWidth ?? fallbackMaxWidth,
     maxHeight: layout?.maxHeight ?? fallbackMaxHeight,
     width: layout?.width,
+    "--overlay-anchor-height": `${layout?.anchorHeight ?? 0}px`,
     visibility: layout ? "visible" : "hidden"
   };
 
   return createPortal(
     <OverlaySurface
       aria-label={ariaLabel}
+      aria-busy={busy || undefined}
       aria-hidden={!open || undefined}
       className={className}
       data-overlay-layer-kind={kind}
       data-overlay-placement={layout?.placement ?? placement}
       data-overlay-state={presence.phase}
+      data-interactive-pointer-owner={interactivePointerOwner ? "true" : undefined}
       id={id}
+      interactive={interactivePointerOwner}
       role={role}
       style={style}
       surfaceRole={resolvedSurfaceRole}
     >
+      {integratedHeader}
       <div
         className="overlay-scroll-viewport"
         data-overlay-scroll-viewport="true"
-        style={{ maxHeight: layout?.maxHeight ?? fallbackMaxHeight }}
+        style={{ maxHeight: integratedAnchor
+          ? Math.min(320, Math.max(0, (layout?.maxHeight ?? fallbackMaxHeight) - (layout?.anchorHeight ?? 0)))
+          : layout?.maxHeight ?? fallbackMaxHeight }}
       >
         {children}
       </div>

@@ -185,7 +185,8 @@ impl Checkpoint {
     }
     pub fn verify(&self) -> Result<(), CodecError> {
         if self.checkpoint_schema_version != CHECKPOINT_SCHEMA_VERSION
-            || self.reducer_version != REDUCER_VERSION
+            || !(super::codec::MIN_READ_REDUCER_VERSION..=REDUCER_VERSION)
+                .contains(&self.reducer_version)
             || self.host_metadata.library_uuid != self.library_uuid.to_string()
         {
             return Err(CodecError::IntegrityMismatch);

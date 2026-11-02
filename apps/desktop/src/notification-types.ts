@@ -14,7 +14,7 @@ import type {
   ProcessLogEntry,
   RendererErrorReport,
   ThumbnailCacheSummary
-} from "@megle/notification-contract";
+} from "@mangoo/notification-contract";
 
 export type {
   DesktopNotificationOperation,
@@ -32,7 +32,7 @@ export type {
   ProcessLogEntry,
   RendererErrorReport,
   ThumbnailCacheSummary
-} from "@megle/notification-contract";
+} from "@mangoo/notification-contract";
 
 export interface NotificationRetryableFailureReference {
   libraryId: string;

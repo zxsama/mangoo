@@ -1,13 +1,13 @@
 import { randomUUID } from "node:crypto";
 
-import { rendererErrorOperationId } from "@megle/notification-contract";
+import { rendererErrorOperationId } from "@mangoo/notification-contract";
 
 import type {
   FileOperationKind,
   FileOperationRecord,
   NotificationOutboxAckRequest,
   NotificationOutboxAckResponse
-} from "@megle/core-client/generated-contract";
+} from "@mangoo/core-client/generated-contract";
 
 import type { CoreSession } from "./core-session.js";
 import type {
@@ -412,6 +412,7 @@ export class NotificationService {
   private closed = false;
   private storedSnapshot = emptyStoredSnapshot();
   private health: NotificationSyncHealth;
+  private readonly fencedSessions = new WeakSet<NotificationCoreSession>();
   private readonly listeners = new Set<(snapshot: NotificationCompactSnapshot) => void>();
   private readonly pendingOutbox = new Map<string, PendingOutboxBatch>();
   private readonly fallbackOperations = new Map<string, DesktopNotificationOperation>();
@@ -781,6 +782,7 @@ export class NotificationService {
     }
 
     let cursor = 0;
+    let needsAcknowledgement = false;
     if (this.store) {
       const store = this.store;
       let syncState: NotificationSyncState;
@@ -795,26 +797,34 @@ export class NotificationService {
         await this.markStoreUnavailable(error);
         throw error;
       }
-      if (syncState.persistedSequence > syncState.ackedSequence) {
-        await this.acknowledge(session, syncState.persistedSequence, signal);
-        try {
-          await store.markAcknowledged(library.id, syncState.persistedSequence);
-          const acknowledgedBatch = this.pendingOutbox.get(library.id);
-          if (
-            acknowledgedBatch &&
-            acknowledgedBatch.maxSequence <= syncState.persistedSequence
-          ) {
-            this.pendingOutbox.delete(library.id);
-          }
-        } catch (error) {
-          await this.markStoreUnavailable(error);
-          throw error;
-        }
-      }
       cursor = syncState.persistedSequence;
+      needsAcknowledgement = syncState.persistedSequence > syncState.ackedSequence;
     }
 
-    const page = await this.listOutbox(session, cursor, signal, this.store ? OUTBOX_WAIT_MS : 0);
+    // A Host Core can switch Libraries without changing its URL or session. Read
+    // the page's authoritative identity before applying or acknowledging anything.
+    const page = await this.listOutbox(
+      library,
+      session,
+      cursor,
+      signal,
+      this.store && !needsAcknowledgement ? OUTBOX_WAIT_MS : 0
+    );
+    signal.throwIfAborted();
+    if (needsAcknowledgement && this.store) {
+      const store = this.store;
+      await this.acknowledge(session, cursor, signal, page.contextRevision);
+      try {
+        await store.markAcknowledged(library.id, cursor);
+        const acknowledgedBatch = this.pendingOutbox.get(library.id);
+        if (acknowledgedBatch && acknowledgedBatch.maxSequence <= cursor) {
+          this.pendingOutbox.delete(library.id);
+        }
+      } catch (error) {
+        await this.markStoreUnavailable(error);
+        throw error;
+      }
+    }
     if (this.store) {
       const store = this.store;
       try {
@@ -870,7 +880,7 @@ export class NotificationService {
       this.emitSnapshot();
       return;
     }
-    await this.acknowledge(session, page.maxSequence, signal);
+    await this.acknowledge(session, page.maxSequence, signal, page.contextRevision);
     try {
       await this.store.markAcknowledged(library.id, page.maxSequence);
     } catch (error) {
@@ -882,20 +892,37 @@ export class NotificationService {
   }
 
   private async listOutbox(
+    library: NotificationLibraryIdentity,
     session: NotificationCoreSession,
     afterSequence: number,
     signal: AbortSignal,
     waitMs = OUTBOX_WAIT_MS
-  ): Promise<{ events: NotificationStoreEvent[]; maxSequence: number }> {
+  ): Promise<{ events: NotificationStoreEvent[]; maxSequence: number; contextRevision: string | null }> {
     const query = new URLSearchParams({
       afterSequence: String(afterSequence),
       limit: String(OUTBOX_LIMIT),
       waitMs: String(waitMs)
     });
+    let contextRevision: string | null = null;
     const body = await this.requestJson(
       `${session.baseUrl}/notifications/outbox?${query}`,
       session,
-      { signal }
+      { signal },
+      (headers) => {
+        const libraryId = headers.get("x-mangoo-library-id");
+        const revision = headers.get("x-mangoo-context-revision");
+        // Standalone single-catalog Core has neither header. A Host session must
+        // never silently fall back to that unfenced transport after discovery.
+        if (libraryId === null && revision === null && !this.fencedSessions.has(session)) return;
+        this.fencedSessions.add(session);
+        if (libraryId !== library.id) {
+          throw new Error("Notification outbox belongs to a different active Library");
+        }
+        if (revision === null || !/^\d+$/.test(revision) || !Number.isSafeInteger(Number(revision))) {
+          throw new TypeError("Invalid notification Library context revision");
+        }
+        contextRevision = revision;
+      }
     );
     if (!body || typeof body !== "object" || !Array.isArray((body as { items?: unknown }).items)) {
       throw new TypeError("invalid notification outbox response");
@@ -918,19 +945,23 @@ export class NotificationService {
         throw new RangeError("notification sequences must be strictly increasing");
       }
     }
-    return { events, maxSequence };
+    return { events, maxSequence, contextRevision };
   }
 
   private async acknowledge(
     session: NotificationCoreSession,
     maxSequence: number,
-    signal: AbortSignal
+    signal: AbortSignal,
+    contextRevision: string | null
   ): Promise<void> {
     const request: NotificationOutboxAckRequest = { maxSequence };
     const body = await this.requestJson(`${session.baseUrl}/notifications/outbox/ack`, session, {
       method: "POST",
       signal,
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        ...(contextRevision === null ? {} : { "x-mangoo-context-revision": contextRevision })
+      },
       body: JSON.stringify(request)
     });
     const acknowledgement = parseNotificationOutboxAckResponse(body);
@@ -942,15 +973,19 @@ export class NotificationService {
   private async requestJson(
     url: string,
     session: NotificationCoreSession,
-    init: RequestInit = {}
+    init: RequestInit = {},
+    inspectHeaders?: (headers: Headers) => void
   ): Promise<unknown> {
     const headers = new Headers(init.headers);
-    headers.set("x-megle-session", session.sessionToken);
+    headers.set("x-mangoo-session", session.sessionToken);
+    init.signal?.throwIfAborted();
     const result = await this.fetchImpl(url, { ...init, headers });
     const text = await result.text();
+    init.signal?.throwIfAborted();
     if (!result.ok) {
       throw new Error(`Core request failed (${result.status}): ${text || result.statusText}`);
     }
+    inspectHeaders?.(result.headers);
     if (!text) return null;
     try {
       return JSON.parse(text) as unknown;

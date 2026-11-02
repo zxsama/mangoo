@@ -10,9 +10,9 @@ function parseArgs(argv) {
     output: null,
     quick: false,
     largeBytes: null,
-    largeTransferRoot: process.env.MEGLE_SYNC_LARGE_TRANSFER_ROOT ?? null,
+    largeTransferRoot: process.env.MANGOO_SYNC_LARGE_TRANSFER_ROOT ?? null,
     cleanupLargeTransfer: false,
-    rendererEvidence: process.env.MEGLE_SYNC_RENDERER_EVIDENCE ?? null,
+    rendererEvidence: process.env.MANGOO_SYNC_RENDERER_EVIDENCE ?? null,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
@@ -37,13 +37,13 @@ if (options.cleanupLargeTransfer) {
   const cleanupRoot = path.resolve(largeTransferRoot);
   if (
     !cleanupRoot.toLowerCase().startsWith(temporaryRoot)
-    || !path.basename(cleanupRoot).startsWith("megle-sync-large-")
+    || !path.basename(cleanupRoot).startsWith("mangoo-sync-large-")
   ) {
-    throw new Error("--cleanup-large-transfer requires a megle-sync-large-* directory under the system temporary root");
+    throw new Error("--cleanup-large-transfer requires a mangoo-sync-large-* directory under the system temporary root");
   }
 }
 const rows = [];
-const expectedCommit = process.env.MEGLE_EVIDENCE_COMMIT
+const expectedCommit = process.env.MANGOO_EVIDENCE_COMMIT
   ?? spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8", windowsHide: true }).stdout.trim();
 
 async function rendererEvidenceRow(file) {
@@ -58,7 +58,7 @@ async function rendererEvidenceRow(file) {
       signal: null,
       status: "blocked",
       required: true,
-      reason: "renderer evidence is absent; pass --renderer-evidence or MEGLE_SYNC_RENDERER_EVIDENCE",
+      reason: "renderer evidence is absent; pass --renderer-evidence or MANGOO_SYNC_RENDERER_EVIDENCE",
     };
   }
   try {
@@ -73,7 +73,7 @@ async function rendererEvidenceRow(file) {
     if (typeof evidence.runId !== "string" || evidence.runId.length < 16) violations.push("missing stable collector run identity");
     if (!expectedCommit || evidence.commit !== expectedCommit) violations.push(`commit ${evidence.commit ?? "missing"} != ${expectedCommit || "unknown"}`);
     if (evidence.dirty !== false) violations.push("collector did not run from a clean tree");
-    if (process.env.MEGLE_EVIDENCE_EXACT_TREE === "1" && evidence.exactTree !== true) violations.push("collector evidence is not exact-tree bound");
+    if (process.env.MANGOO_EVIDENCE_EXACT_TREE === "1" && evidence.exactTree !== true) violations.push("collector evidence is not exact-tree bound");
     if (!evidence.machine?.hostname || !evidence.machine?.platform || !evidence.machine?.cpu) violations.push("missing machine identity");
     if (!evidence.fixture?.digest) violations.push("missing fixture identity");
     if (!Number.isFinite(Date.parse(evidence.capturedAt))) violations.push("missing capture timestamp");
@@ -115,14 +115,14 @@ rows.push(await runCommand({
   name: "paired-sync-performance",
   command: "node",
   args: ["tools/bench/sync-orchestration-bench.mjs"],
-  env: { MEGLE_SYNC_BENCH_ASSETS: assets },
+  env: { MANGOO_SYNC_BENCH_ASSETS: assets },
   runDirectory,
   timeoutMs: 75 * 60 * 1000,
 }));
 rows.push(await runCommand({
   name: "media-inventory-scale",
   command: "cargo",
-  args: ["test", "-p", "megle-core", "--release", "sync::media::worker::tests::media_inventory_scale_probe", "--", "--ignored", "--nocapture"],
+  args: ["test", "-p", "mangoo-core", "--release", "sync::media::worker::tests::media_inventory_scale_probe", "--", "--ignored", "--nocapture"],
   runDirectory,
   timeoutMs: 30 * 60 * 1000,
 }));
@@ -186,11 +186,11 @@ const targetRoot = process.env.CARGO_TARGET_DIR ? path.resolve(root, process.env
 rows.push(await runCommand({
   name: "physical-large-transfer-resume",
   command: "cargo",
-  args: ["test", "-p", "megle-core", "--release", "sync::media::worker::tests::physical_large_transfer_resume_probe", "--", "--ignored", "--nocapture"],
+  args: ["test", "-p", "mangoo-core", "--release", "sync::media::worker::tests::physical_large_transfer_resume_probe", "--", "--ignored", "--nocapture"],
   env: {
-    MEGLE_SYNC_LARGE_TRANSFER_BYTES: largeBytes,
-    MEGLE_SYNC_LARGE_TRANSFER_ROOT: largeTransferRoot,
-    MEGLE_SYNC_BUNDLED_PLUGINS_DIR: path.join(targetRoot, "release", "bundled-plugins"),
+    MANGOO_SYNC_LARGE_TRANSFER_BYTES: largeBytes,
+    MANGOO_SYNC_LARGE_TRANSFER_ROOT: largeTransferRoot,
+    MANGOO_SYNC_BUNDLED_PLUGINS_DIR: path.join(targetRoot, "release", "bundled-plugins"),
   },
   runDirectory,
   timeoutMs: 3 * 60 * 60 * 1000,

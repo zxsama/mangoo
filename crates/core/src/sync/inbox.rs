@@ -291,6 +291,7 @@ pub(crate) fn materialize_truth(
                 "INSERT INTO asset_content_heads(asset_uuid,content_revision_uuid,is_display_winner) SELECT r.asset_uuid,r.content_revision_uuid,CASE WHEN r.content_revision_uuid=(SELECT rr.content_revision_uuid FROM asset_content_revisions rr JOIN sync_events e ON e.event_uuid=rr.event_uuid WHERE rr.asset_uuid=?1 AND NOT EXISTS (SELECT 1 FROM asset_content_supersedes s WHERE s.observed_content_revision_uuid=rr.content_revision_uuid) ORDER BY e.hlc_wall_ms DESC,e.hlc_logical DESC,e.device_uuid DESC,e.actor_epoch DESC,e.actor_seq DESC,e.event_uuid DESC LIMIT 1) THEN 1 ELSE 0 END FROM asset_content_revisions r WHERE r.asset_uuid=?1 AND NOT EXISTS (SELECT 1 FROM asset_content_supersedes s WHERE s.observed_content_revision_uuid=r.content_revision_uuid)",
                 [entity],
             )?;
+            rematerialize_location_projection(transaction, remote_apply)?;
         }
     }
     Ok(())
@@ -495,7 +496,7 @@ fn rematerialize_location_projection(
     // location. Interpret only that local placeholder through its descriptor;
     // retain the anchor for children and leave immutable revisions untouched.
     let mut statement = transaction.prepare(
-        "SELECT r.revision_uuid,r.entity_uuid,CASE WHEN d.root_uuid IS NOT NULL THEN d.library_root_uuid ELSE r.parent_uuid END,CASE WHEN d.root_uuid IS NOT NULL THEN d.requested_name ELSE r.name END,COALESCE(e.hlc_wall_ms,0),COALESCE(e.hlc_logical,0),COALESCE(e.device_uuid,zeroblob(16)),COALESCE(e.actor_epoch,zeroblob(16)),COALESCE(e.actor_seq,0),COALESCE(e.event_uuid,r.revision_uuid),EXISTS(SELECT 1 FROM sync_location_heads h WHERE h.entity_uuid=r.entity_uuid AND h.revision_uuid=r.revision_uuid) FROM sync_location_revisions r LEFT JOIN sync_events e ON e.event_uuid=r.event_uuid LEFT JOIN sync_root_descriptors d ON d.root_folder_uuid=r.entity_uuid AND r.event_uuid IS NULL AND r.origin='bootstrap' AND r.name='' ORDER BY r.entity_uuid,r.revision_uuid",
+        "SELECT r.revision_uuid,r.entity_uuid,CASE WHEN d.root_uuid IS NOT NULL THEN d.library_root_uuid ELSE r.parent_uuid END,CASE WHEN d.root_uuid IS NOT NULL THEN d.requested_name ELSE r.name END,COALESCE(e.hlc_wall_ms,0),COALESCE(e.hlc_logical,0),COALESCE(e.device_uuid,zeroblob(16)),COALESCE(e.actor_epoch,zeroblob(16)),COALESCE(e.actor_seq,0),COALESCE(e.event_uuid,r.revision_uuid),EXISTS(SELECT 1 FROM sync_location_heads h WHERE h.entity_uuid=r.entity_uuid AND h.revision_uuid=r.revision_uuid),COALESCE(e.reducer_version,2)>=3 FROM sync_location_revisions r LEFT JOIN sync_events e ON e.event_uuid=r.event_uuid LEFT JOIN sync_root_descriptors d ON d.root_folder_uuid=r.entity_uuid AND r.event_uuid IS NULL AND r.origin='bootstrap' AND r.name='' ORDER BY r.entity_uuid,r.revision_uuid",
     )?;
     for row in statement.query_map([], |row| {
         Ok((
@@ -510,16 +511,30 @@ fn rematerialize_location_projection(
             row.get::<_, i64>(8)?,
             row.get::<_, Vec<u8>>(9)?,
             row.get::<_, bool>(10)?,
+            row.get::<_, bool>(11)?,
         ))
     })? {
-        let (revision, entity, parent, name, wall, logical, device, epoch, seq, event, is_head) =
-            row?;
+        let (
+            revision,
+            entity,
+            parent,
+            name,
+            wall,
+            logical,
+            device,
+            epoch,
+            seq,
+            event,
+            is_head,
+            preserve_legal_name,
+        ) = row?;
         let entity_uuid = super::types::EntityUuid(uuid::Uuid::from_slice(&entity)?);
         let revision_uuid = RevisionUuid(uuid::Uuid::from_slice(&revision)?);
         let truth = state.entities.entry(entity_uuid).or_default();
         truth.locations.insert(
             revision_uuid,
             LocationRevision {
+                preserve_legal_name,
                 revision_uuid,
                 parent_uuid: parent
                     .map(|value| uuid::Uuid::from_slice(&value).map(super::types::EntityUuid))
@@ -542,98 +557,147 @@ fn rematerialize_location_projection(
         }
     }
     let locations = legalize_locations(&state, logical_root);
-    for (entity_uuid, location) in locations {
-        let entity = entity_uuid.0.as_bytes().as_slice();
-        let heads = state.entities[&entity_uuid]
-            .location_heads
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
-        persist_location_conflict(transaction, entity_uuid, &heads)?;
-        let root_descriptor: Option<(Vec<u8>, i64)> = transaction
+    // Parent folders may have larger UUIDs than their children. Resolve only
+    // entries whose parent is present, then retry deferred descendants.
+    let mut pending = locations.into_iter().collect::<Vec<_>>();
+    while !pending.is_empty() {
+        let before = pending.len();
+        let mut deferred = Vec::new();
+        for (entity_uuid, location) in pending {
+            let entity = entity_uuid.0.as_bytes().as_slice();
+            let heads = state.entities[&entity_uuid]
+                .location_heads
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            persist_location_conflict(transaction, entity_uuid, &heads)?;
+            let root_descriptor: Option<(Vec<u8>, i64)> = transaction
             .query_row(
                 "SELECT root_uuid,logical_revision FROM sync_root_descriptors WHERE root_folder_uuid=?1",
                 [entity],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        if let Some((root_uuid, old_revision)) = root_descriptor {
-            let winning = state.entities[&entity_uuid].winning_location();
-            let winning_revision = winning.map(|value| value.revision_uuid.0.as_bytes().to_vec());
-            transaction.execute(
-                "UPDATE sync_root_descriptors SET winning_location_revision_uuid=?1,requested_name=?2,materialized_name=?3,materialization_fingerprint=?4,logical_revision=?5,updated_at=?6 WHERE root_folder_uuid=?7 AND (NOT (winning_location_revision_uuid IS ?1) OR requested_name<>?2 OR materialized_name<>?3 OR materialization_fingerprint<>?4)",
+            if let Some((root_uuid, old_revision)) = root_descriptor {
+                let winning = state.entities[&entity_uuid].winning_location();
+                let winning_revision =
+                    winning.map(|value| value.revision_uuid.0.as_bytes().to_vec());
+                // Restored legacy roots may only have a local bootstrap location.
+                // It anchors navigation, but cannot revise the immutable seed's
+                // portable root truth without a canonical identity/location event.
+                transaction.execute(
+                "UPDATE sync_root_descriptors SET winning_location_revision_uuid=?1,requested_name=?2,materialized_name=?3,materialization_fingerprint=?4,logical_revision=?5,updated_at=?6 WHERE root_folder_uuid=?7 AND (creation_event_uuid IS NOT NULL OR EXISTS(SELECT 1 FROM sync_location_revisions r WHERE r.revision_uuid=?1 AND r.event_uuid IS NOT NULL)) AND (NOT (winning_location_revision_uuid IS ?1) OR requested_name<>?2 OR materialized_name<>?3 OR materialization_fingerprint<>?4)",
                 params![winning_revision, location.requested_name, location.display_name, location.materialization_fingerprint.as_slice(), old_revision.saturating_add(1), unix_timestamp_millis(), entity],
             )?;
-            let local_only = root_is_local_only(transaction, &root_uuid)?;
-            if !local_only || !preserve_local_only_roots {
-                transaction.execute(
-                    "UPDATE roots SET display_name=?1 WHERE root_uuid=?2",
-                    params![location.display_name, root_uuid],
-                )?;
+                let local_only = root_is_local_only(transaction, &root_uuid)?;
+                if !local_only || !preserve_local_only_roots {
+                    transaction.execute(
+                        "UPDATE roots SET display_name=?1 WHERE root_uuid=?2",
+                        params![location.display_name, root_uuid],
+                    )?;
+                }
+                continue;
             }
-            continue;
-        }
-        let parent = location.parent_uuid.and_then(|parent_uuid| {
-            transaction
-                .query_row(
-                    "SELECT id,root_id FROM folders WHERE folder_uuid=?1",
-                    [parent_uuid.0.as_bytes().as_slice()],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .optional()
-                .ok()
-                .flatten()
-        });
-        let Some((parent_id, root_id)) = parent else {
-            continue;
-        };
-        let local_only: bool = transaction.query_row(
+            let parent = location.parent_uuid.and_then(|parent_uuid| {
+                transaction
+                    .query_row(
+                        "SELECT id,root_id FROM folders WHERE folder_uuid=?1",
+                        [parent_uuid.0.as_bytes().as_slice()],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+            });
+            let Some((parent_id, root_id)) = parent else {
+                deferred.push((entity_uuid, location));
+                continue;
+            };
+            let local_only: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM sync_root_local_bindings WHERE root_id=?1 AND state='local-only-fork')",
             [root_id],
             |row| row.get(0),
         )?;
-        if local_only && preserve_local_only_roots {
-            continue;
-        }
-        if let Some(file_id) = transaction
-            .query_row(
-                "SELECT id FROM files WHERE asset_uuid=?1",
-                [entity],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-        {
-            transaction.execute(
-                "UPDATE files SET root_id=?1,folder_id=?2,name=?3 WHERE id=?4",
-                params![root_id, parent_id, location.display_name, file_id],
-            )?;
-            crate::db::sync_media_fts_for_file_in_transaction_pub(transaction, file_id)?;
-            continue;
-        }
-        let entity_kind: Option<Vec<u8>> = transaction
+            if local_only && preserve_local_only_roots {
+                continue;
+            }
+            if let Some(file_id) = transaction
+                .query_row(
+                    "SELECT id FROM files WHERE asset_uuid=?1",
+                    [entity],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+            {
+                transaction.execute(
+                    "UPDATE files SET root_id=?1,folder_id=?2,name=?3,ext=?5 WHERE id=?4",
+                    params![
+                        root_id,
+                        parent_id,
+                        location.display_name,
+                        file_id,
+                        crate::decode::formats::lowercase_extension(std::path::Path::new(
+                            &location.display_name
+                        ))
+                    ],
+                )?;
+                let ext = crate::decode::formats::lowercase_extension(std::path::Path::new(
+                    &location.display_name,
+                ));
+                crate::db::set_media_presentation_in_transaction(
+                    transaction,
+                    file_id,
+                    crate::decode::formats::media_kind_for_extension(&ext),
+                    false,
+                )?;
+                continue;
+            }
+            let entity_kind: Option<Vec<u8>> = transaction
             .query_row(
                 "SELECT value FROM sync_field_versions WHERE entity_uuid=?1 AND field_name='entity-kind' AND is_winner=1",
                 [entity],
                 |row| row.get(0),
             )
             .optional()?;
-        let is_folder = entity_kind
-            .as_deref()
-            .and_then(|value| serde_json::from_slice::<serde_json::Value>(value).ok())
-            .and_then(|value| value.as_str().map(ToOwned::to_owned))
-            .is_some_and(|kind| kind == "folder");
-        if is_folder {
-            let updated = transaction.execute(
+            let kind = entity_kind
+                .as_deref()
+                .and_then(|value| serde_json::from_slice::<serde_json::Value>(value).ok())
+                .and_then(|value| value.as_str().map(ToOwned::to_owned));
+            if kind.as_deref() == Some("folder") {
+                let updated = transaction.execute(
                 "UPDATE folders SET root_id=?1,parent_id=?2,name=?3,status='active' WHERE folder_uuid=?4",
                 params![root_id, parent_id, location.display_name, entity],
             )?;
-            if updated == 0 {
-                transaction.execute(
+                if updated == 0 {
+                    transaction.execute(
                     "INSERT INTO folders(root_id,parent_id,name,path_hash,mtime,status,folder_uuid) VALUES (?1,?2,?3,'',NULL,'active',?4)",
                     params![root_id, parent_id, location.display_name, entity],
                 )?;
+                }
+            } else {
+                let content: Option<(i64,i64)> = transaction.query_row(
+                "SELECT COALESCE(r.byte_size,0),COALESCE(r.source_mtime_ms,0)/1000 FROM asset_content_heads h JOIN asset_content_revisions r ON r.content_revision_uuid=h.content_revision_uuid WHERE h.asset_uuid=?1 AND h.is_display_winner=1",
+                [entity], |row| Ok((row.get(0)?,row.get(1)?)),
+            ).optional()?;
+                if let Some((size, mtime)) = content {
+                    let ext = crate::decode::formats::lowercase_extension(std::path::Path::new(
+                        &location.display_name,
+                    ));
+                    transaction.execute("INSERT INTO files(root_id,folder_id,name,ext,size,mtime,status,asset_uuid) VALUES (?1,?2,?3,?4,?5,?6,'active',?7)", params![root_id,parent_id,location.display_name,ext,size,mtime,entity])?;
+                    let file_id = transaction.last_insert_rowid();
+                    crate::db::set_media_presentation_in_transaction(
+                        transaction,
+                        file_id,
+                        crate::decode::formats::media_kind_for_extension(&ext),
+                        false,
+                    )?;
+                }
             }
         }
+        if deferred.len() == before {
+            break;
+        }
+        pending = deferred;
     }
     Ok(())
 }
@@ -1258,8 +1322,10 @@ mod tests {
 
     #[test]
     fn bootstrap_conflict_recovery_is_bounded_preserves_truth_and_survives_reopen() {
-        let directory =
-            std::env::temp_dir().join(format!("megle-bootstrap-conflict-{}", uuid::Uuid::now_v7()));
+        let directory = std::env::temp_dir().join(format!(
+            "mangoo-bootstrap-conflict-{}",
+            uuid::Uuid::now_v7()
+        ));
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("catalog.sqlite");
         let library = uuid::Uuid::from_u128(1);
@@ -1539,6 +1605,26 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
+        let restored_truth = database
+            .sync_root_descriptor(root_uuid.as_bytes())
+            .unwrap()
+            .unwrap();
+        for _ in 0..2 {
+            let transaction = database
+                .connection_for_fsops()
+                .unchecked_transaction()
+                .unwrap();
+            rematerialize_location_projection(&transaction, false).unwrap();
+            transaction.commit().unwrap();
+            assert_eq!(
+                database
+                    .sync_root_descriptor(root_uuid.as_bytes())
+                    .unwrap()
+                    .unwrap(),
+                restored_truth,
+                "local bootstrap navigation must preserve restored portable root truth"
+            );
+        }
         let root_rename = event(
             1,
             20,
@@ -1598,6 +1684,15 @@ mod tests {
             .unwrap();
         assert_eq!(sentinel, "");
         assert_eq!(root_name, "Renamed");
+        let renamed = database
+            .sync_root_descriptor(root_uuid.as_bytes())
+            .unwrap()
+            .unwrap();
+        assert_eq!(renamed.requested_name, "Renamed");
+        assert_eq!(
+            renamed.winning_location_revision_uuid,
+            Some(*uuid::Uuid::from_u128(30).as_bytes())
+        );
         assert_eq!(nested, ("Nested".into(), root_id));
     }
 

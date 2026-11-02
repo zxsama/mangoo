@@ -6,7 +6,7 @@ Date: 2026-07-20
 
 ## Summary
 
-Megle will replace the separate Tasks and Recent surfaces with one unified
+Mangoo will replace the separate Tasks and Recent surfaces with one unified
 notification system. The system presents current work, important results,
 durable operation history, and current-process logs without adding work to the
 media browsing hot path.
@@ -45,7 +45,7 @@ snapshots and incremental changes through the preload bridge.
 - There is no read/unread state, unread count, or notification badge number.
 - Process logs do not persist across app restarts.
 - The compact popover does not cancel or retry tasks.
-- Megle does not create persistent events for individual thumbnail generation
+- Mangoo does not create persistent events for individual thumbnail generation
   attempts.
 - The notification center does not replace contextual form validation,
   confirmation dialogs, or blocking library-load recovery UI.
@@ -322,7 +322,7 @@ or 5 MB, whichever is reached first.
 - Renderer batches must be asynchronous and bounded so logging cannot add
   synchronous work to scrolling, media layout, or thumbnail paint loops.
 
-No sensitive-data redaction requirement is added because Megle is local
+No sensitive-data redaction requirement is added because Mangoo is local
 software and the user explicitly selected complete current-process logs.
 
 ## Error Handling

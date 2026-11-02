@@ -1,5 +1,5 @@
 {
-  "name": "@megle/virtual-grid-bench",
+  "name": "@mangoo/virtual-grid-bench",
   "private": true,
   "type": "module",
   "scripts": {

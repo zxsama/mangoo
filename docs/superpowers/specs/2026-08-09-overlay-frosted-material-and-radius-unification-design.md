@@ -15,7 +15,7 @@ Unify the Settings panel/control radius into one fresh preference and make every
 - Shared overlays use the Settings right-content-area material, not the Settings sidebar material.
 - Rename, Move To, and other renderer modals remain DOM overlays. They do not become native `BrowserWindow` instances.
 
-This document supersedes the independent `surfaceCornerRadius` and `controlCornerRadius` entries in section 7.1 of `2026-05-23-megle-desktop-workbench-shell-rearchitecture-design.md`.
+This document supersedes the independent `surfaceCornerRadius` and `controlCornerRadius` entries in section 7.1 of `2026-05-23-mangoo-desktop-workbench-shell-rearchitecture-design.md`.
 
 ## 3. Root Cause
 

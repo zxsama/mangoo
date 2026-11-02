@@ -31,11 +31,11 @@
 - Consumes: Rawler's `rawsource::RawSource`, `decode_dummy`, and `decoders::RawDecodeParams` APIs.
 
 - [x] Add unit tests proving zero-sized and over-budget dimensions are rejected with a stable `source is too large to decode` message, while the maximum allowed dimensions pass.
-- [x] Run `cargo test -p megle-core decode::tests::decode_pixel_budget -- --nocapture` and confirm the new tests fail because the shared guard does not exist.
+- [x] Run `cargo test -p mangoo-core decode::tests::decode_pixel_budget -- --nocapture` and confirm the new tests fail because the shared guard does not exist.
 - [x] Move `MAX_DECODE_PIXELS` and the checked multiplication into `decode/mod.rs`; make `image_crate` call the shared guard.
 - [x] Call the guard in `PsdDecoder` after parsing dimensions and before `document.rgba()`.
 - [x] In `RawlerDecoder`, memory-map once, call `decode_dummy` to obtain dimensions, reject an unsafe raster, then perform the full decode and guard again before development.
-- [x] Run `cargo test -p megle-core decode:: -- --nocapture` and confirm all decoder tests pass.
+- [x] Run `cargo test -p mangoo-core decode:: -- --nocapture` and confirm all decoder tests pass.
 
 ### Task 2: Expiring Preview Negative Cache
 

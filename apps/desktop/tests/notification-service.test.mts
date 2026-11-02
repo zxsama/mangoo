@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
+import { randomInt } from "node:crypto";
 import fs from "node:fs";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { describe, it } from "node:test";
+import { describe, it, type TestContext } from "node:test";
 import type {
   FileOperationRecord,
   NotificationOutboxAckResponse
-} from "@megle/core-client/generated-contract";
-import { rendererErrorOperationId } from "@megle/notification-contract";
+} from "@mangoo/core-client/generated-contract";
+import { rendererErrorOperationId } from "@mangoo/notification-contract";
 
 import {
   createNotificationService,
@@ -47,7 +49,7 @@ const SESSION_B = {
 const TEST_WORKER_URL = new URL("../src/notification-store-worker.ts", import.meta.url);
 
 function testDatabasePath(): string {
-  return notificationDatabasePath(fs.mkdtempSync(path.join(os.tmpdir(), "megle-service-")));
+  return notificationDatabasePath(fs.mkdtempSync(path.join(os.tmpdir(), "mangoo-service-")));
 }
 
 function operation(
@@ -117,6 +119,52 @@ function response(body: unknown, status = 200): Response {
 
 function ackResponse(body: NotificationOutboxAckResponse): Response {
   return response(body);
+}
+
+async function notificationHttpSession(
+  context: TestContext,
+  handler: (request: IncomingMessage, response: ServerResponse) => Promise<void> | void
+): Promise<typeof SESSION_A> {
+  const server = createServer((request, result) => {
+    Promise.resolve(handler(request, result)).catch(() => {
+      result.writeHead(500).end();
+    });
+  });
+  // Windows may allocate a Fetch-blocked low port from listen(0). Bind the
+  // actual fixture in the browser-usable range, without a probe/close race.
+  let lastBindError: unknown;
+  for (let attempt = 0; attempt < 128; attempt += 1) {
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const onError = (error: Error) => {
+          server.off("listening", onListening);
+          reject(error);
+        };
+        const onListening = () => {
+          server.off("error", onError);
+          resolve();
+        };
+        server.once("error", onError);
+        server.once("listening", onListening);
+        server.listen(randomInt(49152, 65536), "127.0.0.1");
+      });
+      break;
+    } catch (error) {
+      if (!(error instanceof Error) || !("code" in error) ||
+          (error.code !== "EACCES" && error.code !== "EADDRINUSE")) throw error;
+      lastBindError = error;
+    }
+  }
+  if (!server.listening) {
+    throw new Error("Could not bind the notification HTTP fixture", { cause: lastBindError });
+  }
+  context.after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  return { baseUrl: `http://127.0.0.1:${address.port}/api`, sessionToken: SESSION_A.sessionToken };
 }
 
 function waitForAbort(signal: AbortSignal | null | undefined): Promise<Response> {
@@ -424,6 +472,182 @@ function thumbnailSummary(library = LIBRARY_A): ThumbnailCacheSummary {
 }
 
 describe("notification service", () => {
+  it("uses the outbox Library revision for HTTP ACK and recovers a durable unacknowledged cursor", async (context) => {
+    const store = new FakeStore();
+    const requests: { path: string; revision: string | undefined; waitMs: string | null }[] = [];
+    let failAcknowledgement = true;
+    const session = await notificationHttpSession(context, async (request, result) => {
+      const url = new URL(request.url!, "http://127.0.0.1");
+      const revision = request.headers["x-mangoo-context-revision"] as string | undefined;
+      requests.push({ path: url.pathname, revision, waitMs: url.searchParams.get("waitMs") });
+      result.setHeader("content-type", "application/json");
+      if (request.method === "POST") {
+        const chunks: Buffer[] = [];
+        for await (const chunk of request) chunks.push(Buffer.from(chunk));
+        assert.deepEqual(JSON.parse(Buffer.concat(chunks).toString()), { maxSequence: 1 });
+        assert.equal((await store.syncState(LIBRARY_A.id)).persistedSequence, 1);
+        if (revision !== "17") {
+          result.writeHead(409).end(JSON.stringify({ code: "stale_library_context" }));
+          return;
+        }
+        result.writeHead(failAcknowledgement ? 503 : 200).end(JSON.stringify(
+          failAcknowledgement ? { error: "temporary ACK failure" } : { acknowledged: true }
+        ));
+        return;
+      }
+      result.setHeader("x-mangoo-library-id", LIBRARY_A.id);
+      result.setHeader("x-mangoo-context-revision", "17");
+      result.end(JSON.stringify({
+        items: Number(url.searchParams.get("afterSequence")) < 1 ? [event(1)] : [],
+        maxSequence: 1
+      }));
+    });
+    const service = await createNotificationService({ store, now: () => NOW });
+    context.after(() => service.close());
+    await assert.rejects(service.runOneDrainForTest(LIBRARY_A, session), /503/);
+    assert.deepEqual(await store.syncState(LIBRARY_A.id), { persistedSequence: 1, ackedSequence: 0 });
+    failAcknowledgement = false;
+    await service.runOneDrainForTest(LIBRARY_A, session);
+    assert.deepEqual(await store.syncState(LIBRARY_A.id), { persistedSequence: 1, ackedSequence: 1 });
+    assert.equal(store.calls.filter((call) => call === "apply").length, 1);
+    assert.deepEqual(requests.map((request) => request.revision), [undefined, "17", undefined, "17"]);
+    assert.equal(requests[2]?.waitMs, "0", "pending durable ACK must not wait for a long poll");
+    assert.equal((await service.compactSnapshot()).syncHealth.state, "healthy");
+  });
+
+  for (const transition of ["A-to-B", "A-to-B-to-A"] as const) {
+    it(`rejects an HTTP ACK from the old outbox epoch after ${transition}`, async (context) => {
+      const store = new FakeStore();
+      let activeLibraryId = LIBRARY_A.id;
+      let activeRevision = 17;
+      let acceptedAcknowledgements = 0;
+      const receivedRevisions: string[] = [];
+      const session = await notificationHttpSession(context, (request, result) => {
+        result.setHeader("content-type", "application/json");
+        if (request.method === "POST") {
+          const revision = String(request.headers["x-mangoo-context-revision"] ?? "");
+          receivedRevisions.push(revision);
+          if (revision !== String(activeRevision)) {
+            result.writeHead(409).end(JSON.stringify({ code: "stale_library_context" }));
+          } else {
+            acceptedAcknowledgements += 1;
+            result.end(JSON.stringify({ acknowledged: true }));
+          }
+          return;
+        }
+        result.setHeader("x-mangoo-library-id", activeLibraryId);
+        result.setHeader("x-mangoo-context-revision", String(activeRevision));
+        result.end(JSON.stringify({ items: [event(1)], maxSequence: 1 }));
+      });
+      const originalApply = store.applyOutboxBatch.bind(store);
+      store.applyOutboxBatch = async (...args) => {
+        await originalApply(...args);
+        activeLibraryId = transition === "A-to-B" ? LIBRARY_B.id : LIBRARY_A.id;
+        activeRevision = transition === "A-to-B" ? 18 : 19;
+      };
+      const service = await createNotificationService({ store, now: () => NOW });
+      context.after(() => service.close());
+      await assert.rejects(service.runOneDrainForTest(LIBRARY_A, session), /409.*stale_library_context/);
+      assert.deepEqual(receivedRevisions, ["17"]);
+      assert.equal(acceptedAcknowledgements, 0);
+      assert.deepEqual(await store.syncState(LIBRARY_A.id), { persistedSequence: 1, ackedSequence: 0 });
+      assert.notEqual((await service.compactSnapshot()).syncHealth.state, "degraded");
+    });
+  }
+
+  it("rejects another Library's HTTP page before persisting or replaying a durable ACK", async (context) => {
+    const store = new FakeStore();
+    store.cursors.set(LIBRARY_A.id, 9);
+    let acknowledgements = 0;
+    const session = await notificationHttpSession(context, (request, result) => {
+      if (request.method === "POST") acknowledgements += 1;
+      result.setHeader("content-type", "application/json");
+      result.setHeader("x-mangoo-library-id", LIBRARY_B.id);
+      result.setHeader("x-mangoo-context-revision", "18");
+      result.end(JSON.stringify({ items: [event(10)], maxSequence: 10 }));
+    });
+    const service = await createNotificationService({ store, now: () => NOW });
+    context.after(() => service.close());
+    await assert.rejects(service.runOneDrainForTest(LIBRARY_A, session), /different active Library/);
+    assert.equal(acknowledgements, 0);
+    assert.equal(store.calls.includes("apply"), false);
+    assert.deepEqual(await store.syncState(LIBRARY_A.id), { persistedSequence: 9, ackedSequence: 0 });
+    assert.equal(store.operations.size, 0);
+  });
+
+  it("rejects incomplete context headers and never downgrades a discovered Host session", async () => {
+    for (const invalidHeaders of [
+      { "x-mangoo-library-id": LIBRARY_A.id },
+      { "x-mangoo-context-revision": "17" },
+      { "x-mangoo-library-id": LIBRARY_A.id, "x-mangoo-context-revision": "invalid" },
+      { "x-mangoo-library-id": LIBRARY_A.id, "x-mangoo-context-revision": "9007199254740992" }
+    ]) {
+      const store = new FakeStore();
+      const service = await createNotificationService({
+        store,
+        fetch: async () => new Response(JSON.stringify({ items: [], maxSequence: 0 }), { headers: invalidHeaders })
+      });
+      await assert.rejects(service.runOneDrainForTest(LIBRARY_A, SESSION_A), /Library/);
+      assert.equal(store.calls.includes("apply"), false);
+      await service.close();
+    }
+    let headers: Record<string, string> = {
+      "x-mangoo-library-id": LIBRARY_A.id,
+      "x-mangoo-context-revision": "17"
+    };
+    const service = await createNotificationService({
+      store: new FakeStore(),
+      fetch: async () => new Response(JSON.stringify({ items: [], maxSequence: 0 }), { headers })
+    });
+    await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+    headers = {};
+    await assert.rejects(service.runOneDrainForTest(LIBRARY_A, SESSION_A), /different active Library/);
+    await service.close();
+  });
+
+  it("persists and acknowledges ordinary Core scan JSON with a null action without degrading", async () => {
+    const databasePath = testDatabasePath();
+    const store = await createNotificationStore({ databasePath, workerUrl: TEST_WORKER_URL });
+    const scan = operation("scan:null-action", 1, "succeeded", {
+      libraryUuid: null,
+      rootUuid: null,
+      managedRootAction: null
+    });
+    let acknowledgements = 0;
+    const service = await createNotificationService({
+      store,
+      fetch: async (input) => {
+        if (String(input).endsWith("/notifications/outbox/ack")) {
+          assert.equal((await store.getOperation(LIBRARY_A.id, scan.operationId))?.managedRootAction, null);
+          acknowledgements += 1;
+          return ackResponse({ acknowledged: true });
+        }
+        return response({ items: [event(1, scan)], maxSequence: 1 });
+      },
+      now: () => NOW
+    });
+    try {
+      await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
+      assert.equal(acknowledgements, 1);
+      assert.deepEqual(await store.syncState(LIBRARY_A.id), { persistedSequence: 1, ackedSequence: 1 });
+      const snapshot = await service.compactSnapshot();
+      assert.equal(snapshot.syncHealth.state, "healthy");
+      assert.equal(snapshot.syncHealth.detail, null);
+      assert.equal(snapshot.latestImportantResults[0]?.operationId, scan.operationId);
+    } finally {
+      await service.close();
+    }
+    const reopened = await createNotificationStore({ databasePath, workerUrl: TEST_WORKER_URL });
+    try {
+      const persisted = await reopened.getOperation(LIBRARY_A.id, scan.operationId);
+      assert.equal(persisted?.status, "succeeded");
+      assert.equal(persisted?.managedRootAction, null);
+      assert.deepEqual(await reopened.syncState(LIBRARY_A.id), { persistedSequence: 1, ackedSequence: 1 });
+    } finally {
+      await reopened.close();
+    }
+  });
+
   it("advances ackedSequence only after true ACK and continues with the next GET", async () => {
     const calls: string[] = [];
     const store = new FakeStore();
@@ -439,7 +663,7 @@ describe("notification service", () => {
         const url = String(input);
         if (url.endsWith("/notifications/outbox/ack")) {
           calls.push("ack");
-          assert.equal(init?.headers && new Headers(init.headers).get("x-megle-session"), "token-a");
+          assert.equal(init?.headers && new Headers(init.headers).get("x-mangoo-session"), "token-a");
           return ackResponse({ acknowledged: true });
         }
         listCalls += 1;
@@ -529,7 +753,7 @@ describe("notification service", () => {
       ackedSequence: 0
     });
     await service.runOneDrainForTest(LIBRARY_A, SESSION_A);
-    assert.equal(listCalls, 2, "a true retry must proceed to GET after the ACK is accepted");
+    assert.equal(listCalls, 3, "each ACK retry must first verify the current outbox Library");
     assert.deepEqual(await store.syncState(LIBRARY_A.id), {
       persistedSequence: 1,
       ackedSequence: 1
@@ -584,13 +808,13 @@ describe("notification service", () => {
       });
 
       await secondService.runOneDrainForTest(LIBRARY_A, SESSION_A);
-      assert.deepEqual(calls, ["ack", "get"], "restart must finish the durable ACK before GET");
+      assert.deepEqual(calls, ["get", "ack"], "restart must verify the Library before replaying its durable ACK");
       assert.deepEqual(await secondStore.syncState(LIBRARY_A.id), {
         persistedSequence: 1,
         ackedSequence: 1
       });
       await secondService.runOneDrainForTest(LIBRARY_A, SESSION_A);
-      assert.deepEqual(calls, ["ack", "get", "get"], "an acknowledged cursor must not be replayed");
+      assert.deepEqual(calls, ["get", "ack", "get"], "an acknowledged cursor must not be replayed");
       assert.equal((await secondStore.compactSnapshot()).active.length, 1);
     } finally {
       await firstService.close();
@@ -645,13 +869,13 @@ describe("notification service", () => {
     });
     try {
       await secondService.runOneDrainForTest(LIBRARY_A, SESSION_A);
-      assert.deepEqual(calls, ["ack", "get"]);
+      assert.deepEqual(calls, ["get", "ack"]);
       assert.deepEqual(await secondStore.syncState(LIBRARY_A.id), {
         persistedSequence: 1,
         ackedSequence: 1
       });
       await secondService.runOneDrainForTest(LIBRARY_A, SESSION_A);
-      assert.deepEqual(calls, ["ack", "get", "get"], "repeat after idempotent ACK must not ACK again");
+      assert.deepEqual(calls, ["get", "ack", "get"], "repeat after idempotent ACK must not ACK again");
     } finally {
       await secondService.close();
     }
@@ -2470,7 +2694,7 @@ describe("notification service", () => {
           return ackResponse({ acknowledged: true });
         }
         return response(
-          acknowledgements > 0
+          Number(new URL(String(input)).searchParams.get("afterSequence")) >= 1
             ? { items: [], maxSequence: 1 }
             : { items: [event(1)], maxSequence: 1 }
         );

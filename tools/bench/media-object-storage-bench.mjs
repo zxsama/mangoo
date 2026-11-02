@@ -119,7 +119,7 @@ function cdcChunks(bytes, min = 2 * MIB, target = 8 * MIB, max = 16 * MIB) {
 }
 
 function mutations(bytes) {
-  const marker = Buffer.from("MEGLE-LOCALIZED-EDIT-V1");
+  const marker = Buffer.from("MANGOO-LOCALIZED-EDIT-V1");
   const header = Buffer.from(bytes);
   marker.copy(header, 0, 0, Math.min(marker.length, header.length));
   const middle = Math.floor(bytes.length / 2);

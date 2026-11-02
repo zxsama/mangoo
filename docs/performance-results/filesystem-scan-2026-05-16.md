@@ -125,7 +125,7 @@ In this benchmark:
 - Creating/touching `500k` empty files took about `181s`.
 - Scanning and inserting those files took about `2.26s`.
 
-This reinforces that Megle should avoid bulk file creation in user media folders. Thumbnail/cache files must stay in Megle's own cache location.
+This reinforces that Mangoo should avoid bulk file creation in user media folders. Thumbnail/cache files must stay in Mangoo's own cache location.
 
 ## Implementation Rules
 

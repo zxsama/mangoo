@@ -9,8 +9,8 @@ import { performance } from "node:perf_hooks";
 
 const SOURCE_MODE_ARGUMENT = "--notification-center-source-mode";
 const INJECTED_FAILURE_ARGUMENT = "--notification-center-injected-failure";
-const CORE_PROBE_PREFIX = "MEGLE_NOTIFICATION_BENCH_JSON:";
-const CORE_FAULT_PROBE_PREFIX = "MEGLE_NOTIFICATION_BENCH_FAULT_JSON:";
+const CORE_PROBE_PREFIX = "MANGOO_NOTIFICATION_BENCH_JSON:";
+const CORE_FAULT_PROBE_PREFIX = "MANGOO_NOTIFICATION_BENCH_FAULT_JSON:";
 const BENCHMARK_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const REPOSITORY_ROOT = path.resolve(BENCHMARK_DIRECTORY, "../..");
 const BENCHMARK_SCRATCH_ROOT = path.join(REPOSITORY_ROOT, ".tmp", "notification-center-bench");
@@ -229,7 +229,7 @@ function spawnCargo(args) {
 function notificationProbeTempDirectories() {
   return fs
     .readdirSync(os.tmpdir(), { withFileTypes: true })
-    .filter((entry) => entry.isDirectory() && entry.name.startsWith("megle-notification-benchmark-"))
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith("mangoo-notification-benchmark-"))
     .map((entry) => entry.name)
     .sort();
 }
@@ -247,7 +247,7 @@ function runCoreProbe() {
   const result = spawnCargo([
     "test",
     "-p",
-    "megle-core",
+    "mangoo-core",
     "db::tests::notification_center_benchmark_probe",
     "--",
     "--ignored",
@@ -476,7 +476,7 @@ async function runCleanupSelfTest() {
         coreFailureResult = spawnCargo([
           "test",
           "-p",
-          "megle-core",
+          "mangoo-core",
           "db::tests::notification_center_benchmark_fault_probe",
           "--",
           "--ignored",
@@ -511,7 +511,7 @@ async function runCleanupSelfTest() {
         assert.ok(relativeTempDirectory && !relativeTempDirectory.startsWith(".."));
         assert.equal(path.isAbsolute(relativeTempDirectory), false);
         assert.ok(
-          path.basename(coreFaultProbe.tempDirectory).startsWith("megle-notification-benchmark-")
+          path.basename(coreFaultProbe.tempDirectory).startsWith("mangoo-notification-benchmark-")
         );
         assert.equal(
           processExists(coreFaultProbe.processId),
@@ -564,7 +564,7 @@ function installReportingBridge(store, reportedSummaries) {
     configurable: true,
     writable: true,
     value: {
-      megleDesktop: {
+      mangooDesktop: {
         windowRole: "main",
         notifications: {
           async publishThumbnailSummary(summary) {

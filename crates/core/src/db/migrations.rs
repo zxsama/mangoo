@@ -61,3 +61,16 @@ pub const SYNC_ROOT_RECONCILIATION_MIGRATION: &str =
     include_str!("../../migrations/0032_sync_root_reconciliation.sql");
 pub const MEDIA_MATERIALIZATION_DESTINATION_MIGRATION: &str =
     include_str!("../../migrations/0033_media_materialization_destination.sql");
+pub const ALL_FILE_COLLECTION_MIGRATION: &str =
+    include_str!("../../migrations/0034_all_file_collection.sql");
+pub const MATERIALIZATION_STAGING_OWNERSHIP_MIGRATION: &str =
+    include_str!("../../migrations/0035_materialization_staging_ownership.sql");
+pub const ALL_FILE_BROWSING_MIGRATION: &str =
+    include_str!("../../migrations/0036_all_file_browsing.sql");
+pub const DECODER_PRESENTATIONS_MIGRATION: &str =
+    include_str!("../../migrations/0037_decoder_presentations.sql");
+pub const FOLDER_APPEARANCE_MIGRATION: &str =
+    include_str!("../../migrations/0038_folder_appearance.sql");
+
+pub const DIRECTORY_PREFERENCES_MIGRATION: &str =
+    include_str!("../../migrations/0039_directory_preferences.sql");

@@ -1,8 +1,15 @@
 # Testing Strategy
 
-## OneDrive Provider
+## Provider verification ownership
 
-`cargo test -p megle-onedrive-provider` runs unit tests plus a real-child Graph emulator flow. `npm run check:onedrive-bundle` additionally hashes the packaged Windows executable and runs the same process conformance suite through that exact bundled path. `npm run bench:onedrive-provider` repeats the real-child flow in release mode. Live Microsoft Personal/Business checks are deliberately ignored unless an operator supplies credentials and invokes `npm run test:onedrive-live`; emulator success is never recorded as live-account evidence.
+Mangoo tests the generic runtime and synchronization policy with its fake
+Provider, including the 16-case Host fault matrix. OneDrive unit/process tests,
+four vendor fault groups, copied-artifact checks, benchmark and live release
+requirements run in the independent
+[`Mangoo_OneDriveSync` repository](../../Mangoo_OneDriveSync/README.md).
+The former Host OneDrive commands are no longer available. Emulator success
+does not qualify live-account or product OAuth evidence; see the
+[extraction note](onedrive-extraction.md).
 
 Tests and code should move together. Phase 1 starts with fast checks that enforce the repository shape, API contract, and database schema before the full Rust/Electron build is available.
 

@@ -28,8 +28,8 @@ export function compactNotificationPresentation(
     return {
       failureCue: null,
       health: "degraded",
-      healthLabel: "同步受限",
-      idleLabel: hasCurrentActivity ? null : "等待通知同步恢复"
+      healthLabel: "通知服务受限",
+      idleLabel: hasCurrentActivity ? null : "等待通知服务恢复"
     };
   }
 

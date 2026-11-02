@@ -205,6 +205,9 @@ where
         let activated = match activate().await {
             Ok(runtime) => runtime,
             Err(error) => {
+                if error.is::<ActivationCleanupFailure>() {
+                    return Err(error);
+                }
                 state.abnormal_exit(Instant::now());
                 let until = state.restart_delay(Instant::now()).map(|delay| {
                     crate::host_registry::unix_timestamp_millis_for_runtime()
@@ -225,11 +228,21 @@ where
         };
         state.ready();
         let session_id = uuid::Uuid::now_v7().to_string();
-        let description = match activated.provider.describe().await {
+        let description_result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                activated.provider.close_admission();
+                activated.shutdown().await?;
+                manager.unregister(&plugin_id, &account_uuid)?;
+                return Ok(());
+            },
+            result = activated.provider.describe() => result,
+        };
+        let description = match description_result {
             Ok(description) => description,
             Err(error) => {
                 let detail = error.detail.clone();
-                let _ = activated.shutdown().await;
+                activated.shutdown().await?;
                 manager.unregister(&plugin_id, &account_uuid)?;
                 state.abnormal_exit(Instant::now());
                 if !registry.record_plugin_runtime_failure(
@@ -272,10 +285,16 @@ where
                         manager.unregister(&plugin_id, &account_uuid)?;
                         return Ok(());
                     }
-                    let healthy = matches!(
-                        tokio::time::timeout(health_policy.deadline, activated.provider.health()).await,
-                        Ok(Ok(crate::sync::provider::ProviderHealth { ready: true, .. }))
-                    );
+                    let healthy = tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => {
+                            activated.provider.close_admission();
+                            activated.shutdown().await?;
+                            manager.unregister(&plugin_id, &account_uuid)?;
+                            return Ok(());
+                        },
+                        result = tokio::time::timeout(health_policy.deadline, activated.provider.health()) => matches!(result, Ok(Ok(crate::sync::provider::ProviderHealth { ready: true, .. }))),
+                    };
                     if healthy {
                         healthy_successes = healthy_successes.saturating_add(1);
                         state.health_result(true, health_policy.degraded_threshold);
@@ -306,14 +325,23 @@ where
             }
         };
         if registry.plugin_has_pending_probation(&plugin_id)? {
-            if registry
-                .rollback_plugin_probation_for_launch(&plugin_id, &launch_fingerprint, failure)?
-                .is_none()
-            {
+            if let Some((stopped_epoch, _)) = registry.rollback_plugin_probation_for_launch(
+                &plugin_id,
+                &launch_fingerprint,
+                failure,
+            )? {
+                manager.close_plugin(&plugin_id, stopped_epoch);
+                activated.provider.close_admission();
                 activated.shutdown().await?;
                 manager.unregister(&plugin_id, &account_uuid)?;
-                return Ok(());
+                manager.join_plugin_work(&plugin_id).await;
+                // A concurrent user command owns any newer stop epoch.
+                registry.finish_plugin_runtime_restart_for_epoch(&plugin_id, stopped_epoch)?;
+            } else {
+                activated.shutdown().await?;
+                manager.unregister(&plugin_id, &account_uuid)?;
             }
+            return Ok(());
         }
         activated.shutdown().await?;
         manager.unregister(&plugin_id, &account_uuid)?;
@@ -432,6 +460,11 @@ impl ActivatedProvider {
         // The provider gets a cooperative deadline first; process-tree kill is
         // the deterministic fallback and the child remains joined by wait().
         let _ = tokio::time::timeout(Duration::from_secs(5), self.provider.shutdown()).await;
+        self.provider.close_admission();
+        self.provider
+            .join_closed()
+            .await
+            .map_err(std::io::Error::other)?;
         let child = self.child.lock().await.take();
         if let Some(mut child) = child {
             child.terminate_tree().await?;
@@ -454,78 +487,35 @@ pub async fn activate_and_register(
     allowlist: &[TrustEntry],
     runtime_dir: std::path::PathBuf,
     reverse: Option<Arc<dyn super::rpc::ReverseRpcHandler>>,
-    onedrive_client_id: Option<String>,
+    configuration: std::collections::BTreeMap<String, String>,
 ) -> anyhow::Result<ActivatedProvider> {
     if !manifest.rpc.wire_versions.contains(&1) {
         anyhow::bail!("Provider manifest does not support Host wire version 1");
     }
     let executable = verify_bundled_entry(manifest, bundled_root, platform, allowlist)
         .map_err(|e| anyhow::anyhow!("plugin trust verification failed: {e:?}"))?;
-    let safe_env = provider_safe_env(&manifest.id, &runtime_dir, onedrive_client_id);
+    let safe_env = provider_safe_env(&runtime_dir, configuration)?;
     let mut child = ChildProcess::spawn_verified(
         &executable,
         &LaunchSpec {
             runtime_dir,
             safe_env,
         },
-    )?;
-    let (stdin, stdout, stderr) = child.take_stdio()?;
+    )
+    .await?;
+    let (stdin, stdout, stderr) = match child.take_stdio() {
+        Ok(stdio) => stdio,
+        Err(error) => {
+            child
+                .terminate_tree()
+                .await
+                .map_err(ActivationCleanupFailure)?;
+            child.wait().await.map_err(ActivationCleanupFailure)?;
+            return Err(error.into());
+        }
+    };
     let session =
         FramedSession::start_with_handler(stdout, stdin, FrameLimits::default(), 1, reverse);
-    let mut nonce = [0_u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-    let hello = Hello {
-        nonce,
-        wire_versions: vec![1],
-        plugin_id: manifest.id.clone(),
-        version: manifest.version.clone(),
-        account_uuid: account_uuid.to_owned(),
-        capabilities: manifest
-            .rpc
-            .capabilities
-            .iter()
-            .map(|capability| match capability {
-                crate::plugins::manifest::Capability::SyncProviderV1 => {
-                    crate::plugins::SYNC_PROVIDER_V1_CAPABILITY.to_owned()
-                }
-            })
-            .collect(),
-        granted_permissions,
-        method_versions: manifest.rpc.method_versions.clone(),
-        limits: RpcLimits::host_default(),
-    };
-    let ack: HelloAck = serde_json::from_value(
-        session
-            .call(
-                "runtime.hello",
-                serde_json::to_value(&hello)?,
-                Duration::from_secs(5),
-                None,
-                None,
-            )
-            .await
-            .map_err(|error| anyhow::anyhow!("provider hello failed: {error:?}"))?,
-    )?;
-    verify_hello(&hello, &ack)
-        .map_err(|error| anyhow::anyhow!("provider hello rejected: {error}"))?;
-    session.complete_handshake();
-    let provider: Arc<dyn SyncProvider> =
-        Arc::new(FramedSyncProvider::new(session, Duration::from_secs(30)));
-    let description = tokio::time::timeout(Duration::from_secs(5), provider.describe())
-        .await
-        .map_err(|_| anyhow::anyhow!("provider handshake deadline exceeded"))??;
-    if description.plugin_id != manifest.id
-        || description.account_uuid != account_uuid
-        || !description
-            .capabilities
-            .iter()
-            .any(|v| v == crate::plugins::SYNC_PROVIDER_V1_CAPABILITY)
-        || description.max_object_bytes == 0
-        || description.max_object_bytes > hello.limits.max_object_bytes
-    {
-        child.terminate_tree().await?;
-        anyhow::bail!("provider handshake identity or capability mismatch");
-    }
     let plugin_id = manifest.id.clone();
     let stderr_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).split(b'\n');
@@ -534,48 +524,117 @@ pub async fn activate_and_register(
             tracing::debug!(plugin_id = %plugin_id, message = %safe, "provider stderr");
         }
     });
-    manager.register(&manifest.id, account_uuid, Arc::clone(&provider))?;
-    Ok(ActivatedProvider {
-        provider,
+    let provider: Arc<dyn SyncProvider> = Arc::new(FramedSyncProvider::new(
+        session.clone(),
+        Duration::from_secs(30),
+    ));
+    let activated = ActivatedProvider {
+        provider: Arc::clone(&provider),
         child: tokio::sync::Mutex::new(Some(child)),
         stderr_task: tokio::sync::Mutex::new(Some(stderr_task)),
-    })
+    };
+    let handshake = async {
+        let mut nonce = [0_u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+        let hello = Hello {
+            nonce,
+            wire_versions: vec![1],
+            plugin_id: manifest.id.clone(),
+            version: manifest.version.clone(),
+            account_uuid: account_uuid.to_owned(),
+            capabilities: manifest
+                .rpc
+                .capabilities
+                .iter()
+                .map(|capability| match capability {
+                    crate::plugins::manifest::Capability::SyncProviderV1 => {
+                        crate::plugins::SYNC_PROVIDER_V1_CAPABILITY.to_owned()
+                    }
+                    crate::plugins::manifest::Capability::FileDecoderV1 => {
+                        crate::plugins::FILE_DECODER_V1_CAPABILITY.to_owned()
+                    }
+                })
+                .collect(),
+            granted_permissions,
+            method_versions: manifest.rpc.method_versions.clone(),
+            limits: RpcLimits::host_default(),
+        };
+        let ack: HelloAck = serde_json::from_value(
+            session
+                .call(
+                    "runtime.hello",
+                    serde_json::to_value(&hello)?,
+                    Duration::from_secs(5),
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!("provider hello failed: {error:?}"))?,
+        )?;
+        verify_hello(&hello, &ack)
+            .map_err(|error| anyhow::anyhow!("provider hello rejected: {error}"))?;
+        session.complete_handshake();
+        let description = tokio::time::timeout(Duration::from_secs(5), provider.describe())
+            .await
+            .map_err(|_| anyhow::anyhow!("provider handshake deadline exceeded"))??;
+        if description.plugin_id != manifest.id
+            || description.account_uuid != account_uuid
+            || !description
+                .capabilities
+                .iter()
+                .any(|v| v == crate::plugins::SYNC_PROVIDER_V1_CAPABILITY)
+            || description.max_object_bytes == 0
+            || description.max_object_bytes > hello.limits.max_object_bytes
+        {
+            anyhow::bail!("provider handshake identity or capability mismatch");
+        }
+        manager.register(&manifest.id, account_uuid, Arc::clone(&provider))?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = handshake {
+        // A failed hello, describe, or registration still owns a live child.
+        // Close first so cleanup does not wait for another cooperative RPC.
+        activated.provider.close_admission();
+        activated
+            .shutdown()
+            .await
+            .map_err(ActivationCleanupFailure)?;
+        return Err(error);
+    }
+    Ok(activated)
 }
 
+#[derive(Debug)]
+struct ActivationCleanupFailure(std::io::Error);
+
+impl std::fmt::Display for ActivationCleanupFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Provider activation cleanup failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for ActivationCleanupFailure {}
+
 fn provider_safe_env(
-    plugin_id: &str,
     runtime_dir: &std::path::Path,
-    onedrive_client_id: Option<String>,
-) -> std::collections::HashMap<String, String> {
-    if plugin_id == "com.megle.fake-sync" {
-        let mut values = std::collections::HashMap::from([(
-            "MEGLE_FAKE_PROVIDER_STATE_DIR".to_owned(),
+    configuration: std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let json = serde_json::to_string(&configuration)?;
+    anyhow::ensure!(
+        configuration.len() <= 8 && json.len() <= 20 * 1024,
+        "invalid provider startup configuration"
+    );
+    Ok(std::collections::HashMap::from([
+        ("MANGOO_PLUGIN_CONFIGURATION".to_owned(), json),
+        (
+            "MANGOO_PLUGIN_STATE_DIR".to_owned(),
             runtime_dir
                 .join("provider-state")
                 .to_string_lossy()
                 .into_owned(),
-        )]);
-        if let Ok(fault) = std::env::var("MEGLE_FAKE_PROVIDER_FAULT") {
-            values.insert("MEGLE_FAKE_PROVIDER_FAULT".to_owned(), fault);
-        }
-        return values;
-    }
-    if plugin_id != "com.megle.onedrive" {
-        return Default::default();
-    }
-    let mut values = std::collections::HashMap::new();
-    if let Some(client_id) = onedrive_client_id {
-        values.insert("MEGLE_ONEDRIVE_CLIENT_ID".to_owned(), client_id);
-    }
-    let mut keys = vec!["MEGLE_ONEDRIVE_AUTHORITY", "MEGLE_ONEDRIVE_AUTH_MODE"];
-    if cfg!(debug_assertions) {
-        keys.push("MEGLE_ONEDRIVE_EMULATOR_URL");
-    }
-    values.extend(
-        keys.into_iter()
-            .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value))),
-    );
-    values
+        ),
+    ]))
 }
 #[cfg(test)]
 mod tests {
@@ -639,9 +698,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plugin_lifecycle_probation_rollback_joins_before_new_epoch_and_respects_newer_stop() {
+        for superseded in [false, true] {
+            let root =
+                std::env::temp_dir().join(format!("mangoo-rollback-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir_all(&root).unwrap();
+            let registry = Arc::new(
+                crate::host_registry::HostRegistry::open(root.join("host.sqlite")).unwrap(),
+            );
+            let id = "com.mangoo.fake-sync";
+            for version in ["1.0.0", "2.0.0"] {
+                let mut manifest: serde_json::Value = serde_json::from_str(include_str!(
+                    "../../../../../bundled-plugins/com.mangoo.fake-sync/plugin.template.json"
+                ))
+                .unwrap();
+                manifest["version"] = serde_json::json!(version);
+                registry
+                    .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
+                        plugin_id: id,
+                        version,
+                        manifest_json: &manifest.to_string(),
+                        entry_relative_path: &format!("provider-{version}"),
+                        entry_sha256: &[0; 32],
+                        install_root: &root,
+                        trust_policy_id: "test",
+                        requested_permissions_json: "[]",
+                    })
+                    .unwrap();
+            }
+            registry
+                .upsert_plugin_account("account", id, None, "authenticated")
+                .unwrap();
+            registry.set_plugin_intent(id, true, true).unwrap();
+            registry.select_plugin_version(id, "2.0.0", true).unwrap();
+            // The declaration requests permissions; grant them while the candidate is stopped.
+            let permissions =
+                serde_json::from_str::<crate::plugins::manifest::ManifestRecord>(include_str!(
+                    "../../../../../bundled-plugins/com.mangoo.fake-sync/plugin.template.json"
+                ))
+                .unwrap()
+                .requested_permissions;
+            registry
+                .set_plugin_grants(id, &serde_json::to_string(&permissions).unwrap(), true)
+                .unwrap();
+            registry.finish_plugin_runtime_restart(id).unwrap();
+            let launch = registry.plugin_runtime_launches().unwrap().remove(0);
+            let manager = ProviderManager::default();
+            manager.open_plugin(id, launch.lifecycle_epoch).unwrap();
+            let held = manager.begin_work(id).unwrap();
+            let inner: Arc<dyn SyncProvider> =
+                Arc::new(crate::sync::provider::InMemorySyncProvider::default());
+            manager.register(id, "account", inner.clone()).unwrap();
+            let previous = manager.resolve(id, "account").unwrap().unwrap();
+            let task = tokio::spawn(supervise_until_cancelled(
+                registry.clone(),
+                manager.clone(),
+                id.into(),
+                "account".into(),
+                launch.fingerprint(),
+                tokio_util::sync::CancellationToken::new(),
+                BackoffPolicy::default(),
+                HealthPolicy {
+                    interval: Duration::from_secs(30),
+                    deadline: Duration::from_secs(1),
+                    degraded_threshold: 1,
+                    probation_successes: 3,
+                },
+                move || {
+                    let provider = inner.clone();
+                    async move {
+                        Ok(ActivatedProvider {
+                            provider,
+                            child: tokio::sync::Mutex::new(None),
+                            stderr_task: tokio::sync::Mutex::new(None),
+                        })
+                    }
+                },
+            ));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while registry.host_plugin(id).unwrap().unwrap().selected_version != "1.0.0" {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let stopped_epoch = registry.plugin_lifecycle_epoch(id).unwrap();
+            assert_eq!(
+                registry.host_plugin(id).unwrap().unwrap().runtime_state,
+                "stopping"
+            );
+            assert!(registry.plugin_runtime_launches().unwrap().is_empty());
+            assert!(!task.is_finished());
+            assert!(previous.health().await.is_err());
+            if superseded {
+                registry.set_plugin_intent(id, false, true).unwrap();
+                manager.close_plugin(id, registry.plugin_lifecycle_epoch(id).unwrap());
+            }
+            drop(held);
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if superseded {
+                assert_eq!(
+                    registry.host_plugin(id).unwrap().unwrap().runtime_state,
+                    "stopping"
+                );
+                assert!(registry.plugin_runtime_launches().unwrap().is_empty());
+            } else {
+                let next = registry.plugin_runtime_launches().unwrap().remove(0);
+                assert!(next.lifecycle_epoch > stopped_epoch);
+                manager.open_plugin(id, next.lifecycle_epoch).unwrap();
+                assert!(manager.begin_work(id).is_ok());
+            }
+            assert!(previous.health().await.is_err());
+            drop(registry);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
     async fn health_supervisor_restarts_and_joins_on_cancellation() {
         let root = std::env::temp_dir().join(format!(
-            "megle_supervisor_{}_{}",
+            "mangoo_supervisor_{}_{}",
             std::process::id(),
             uuid::Uuid::now_v7()
         ));
@@ -650,7 +830,7 @@ mod tests {
             Arc::new(crate::host_registry::HostRegistry::open(root.join("host.sqlite")).unwrap());
         registry
             .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
-                plugin_id: "com.megle.fake",
+                plugin_id: "com.mangoo.fake",
                 version: "1.0.0",
                 manifest_json: "{}",
                 entry_relative_path: "fake",
@@ -661,10 +841,10 @@ mod tests {
             })
             .unwrap();
         registry
-            .upsert_plugin_account("fake-account", "com.megle.fake", None, "authenticated")
+            .upsert_plugin_account("fake-account", "com.mangoo.fake", None, "authenticated")
             .unwrap();
         registry
-            .set_plugin_intent("com.megle.fake", true, true)
+            .set_plugin_intent("com.mangoo.fake", true, true)
             .unwrap();
         let launch_fingerprint = registry.plugin_runtime_launches().unwrap()[0].fingerprint();
         let manager = ProviderManager::default();
@@ -675,7 +855,7 @@ mod tests {
         let task = tokio::spawn(supervise_until_cancelled(
             Arc::clone(&registry),
             manager.clone(),
-            "com.megle.fake".into(),
+            "com.mangoo.fake".into(),
             "fake-account".into(),
             launch_fingerprint,
             cancellation_for_task,
@@ -720,7 +900,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(manager
-            .resolve("com.megle.fake", "fake-account")
+            .resolve("com.mangoo.fake", "fake-account")
             .unwrap()
             .is_none());
         let _ = std::fs::remove_dir_all(root);
@@ -729,7 +909,7 @@ mod tests {
     #[tokio::test]
     async fn supervisor_stops_when_account_generation_invalidates_its_launch() {
         let root = std::env::temp_dir().join(format!(
-            "megle_supervisor_stale_{}_{}",
+            "mangoo_supervisor_stale_{}_{}",
             std::process::id(),
             uuid::Uuid::now_v7()
         ));
@@ -738,7 +918,7 @@ mod tests {
             Arc::new(crate::host_registry::HostRegistry::open(root.join("host.sqlite")).unwrap());
         registry
             .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
-                plugin_id: "com.megle.fake",
+                plugin_id: "com.mangoo.fake",
                 version: "1.0.0",
                 manifest_json: "{}",
                 entry_relative_path: "fake",
@@ -749,10 +929,10 @@ mod tests {
             })
             .unwrap();
         registry
-            .upsert_plugin_account("fake-account", "com.megle.fake", None, "authenticated")
+            .upsert_plugin_account("fake-account", "com.mangoo.fake", None, "authenticated")
             .unwrap();
         registry
-            .set_plugin_intent("com.megle.fake", true, true)
+            .set_plugin_intent("com.mangoo.fake", true, true)
             .unwrap();
         let launch_fingerprint = registry.plugin_runtime_launches().unwrap()[0].fingerprint();
         let manager = ProviderManager::default();
@@ -760,7 +940,7 @@ mod tests {
         let task = tokio::spawn(supervise_until_cancelled(
             Arc::clone(&registry),
             manager.clone(),
-            "com.megle.fake".into(),
+            "com.mangoo.fake".into(),
             "fake-account".into(),
             launch_fingerprint.clone(),
             tokio_util::sync::CancellationToken::new(),
@@ -776,7 +956,7 @@ mod tests {
                 async move {
                     let provider: Arc<dyn SyncProvider> =
                         Arc::new(crate::sync::provider::InMemorySyncProvider::default());
-                    manager.register("com.megle.fake", "fake-account", Arc::clone(&provider))?;
+                    manager.register("com.mangoo.fake", "fake-account", Arc::clone(&provider))?;
                     Ok(ActivatedProvider {
                         provider,
                         child: tokio::sync::Mutex::new(None),
@@ -788,7 +968,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if manager
-                    .resolve("com.megle.fake", "fake-account")
+                    .resolve("com.mangoo.fake", "fake-account")
                     .unwrap()
                     .is_some()
                 {
@@ -800,7 +980,7 @@ mod tests {
         .await
         .unwrap();
         assert!(registry
-            .require_plugin_reauthorization_for_launch("com.megle.fake", &launch_fingerprint)
+            .require_plugin_reauthorization_for_launch("com.mangoo.fake", &launch_fingerprint)
             .unwrap());
         tokio::time::timeout(Duration::from_secs(1), task)
             .await
@@ -808,7 +988,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(manager
-            .resolve("com.megle.fake", "fake-account")
+            .resolve("com.mangoo.fake", "fake-account")
             .unwrap()
             .is_none());
         let _ = std::fs::remove_dir_all(root);

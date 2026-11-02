@@ -1,6 +1,6 @@
-# Megle Sync Protocol v1
+# Mangoo Sync Protocol v1
 
-Megle keeps browsing and search on each Library's local indexed SQLite. The
+Mangoo keeps browsing and search on each Library's local indexed SQLite. The
 database file and WAL are never transport objects. Providers move immutable
 event segments, checkpoints, and (in later phases) media objects.
 

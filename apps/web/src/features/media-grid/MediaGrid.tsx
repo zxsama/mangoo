@@ -2,7 +2,10 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import type { KeyboardEvent, ReactNode } from "react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
-import type { MediaRecord, ThumbnailResponse } from "@megle/core-client";
+import type { MediaRecord, ThumbnailResponse } from "@mangoo/core-client";
+import { FileFormatArtwork, FileFormatBadge } from "./FileFormatArtwork";
+import { VideoThumbnailHover } from "./VideoThumbnailHover";
+import { stopVideoHover } from "./videoHoverModel";
 import { FolderLocationIcon } from "../library/FolderLocationIcon";
 import { MediaLoadingIndicator, MediaLoadingRing } from "../loading/MediaLoadingRing";
 import {
@@ -11,6 +14,8 @@ import {
   createOriginalFallbackObjectUrl,
   discardOriginalFallbackObjectUrl,
   mediaContentSignature,
+  mediaPreviewKind,
+  isThumbnailUnavailable,
   mediaFileContentSignature,
   preloadImageObjectUrl,
   previewPlaceholderDataUrl,
@@ -66,17 +71,6 @@ const CONTENT_HEADER_TOP_GAP = 24;
 const CONTENT_SECTION_HEADER_HEIGHT = SECTION_HEADER_HEIGHT + CONTENT_HEADER_TOP_GAP;
 const EMPTY_ROW_HEIGHT = 132;
 const PROGRESSIVE_EXACT_LAYOUT_PAGE_SIZE = 96;
-const ORIGINAL_FALLBACK_IMAGE_EXTENSIONS = new Set([
-  "avif",
-  "bmp",
-  "gif",
-  "jpeg",
-  "jpg",
-  "png",
-  "tif",
-  "tiff",
-  "webp"
-]);
 const scrollPositionByKey = new Map<string, number>();
 const EMPTY_MEDIA_ITEMS: MediaRecord[] = [];
 type MediaGridCssVariables = CSSProperties & {
@@ -143,6 +137,7 @@ interface MediaGridFolderSection {
 }
 
 interface MediaGridProps {
+  hoverPlaybackEnabled?: boolean;
   aheadRowCount?: number;
   contentHeader?: ReactNode;
   emptyContent?: ReactNode;
@@ -203,6 +198,7 @@ function buildFolderWindowGeometry({
 }
 
 export function MediaGrid({
+  hoverPlaybackEnabled = true,
   aheadRowCount = AHEAD_THUMBNAIL_ROW_COUNT,
   contentHeader,
   emptyContent,
@@ -1199,6 +1195,23 @@ export function MediaGrid({
         (segmentIndex) => mediaWindow.resolveSegment(segmentIndex)?.itemIndexes ?? []
       ))].sort((left, right) => left - right)
     : [];
+  // Small, fully loaded folders use exact geometry rather than the windowed
+  // paths below. They still need to re-read their visible records when the
+  // parent invalidates presentation capabilities and replaces this callback.
+  const exactRenderedSlotIndexes = !windowedMedia && !justifiedFullTotal && mediaSlots
+    ? renderedPlacementIndexes.flatMap((index) => {
+        const item = layoutItems[index];
+        const slot = item ? slotIndexById.get(item.id) : undefined;
+        return slot === undefined ? [] : [slot];
+      })
+    : [];
+  const exactRenderedStart = exactRenderedSlotIndexes.length ? Math.min(...exactRenderedSlotIndexes) : null;
+  const exactRenderedEnd = exactRenderedSlotIndexes.length ? Math.max(...exactRenderedSlotIndexes) + 1 : null;
+  useEffect(() => {
+    if (exactRenderedStart !== null && exactRenderedEnd !== null) {
+      onRequestMediaWindow?.(exactRenderedStart, exactRenderedEnd);
+    }
+  }, [exactRenderedStart, exactRenderedEnd, onRequestMediaWindow]);
   // Justified/masonry full-total prefetch: the rendered placement indices are
   // absolute slot indices, so request the media window covering the visible
   // range plus an ahead overscan. This loads real thumbnails before they scroll
@@ -1599,6 +1612,7 @@ export function MediaGrid({
               >
                 {item ? (
                   <MediaTile
+                    hoverPlaybackEnabled={hoverPlaybackEnabled}
                     labelGap={gridPreferences.labelGap}
                     item={item}
                     layoutMode={layoutMode}
@@ -1677,6 +1691,7 @@ export function MediaGrid({
                 role="gridcell"
               >
                 <MediaTile
+                  hoverPlaybackEnabled={hoverPlaybackEnabled}
                   labelGap={gridPreferences.labelGap}
                   item={item}
                   layoutMode={layoutMode}
@@ -1721,6 +1736,7 @@ function resolveFolderWindowPlacement(
 }
 
 function MediaTile({
+  hoverPlaybackEnabled,
   allowOriginalFallback,
   labelGap,
   item,
@@ -1736,6 +1752,7 @@ function MediaTile({
   thumbnail,
   thumbnailLoadPriority
 }: {
+  hoverPlaybackEnabled: boolean;
   allowOriginalFallback: boolean;
   labelGap: number;
   item: MediaRecord;
@@ -1779,6 +1796,7 @@ function MediaTile({
         onSelect(item.id);
       }}
       onDoubleClick={() => {
+        stopVideoHover();
         prioritizeSelectedMedia();
         onSelect(item.id);
         onOpenPreview(item.id);
@@ -1788,6 +1806,7 @@ function MediaTile({
           return;
         }
         if (event.key === "Enter" || event.key === " ") {
+          stopVideoHover();
           event.preventDefault();
           event.stopPropagation();
           prioritizeSelectedMedia();
@@ -1837,6 +1856,8 @@ function MediaTile({
           thumbHeight={placement.thumbHeight}
           thumbWidth={placement.thumbWidth}
         />
+        {hoverPlaybackEnabled && mediaPreviewKind(item) === "original-video" && <VideoThumbnailHover item={item} />}
+        <FileFormatBadge file={item} />
         <button
           aria-label={`Locate ${item.name} in folder`}
           className="media-tile-locate-button"
@@ -1844,6 +1865,7 @@ function MediaTile({
           onClick={(event) => {
             event.preventDefault();
             event.stopPropagation();
+            stopVideoHover();
             onLocateFolder(item.folderId);
           }}
           onDoubleClick={(event) => {
@@ -1995,6 +2017,7 @@ function ThumbnailStateView({
     return (
       <ReadyThumbnail
         alt={item.name}
+        file={item}
         className={`tile-thumb tile-thumb--${layoutMode}`}
         fileId={item.id}
         contentSignature={mediaFileContentSignature(item)}
@@ -2003,79 +2026,6 @@ function ThumbnailStateView({
         resourcePriority={resourcePriority}
         style={presentationStyle}
         thumbnailUpdatedAt={hasLiveReadyThumbnail ? thumbnail.updatedAt : null}
-      />
-    );
-  }
-
-  if (state === "failed") {
-    return (
-      <div className={`tile-thumb tile-thumb-failed tile-thumb--${layoutMode}`} style={presentationStyle}>
-        <span>failed</span>
-        <ThumbnailInteractionRing />
-      </div>
-    );
-  }
-
-  if (state === "skipped_small") {
-    if (previewPlaceholderUrl) {
-      return (
-        <PlaceholderThumbnail
-          alt={item.name}
-          className={`tile-thumb tile-thumb-placeholder tile-thumb--${layoutMode}`}
-          src={previewPlaceholderUrl}
-          style={presentationStyle}
-        />
-      );
-    }
-    return (
-      <div className={`tile-thumb tile-thumb-skipped tile-thumb--${layoutMode}`} style={presentationStyle}>
-        <span>{item.kind ?? "file"}</span>
-        <ThumbnailInteractionRing />
-      </div>
-    );
-  }
-
-  if (state === "queued") {
-    if (allowOriginalFallback && isLikelyImageMedia(item)) {
-      return (
-        <OriginalFallbackThumbnail
-          alt={item.name}
-          className={`tile-thumb tile-thumb--${layoutMode}`}
-          fallbackUrl={previewPlaceholderUrl}
-          item={item}
-          requestPriority={requestPriority}
-          resourcePriority={originalFallbackResourcePriority}
-          style={presentationStyle}
-        />
-      );
-    }
-    if (previewPlaceholderUrl) {
-      return (
-        <PlaceholderThumbnail
-          alt={item.name}
-          className={`tile-thumb tile-thumb-placeholder tile-thumb--${layoutMode}`}
-          src={previewPlaceholderUrl}
-          style={presentationStyle}
-        />
-      );
-    }
-    return (
-      <div className={`tile-thumb tile-thumb-loading tile-thumb--${layoutMode}`} style={presentationStyle}>
-        <ThumbnailInteractionRing />
-      </div>
-    );
-  }
-
-  if (allowOriginalFallback && isLikelyImageMedia(item)) {
-    return (
-      <OriginalFallbackThumbnail
-        alt={item.name}
-        className={`tile-thumb tile-thumb--${layoutMode}`}
-        fallbackUrl={previewPlaceholderUrl}
-        item={item}
-        requestPriority={requestPriority}
-        resourcePriority={originalFallbackResourcePriority}
-        style={presentationStyle}
       />
     );
   }
@@ -2091,8 +2041,23 @@ function ThumbnailStateView({
     );
   }
 
+  if (allowOriginalFallback && isLikelyImageMedia(item) && state !== "failed" && state !== "skipped_small" && state !== "unavailable") {
+    return (
+      <OriginalFallbackThumbnail
+        alt={item.name}
+        className={`tile-thumb tile-thumb--${layoutMode}`}
+        fallbackUrl={null}
+        item={item}
+        requestPriority={requestPriority}
+        resourcePriority={originalFallbackResourcePriority}
+        style={presentationStyle}
+      />
+    );
+  }
+
   return (
-    <div className={`tile-thumb tile-thumb-loading tile-thumb--${layoutMode}`} style={presentationStyle}>
+    <div className={`tile-thumb tile-thumb-file tile-thumb--${layoutMode}`} style={presentationStyle}>
+      <FileFormatArtwork file={item} />
       <ThumbnailInteractionRing />
     </div>
   );
@@ -2103,11 +2068,7 @@ function ThumbnailInteractionRing() {
 }
 
 function isLikelyImageMedia(item: MediaRecord): boolean {
-  if (item.kind?.toLowerCase() === "image") {
-    return true;
-  }
-  const normalizedExt = (item.ext ?? "").trim().toLowerCase().replace(/^\./, "");
-  return ORIGINAL_FALLBACK_IMAGE_EXTENSIONS.has(normalizedExt);
+  return mediaPreviewKind(item) === "original-image";
 }
 
 function thumbnailPresentationStyle(
@@ -2134,7 +2095,8 @@ function normalizeMediaThumbnailState(value: string | null | undefined): Thumbna
     value === "queued" ||
     value === "ready" ||
     value === "failed" ||
-    value === "skipped_small"
+    value === "skipped_small" ||
+    value === "unavailable"
   ) {
     return value;
   }
@@ -2145,6 +2107,7 @@ function shouldRefreshThumbnailState(
   item: MediaRecord,
   thumbnail: ThumbnailResponse | undefined
 ): boolean {
+  if (isThumbnailUnavailable(item) && item.thumbnailState !== "ready") return false;
   const rowState = normalizeMediaThumbnailState(item.thumbnailState);
   const hasLiveThumbnailMetadata = thumbnail?.state === "ready" && thumbnail.updatedAt !== null;
   if (!hasLiveThumbnailMetadata && rowState === "ready") {
@@ -2349,13 +2312,13 @@ function OriginalFallbackThumbnail({
     };
   }, [cacheKey, requestPriority, resourcePriority, retryToken]);
 
-  if (error && !src) {
+  if (error) {
     if (fallbackUrl) {
       return <PlaceholderThumbnail alt={alt} className={className} src={fallbackUrl} style={style} />;
     }
     return (
       <div className={`${className} tile-thumb-failed`} style={style}>
-        <span>load error</span>
+        <FileFormatArtwork file={item} />
         <ThumbnailInteractionRing />
       </div>
     );
@@ -2366,7 +2329,8 @@ function OriginalFallbackThumbnail({
       return <PlaceholderThumbnail alt={alt} className={className} src={fallbackUrl} style={style} />;
     }
     return (
-      <div className={`${className} tile-thumb-loading`} style={style}>
+      <div className={`${className} tile-thumb-file`} style={style}>
+        <FileFormatArtwork file={item} />
         <ThumbnailInteractionRing />
       </div>
     );
@@ -2381,6 +2345,7 @@ function OriginalFallbackThumbnail({
         }
         decoding="async"
         loading="eager"
+        onError={() => setError(true)}
         src={src}
       />
       <ThumbnailInteractionRing />
@@ -2392,6 +2357,7 @@ function ReadyThumbnail({
   alt,
   className,
   fileId,
+  file,
   contentSignature,
   previewPlaceholderUrl,
   requestPriority,
@@ -2402,6 +2368,7 @@ function ReadyThumbnail({
   alt: string;
   className: string;
   fileId: number;
+  file: MediaRecord;
   contentSignature: string;
   previewPlaceholderUrl: string | null;
   requestPriority: "interactive" | "resource";
@@ -2591,10 +2558,10 @@ function ReadyThumbnail({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cacheKey, fileId, originalBridgeToken.cacheKey, retryToken]);
 
-  if (error && !src) {
+  if (error) {
     return (
       <div className={`${className} tile-thumb-failed`} style={style}>
-        <span>load error</span>
+        <FileFormatArtwork file={file} />
         <ThumbnailInteractionRing />
       </div>
     );
@@ -2607,7 +2574,8 @@ function ReadyThumbnail({
       );
     }
     return (
-      <div className={`${className} tile-thumb-loading`} style={style}>
+      <div className={`${className} tile-thumb-file`} style={style}>
+        <FileFormatArtwork file={file} />
         <ThumbnailInteractionRing />
       </div>
     );
@@ -2622,6 +2590,7 @@ function ReadyThumbnail({
         }
         decoding="async"
         loading="eager"
+        onError={() => setError(true)}
         src={src}
       />
       <ThumbnailInteractionRing />

@@ -81,7 +81,7 @@ Reasoning:
 Use the same harness with a larger operation count after this smoke:
 
 ```powershell
-$env:MEGLE_ARTISTS_SWEEP_OPERATION_COUNT='200'
+$env:MANGOO_ARTISTS_SWEEP_OPERATION_COUNT='200'
 npm --prefix tools/bench/thumbnail run bench:persistent-cache
 ```
 

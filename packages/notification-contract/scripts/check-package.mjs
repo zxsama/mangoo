@@ -4,7 +4,7 @@ import process from "node:process";
 
 const source = readFileSync(path.join(process.cwd(), "src", "index.ts"), "utf8");
 
-if (!/import type \{[\s\S]*NotificationOperationSnapshot[\s\S]*\} from "@megle\/core-client\/generated-contract"/.test(source)) {
+if (!/import type \{[\s\S]*NotificationOperationSnapshot[\s\S]*\} from "@mangoo\/core-client\/generated-contract"/.test(source)) {
   throw new Error("notification contract must reuse the generated Core notification operation type");
 }
 const generated = readFileSync(path.join(process.cwd(), "..", "core-client", "src", "generated-contract.ts"), "utf8");

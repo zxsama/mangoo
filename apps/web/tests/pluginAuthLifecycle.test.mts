@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { after, before, describe, it } from "node:test";
-import { createServer, type ViteDevServer } from "vite";
+import { createServer, type ViteDevServer } from "./viteTestServer.mts";
 
 const webRoot = fileURLToPath(new URL("../", import.meta.url));
 const runner = fileURLToPath(new URL("./fixtures/runOverlayLifecycle.mjs", import.meta.url));
@@ -24,13 +24,16 @@ before(async () => {
 });
 after(async () => server?.close());
 
-describe("mounted OneDrive auth lifecycle", () => {
+describe("mounted second-provider auth lifecycle", () => {
+  it("refreshes retained account and availability after another window changes plugin state", () => assert.equal(result.crossWindowInvalidation, true));
+  it("supports multiple visible fields, partial environment locks, explicit confirmation and disabled local help", () => assert.deepEqual(result.partialLocks, { lockedOnlyEnvironment: true, hiddenExcluded: true, retainedAccount: true, planOnlyEditable: true, confirmationRequired: true, explicitEnable: true, localHelp: true }));
+  it("revalidates each flow use and clears stale, expired, stopping and failed browser flows", () => assert.deepEqual(result.exactFlow, { resolvedEachUse: true, idsOnly: true, freshCopiedUrl: true, staleCopyCleared: true, staleReopenPrevented: true, expiredCleared: true, stoppedCleared: true, disabledNoDispatch: true, browserFailureCancelled: true, focusOnlySuccess: true }));
   it("keeps the configuration action stable and exposes account management", () => assert.deepEqual(result.authenticatedStableAction, { stableLabel: true, accountActionsVisible: true, singleConnectedStatus: true, accountNameVisible: true, effectiveStatusHidden: true, opensConfiguration: true }));
-  it("keeps a failed cancel retryable", () => assert.deepEqual(result.cancelFailure, { flowRetained: true, retryAvailable: true }));
+  it("keeps a failed cancel retryable", () => assert.deepEqual(result.cancelFailure, { flowCleared: true, retryAvailable: true }));
   it("dispatches a manual URI and clears terminal and unmounted state", () => { assert.deepEqual(result.manualCompletion, { dispatched: true, terminalCleared: true }); assert.deepEqual(result.unmountCleanup, { responseUriGone: true, flowGone: true }); });
   it("keeps enablement explicit while preparing only requested grants for configuration", () => { assert.deepEqual(result.disabledConfiguration, { wizardOpened: true, enableStayedExplicit: true }); assert.deepEqual(result.configurationPreparation, { grantedRequestedPermissions: true, separateApprovalHidden: true }); });
   it("renders configuration and connection state in one status location", () => assert.deepEqual(result.stableActionStatus, { ineffectiveStatusVisible: true, connectedStatusAbsent: true, duplicateStatusAbsent: true, effectiveStatusHidden: true }));
-  it("keeps the stable action while retrying a degraded Provider", () => assert.deepEqual(result.retryState, { stableLabel: true, runtimeRetried: true }));
+  it("keeps the stable action while retrying a degraded Provider", () => assert.deepEqual(result.retryState, { stableLabel: true, localConfigurationOnly: true }));
   it("enforces sequential setup and single-click configuration", () => {
     assert.deepEqual(result.wizardGates, { combinedSetupBlocked: true, nextEnabledForValidation: true, requiredFieldError: true, formatFieldError: true, clientIdAccepted: true });
     assert.deepEqual(result.reopenState, { stalePlanGone: true, forwardLabelStable: true });
@@ -39,18 +42,17 @@ describe("mounted OneDrive auth lifecycle", () => {
     assert.deepEqual(result.configConfirm, { confirmed: true });
     assert.deepEqual(result.backNavigation, { returnedToClientId: true, didNotSkipToLogin: true });
     assert.equal(result.configNoop.committed, true);
-    assert.deepEqual(result.readOnly, { editorHidden: true, managedStatusVisible: true });
+    assert.deepEqual(result.readOnly, { editorLocked: true, managedStatusVisible: true });
   });
   it("keeps the wizard shell stable, scroll-safe, and on shared action buttons", () => assert.deepEqual(result.wizardLayout, {
     stableHeight: true,
     registrationScroll: { markedForOverlay: true, overflowY: "auto" },
-    clientIdPresentation: { centered: true, nativeAppearanceRemoved: true, deliberateSurface: true, placeholderPresent: true },
+    clientIdPresentation: { scrollSafe: true, nativeAppearanceRemoved: true, deliberateSurface: true, placeholderPresent: true },
     footerVisible: true,
     unifiedActions: true,
   }));
-  it("surfaces a blocked Entra registration-page launch", () => assert.equal(result.portalOpenFailureVisible, true));
+  it("surfaces a blocked provider help-page launch", () => assert.equal(result.portalOpenFailureVisible, true));
   it("opts plugin navigation out of proximity and local pointer glow", () => { assert.deepEqual(result.pointerOptOut, { declared: true, outsideInactive: true, insideInactive: true }); });
   it("keeps plugin selection and the relocated detail switch working", () => { assert.deepEqual(result.cardInteraction, { selected: true, toggled: true }); });
   it("renders concise plugin rows and an accessible technical disclosure", () => { assert.deepEqual(result.conciseCard, { friendlyNameVisible: true, rawIdHidden: true, oneLineOrder: true, versionAdjacent: true, rawErrorHidden: true, toggleMovedToDetail: true, toggleAccessible: true }); assert.deepEqual(result.tabRelationship, { controlsPanel: true, panelLabelledByTab: true, panelRole: true }); assert.deepEqual(result.technicalDisclosure, { collapsedInitially: true, pointerGlowDisabled: true, chevronBeforeLabel: true, diagnosticsNested: true, removalNested: true }); assert.equal(result.technicalOpenedWithKeyboard, true); });
-  it("keeps nested OneDrive setup in the managed-library overlay family and restores the flow", () => { assert.deepEqual(result.wizardResume, { focusRestored: true, nestedWizardPersisted: true, remoteReloaded: true }); assert.deepEqual(result.wizardRevision, { staleIntentCleared: true }); });
 });

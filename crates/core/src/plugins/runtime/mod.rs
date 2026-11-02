@@ -1,3 +1,4 @@
+pub mod decoder_process;
 pub mod frame;
 mod generated_trust;
 pub mod process;

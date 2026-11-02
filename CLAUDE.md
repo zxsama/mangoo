@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Megle is a Windows-first local media browser that indexes existing folders without importing originals. It is contract-first: every cross-process boundary (HTTP API, plugin manifest, SQLite schema) is defined before implementation so the Electron shell, React UI, Rust Core, and tests stay aligned.
+Mangoo is a Windows-first local media browser that indexes existing folders without importing originals. It is contract-first: every cross-process boundary (HTTP API, plugin manifest, SQLite schema) is defined before implementation so the Electron shell, React UI, Rust Core, and tests stay aligned.
 
 The stack: Electron desktop shell, React + TypeScript + Vite UI, Rust + Axum Core service, SQLite WAL (with planned FTS5).
 
@@ -17,7 +17,7 @@ npm test                  # full verification: structure, contracts, schema, typ
 npm run dev               # vite dev server + build desktop + spawn electron (dev harness)
 npm run check:structure   # required dirs/files, package scripts, openapi paths, plugin caps
 npm run check:core-api    # validates contracts/core-api/openapi.yaml shape
-npm run check:core-client # @megle/core-client contract-vs-types check + typecheck
+npm run check:core-client # @mangoo/core-client contract-vs-types check + typecheck
 npm run check:desktop     # desktop adapter check + typecheck
 npm run check:web         # web client check + typecheck
 npm run check:schema      # python: applies migrations to a temp sqlite, verifies tables/indexes
@@ -27,14 +27,14 @@ npm run check:rust        # cargo fmt --check + cargo test --workspace (skips if
 Workspace-scoped commands:
 
 ```text
-npm --workspace @megle/web run build|dev|typecheck|preview
-npm --workspace @megle/desktop run build|typecheck
-npm --workspace @megle/core-client run check|typecheck
-cargo test -p megle-core <test_name>     # run a single Rust test
-cargo run  -p megle-core                 # requires MEGLE_SESSION_TOKEN env var
+npm --workspace @mangoo/web run build|dev|typecheck|preview
+npm --workspace @mangoo/desktop run build|typecheck
+npm --workspace @mangoo/core-client run check|typecheck
+cargo test -p mangoo-core <test_name>     # run a single Rust test
+cargo run  -p mangoo-core                 # requires MANGOO_SESSION_TOKEN env var
 ```
 
-`check:schema` requires Python 3. `check:rust` falls back to `~/.cargo/bin` if cargo is not on PATH and prints `SKIP` rather than failing when the toolchain is unavailable. To run `cargo` directly (e.g. `cargo test -p megle-core <test>`) when it is not on the shell PATH, prepend it: `export PATH="$HOME/.cargo/bin:$PATH"` (MSVC toolchain on Windows; install rustfmt once with `rustup component add rustfmt`).
+`check:schema` requires Python 3. `check:rust` falls back to `~/.cargo/bin` if cargo is not on PATH and prints `SKIP` rather than failing when the toolchain is unavailable. To run `cargo` directly (e.g. `cargo test -p mangoo-core <test>`) when it is not on the shell PATH, prepend it: `export PATH="$HOME/.cargo/bin:$PATH"` (MSVC toolchain on Windows; install rustfmt once with `rustup component add rustfmt`).
 
 ## High-Level Architecture
 
@@ -42,31 +42,31 @@ Three processes, one contract:
 
 ```text
 Electron main (apps/desktop)
-  spawns megle-core.exe via cargo run, holds session token + bind addr
+  spawns mangoo-core.exe via cargo run, holds session token + bind addr
   opens BrowserWindow pointing at the vite dev server or built bundle
     |
 React UI (apps/web)
-  uses @megle/core-client over HTTP only; never touches the filesystem
+  uses @mangoo/core-client over HTTP only; never touches the filesystem
     |
 Rust Core (crates/core)
   axum router + sqlite + scan/thumbnails/fsops/plugins/watch modules
 ```
 
-The desktop shell (`apps/desktop/src/main.ts`, `core-process.ts`, `core-session.ts`) generates a session token, allocates a bind address, sets `MEGLE_SESSION_TOKEN` / `MEGLE_CORE_ADDR` / `MEGLE_HOST_DB_PATH` / `MEGLE_LIBRARIES_DIR` / `MEGLE_ALLOWED_ORIGIN`, then spawns one long-lived Host Core. `tools/dev/run-dev.mjs` is the dev orchestrator: it starts Vite (forced to `127.0.0.1:5173 --strictPort`), builds the desktop TS, then launches Electron against `apps/desktop/dist/main.js`.
+The desktop shell (`apps/desktop/src/main.ts`, `core-process.ts`, `core-session.ts`) generates a session token, allocates a bind address, sets `MANGOO_SESSION_TOKEN` / `MANGOO_CORE_ADDR` / `MANGOO_HOST_DB_PATH` / `MANGOO_LIBRARIES_DIR` / `MANGOO_ALLOWED_ORIGIN`, then spawns one long-lived Host Core. `tools/dev/run-dev.mjs` is the dev orchestrator: it starts Vite (forced to `127.0.0.1:5173 --strictPort`), builds the desktop TS, then launches Electron against `apps/desktop/dist/main.js`.
 
 ### Security Boundary
 
-- All Core API requests carry `X-Megle-Session: <token>`. Desktop owns the token lifecycle and passes it to both Core (env var) and the renderer (preload bridge).
-- Dev CORS is opt-in through `MEGLE_ALLOWED_ORIGIN` and must remain **exact origin only**. Do not introduce wildcard origins or disable Electron web security.
-- Electron picks a dynamic loopback port before spawning Core. Explicit `MEGLE_CORE_ADDR` / `MEGLE_CORE_URL` overrides are honored but must agree on host/port. Local URL bind derivation supports `localhost` normalization and IP literals only — arbitrary hostnames are rejected.
-- `MEGLE_CORE_EXTERNAL=1` runs against an externally launched Core; in that mode `MEGLE_CORE_URL` and `MEGLE_SESSION_TOKEN` must both be set explicitly. Desktop will not generate a token for external Core mode.
+- All Core API requests carry `X-Mangoo-Session: <token>`. Desktop owns the token lifecycle and passes it to both Core (env var) and the renderer (preload bridge).
+- Dev CORS is opt-in through `MANGOO_ALLOWED_ORIGIN` and must remain **exact origin only**. Do not introduce wildcard origins or disable Electron web security.
+- Electron picks a dynamic loopback port before spawning Core. Explicit `MANGOO_CORE_ADDR` / `MANGOO_CORE_URL` overrides are honored but must agree on host/port. Local URL bind derivation supports `localhost` normalization and IP literals only — arbitrary hostnames are rejected.
+- `MANGOO_CORE_EXTERNAL=1` runs against an externally launched Core; in that mode `MANGOO_CORE_URL` and `MANGOO_SESSION_TOKEN` must both be set explicitly. Desktop will not generate a token for external Core mode.
 - Token is currently exposed to renderer; future hardening will proxy Core requests through preload/main. Don't design new code around direct renderer-to-Core.
 
 ### Contract-First Boundaries
 
 - `contracts/core-api/openapi.yaml` is the single source of truth for HTTP endpoints, DTO names, and status codes. UI, Core, and tests all flow from it.
-- `packages/core-client` (`@megle/core-client`) holds a hand-maintained `generated-contract.ts` aligned to the OpenAPI by `scripts/check-contract.mjs`. Treat it as a generator placeholder: edit when the contract changes, never the other way around.
-- `packages/notification-contract` (`@megle/notification-contract`) owns the type-only Desktop/Web preload boundary for notification snapshots, history, actions, subscriptions, and process logs. It reuses generated Core operation types and must remain free of runtime Node dependencies.
+- `packages/core-client` (`@mangoo/core-client`) holds a hand-maintained `generated-contract.ts` aligned to the OpenAPI by `scripts/check-contract.mjs`. Treat it as a generator placeholder: edit when the contract changes, never the other way around.
+- `packages/notification-contract` (`@mangoo/notification-contract`) owns the type-only Desktop/Web preload boundary for notification snapshots, history, actions, subscriptions, and process logs. It reuses generated Core operation types and must remain free of runtime Node dependencies.
 - `contracts/plugins/manifest.schema.json` defines plugin manifest fields and capabilities (`decoder`, `metadata`, `action`, `import-provider`).
 - SQLite schema is current through `0025`. Version `0014` is the code-owned `apply_interactive_folder_scan_task_migration` in `Database::apply_migrations`; every other version is a numbered SQL file. The latest files are `crates/core/migrations/0021_notification_outbox.sql`, `0022_file_operation_journal.sql`, `0023_file_operation_recovery_metadata.sql`, `crates/core/migrations/0024_file_operation_object_binding.sql`, and `crates/core/migrations/0025_preview_blobs.sql`. A new migration must be (1) created as SQL unless it genuinely requires code-owned transformation, (2) declared in `crates/core/src/db/migrations.rs` when file-backed, (3) gated in `Database::apply_migrations` (`crates/core/src/db/mod.rs`), and (4) asserted in `tools/checks/validate_sqlite_schema.py` (`MIGRATIONS` plus `REQUIRED_TABLES`/`REQUIRED_INDEXES`).
 - Some structural checks grep Rust source for implementation markers and **specific test names** (e.g. `tools/checks/validate-core-api.mjs` pins viewport-window markers in `db/mod.rs`). Renaming a guarded function/test or deleting a marked code pattern fails the check — update the check alongside the rename.
@@ -77,17 +77,21 @@ When adding an API path, plugin capability, table, or index, update the contract
 
 `crates/core/src` keeps `api`, `db`, `decode`, `roots`, `scan`, `thumbnails`, `fsops`, `plugins`, `watch`, and `tasks` as **modules inside one crate**. Do not pre-split them into separate workspace crates — `validate-structure.mjs` actively rejects `crates/indexer` and `crates/thumbnails`. Crate-splitting comes only after module boundaries stabilize.
 
-`main.rs` reads `MEGLE_HOST_DB_PATH` (required), `MEGLE_LIBRARIES_DIR`, `MEGLE_CORE_ADDR`, `MEGLE_SESSION_TOKEN` (required), and `MEGLE_ALLOWED_ORIGIN`, opens the Host registry, recovers managed Library journals, and serves one router whose active Library runtime is switched atomically by the Core API.
+`main.rs` reads `MANGOO_HOST_DB_PATH` (required), `MANGOO_LIBRARIES_DIR`, `MANGOO_CORE_ADDR`, `MANGOO_SESSION_TOKEN` (required), and `MANGOO_ALLOWED_ORIGIN`, opens the Host registry, recovers managed Library journals, and serves one router whose active Library runtime is switched atomically by the Core API.
 
 ### Web UI Layout
 
-`apps/web/src` is split into `app/` (App shell), `core/` (HTTP client, types, query hooks), `design/` (tokens), and `features/` (`library`, `media-grid`, `preview`, `notifications`). The UI talks to Core via `@megle/core-client`; it must not import Node filesystem APIs or call raw `fetch`. Stack: TanStack Query for server state, TanStack Virtual for the grid, Zustand for UI state.
+`apps/web/src` is split into `app/` (App shell), `core/` (HTTP client, types, query hooks), `design/` (tokens), and `features/` (`library`, `media-grid`, `preview`, `notifications`). The UI talks to Core via `@mangoo/core-client`; it must not import Node filesystem APIs or call raw `fetch`. Stack: TanStack Query for server state, TanStack Virtual for the grid, Zustand for UI state.
 
-`apps/web/src/core/client.ts` and `types.ts` are thin runtime config + re-export wrappers over `@megle/core-client`. UI code consumes hooks (`useLibraryData`) or the wrapped client — it must not declare duplicate Core DTOs, call raw `fetch`, or read `thumbnailCacheKey` directly. Web boundary checks (`check:web`) currently use lightweight source regexes; if they start producing false positives or negatives, escalate to AST parsing rather than weakening the rules.
+`apps/web/src/core/client.ts` and `types.ts` are thin runtime config + re-export wrappers over `@mangoo/core-client`. UI code consumes hooks (`useLibraryData`) or the wrapped client — it must not declare duplicate Core DTOs, call raw `fetch`, or read `thumbnailCacheKey` directly. Web boundary checks (`check:web`) currently use lightweight source regexes; if they start producing false positives or negatives, escalate to AST parsing rather than weakening the rules.
 
 ### Approved UI Direction
 
-UI must follow `docs/superpowers/specs/2026-05-16-megle-ui-liquid-glass-design.md`: Eagle-like information architecture, frameless Electron chrome, layered acrylic frosted-glass design system, dense dark content stage. One design language applies across all screens, menus, dialogs, inspectors, settings, plugins, and the notification center. Acrylic and frosted-glass materials live on chrome and control layers only — the media grid, preview canvas, and other heavy content surfaces stay dark and stable. Implementation stack: Radix UI primitives + Tailwind CSS + Lucide. Don't grow `apps/web/src/styles.css` into the permanent design system; introduce shared `design-tokens` and `ui` package boundaries instead. The reusable app shell covers Library, Settings, Plugins, and the unified notification surface before per-feature polish.
+UI must follow `docs/superpowers/specs/2026-05-16-mangoo-ui-liquid-glass-design.md`: Eagle-like information architecture, frameless Electron chrome, layered acrylic frosted-glass design system, dense dark content stage. One design language applies across all screens, menus, dialogs, inspectors, settings, plugins, and the notification center. Acrylic and frosted-glass materials live on chrome and control layers only — the media grid, preview canvas, and other heavy content surfaces stay dark and stable. Interface icons use the curated Phosphor module in `apps/web/src/design/icons.ts`; see `docs/superpowers/specs/2026-10-31-onboarding-and-icons.md`. Don't grow `apps/web/src/styles.css` into the permanent design system; introduce shared `design-tokens` and `ui` package boundaries instead. The reusable app shell covers Library, Settings, Plugins, and the unified notification surface before per-feature polish.
+
+### Single Visible Boundary
+
+Every control/surface shape has at most one thin visible boundary. Do not stack a base border with inset/bevel highlights, zero-blur shadow rings or an outer focus halo. Keyboard focus must remain visible by emphasizing that single boundary. The global pointer effect may illuminate the same edge, but cannot introduce a second concentric contour. Soft elevation shadows and boundaries of distinct parent/child shapes are separate concerns. Maintain this contract in shared styles and UI-design validation, not per-page overrides.
 
 ### Unified Pointer-Highlight System
 
@@ -112,7 +116,7 @@ The schema separates `roots` / `folders` / `files` / `media` / `user_metadata` /
 - Thumbnails are stored as WebP BLOBs in `thumb_blobs` and served by `GET /api/media/{fileId}/thumbnail/blob` (1-year immutable; the client fingerprints the URL by version). A blob row exists only when state is `ready` and the file is active — every reset/disable/delete drops it in the same transaction, so a present blob is always serveable.
 - Generation downscales via `DynamicImage::thumbnail_exact` (fast single-pass area-average) then WebP-encodes. There is no reduced-resolution JPEG decode in the pinned `image`/`zune-jpeg`, so do not assume one.
 - **All decoding goes through the registry in `crates/core/src/decode/`**, never `image::open` directly. It is a capability-ordered responsibility chain — `ImageCrateDecoder` (JPEG/PNG/GIF/WebP/BMP/common TIFF, no subprocess) then `FfmpegDecoder` (AVIF/HEIC/HEIF/PSD/exotic TIFF, via the already-installed ffmpeg binary) — with **graceful fall-through**: a decoder that claims an extension but fails does not end the attempt, the next claiming decoder runs. The aggregate error preserves every link's text verbatim, which is what lets `classify_thumbnail_failure` still see a transient signature contributed by any one link. `no decoder handles` and `decoder unavailable` are distinct, diagnosable messages (both `permanent` — an uninstalled ffmpeg will not install itself, and marking it transient would arm the 60s retry sweep against every AVIF forever). Adding a format family means adding one decoder; do not add a C-dependency crate (no cmake/nasm available). `decode/formats.rs` is the SINGLE table of what an extension means — `scan` and `watch` both import it, having previously held byte-identical private copies that drifted (`.heic` indexed, `.heif` not).
-- `GET /api/media/{fileId}/preview` is a **preview-source resolver**, not a file streamer. With no `viewportLongPx` it streams the original bytes verbatim — byte-identical to the pre-pipeline behaviour, which is a hard compatibility requirement. With a viewport it may return an adaptive downscaled WebP tier; a browser-unrenderable image returns a WebP transcode. Tiers are keyed by **longest side** (`preview_2048`, `preview_3072`, plus `preview_native` for a bounded full-size transcode), because that bounds decoded memory unconditionally and matches the preview's `fit-long-edge` mode. Originals at or below 4096px never get a tier. The `x-megle-preview-tier` response header names what was served. Generation **degrades rather than fails**: if a tier cannot be produced the route falls through to streaming the original, so a transient decode failure can never blank a picture that used to display. Decode runs on `spawn_blocking`, NEVER inside a `run_shared_database` closure — that closure owns the single WAL-checkpointing writer connection.
+- `GET /api/media/{fileId}/preview` is a **preview-source resolver**, not a file streamer. With no `viewportLongPx` it streams the original bytes verbatim — byte-identical to the pre-pipeline behaviour, which is a hard compatibility requirement. With a viewport it may return an adaptive downscaled WebP tier; a browser-unrenderable image returns a WebP transcode. Tiers are keyed by **longest side** (`preview_2048`, `preview_3072`, plus `preview_native` for a bounded full-size transcode), because that bounds decoded memory unconditionally and matches the preview's `fit-long-edge` mode. Originals at or below 4096px never get a tier. The `x-mangoo-preview-tier` response header names what was served. Generation **degrades rather than fails**: if a tier cannot be produced the route falls through to streaming the original, so a transient decode failure can never blank a picture that used to display. Decode runs on `spawn_blocking`, NEVER inside a `run_shared_database` closure — that closure owns the single WAL-checkpointing writer connection.
 - Preview tiers cache in **`preview_blobs`**, a table separate from `thumb_blobs` under a 2 GiB LRU keyed on `(source_size, source_mtime)` for staleness. They are deliberately NOT a new `thumb_blobs` profile: that table holds ~663k rows / ~18 GB on a real library and its `CHECK` cannot be altered in place, so widening it would copy 18 GB during `apply_migrations` on app open. Note `data BLOB` is the LAST column — SQLite walks a row's overflow-page chain to reach any column after a spilled BLOB, and with `data` in the middle the eviction sweep cost 1537ms per cache miss instead of 1.27ms.
 - The preview surface paints a **stable `<canvas>`** (no React `key`, so it is never remounted) from a Worker-decoded `ImageBitmap` pool. This is the fix for slow prev/next: the old path mounted a fresh `<img key={src}>` per frame, and a decoded bitmap does not transfer to a new element even with the same object URL, so every navigation paid a full-resolution main-thread decode (337ms at 16384px). Zoom/pan is unchanged — it is a CSS transform on the wrapper `.central-preview-transform`, so the canvas is just a differently-painted element of the same intrinsic size; the canvas **backing store** is the bitmap's size while its **CSS box** is the media's natural size. `ImageBitmap`s must be explicitly `.close()`d on eviction, overwrite, delete, and library switch. The pool takes 75% of the user's preview-buffer setting and the compressed-byte cache 25%. There is **no navigation lock** — `canNavigatePreview` is position-only, and `PreviewCanvas` aborts a request it outran.
 - Failed thumbnails carry `thumbs.failure_kind` (`transient` | `permanent`), set by the pure `classify_thumbnail_failure` (`crates/core/src/thumbnails/mod.rs`) from the stored error text: network drops (`os error 53`, "找不到网络路径"/"网络"/`network path`), `database is locked`, and `Memory limit exceeded` are `transient`; everything else (unsupported format, corrupt file) is `permanent`. Only `transient` failures on a currently-reachable root are automatic-retry candidates — via the existing viewport `RetryFailedAndStale` priority-scope path (immediate, for what the user is browsing) and a 60s `bulk(-10)` background sweep (`spawn_transient_retry_sweep`, `crates/core/src/api/mod.rs`) that clears the backlog. `permanent` failures never auto-retry; only the user's manual `retry_task` can requeue them. Root reachability is an in-memory-only probe (`roots/reachability.rs`, `AppState.root_reachability`, `stat` on the root's own path every 30s, never persisted) exposed as `RootRecord.reachable`; an unreachable root (NAS offline) shows a `FolderX` disconnected icon in the sidebar and is skipped entirely by both retry paths — one `stat` gates the whole share so a NAS blip can't turn into a retry storm.
@@ -129,7 +133,7 @@ These conventions keep the UI fluid on million-file libraries; preserve them whe
 
 ### File Operations
 
-Megle maps real directories, so file ops are real:
+Mangoo maps real directories, so file ops are real:
 - Default delete goes to the Windows recycle bin; permanent delete needs a second confirmation.
 - Same-volume moves use rename; cross-volume uses copy+verify+delete.
 - Every operation writes a row to `file_operations` for tracking.
@@ -155,9 +159,9 @@ These are enforced by checks or called out in `docs/project-structure.md`:
 - `docs/project-structure.md` — directory ownership and what not to create yet.
 - `docs/testing-strategy.md` — current test layers and the gates required before feature work.
 - `docs/final-solution.md` — locked product rules (Windows first, no managed library, recycle-bin default, plugin-ready).
-- `docs/superpowers/specs/2026-05-16-megle-ui-liquid-glass-design.md` — approved acrylic frosted-glass UI design spec.
-- `docs/superpowers/plans/2026-05-16-megle-ui-foundation.md` — UI foundation implementation plan.
-- `docs/superpowers/plans/2026-05-16-megle-complete-product-plan.md` — master execution order spanning UI foundation through release hardening.
+- `docs/superpowers/specs/2026-05-16-mangoo-ui-liquid-glass-design.md` — approved acrylic frosted-glass UI design spec.
+- `docs/superpowers/plans/2026-05-16-mangoo-ui-foundation.md` — UI foundation implementation plan.
+- `docs/superpowers/plans/2026-05-16-mangoo-complete-product-plan.md` — master execution order spanning UI foundation through release hardening.
 
 ## Current Implementation State (carried forward from Codex memory)
 
@@ -191,19 +195,19 @@ This is a historical delivery record, not the current presentation contract. Cur
 
 End-to-end real-photo testing against `C:/Users/84460/Pictures/normal` (31 multi-MB illustrations) shipped three additional fixes that anyone running `npm run dev` against a real directory needs:
 
-- `apps/desktop/src/preload.cjs` (CommonJS, hand-maintained) replaces the old `preload.ts`. Electron's sandboxed preload runtime requires CJS, but the workspace root is `"type": "module"`, so a `.ts → .js` build was loaded as ESM and crashed with "Cannot use import statement outside a module" — the renderer never received `window.megleDesktop`. The `.cjs` is short enough that a static file beats forcing a separate tsconfig.
+- `apps/desktop/src/preload.cjs` (CommonJS, hand-maintained) replaces the old `preload.ts`. Electron's sandboxed preload runtime requires CJS, but the workspace root is `"type": "module"`, so a `.ts → .js` build was loaded as ESM and crashed with "Cannot use import statement outside a module" — the renderer never received `window.mangooDesktop`. The `.cjs` is short enough that a static file beats forcing a separate tsconfig.
 - `apps/web/src/core/mediaResources.ts::isFreshThumbnailForMediaRecord` no longer requires `mediaRecord.thumbnailCacheKey`. `/api/media` listing intentionally omits per-row thumbnail metadata for performance, so the freshness check used to reject every `ready` thumbnail and tiles stayed in `loading` forever. Now it trusts `ThumbnailResponse.fileId` and the response state.
-- The new `GET /api/media/{fileId}/thumbnail/blob` endpoint streams the cached WebP bytes (`image/webp` + 1-year immutable cache), and `apps/web/src/features/media-grid/MediaGrid.tsx::ReadyThumbnail` + `apps/web/src/features/preview/PreviewPanel.tsx::ReadyPreviewImage` fetch the blob through `@megle/core-client::getThumbnailBlob` and render `<img>` elements via `URL.createObjectURL`. Phase 1 only rendered placeholder text in tiles — the cache files existed on disk but never reached the screen.
+- The new `GET /api/media/{fileId}/thumbnail/blob` endpoint streams the cached WebP bytes (`image/webp` + 1-year immutable cache), and `apps/web/src/features/media-grid/MediaGrid.tsx::ReadyThumbnail` + `apps/web/src/features/preview/PreviewPanel.tsx::ReadyPreviewImage` fetch the blob through `@mangoo/core-client::getThumbnailBlob` and render `<img>` elements via `URL.createObjectURL`. Phase 1 only rendered placeholder text in tiles — the cache files existed on disk but never reached the screen.
 
 ### Dev Ergonomics
 
 Three optional env vars / scripts make local debugging cheap:
 
-- `MEGLE_AUTO_ADD_ROOT="<path>"` — Electron auto-adds the path as a root after Core is healthy. Lets `npm run dev` come up with data already loaded.
-- `MEGLE_REMOTE_DEBUG=1` — `tools/dev/run-dev.mjs` passes `--remote-debugging-port=9500` to Electron so you can attach Chrome DevTools or use the next script. (Default is 9500, not 9222: on Windows 9222 is inside a reserved excluded TCP port range — `netsh interface ipv4 show excludedportrange protocol=tcp` — so Electron can't bind it and CDP silently fails with "Cannot start http server for devtools". Override with `MEGLE_REMOTE_DEBUG_PORT`, but keep it outside the excluded ranges.)
+- `MANGOO_AUTO_ADD_ROOT="<path>"` — Electron auto-adds the path as a root after Core is healthy. Lets `npm run dev` come up with data already loaded.
+- `MANGOO_REMOTE_DEBUG=1` — `tools/dev/run-dev.mjs` passes `--remote-debugging-port=9500` to Electron so you can attach Chrome DevTools or use the next script. (Default is 9500, not 9222: on Windows 9222 is inside a reserved excluded TCP port range — `netsh interface ipv4 show excludedportrange protocol=tcp` — so Electron can't bind it and CDP silently fails with "Cannot start http server for devtools". Override with `MANGOO_REMOTE_DEBUG_PORT`, but keep it outside the excluded ranges.)
 - `tools/dev/cdp-inspect.mjs <ws-url>` — connects to the renderer over CDP and prints `hasBridge`, `coreUrl`, token presence, tile counts (`ready` / `loading` / `failed`), `<img>` count, and recent console errors. Use it instead of guessing whether the UI rendered. Wire-up: `WS=$(curl -sS http://127.0.0.1:9500/json | python -c "import json,sys; print([p for p in json.load(sys.stdin) if p['type']=='page'][0]['webSocketDebuggerUrl'])") && node tools/dev/cdp-inspect.mjs "$WS"`.
 
-Remaining scan work explicitly deferred: transactional scan batching, chunked commits, worker shutdown, progress counters, cancellation/retry semantics, clearer rescan failure/staleness behavior. The Phase 1 dynamic-port probe still has a small probe-and-close bind race before Core starts. Desktop dev still uses `cargo run -p megle-core`; a packaged Core sidecar replaces this for production.
+Remaining scan work explicitly deferred: transactional scan batching, chunked commits, worker shutdown, progress counters, cancellation/retry semantics, clearer rescan failure/staleness behavior. The Phase 1 dynamic-port probe still has a small probe-and-close bind race before Core starts. Desktop dev still uses `cargo run -p mangoo-core`; a packaged Core sidecar replaces this for production.
 
 ### Desktop Chrome Notes (carried forward)
 
@@ -217,7 +221,7 @@ The app opens multiple libraries, one at a time. **A library = a single `.sqlite
 
 - **Registry:** `apps/desktop/src/library-registry.ts` reads/writes `userData/libraries.json` (`{ activeLibraryId, libraries: [{ id, name, dbPath, lastOpenedAt }] }`). Cold start reads it, opens the active library, and seeds a "Default" entry from the dev/base DB path if the registry is empty.
 - **Restart, reusing port + token:** `main.ts::restartCoreForLibrary(dbPath)` stops the old Core, `waitForPortFree`, then `sessionForDbPath(base, dbPath)` builds a session with the **same bindAddress + sessionToken**, so the renderer's injected `coreUrl`/`token` stay valid — **no `window.reload()`**. On a failed health-check it tracks the new handle in `pendingCoreProcess` before awaiting and `.stop()`s it on failure (never leak the process/port).
-- **IPC + bridge:** `megle:list-libraries`/`switch-library`/`create-library`/`open-library`/`remove-library-from-list`/`rename-library`/`pick-library-file`/`pick-new-library-path`, plus a `megle:library-load-phase` push. Renderer wrappers live in `apps/web/src/core/desktop.ts`; types in `apps/web/src/core/libraryTypes.ts` (`LibrarySummary`, `LibraryLoadPhase`). Root add/remove reuse the existing `@megle/core-client` (`addRoot`/`removeRoot`) and act ONLY on the active library.
+- **IPC + bridge:** `mangoo:list-libraries`/`switch-library`/`create-library`/`open-library`/`remove-library-from-list`/`rename-library`/`pick-library-file`/`pick-new-library-path`, plus a `mangoo:library-load-phase` push. Renderer wrappers live in `apps/web/src/core/desktop.ts`; types in `apps/web/src/core/libraryTypes.ts` (`LibrarySummary`, `LibraryLoadPhase`). Root add/remove reuse the existing `@mangoo/core-client` (`addRoot`/`removeRoot`) and act ONLY on the active library.
 - **Load phase / overlay:** `LibraryLoadPhase = "starting-core" | "opening-library" | "loading-media" | "ready" | {kind:"error";message}`. `App.tsx` holds `libraryPhase`, subscribes via `subscribeLibraryPhase`, and renders `LibraryLoadingOverlay` over the center pane until ready. IMPORTANT: cold start pushes NO phase events (only the switch path emits them), so the phase advances to `"ready"` from ANY non-error phase once `library.roots` resolve — don't gate it only on `"loading-media"` or the overlay hangs on cold start.
 - **UI:** sidebar top = current-library name + switch button (opens `LibrarySwitcher`); the switcher popup lists libraries with per-row add/remove-folder (active library only, greyed for inactive) + create/open footer; full management is planned for a Settings section (not yet built). Create/open auto-switch.
 
@@ -234,7 +238,7 @@ Web apps/web/src/features/notifications/ -> compact status, full history/actions
 
 - **Core library DB:** `notification_operation_heads` stores the current operation head and `notification_outbox` publishes revisioned changes transactionally. Core remains authoritative for active library work; the existing file-operation audit/history endpoint stays available for migration and recovery.
 - **Desktop durable mirror:** `apps/desktop/src/notification-service.ts` drains and acknowledges each library Outbox only after `userData/notifications.sqlite` persists the revision. The mirror survives library switches and desktop restarts and powers cross-library status/history; process logs remain local to the desktop session and use a bounded buffer.
-- **Typed preload boundary:** renderer code uses the `packages/notification-contract` (`@megle/notification-contract`) bridge for compact snapshots, paged history/facets, cancel/retry actions, change subscriptions, and snapshot-plus-subscribe process logs. Do not bypass IPC with renderer-owned notification transport.
+- **Typed preload boundary:** renderer code uses the `packages/notification-contract` (`@mangoo/notification-contract`) bridge for compact snapshots, paged history/facets, cancel/retry actions, change subscriptions, and snapshot-plus-subscribe process logs. Do not bypass IPC with renderer-owned notification transport.
 - **Web constraints:** no raw fetch for notification data, no notification polling, and no per-thumbnail notifications. Thumbnail activity is aggregated by library, while every background operation declares one logical grouping key and one presentation class (`important`, `history_only`, or `status_only`).
 
 #### Retired Surfaces
@@ -245,7 +249,7 @@ Web apps/web/src/features/notifications/ -> compact status, full history/actions
 
 ## Next Execution Order
 
-1. Execute the integrated complete-product plan at `docs/superpowers/plans/2026-05-16-megle-complete-product-plan.md`, starting with the UI foundation track.
+1. Execute the integrated complete-product plan at `docs/superpowers/plans/2026-05-16-mangoo-complete-product-plan.md`, starting with the UI foundation track.
 2. After UI foundation, write and execute the Phase 2 real-directory-browsing child plan.
 3. Harden scanning with transactional batching, recovery, progress, and failure semantics.
 4. Add a smoke path for `npm run dev` once GUI launch behavior is ready to verify manually.

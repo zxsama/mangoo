@@ -9,6 +9,7 @@ import {
   OverlayDialogBody,
   OverlayDialogHeader,
   OverlayProvider,
+  OverlaySelect,
   OverlaySurface
 } from "../../src/design/overlays";
 import "../../src/styles.css";
@@ -55,9 +56,9 @@ function OverlayAppearanceVisualFixture() {
     const handleModalToggle = (event: Event) => {
       setModalOpen((event as CustomEvent<boolean>).detail !== false);
     };
-    window.addEventListener("megle-overlay-fixture-modal", handleModalToggle);
+    window.addEventListener("mangoo-overlay-fixture-modal", handleModalToggle);
     return () => {
-      window.removeEventListener("megle-overlay-fixture-modal", handleModalToggle);
+      window.removeEventListener("mangoo-overlay-fixture-modal", handleModalToggle);
     };
   }, []);
 
@@ -97,14 +98,12 @@ function OverlayAppearanceVisualFixture() {
                   <input className="overlay-field-input" defaultValue="fixture" />
                 </span>
               </label>
-              <label className="overlay-field">
-                <span className="overlay-field-label">Status</span>
-                <span className="overlay-field-control" data-appearance-surface="select-control">
-                  <select className="overlay-field-select" data-appearance-surface="select-element" defaultValue="all">
-                    <option value="all">All</option>
-                  </select>
-                </span>
-              </label>
+              <OverlaySelect label="Status" data-appearance-surface="select-element" defaultValue="all">
+                <option value="all">All</option>
+                <option value="running">Running</option>
+                <option value="completed">Completed</option>
+                <option value="disabled" disabled>Unavailable</option>
+              </OverlaySelect>
               <div className="move-tree overlay-appearance-readable-inner" data-appearance-surface="readable-inner">
                 Readable inner region
               </div>

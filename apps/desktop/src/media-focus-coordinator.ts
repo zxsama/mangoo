@@ -6,7 +6,7 @@ import type {
   MediaFocusRequest,
   MediaFocusStage,
   MediaFocusStageUpdate
-} from "@megle/notification-contract";
+} from "@mangoo/notification-contract";
 
 interface PendingMediaFocus {
   cancel: (cancellation: MediaFocusCancellation) => void;

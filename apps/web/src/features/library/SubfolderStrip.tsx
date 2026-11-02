@@ -1,9 +1,12 @@
-import { Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Folder } from "lucide-react";
+import { Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp } from "../../design/icons";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
-import type { FolderRecord, MediaRecord } from "@megle/core-client";
+import { FolderGlyph } from "./FolderGlyph";
+import type { FolderRecord, MediaRecord } from "@mangoo/core-client";
 import {
   mediaFileContentSignature,
+  mediaPreviewKind,
+  previewPlaceholderDataUrl,
   readCachedThumbnailObjectUrl,
   rememberThumbnailObjectUrl,
   requestOriginalPreviewBlob,
@@ -12,6 +15,7 @@ import {
   thumbnailObjectUrlCacheKey
 } from "../../core/mediaResources";
 import type { SubfolderSiblingPosition } from "./subfolderHierarchy";
+import { FileFormatArtwork, FileFormatBadge } from "../media-grid/FileFormatArtwork";
 import { MediaLoadingRing } from "../loading/MediaLoadingRing";
 
 interface SubfolderStripProps {
@@ -158,7 +162,7 @@ export function SubfolderCard({
         type="button"
       >
         <span className="subfolder-card-cover" aria-hidden="true">
-          <FolderCoverPreview coverLoaded={coverLoaded} coverMedia={coverMedia} />
+          <FolderCoverPreview folder={folder} coverLoaded={coverLoaded} coverMedia={coverMedia} />
           <span className="subfolder-card-pointer-surface" />
           <span className="library-thumbnail-interaction-ring" />
         </span>
@@ -195,9 +199,11 @@ export function SubfolderCard({
 }
 
 function FolderCoverPreview({
+  folder,
   coverLoaded,
   coverMedia
 }: {
+  folder: FolderRecord;
   coverLoaded: boolean;
   coverMedia: MediaRecord[];
 }) {
@@ -213,6 +219,7 @@ function FolderCoverPreview({
     cacheKey ? readCachedThumbnailObjectUrl(cacheKey) : null
   );
   const [failed, setFailed] = useState(false);
+  const presentationGeneration = coverMediaItem?.presentation?.generation;
   const [retryTick, setRetryTick] = useState(0);
   const objectUrlRef = useRef<string | null>(src);
   const cacheOwnsObjectUrlRef = useRef(src !== null);
@@ -241,8 +248,10 @@ function FolderCoverPreview({
 
     let revoked = false;
     let objectUrl: string | null = null;
+    let retryTimer: number | undefined;
     const controller = new AbortController();
     setFailed(false);
+    setSrc(null);
 
     requestThumbnailState(coverMediaItem, "visible", { signal: controller.signal })
       .then((thumbnail) => {
@@ -253,6 +262,10 @@ function FolderCoverPreview({
             signal: controller.signal
           });
         }
+        if (thumbnail.state === "pending" || thumbnail.state === "queued") {
+          retryTimer = window.setTimeout(() => { if (!revoked) setRetryTick((value) => value + 1); }, 1000);
+        }
+        if (mediaPreviewKind(coverMediaItem) !== "original-image") return null;
         return requestOriginalPreviewBlob(coverMediaItem, {
           requestPriority: "resource",
           resourcePriority: "visible",
@@ -263,6 +276,7 @@ function FolderCoverPreview({
         if (isAbortError(cause)) {
           throw cause;
         }
+        if (mediaPreviewKind(coverMediaItem) !== "original-image") return null;
         return requestOriginalPreviewBlob(coverMediaItem, {
           requestPriority: "resource",
           resourcePriority: "visible",
@@ -270,6 +284,7 @@ function FolderCoverPreview({
         });
       })
       .then((blob) => {
+        if (!blob) return;
         objectUrl = URL.createObjectURL(blob);
         if (revoked) {
           URL.revokeObjectURL(objectUrl);
@@ -291,14 +306,12 @@ function FolderCoverPreview({
         }
         if (!revoked && !isAbortError(cause)) {
           setFailed(true);
-          window.setTimeout(() => {
-            setRetryTick((value) => value + 1);
-          }, 1000);
         }
       });
 
     return () => {
       revoked = true;
+      window.clearTimeout(retryTimer);
       controller.abort();
       if (objectUrl && objectUrlRef.current !== objectUrl) {
         URL.revokeObjectURL(objectUrl);
@@ -314,7 +327,15 @@ function FolderCoverPreview({
     // and re-fetched the cover on every scroll — the cover flashed its background
     // and reloaded. cacheKey stays constant while the cover's content is the same.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cacheKey, retryTick]);
+  }, [cacheKey, presentationGeneration, retryTick]);
+
+  if ((!src || failed) && coverMediaItem) {
+    const placeholder = previewPlaceholderDataUrl(coverMediaItem);
+    return <span className="subfolder-card-cover-image-frame" data-cover-status="file">
+      {placeholder ? <img alt="" className="subfolder-card-cover-image" src={placeholder} /> : <FileFormatArtwork file={coverMediaItem} />}
+      <FileFormatBadge file={coverMediaItem} />
+    </span>;
+  }
 
   if (!src || failed) {
     const coverStatus = failed ? "failed" : coverMediaItem ? "loading" : coverLoaded ? "empty" : "loading";
@@ -323,7 +344,7 @@ function FolderCoverPreview({
         className="subfolder-card-cover-fallback"
         data-cover-status={coverStatus}
       >
-        <Folder size={22} />
+        <FolderGlyph icon={folder.icon} color={folder.color} size={22} />
       </span>
     );
   }
@@ -339,7 +360,9 @@ function FolderCoverPreview({
         }
         loading="lazy"
         src={src}
+        onError={() => setFailed(true)}
       />
+      {coverMediaItem ? <FileFormatBadge file={coverMediaItem} /> : null}
     </span>
   );
 }

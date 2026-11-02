@@ -138,6 +138,11 @@ function extractTopLevelObjectEntries(objectSource, windowIndex) {
     .map((entry) => {
       const trimmedEntry = stripComments(entry).trim();
       if (trimmedEntry.startsWith("...")) {
+        // This literal conditional can only add an icon, never a material or
+        // transparency option. Undefined icons must be omitted for Electron.
+        if (/^\.\.\.\(\s*windowIcon\s*\?\s*\{\s*icon\s*:\s*windowIcon\s*\}\s*:\s*\{\s*\}\s*\)$/.test(trimmedEntry)) {
+          return null;
+        }
         unsafeTopLevelSpreads.push({
           windowIndex,
           source: trimmedEntry

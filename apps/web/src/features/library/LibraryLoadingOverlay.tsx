@@ -1,4 +1,4 @@
-import { Loader2 } from "lucide-react";
+import { Loader2 } from "../../design/icons";
 import { LiquidGlassButton, LiquidGlassSurface } from "../../design/liquid-glass";
 import { isErrorPhase, type LibraryLoadPhase } from "../../core/libraryTypes";
 

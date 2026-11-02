@@ -17,7 +17,7 @@ The existing real test (`tools/dev/real-load-test.mts`) verifies scan/priority o
 
 ## Data source
 
-Real image directory (not synthetic seed): `Y:\Repository\Billfish\Artists`, ~500k+ files, deeply nested. Overridable via `MEGLE_REAL_LOAD_ROOT`. Because it is genuinely million-scale, no synthetic row top-up is needed — the real scan produces real deep-scroll depth and real write-lock contention.
+Real image directory (not synthetic seed): `Y:\Repository\Billfish\Artists`, ~500k+ files, deeply nested. Overridable via `MANGOO_REAL_LOAD_ROOT`. Because it is genuinely million-scale, no synthetic row top-up is needed — the real scan produces real deep-scroll depth and real write-lock contention.
 
 ## Verified hot-path map (from code)
 
@@ -34,7 +34,7 @@ Real image directory (not synthetic seed): `Y:\Repository\Billfish\Artists`, ~50
 
 New file `tools/dev/real-hot-loop-test.mts`, reusing the process lifecycle + HTTP helpers from `real-load-test.mts`.
 
-1. Spawn real Core (`cargo run --release -p megle-core`) against a fresh temp `MEGLE_DB_PATH`.
+1. Spawn real Core (`cargo run --release -p mangoo-core`) against a fresh temp `MANGOO_DB_PATH`.
 2. `addRoot` → `Y:\Repository\Billfish\Artists`. Wait until enough media is indexed for deep pagination (do not require full scan completion).
 3. Run the 100 operations WHILE background scan + thumbnail generation is still active (worst case: browsing while ingesting). Mid-run, trigger one `enqueueThumbnailCache` generate-all to create the write-lock storm.
 4. The 100 operations are a weighted real-interaction sequence, each timed:
@@ -64,7 +64,7 @@ Correctness assertions (test FAILS on violation):
 
 New file `tools/dev/desktop-scroll-trace.mjs`, reusing `cdp-inspect.mjs` wiring.
 
-1. Launch `run-dev.mjs` with `MEGLE_REMOTE_DEBUG=1` and `MEGLE_AUTO_ADD_ROOT` = the real dir.
+1. Launch `run-dev.mjs` with `MANGOO_REMOTE_DEBUG=1` and `MANGOO_AUTO_ADD_ROOT` = the real dir.
 2. Attach CDP to the renderer, run a scripted scroll sequence, capture a performance trace.
 3. Assert render-thread health that Test A cannot see: no main-thread long task over budget during scroll, tile counts resolve (ready grows; no permanent loading/failed), no console errors, no wrong-image flicker.
 

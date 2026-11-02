@@ -7,6 +7,7 @@ mod fsops;
 mod host_registry;
 mod library_manager;
 mod library_path;
+mod plugin_configuration;
 mod plugins;
 mod roots;
 mod scan;
@@ -24,7 +25,7 @@ use axum::http::HeaderValue;
 use crate::api::BasicAuthCredentials;
 
 fn run_plugin_runtime_test_helper() -> anyhow::Result<bool> {
-    let Ok(mode) = std::env::var("MEGLE_PLUGIN_RUNTIME_TEST_HELPER") else {
+    let Ok(mode) = std::env::var("MANGOO_PLUGIN_RUNTIME_TEST_HELPER") else {
         return Ok(false);
     };
     match mode.as_str() {
@@ -39,7 +40,7 @@ fn run_plugin_runtime_test_helper() -> anyhow::Result<bool> {
         },
         "tree" => {
             let child = std::process::Command::new(std::env::current_exe()?)
-                .env("MEGLE_PLUGIN_RUNTIME_TEST_HELPER", "hang")
+                .env("MANGOO_PLUGIN_RUNTIME_TEST_HELPER", "hang")
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -84,7 +85,7 @@ fn run_plugin_runtime_test_helper() -> anyhow::Result<bool> {
                         })
                     }
                     "describe" => serde_json::json!({
-                        "pluginId":"com.megle.fake",
+                        "pluginId":"com.mangoo.fake",
                         "accountUuid":"fake-account",
                         "capabilities":["sync-provider.v1"],
                         "maxObjectBytes":67108864u64
@@ -128,52 +129,52 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     initialize_tracing();
-    let host_path = std::env::var("MEGLE_HOST_DB_PATH")
+    let host_path = std::env::var("MANGOO_HOST_DB_PATH")
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
-    let libraries_dir = std::env::var("MEGLE_LIBRARIES_DIR")
+    let libraries_dir = std::env::var("MANGOO_LIBRARIES_DIR")
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
-    let bind_addr: SocketAddr = std::env::var("MEGLE_CORE_ADDR")
+    let bind_addr: SocketAddr = std::env::var("MANGOO_CORE_ADDR")
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "127.0.0.1:47321".to_string())
         .parse()?;
-    let basic_auth = std::env::var("MEGLE_BASIC_AUTH")
+    let basic_auth = std::env::var("MANGOO_BASIC_AUTH")
         .ok()
         .filter(|s| !s.is_empty())
         .and_then(|raw| {
             BasicAuthCredentials::parse(&raw).or_else(|| {
-                tracing::warn!("MEGLE_BASIC_AUTH is set but is not in `user:pass` form; ignoring");
+                tracing::warn!("MANGOO_BASIC_AUTH is set but is not in `user:pass` form; ignoring");
                 None
             })
         });
-    // Treat unset and empty-string `MEGLE_SESSION_TOKEN` identically: an empty
-    // env var (e.g. from `${MEGLE_SESSION_TOKEN:-}` in compose) means "no
+    // Treat unset and empty-string `MANGOO_SESSION_TOKEN` identically: an empty
+    // env var (e.g. from `${MANGOO_SESSION_TOKEN:-}` in compose) means "no
     // session token configured", not "configured to the empty token".
-    let session_token = std::env::var("MEGLE_SESSION_TOKEN")
+    let session_token = std::env::var("MANGOO_SESSION_TOKEN")
         .ok()
         .filter(|s| !s.is_empty());
     if session_token.is_none() && basic_auth.is_none() {
         // When Basic auth is enabled the operator can opt out of the
-        // desktop session-token mechanism by leaving `MEGLE_SESSION_TOKEN`
+        // desktop session-token mechanism by leaving `MANGOO_SESSION_TOKEN`
         // unset. Otherwise the token is mandatory.
-        anyhow::bail!("MEGLE_SESSION_TOKEN must be set before starting Megle Core");
+        anyhow::bail!("MANGOO_SESSION_TOKEN must be set before starting Mangoo Core");
     }
-    let allowed_origin = std::env::var("MEGLE_ALLOWED_ORIGIN")
+    let allowed_origin = std::env::var("MANGOO_ALLOWED_ORIGIN")
         .ok()
         .filter(|s| !s.is_empty())
         .map(|origin| origin.parse::<HeaderValue>())
         .transpose()?;
 
     let host_path = host_path.ok_or_else(|| {
-        anyhow::anyhow!("MEGLE_HOST_DB_PATH must be set before starting Megle Core")
+        anyhow::anyhow!("MANGOO_HOST_DB_PATH must be set before starting Mangoo Core")
     })?;
     let libraries_dir = libraries_dir
         .or_else(|| host_path.parent().map(|parent| parent.join("libraries")))
-        .ok_or_else(|| anyhow::anyhow!("MEGLE_LIBRARIES_DIR is required for Core Host mode"))?;
+        .ok_or_else(|| anyhow::anyhow!("MANGOO_LIBRARIES_DIR is required for Core Host mode"))?;
     let state = api::AppState::new_host(host_path, libraries_dir).await?;
     let web_dir = resolve_web_dir();
 
@@ -182,7 +183,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         event_kind = "startup_ready",
         bind_addr = %ready_addr,
-        "Megle Core ready"
+        "Mangoo Core ready"
     );
     let serve_result = axum::serve(
         listener,
@@ -244,7 +245,7 @@ async fn wait_for_shutdown_signal() {
 
 #[cfg(windows)]
 fn configured_parent_pid() -> Option<u32> {
-    let value = std::env::var("MEGLE_PARENT_PID").ok();
+    let value = std::env::var("MANGOO_PARENT_PID").ok();
     parse_parent_pid(value.as_deref())
 }
 
@@ -321,10 +322,10 @@ async fn bind_with_retry(bind_addr: SocketAddr) -> anyhow::Result<tokio::net::Tc
 
 /// Resolve the directory holding the built web UI when static-serve mode is
 /// requested. Returns `None` (and the API runs without a static UI) when:
-/// - `MEGLE_SERVE_WEB` is not `1`,
+/// - `MANGOO_SERVE_WEB` is not `1`,
 /// - or the configured directory does not exist on disk.
 fn resolve_web_dir() -> Option<PathBuf> {
-    let enabled = std::env::var("MEGLE_SERVE_WEB")
+    let enabled = std::env::var("MANGOO_SERVE_WEB")
         .ok()
         .filter(|s| !s.is_empty())
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -332,14 +333,14 @@ fn resolve_web_dir() -> Option<PathBuf> {
     if !enabled {
         return None;
     }
-    let configured = std::env::var("MEGLE_WEB_DIR")
+    let configured = std::env::var("MANGOO_WEB_DIR")
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("apps/web/dist"));
     if !configured.is_dir() || !configured.join("index.html").is_file() {
         tracing::warn!(
-            "MEGLE_SERVE_WEB=1 but {} is not a built web root containing index.html; static UI disabled",
+            "MANGOO_SERVE_WEB=1 but {} is not a built web root containing index.html; static UI disabled",
             configured.display()
         );
         return None;

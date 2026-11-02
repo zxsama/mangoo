@@ -40,6 +40,7 @@ function schemaTsType(schema) {
   if (schema?.$ref) return schema.$ref.split("/").at(-1);
   const value = dereference(schema);
   if (!value) return "unknown";
+  if (value.allOf?.length === 1) return schemaTsType(value.allOf[0]);
   if (value.anyOf || value.oneOf) {
     const variants = [...(value.anyOf ?? []), ...(value.oneOf ?? [])]
       .filter((variant) => dereference(variant)?.type !== "null")
@@ -47,6 +48,7 @@ function schemaTsType(schema) {
     return [...new Set(variants)].join(" | ") || "null";
   }
   if (value.$ref) return value.$ref.split("/").at(-1);
+  if (Object.hasOwn(value, "const")) return JSON.stringify(value.const);
   if (value.type === "array") return `${schemaTsType(value.items)}[]`;
   if (value.enum) return value.enum.map((item) => JSON.stringify(item)).join(" | ");
   if (value.type === "integer" || value.type === "number") return "number";
@@ -309,6 +311,9 @@ for (const name of [
   "MoveRequest",
   "DeleteRequest",
   "HostPluginProjection",
+  "HostPluginViewDocument",
+  "PluginUiView",
+  "PluginUiContribution",
   "HostPluginListResponse",
   "PluginDiscoveryError",
   "PluginDiscoveryResponse",
@@ -318,10 +323,16 @@ for (const name of [
   "PluginAuthBeginResponse",
   "PluginAuthCompleteRequest",
   "PluginAuthCancelRequest",
-  "OneDriveConfiguration",
-  "OneDriveConfigurationPlanRequest",
-  "OneDriveConfigurationPlan",
-  "OneDriveConfigurationCommitRequest",
+  "PluginConfiguration",
+  "PluginConfigurationField",
+  "PluginContributions",
+  "PluginAuthenticationContribution",
+  "PluginPresentationContribution",
+  "PluginExternalLink",
+  "PluginExternalLinkRequest",
+  "PluginConfigurationPlanRequest",
+  "PluginConfigurationPlan",
+  "PluginConfigurationCommitRequest",
   "PluginHealthResponse",
   "PluginDiagnosticsResponse",
   "SyncProviderStatus",
@@ -404,11 +415,49 @@ assertInterfaceMatchesSchema("ScanSummary");
 assertInterfaceMatchesSchema("LibrarySummary");
 assertInterfaceMatchesSchema("LibraryListResponse");
 assertInterfaceMatchesSchema("ActiveLibraryResponse");
+assertInterfaceMatchesSchema("LibraryContentRootInput");
+assertEnumMatchesGeneratedType("LibraryPreflightReason");
+assertEnumMatchesGeneratedType("LibraryPreflightPathRole");
 assertInterfaceMatchesSchema("LibraryPreflightRequest");
 assertInterfaceMatchesSchema("LibraryPreflightResponse");
 assertInterfaceMatchesSchema("CreateLibraryRequest");
 assertInterfaceMatchesSchema("UpdateLibraryRequest");
 assertInterfaceMatchesSchema("CreateLibraryResponse");
+assertInterfaceMatchesSchema("OpenLibraryRequest");
+assertInterfaceMatchesSchema("OpenLibraryResponse");
+for (const name of ["LibraryPreflightRequest", "CreateLibraryRequest"]) {
+  const roots = schema(name).properties.contentRoots;
+  if (roots?.minItems !== 1 || roots?.items?.$ref !== "#/components/schemas/LibraryContentRootInput") {
+    fail(`${name} must require one or more ordered LibraryContentRootInput entries`);
+  }
+}
+for (const name of ["LibrarySummary", "LibraryPreflightRequest", "CreateLibraryRequest", "OpenLibraryRequest", "SyncRestoreLegacyItem", "SyncRestorePlan"]) {
+  if (Object.hasOwn(schema(name).properties, "managedRoot")) fail(`${name} must use explicit storage/content path roles`);
+  requireNotLine(interfaceBody(name), "managedRoot:", `generated-contract.ts ${name}`);
+}
+const normalizedRoots = schema("LibraryPreflightResponse").properties.normalizedContentRoots;
+const successRoots = normalizedRoots.anyOf?.find((variant) => variant.type === "array");
+if (!schemaAllowsNull(normalizedRoots) || successRoots?.minItems !== 1 || successRoots?.items?.$ref !== "#/components/schemas/LibraryContentRootInput") {
+  fail("LibraryPreflightResponse must allow null failure roots and nonempty successful LibraryContentRootInput roots");
+}
+if (schema("LibraryContentRootInput").properties.path.minLength !== 1) {
+  fail("LibraryContentRootInput must reject empty placeholder paths");
+}
+const preflightResultBranch = schema("LibraryPreflightResponse").allOf?.find((branch) => branch.if?.properties?.ok?.const === true);
+for (const [property, successType] of [["normalizedDatabasePath", "string"], ["normalizedContentRoots", "array"], ["preflightToken", "string"]]) {
+  if (preflightResultBranch?.then?.properties?.[property]?.type !== successType || preflightResultBranch?.else?.properties?.[property]?.type !== "null") {
+    fail(`LibraryPreflightResponse ${property} must be populated only on success and null on failure`);
+  }
+}
+assertOperationRoute("preflightLibrary", "post", "/libraries/preflight");
+assertOperationRequestSchema("preflightLibrary", "LibraryPreflightRequest");
+assertOperationRoute("createLibrary", "post", "/libraries");
+assertOperationRequestSchema("createLibrary", "CreateLibraryRequest");
+assertOperationRoute("openLibrary", "post", "/libraries/open");
+assertOperationRequestSchema("openLibrary", "OpenLibraryRequest");
+assertExactOperationParameters("openLibrary", ["contextRevision"]);
+assertOperationRoute("forgetLibrary", "delete", "/libraries/{libraryUuid}/registration");
+assertExactOperationParameters("forgetLibrary", ["libraryUuid", "contextRevision"]);
 assertInterfaceMatchesSchema("LibraryErrorResponse");
 assertInterfaceMatchesSchema("AcceptedRootResponse");
 assertInterfaceMatchesSchema("ScanTaskRequest");
@@ -416,7 +465,24 @@ assertInterfaceMatchesSchema("InteractiveFolderScanTaskRequest");
 assertInterfaceMatchesSchema("ThumbnailPriorityScopeSyncRequest");
 assertInterfaceMatchesSchema("RootRecord");
 assertInterfaceMatchesSchema("FolderRecord");
+for (const name of ["DirectorySortRule", "DirectorySortSource", "DirectorySortState", "DirectorySortMutationResult"]) {
+  assertInterfaceMatchesSchema(name);
+}
+assertEnumMatchesGeneratedType("DirectorySortOrder");
+for (const kind of ["Root", "Folder"]) {
+  const id = `${kind.toLowerCase()}Id`;
+  const route = `/${kind.toLowerCase()}s/{${id}}/sort`;
+  for (const [prefix, method] of [["get", "get"], ["update", "patch"], ["reset", "delete"]]) {
+    assertOperationRoute(`${prefix}${kind}Sort`, method, route);
+    assertExactOperationParameters(`${prefix}${kind}Sort`, method === "get" ? [id] : [id, "contextRevision"]);
+  }
+  assertOperationRequestSchema(`update${kind}Sort`, "DirectorySortRule");
+}
+assertOperationRoute("updateRootAppearance", "patch", "/roots/{rootId}/appearance");
+assertOperationRequestSchema("updateRootAppearance", "UpdateFolderAppearanceRequest");
+assertExactOperationParameters("updateRootAppearance", ["rootId", "contextRevision"]);
 assertInterfaceMatchesSchema("MediaRecord");
+assertInterfaceMatchesSchema("PlaybackSession");
 assertInterfaceMatchesSchema("MediaPositionResponse");
 assertInterfaceMatchesSchema("ThumbnailFailureRecord");
 assertInterfaceMatchesSchema("ThumbnailAsset");
@@ -441,6 +507,11 @@ assertInterfaceMatchesSchema("RenameRequest");
 assertInterfaceMatchesSchema("MoveRequest");
 assertInterfaceMatchesSchema("DeleteRequest");
 assertInterfaceMatchesSchema("HostPluginProjection");
+assertInterfaceMatchesSchema("HostPluginViewDocument");
+assertInterfaceMatchesSchema("PluginUiView");
+assertInterfaceMatchesSchema("PluginUiContribution");
+assertEnumMatchesGeneratedType("PluginUiSlot");
+assertOperationRoute("getPluginViewDocument", "get", "/plugins/{pluginId}/views/{viewId}");
 assertInterfaceMatchesSchema("PluginDiscoveryError");
 assertInterfaceMatchesSchema("PluginDiscoveryResponse");
 assertInterfaceMatchesSchema("PluginCommandResponse");
@@ -705,7 +776,7 @@ if (
 const thumbnailBody = interfaceBody("ThumbnailResponse");
 for (const line of [
   'target: "grid_320";',
-  'state: "pending" | "queued" | "ready" | "failed" | "skipped_small";',
+  'state: "pending" | "queued" | "ready" | "failed" | "skipped_small" | "unavailable";',
   'shortSidePx: number;',
   'outputFormat: "image/webp";',
   "width: number | null;",
@@ -789,7 +860,7 @@ if (!/retryTask:\s*\(taskId:\s*number\)\s*=>\s*request<AcceptedRootResponse>\(`\
 }
 
 if (
-  !/listFolderChildren:\s*\(\s*folderId:\s*number,\s*params:\s*ListFolderChildrenParams\s*=\s*\{\},\s*options:\s*CoreRequestOptions\s*=\s*\{\}\s*\)\s*=>[\s\S]*?request<Page<FolderRecord>>\(`\/folders\/\$\{folderId\}\/children\$\{query\(params\)\}`,\s*\{[\s\S]*?requestPriority:\s*options\.requestPriority\s*\?\?\s*"navigation",[\s\S]*?signal:\s*options\.signal\s*\}\)/.test(
+  !/listFolderChildren:\s*\(\s*folderId:\s*number,\s*params:\s*ListFolderChildrenParams\s*=\s*\{\},\s*options:\s*CoreRequestOptions\s*=\s*\{\}\s*\)\s*=>[\s\S]*?request<FolderChildrenPage>\(`\/folders\/\$\{folderId\}\/children\$\{query\(params\)\}`,\s*\{[\s\S]*?requestPriority:\s*options\.requestPriority\s*\?\?\s*"navigation",[\s\S]*?signal:\s*options\.signal\s*\}\)/.test(
     client
   )
 ) {
@@ -897,8 +968,8 @@ if (!/getPreviewBlob:\s*\(fileId:\s*number,\s*options:\s*BlobRequestOptions\s*=\
 if (!/getPreviewResource:\s*\(fileId:\s*number,\s*options:\s*PreviewResourceOptions\s*=\s*\{\}\)\s*=>\s*fetchBlobWithTier\(/.test(client)) {
   fail("client.ts getPreviewResource must request the resolved preview representation");
 }
-if (!/x-megle-preview-tier/.test(client)) {
-  fail("client.ts must read the x-megle-preview-tier response header");
+if (!/x-mangoo-preview-tier/.test(client)) {
+  fail("client.ts must read the x-mangoo-preview-tier response header");
 }
 // The query serialiser is a whitelist; a parameter it does not know is dropped
 // silently and the server never sees a viewport.
@@ -977,8 +1048,8 @@ if (!/if \(!response\.ok\)\s*{[\s\S]*?const body = await readResponseBody\(respo
   fail("client.ts must use tolerant body parsing only for non-OK CoreApiError responses");
 }
 
-if (!client.includes("x-megle-session")) {
-  fail("client.ts must send x-megle-session when configured");
+if (!client.includes("x-mangoo-session")) {
+  fail("client.ts must send x-mangoo-session when configured");
 }
 
 if (!generated.includes("Generated-client boundary placeholder")) {

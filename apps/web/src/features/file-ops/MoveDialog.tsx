@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight, Folder } from "lucide-react";
+import { ChevronDown, ChevronRight, Folder } from "../../design/icons";
 import {
   useEffect,
   useLayoutEffect,
@@ -9,7 +9,7 @@ import {
   type KeyboardEvent,
   type RefObject,
 } from "react";
-import type { FolderRecord } from "@megle/core-client";
+import type { FolderRecord } from "@mangoo/core-client";
 import type { LibraryState } from "../../core/useLibraryData";
 import { LiquidGlassButton } from "../../design/liquid-glass";
 import {

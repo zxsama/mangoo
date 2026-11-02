@@ -1,4 +1,4 @@
-import { Search, X } from "lucide-react";
+import { Search, X } from "../../design/icons";
 import { useRef } from "react";
 import { OverlayField } from "../../design/overlays";
 

@@ -2,14 +2,17 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { createRequire } from "node:module";
+import { isMangooWebServerReady, resolveWebDevUrl, waitForMangooWebServer } from "./web-dev-url.mjs";
 
 const root = process.cwd();
-const webUrl = process.env.MEGLE_WEB_URL ?? "http://127.0.0.1:5173";
+const webUrl = await resolveWebDevUrl({ defaultUrl: "http://127.0.0.1:5173" });
+console.log(`[mangoo] Starting Desktop with Web at ${webUrl}`);
 const parsedWebUrl = new URL(webUrl);
 const webHost = parsedWebUrl.hostname;
 const webPort = parsedWebUrl.port || (parsedWebUrl.protocol === "https:" ? "443" : "80");
 const dataDir = path.join(root, ".data");
-const hostDir = path.join(dataDir, "host");
+const hostDir = path.join(dataDir, "mangoo", "host");
 
 fs.mkdirSync(dataDir, { recursive: true });
 
@@ -20,12 +23,12 @@ function spawnChild(command, args, options = {}) {
     cwd: root,
     env: {
       ...process.env,
-      MEGLE_WEB_URL: webUrl,
-      MEGLE_HOST_DB_PATH: process.env.MEGLE_HOST_DB_PATH ?? path.join(hostDir, "host.sqlite"),
-      MEGLE_LIBRARIES_DIR: process.env.MEGLE_LIBRARIES_DIR ?? path.join(hostDir, "libraries")
+      MANGOO_WEB_URL: webUrl,
+      MANGOO_HOST_DB_PATH: process.env.MANGOO_HOST_DB_PATH ?? path.join(hostDir, "host.sqlite"),
+      MANGOO_LIBRARIES_DIR: process.env.MANGOO_LIBRARIES_DIR ?? path.join(hostDir, "libraries")
     },
     stdio: "inherit",
-    shell: process.platform === "win32",
+    shell: false,
     windowsHide: true,
     ...options
   });
@@ -64,41 +67,7 @@ function findCargoCommand() {
 }
 
 function electronCommand() {
-  const command = process.platform === "win32" ? "electron.cmd" : "electron";
-  return path.join(root, "node_modules", ".bin", command);
-}
-
-async function waitForUrl(url, timeoutMs = 20_000) {
-  const deadline = Date.now() + timeoutMs;
-  let lastError;
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(url);
-      if (response.ok) return;
-      lastError = new Error(`${url} returned ${response.status}`);
-    } catch (error) {
-      lastError = error;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-  throw new Error(`Timed out waiting for ${url}: ${String(lastError)}`);
-}
-
-async function isMegleWebServerReady(url) {
-  try {
-    const response = await fetch(url, {
-      cache: "no-store"
-    });
-    if (!response.ok) return false;
-
-    const contentType = response.headers.get("content-type") ?? "";
-    if (!contentType.includes("text/html")) return true;
-
-    const html = await response.text();
-    return html.includes("<title>Megle</title>") && html.includes("/src/main.tsx");
-  } catch {
-    return false;
-  }
+  return createRequire(import.meta.url)("electron");
 }
 
 function shutdown() {
@@ -117,47 +86,43 @@ process.on("SIGTERM", () => {
 });
 process.on("exit", shutdown);
 
-if (process.env.MEGLE_CORE_EXTERNAL !== "1") {
+if (process.env.MANGOO_CORE_EXTERNAL !== "1") {
   run("node", ["tools/build/build-bundled-plugins.mjs"]);
-  run(findCargoCommand(), ["build", "-p", "megle-core"]);
+  run(findCargoCommand(), ["build", "-p", "mangoo-core"]);
 }
 
-if (await isMegleWebServerReady(webUrl)) {
-  console.log(`[megle] Reusing existing Megle web dev server at ${webUrl}`);
+if (await isMangooWebServerReady(webUrl)) {
+  console.log(`[mangoo] Reusing existing Mangoo web dev server at ${webUrl}`);
 } else {
-  spawnChild("npm", [
-    "--workspace",
-    "@megle/web",
-    "run",
-    "dev",
-    "--",
+  const web = spawnChild(process.execPath, [
+    path.join(root, "node_modules", "vite", "bin", "vite.js"),
     "--host",
     webHost,
     "--port",
     webPort,
     "--strictPort"
-  ]);
-  await waitForUrl(webUrl);
+  ], { cwd: path.join(root, "apps", "web") });
+  await waitForMangooWebServer(webUrl, web);
 }
 
-run("npm", ["--workspace", "@megle/desktop", "run", "build"]);
+run("npm", ["--workspace", "@mangoo/desktop", "run", "build"]);
 
 const electronArgs = ["apps/desktop/dist/main.js"];
-if (process.env.MEGLE_ELECTRON_USER_DATA_DIR) {
-  electronArgs.unshift(`--user-data-dir=${path.resolve(process.env.MEGLE_ELECTRON_USER_DATA_DIR)}`);
+if (process.env.MANGOO_ELECTRON_USER_DATA_DIR) {
+  electronArgs.unshift(`--user-data-dir=${path.resolve(process.env.MANGOO_ELECTRON_USER_DATA_DIR)}`);
 }
-if (process.env.MEGLE_REMOTE_DEBUG === "1") {
+if (process.env.MANGOO_REMOTE_DEBUG === "1") {
   // Default 9500, NOT 9222: on Windows 9222 falls inside a reserved excluded TCP
   // port range (netsh excludedportrange lists 9181-9280), so Electron fails to
   // bind it ("Cannot start http server for devtools" / WSAEACCES) and CDP is
-  // unavailable. 9500 sits in a free gap. Override with MEGLE_REMOTE_DEBUG_PORT.
-  electronArgs.unshift(`--remote-debugging-port=${process.env.MEGLE_REMOTE_DEBUG_PORT ?? "9500"}`);
+  // unavailable. 9500 sits in a free gap. Override with MANGOO_REMOTE_DEBUG_PORT.
+  electronArgs.unshift(`--remote-debugging-port=${process.env.MANGOO_REMOTE_DEBUG_PORT ?? "9500"}`);
 }
-if (process.env.MEGLE_VISUAL_HARNESS === "1") {
-  electronArgs.push("--megle-visual-harness=1");
+if (process.env.MANGOO_VISUAL_HARNESS === "1") {
+  electronArgs.push("--mangoo-visual-harness=1");
 }
-if (process.env.MEGLE_VISUAL_RUN_ID) {
-  electronArgs.push(`--megle-visual-run-id=${process.env.MEGLE_VISUAL_RUN_ID}`);
+if (process.env.MANGOO_VISUAL_RUN_ID) {
+  electronArgs.push(`--mangoo-visual-run-id=${process.env.MANGOO_VISUAL_RUN_ID}`);
 }
 const electron = spawnChild(electronCommand(), electronArgs);
 electron.on("exit", (code) => {

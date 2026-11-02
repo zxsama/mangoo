@@ -50,6 +50,18 @@ const assertRootLayerInvariant = (state: ReturnType<typeof createOverlayStackSta
 };
 
 describe("overlay stack", () => {
+  it("accepts a select only above its current modal parent and preserves the modal on close", () => {
+    let state = openOverlayRoot(createOverlayStackState(), "library");
+    state = pushOverlayLayer(state, layer("dialog", "library", "modal"));
+    state = pushOverlayLayer(state, layer("select", "library", "nested", "dialog"));
+    assert.deepEqual(state.layers.map((item) => item.id), ["dialog", "select"]);
+    assert.deepEqual(overlayStack.overlayLayerZIndexes(state.layers), [140, 150]);
+    assert.equal(pushOverlayLayer(state, layer("sibling", "library", "nested", "dialog")), state);
+    const dismissed = popOverlayLayer(state, "select");
+    assert.equal(topOverlayLayer(dismissed)?.id, "dialog");
+    assert.deepEqual(popOverlayLayer(state, "dialog").layers, []);
+  });
+
   it("replaces the active root when another titlebar overlay opens", () => {
     let state = openOverlayRoot(createOverlayStackState(), "filter");
     state = pushOverlayLayer(state, layer("filter-root", "filter", "root"));

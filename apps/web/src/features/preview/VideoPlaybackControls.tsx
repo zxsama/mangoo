@@ -1,4 +1,4 @@
-import { Pause, Play, Volume2, VolumeX } from "lucide-react";
+import { Pause, Play, Volume2, VolumeX } from "../../design/icons";
 import { LiquidGlassButton } from "../../design/liquid-glass";
 import {
   formatMediaTime,

@@ -11,7 +11,7 @@ import type {
   ManagedRootNotificationTarget,
   ProcessLogSubscriptionHandle as DesktopProcessLogSubscriptionHandle,
   ProcessLogSubscriptionInitialSnapshot
-} from "@megle/notification-contract";
+} from "@mangoo/notification-contract";
 import { getDesktopBridge } from "../../core/desktop.ts";
 import {
   buildCompactNotificationModel,

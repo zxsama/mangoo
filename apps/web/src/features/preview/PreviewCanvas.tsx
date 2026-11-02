@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 
-import type { MediaRecord } from "@megle/core-client";
+import type { MediaRecord } from "@mangoo/core-client";
 
 import { mediaFileContentSignature } from "../../core/mediaResources";
 

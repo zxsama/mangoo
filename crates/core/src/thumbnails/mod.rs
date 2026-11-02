@@ -525,7 +525,7 @@ pub fn generate_video_thumbnail(
 
 pub fn generate_video_thumbnail_bytes(source_path: &Path) -> anyhow::Result<GeneratedThumbnail> {
     let temp_root = std::env::temp_dir().join(format!(
-        "megle-video-thumbnail-{}-{}",
+        "mangoo-video-thumbnail-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -721,7 +721,7 @@ mod tests {
         // watcher. The join of the two halves lives in
         // `scan::tests::scan_indexes_heif_as_an_image_through_the_shared_format_table`.
         let dir = std::env::temp_dir().join(format!(
-            "megle_thumb_heif_{}_{}",
+            "mangoo_thumb_heif_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -754,7 +754,7 @@ mod tests {
     #[test]
     fn image_thumbnail_generation_flows_through_the_decoder_registry() {
         let dir = std::env::temp_dir().join(format!(
-            "megle_thumb_registry_{}_{}",
+            "mangoo_thumb_registry_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -786,7 +786,7 @@ mod tests {
     #[test]
     fn an_unclaimed_format_reports_the_no_decoder_marker() {
         let dir = std::env::temp_dir().join(format!(
-            "megle_thumb_nodecoder_{}_{}",
+            "mangoo_thumb_nodecoder_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1325,7 +1325,7 @@ mod tests {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
         std::env::temp_dir().join(format!(
-            "megle_thumbnail_policy_test_{}_{}_{}",
+            "mangoo_thumbnail_policy_test_{}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

@@ -1,16 +1,23 @@
 import path from "node:path";
 
+export function resolveCoreBinary({ root = process.cwd(), coreBinary, env = process.env } = {}) {
+  const explicit = coreBinary ?? env.MANGOO_CORE_BINARY;
+  if (explicit) return path.resolve(root, explicit);
+  const targetDir = path.resolve(root, env.CARGO_TARGET_DIR || "target");
+  return path.join(targetDir, "debug", process.platform === "win32" ? "mangoo-core.exe" : "mangoo-core");
+}
+
 export function managedLibraryHostEnv(dataDir) {
   const hostDir = path.join(dataDir, "host");
   return {
-    MEGLE_HOST_DB_PATH: path.join(hostDir, "host.sqlite"),
-    MEGLE_LIBRARIES_DIR: path.join(hostDir, "libraries")
+    MANGOO_HOST_DB_PATH: path.join(hostDir, "host.sqlite"),
+    MANGOO_LIBRARIES_DIR: path.join(hostDir, "libraries")
   };
 }
 
 async function apiRequest(baseUrl, token, apiPath, init = {}) {
   const headers = new Headers(init.headers);
-  headers.set("x-megle-session", token);
+  headers.set("x-mangoo-session", token);
   if (init.body && !headers.has("content-type")) headers.set("content-type", "application/json");
   const response = await fetch(`${baseUrl}${apiPath}`, { ...init, headers });
   const text = await response.text();
@@ -24,20 +31,22 @@ export async function createAndActivateManagedLibrary({
   baseUrl,
   token,
   name,
-  managedRoot
+  databasePath,
+  contentRoots
 }) {
   const preflight = await apiRequest(baseUrl, token, "/libraries/preflight", {
     method: "POST",
-    body: JSON.stringify({ name, managedRoot })
+    body: JSON.stringify({ name, databasePath, contentRoots })
   });
-  if (!preflight?.ok || !preflight.preflightToken) {
+  if (!preflight?.ok || !preflight.preflightToken || !preflight.normalizedDatabasePath || !preflight.normalizedContentRoots?.length) {
     throw new Error(`managed Library preflight rejected: ${JSON.stringify(preflight)}`);
   }
   const created = await apiRequest(baseUrl, token, "/libraries", {
     method: "POST",
     body: JSON.stringify({
       name,
-      managedRoot: preflight.normalizedRoot,
+      databasePath: preflight.normalizedDatabasePath,
+      contentRoots: preflight.normalizedContentRoots,
       initialMode: "local-only",
       preflightToken: preflight.preflightToken,
       activate: true
@@ -66,7 +75,7 @@ export async function addExistingMediaRoot({
 }) {
   return apiRequest(baseUrl, token, "/roots", {
     method: "POST",
-    headers: { "x-megle-context-revision": String(contextRevision) },
+    headers: { "x-mangoo-context-revision": String(contextRevision) },
     body: JSON.stringify({ path: mediaRoot, displayName })
   });
 }

@@ -2,9 +2,10 @@ import {
   useId,
   type InputHTMLAttributes,
   type ReactNode,
-  type Ref,
-  type SelectHTMLAttributes
+  type Ref
 } from "react";
+
+export { OverlaySelect, type OverlaySelectProps } from "./OverlaySelect";
 
 export interface OverlayFieldProps extends InputHTMLAttributes<HTMLInputElement> {
   error?: string | null;
@@ -12,10 +13,6 @@ export interface OverlayFieldProps extends InputHTMLAttributes<HTMLInputElement>
   label?: string;
   leadingIcon?: ReactNode;
   trailingAction?: ReactNode;
-}
-
-export interface OverlaySelectProps extends SelectHTMLAttributes<HTMLSelectElement> {
-  label: string;
 }
 
 export function OverlayField({
@@ -59,24 +56,6 @@ export function OverlayField({
       {error ? (
         <div className="overlay-field-error" id={errorId} role="alert">{error}</div>
       ) : null}
-    </div>
-  );
-}
-
-export function OverlaySelect({ className, id, label, ...props }: OverlaySelectProps) {
-  const generatedId = useId();
-  const selectId = id ?? `overlay-select-${generatedId}`;
-
-  return (
-    <div className="overlay-field overlay-select-field">
-      <label className="overlay-field-label" htmlFor={selectId}>{label}</label>
-      <div className="overlay-field-control">
-        <select
-          {...props}
-          className={`overlay-field-select${className ? ` ${className}` : ""}`}
-          id={selectId}
-        />
-      </div>
     </div>
   );
 }

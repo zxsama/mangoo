@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn seal_is_idempotent_and_never_replaces_conflict() {
-        let root = std::env::temp_dir().join(format!("megle-media-pack-{}", uuid::Uuid::now_v7()));
+        let root = std::env::temp_dir().join(format!("mangoo-media-pack-{}", uuid::Uuid::now_v7()));
         let bytes = b"abc";
         let hash: [u8; 32] = Sha256::digest(bytes).into();
         let path = durable_publish(&root, Path::new("data/object"), bytes, hash).unwrap();

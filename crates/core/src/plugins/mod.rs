@@ -1,9 +1,13 @@
 pub mod auth_flow;
+pub mod contributions;
+pub mod decoder;
 pub mod manifest;
 pub mod runtime;
 pub mod secret_store;
+pub mod ui;
 
 pub const SYNC_PROVIDER_V1_CAPABILITY: &str = "sync-provider.v1";
+pub const FILE_DECODER_V1_CAPABILITY: &str = "file-decoder.v1";
 
 #[allow(unused_imports)]
 pub use manifest::{parse_manifest, ManifestError, ManifestRecord};
@@ -11,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub fn bundled_root_from_environment() -> anyhow::Result<PathBuf> {
-    if let Some(value) = std::env::var_os("MEGLE_PLUGINS_DIR").filter(|v| !v.is_empty()) {
+    if let Some(value) = std::env::var_os("MANGOO_PLUGINS_DIR").filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(value));
     }
     let executable = std::env::current_exe()?;

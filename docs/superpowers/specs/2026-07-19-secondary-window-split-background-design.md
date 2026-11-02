@@ -9,7 +9,7 @@ Restyle the standalone Settings and Plugins windows so their body uses the visua
 - no vertical divider is drawn between the panes;
 - the existing titlebar appearance and its bottom divider remain unchanged.
 
-The result must remain part of Megle's shared Liquid Glass system rather than becoming two unrelated component-specific themes.
+The result must remain part of Mangoo's shared Liquid Glass system rather than becoming two unrelated component-specific themes.
 
 ## Shared Window Surface
 

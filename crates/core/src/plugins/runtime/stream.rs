@@ -111,12 +111,6 @@ impl Streams {
             .map(|s| s.credit)
             .ok_or(ProtocolError::InvalidStreamId)
     }
-    pub fn next_sequence(&self, id: u64) -> Result<u32, ProtocolError> {
-        self.streams
-            .get(&id)
-            .map(|state| state.next_sequence)
-            .ok_or(ProtocolError::InvalidStreamId)
-    }
     pub fn accept_data(&mut self, frame: &Frame) -> Result<(), ProtocolError> {
         let state = self
             .streams

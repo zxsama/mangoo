@@ -1,4 +1,5 @@
 import { useEffect, type RefObject } from "react";
+import { useOptionalOverlayFamilyFocus } from "./OverlayProvider";
 import { resolveOverlayFocusRestoreTarget } from "./overlayRuntime";
 
 const TABBABLE_SELECTOR =
@@ -16,6 +17,7 @@ function isVisible(element: HTMLElement): boolean {
 function getTabbable(container: HTMLElement): HTMLElement[] {
   const nodes = Array.from(container.querySelectorAll<HTMLElement>(TABBABLE_SELECTOR));
   return nodes.filter((node) => {
+    if (node.tabIndex < 0) return false;
     if (node.hasAttribute("disabled")) return false;
     if (node.getAttribute("aria-disabled") === "true") return false;
     if (node.getAttribute("aria-hidden") === "true") return false;
@@ -34,6 +36,7 @@ export function useOverlayFocusTrap(
   options: UseOverlayFocusTrapOptions = {}
 ): void {
   const { initialFocusRef, restoreFocusRef } = options;
+  const isFocusOwnedByLayerAbove = useOptionalOverlayFamilyFocus()?.isFocusOwnedByLayerAbove;
 
   useEffect(() => {
     if (!open) return;
@@ -53,6 +56,9 @@ export function useOverlayFocusTrap(
       if (event.key !== "Tab") return;
       const node = containerRef.current;
       if (!node) return;
+      // Portaled children own their keyboard loop while focus is in their
+      // registered surface; the parent must not wrap focus behind the child.
+      if (isFocusOwnedByLayerAbove?.(node, document.activeElement)) return;
       const tabbables = getTabbable(node);
       if (tabbables.length === 0) {
         event.preventDefault();
@@ -80,5 +86,5 @@ export function useOverlayFocusTrap(
       const requestedRestore = restoreFocusRef?.current ?? null;
       resolveOverlayFocusRestoreTarget(requestedRestore, previousFocus)?.focus();
     };
-  }, [containerRef, initialFocusRef, open, restoreFocusRef]);
+  }, [containerRef, initialFocusRef, isFocusOwnedByLayerAbove, open, restoreFocusRef]);
 }

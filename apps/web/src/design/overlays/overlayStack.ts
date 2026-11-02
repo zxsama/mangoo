@@ -57,7 +57,7 @@ export function pushOverlayLayer(
     const parent = layer.parentId
       ? otherLayers.find((item) => item.id === layer.parentId)
       : null;
-    if (!parent || parent.rootId !== layer.rootId || parent.kind === "modal") {
+    if (!parent || parent.rootId !== layer.rootId) {
       return state;
     }
     if (existingIndex < 0 && otherLayers.at(-1)?.id !== parent.id) {
@@ -82,7 +82,25 @@ export function pushOverlayLayer(
 }
 
 export function popOverlayLayer(state: OverlayStackState, id: string): OverlayStackState {
-  return { ...state, layers: state.layers.filter((layer) => layer.id !== id) };
+  const removed = new Set([id]);
+  const layers = state.layers.filter((layer) => {
+    if (removed.has(layer.id) || (layer.parentId && removed.has(layer.parentId))) {
+      removed.add(layer.id);
+      return false;
+    }
+    return true;
+  });
+  return { ...state, layers };
+}
+
+/** Keep each registered child above its actual parent, including modal children. */
+export function overlayLayerZIndexes(layers: OverlayLayerRegistration[]): number[] {
+  let previous = 110;
+  return layers.map((layer) => {
+    const base = layer.kind === "modal" ? 140 : layer.kind === "nested" ? 130 : 120;
+    previous = Math.max(base, previous + 10);
+    return previous;
+  });
 }
 
 export function unregisterOverlayLayer(

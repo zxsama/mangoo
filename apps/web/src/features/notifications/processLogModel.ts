@@ -4,7 +4,7 @@ import type {
   DesktopProcessLogLine,
   ThumbnailFailureSnapshot,
   ThumbnailFailureDetail
-} from "@megle/notification-contract";
+} from "@mangoo/notification-contract";
 
 export type ProcessLogRow =
   | { kind: "log"; line: DesktopProcessLogLine }

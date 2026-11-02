@@ -38,7 +38,7 @@ export function OnboardingHero({ rootCount, loading, onAddRoot }: OnboardingHero
       <div className="onboarding-hero-content">
         <h2 className="onboarding-hero-title">Add a folder to get started</h2>
         <p className="onboarding-hero-copy">
-          Megle indexes existing folders without copying their contents. Point it at a
+          Mangoo indexes existing folders without copying their contents. Point it at a
           local directory and your media will start showing up here.
         </p>
         <LiquidGlassButton

@@ -1,10 +1,10 @@
-import { ChevronRight, Database, Loader2, Trash2 } from "lucide-react";
-import type { HostPluginProjection, PluginCapability } from "@megle/core-client";
+import { ChevronRight, Database, Loader2, Trash2 } from "../../design/icons";
+import type { HostPluginProjection, PluginCapability } from "@mangoo/core-client";
 import { LiquidGlassButton } from "../../design/liquid-glass";
 import { StatusPill } from "./StatusPill";
-import { OneDriveAccountSetup } from "./OneDriveAccountSetup";
-import { ONEDRIVE_PLUGIN_ID } from "./pluginAuthModel";
+import { PluginAccountSetup } from "./PluginAccountSetup";
 import { pluginPanelId, pluginTabId } from "./PluginCard";
+import { PluginContributionsSlot } from "./PluginContributionsSlot";
 
 interface PluginDetailProps {
   plugin: HostPluginProjection;
@@ -17,7 +17,8 @@ interface PluginDetailProps {
 }
 
 const CAPABILITY_LABEL: Record<PluginCapability, string> = {
-  "sync-provider.v1": "Sync provider v1"
+  "sync-provider.v1": "Sync provider v1",
+  "file-decoder.v1": "文件解析"
 };
 
 export function PluginDetail({
@@ -29,8 +30,8 @@ export function PluginDetail({
   onRemove,
   onRefresh
 }: PluginDetailProps) {
-  const isOneDrive = plugin.pluginId === ONEDRIVE_PLUGIN_ID;
-  const toggleDisabled = busy || plugin.runtimeState === "incompatible";
+  const hasSetup = !plugin.contributions?.ui && Boolean(plugin.contributions?.configuration.length || plugin.contributions?.authentication);
+  const toggleDisabled = busy || plugin.runtimeState === "incompatible" || plugin.runtimeState === "stopping";
   const toggleLabel = plugin.enabledIntent ? "停用插件" : "启用插件";
 
   return (
@@ -68,21 +69,22 @@ export function PluginDetail({
               </label>
             </div>
           </div>
-          {!isOneDrive ? (
+          {!hasSetup ? (
             <StatusPill status={plugin.runtimeState} title={plugin.lastErrorDetail ?? undefined} />
           ) : null}
         </div>
       </header>
 
-      {isOneDrive ? (
+      {hasSetup ? (
         <div className="plugin-detail-section plugin-detail-primary-section">
-          <OneDriveAccountSetup onChanged={onRefresh} />
+          <PluginAccountSetup key={plugin.pluginId} pluginId={plugin.pluginId} onChanged={onRefresh} />
         </div>
       ) : null}
+      <PluginContributionsSlot slot="plugin-detail" pluginId={plugin.pluginId} />
 
-      {!isOneDrive && (plugin.permissionRequired || plugin.runtimeState === "crashed-backoff" || plugin.runtimeState === "degraded") ? (
+      {(plugin.permissionRequired || plugin.runtimeState === "crashed-backoff" || plugin.runtimeState === "degraded") ? (
         <div className="plugin-primary-actions">
-          {plugin.permissionRequired ? (
+          {plugin.permissionRequired && !hasSetup ? (
             <LiquidGlassButton className="plugin-action" disabled={busy} onClick={onApprovePermissions} tone="primary" type="button">
               Approve permissions
             </LiquidGlassButton>

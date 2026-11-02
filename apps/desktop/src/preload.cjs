@@ -37,6 +37,23 @@ function subscribeNotificationWindowIntent(cb) {
   return () => notificationWindowIntentSubscribers.delete(cb);
 }
 
+let pendingPluginViewIntent = null;
+const pluginViewIntentSubscribers = new Set();
+ipcRenderer.on("mangoo:plugin-view-intent", (_event, intent) => {
+  if (pluginViewIntentSubscribers.size === 0) { pendingPluginViewIntent = intent; return; }
+  pendingPluginViewIntent = null;
+  for (const subscriber of pluginViewIntentSubscribers) subscriber(intent);
+});
+function subscribePluginViewIntent(cb) {
+  pluginViewIntentSubscribers.add(cb);
+  if (pendingPluginViewIntent !== null) {
+    const intent = pendingPluginViewIntent;
+    pendingPluginViewIntent = null;
+    cb(intent);
+  }
+  return () => pluginViewIntentSubscribers.delete(cb);
+}
+
 const MAX_QUEUED_LOG_LINES = 5000;
 
 function mergeQueuedLogBatch(previous, next) {
@@ -112,23 +129,23 @@ function snapshotAndSubscribeLogs(query, cb) {
   };
 }
 
-const visualHarnessEnabled = readArg("--megle-visual-harness=") === "1";
-const requestedWindowRole = readArg("--megle-window=");
+const visualHarnessEnabled = readArg("--mangoo-visual-harness=") === "1";
+const requestedWindowRole = readArg("--mangoo-window=");
 const windowRole = ["main", "settings", "plugins", "notifications"].includes(requestedWindowRole)
   ? requestedWindowRole
   : "unknown";
 const windowControls = {
-  minimize: () => ipcRenderer.invoke("megle:window-minimize"),
-  maximize: () => ipcRenderer.invoke("megle:window-maximize"),
-  close: () => ipcRenderer.invoke("megle:window-close"),
-  isMaximized: () => ipcRenderer.invoke("megle:window-is-maximized"),
-  beginDrag: (payload) => ipcRenderer.invoke("megle:window-begin-drag", payload),
-  moveDrag: () => ipcRenderer.invoke("megle:window-drag-move"),
-  endDrag: () => ipcRenderer.invoke("megle:window-end-drag"),
-  getBounds: () => ipcRenderer.invoke("megle:window-get-bounds"),
-  setPosition: (x, y) => ipcRenderer.invoke("megle:window-set-position", x, y)
+  minimize: () => ipcRenderer.invoke("mangoo:window-minimize"),
+  maximize: () => ipcRenderer.invoke("mangoo:window-maximize"),
+  close: () => ipcRenderer.invoke("mangoo:window-close"),
+  isMaximized: () => ipcRenderer.invoke("mangoo:window-is-maximized"),
+  beginDrag: (payload) => ipcRenderer.invoke("mangoo:window-begin-drag", payload),
+  moveDrag: () => ipcRenderer.invoke("mangoo:window-drag-move"),
+  endDrag: () => ipcRenderer.invoke("mangoo:window-end-drag"),
+  getBounds: () => ipcRenderer.invoke("mangoo:window-get-bounds"),
+  setPosition: (x, y) => ipcRenderer.invoke("mangoo:window-set-position", x, y)
 };
-/** @type {import("@megle/notification-contract").NotificationIpcBridge} */
+/** @type {import("@mangoo/notification-contract").NotificationIpcBridge} */
 const notificationsBridge = {
   getCompactSnapshot: () => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.compact),
   getHistoryFacets: () => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.historyFacets),
@@ -154,40 +171,40 @@ const notificationsBridge = {
 const commonWindowBridge = {
   windowRole,
   notifySecondaryWindowReady: (role) =>
-    ipcRenderer.invoke("megle:secondary-window-ready", role),
+    ipcRenderer.invoke("mangoo:secondary-window-ready", role),
   windowControls
 };
 const fullBridge = {
   ...commonWindowBridge,
-  coreUrl: readArg("--megle-core-url="),
-  sessionToken: readArg("--megle-session-token="),
-  notifyShellReady: () => ipcRenderer.invoke("megle:shell-ready"),
-  pickFolder: (request) => ipcRenderer.invoke("megle:pick-folder", request),
-  diagnostics: () => ipcRenderer.invoke("megle:diagnostics"),
-  openSettingsWindow: () => ipcRenderer.invoke("megle:open-settings-window"),
-  closeSettingsWindow: () => ipcRenderer.invoke("megle:close-settings-window"),
-  openPluginsWindow: () => ipcRenderer.invoke("megle:open-plugins-window"),
-  closePluginsWindow: () => ipcRenderer.invoke("megle:close-plugins-window"),
+  coreUrl: readArg("--mangoo-core-url="),
+  sessionToken: readArg("--mangoo-session-token="),
+  notifyShellReady: () => ipcRenderer.invoke("mangoo:shell-ready"),
+  pickFolder: (request) => ipcRenderer.invoke("mangoo:pick-folder", request),
+  diagnostics: () => ipcRenderer.invoke("mangoo:diagnostics"),
+  openSettingsWindow: () => ipcRenderer.invoke("mangoo:open-settings-window"),
+  closeSettingsWindow: () => ipcRenderer.invoke("mangoo:close-settings-window"),
+  openPluginsWindow: () => ipcRenderer.invoke("mangoo:open-plugins-window"),
+  ...(windowRole === "plugins" ? { onPluginViewIntent: subscribePluginViewIntent } : {}),
+  closePluginsWindow: () => ipcRenderer.invoke("mangoo:close-plugins-window"),
   openNotificationsWindow: (intent) => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.openWindow, intent),
   closeNotificationsWindow: () => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.closeWindow),
   shell: {
-    revealPath: (path) => ipcRenderer.invoke("megle:shell-reveal-path", path),
-    openPath: (path) => ipcRenderer.invoke("megle:shell-open-path", path),
-    openExternalAuthorizationUrl: (url) =>
-      ipcRenderer.invoke("megle:open-external-authorization-url", url),
-    openEntraAppRegistrationPage: () =>
-      ipcRenderer.invoke("megle:open-entra-app-registration-page"),
+    revealPath: (path) => ipcRenderer.invoke("mangoo:shell-reveal-path", path),
+    openPath: (path) => ipcRenderer.invoke("mangoo:shell-open-path", path),
+    openPluginExternalLink: (request) =>
+      ipcRenderer.invoke("mangoo:open-plugin-external-link", request),
     requestOAuthReturnFocus: () =>
-      ipcRenderer.invoke("megle:request-oauth-return-focus"),
-    copyText: (text) => ipcRenderer.invoke("megle:clipboard-write-text", text)
+      ipcRenderer.invoke("mangoo:request-oauth-return-focus"),
+    copyText: (text) => ipcRenderer.invoke("mangoo:clipboard-write-text", text)
   },
-  getLibraryPhase: () => ipcRenderer.invoke("megle:get-library-load-phase"),
-  retryLibraryLoad: () => ipcRenderer.invoke("megle:retry-library-load"),
-  pickNewLibraryPath: (defaultName) => ipcRenderer.invoke("megle:pick-new-library-path", defaultName),
+  getLibraryPhase: () => ipcRenderer.invoke("mangoo:get-library-load-phase"),
+  retryLibraryLoad: () => ipcRenderer.invoke("mangoo:retry-library-load"),
+  pickNewLibraryPath: (defaultName) => ipcRenderer.invoke("mangoo:pick-new-library-path", defaultName),
+  resolveLibraryCreationPaths: (input) => ipcRenderer.invoke("mangoo:resolve-library-creation-paths", input),
   onLibraryPhase: (cb) => {
     const listener = (_event, phase) => cb(phase);
-    ipcRenderer.on("megle:library-load-phase", listener);
-    return () => ipcRenderer.removeListener("megle:library-load-phase", listener);
+    ipcRenderer.on("mangoo:library-load-phase", listener);
+    return () => ipcRenderer.removeListener("mangoo:library-load-phase", listener);
   },
   onFocusMedia: (cb) => subscribe(NOTIFICATION_IPC_CHANNELS.focusMediaRequested, cb),
   onFocusMediaCancelled: (cb) => subscribe(NOTIFICATION_IPC_CHANNELS.focusMediaCancelled, cb),
@@ -199,6 +216,8 @@ const fullBridge = {
 };
 const notificationWindowBridge = {
   ...commonWindowBridge,
+  listNotificationPluginEntries: () => ipcRenderer.invoke("mangoo:notification-plugin-entries"),
+  openNotificationPluginView: (request) => ipcRenderer.invoke("mangoo:open-notification-plugin-view", request),
   closeNotificationsWindow: () => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.closeWindow),
   onNotificationWindowIntent: subscribeNotificationWindowIntent,
   focusMedia: (input) => ipcRenderer.invoke(NOTIFICATION_IPC_CHANNELS.focusMedia, input),
@@ -209,9 +228,9 @@ const roleBridge = windowRole === "notifications"
   : ["main", "settings", "plugins"].includes(windowRole)
     ? fullBridge
     : { windowRole };
-contextBridge.exposeInMainWorld("megleDesktop", {
+contextBridge.exposeInMainWorld("mangooDesktop", {
   ...roleBridge,
   ...(visualHarnessEnabled
-    ? { visual: { capturePage: () => ipcRenderer.invoke("megle:visual-capture-page") } }
+    ? { visual: { capturePage: () => ipcRenderer.invoke("mangoo:visual-capture-page") } }
     : {})
 });

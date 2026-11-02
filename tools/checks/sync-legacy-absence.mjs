@@ -6,28 +6,38 @@ import { root } from "./sync-release-lib.mjs";
 const checks = [
   {
     file: "crates/core/src/main.rs",
-    required: ["MEGLE_HOST_DB_PATH", "MEGLE_LIBRARIES_DIR", "AppState::new_host"],
-    forbidden: ["MEGLE_DB_PATH", "MEGLE_ROOT_PATH", "open_legacy_catalog", "adopt_legacy_root"],
+    required: ["MANGOO_HOST_DB_PATH", "MANGOO_LIBRARIES_DIR", "AppState::new_host"],
+    forbidden: ["MANGOO_DB_PATH", "MANGOO_ROOT_PATH", "open_legacy_catalog", "adopt_legacy_root"],
   },
   {
     file: "crates/core/src/library_manager.rs",
     required: ["create_library", "restore_active", "atomic_write_marker_guarded"],
-    forbidden: ["MEGLE_DB_PATH", "legacy_root", "adopt_existing_root", "select_catalog_path"],
+    forbidden: ["MANGOO_DB_PATH", "legacy_root", "adopt_existing_root", "select_catalog_path"],
   },
   {
     file: "apps/desktop/src/core-process.ts",
-    required: ["MEGLE_HOST_DB_PATH", "MEGLE_LIBRARIES_DIR"],
-    forbidden: ["MEGLE_DB_PATH", "libraries.json", "sessionForDbPath"],
+    required: ["MANGOO_HOST_DB_PATH", "MANGOO_LIBRARIES_DIR"],
+    forbidden: ["MANGOO_DB_PATH", "libraries.json", "sessionForDbPath"],
   },
   {
     file: "apps/desktop/src/main.ts",
-    required: ["createColdStartSession", "hostDbPath", "librariesDir"],
-    forbidden: ["MEGLE_DB_PATH", "libraries.json", "restartCoreForLibrary", "pick-library-file", "open-library"],
+    required: ["createColdStartSession", "withDefaultHostStorage", "startCoreProcess(session"],
+    forbidden: ["MANGOO_DB_PATH", "libraries.json", "restartCoreForLibrary", "pick-library-file", "open-library"],
+  },
+  {
+    file: "apps/desktop/src/core-session.ts",
+    required: ["createCoreSession", "hostDbPath: process.env.MANGOO_HOST_DB_PATH", "librariesDir: process.env.MANGOO_LIBRARIES_DIR"],
+    forbidden: ["MANGOO_DB_PATH", "MANGOO_ROOT_PATH", "sessionForDbPath"],
+  },
+  {
+    file: "apps/desktop/src/product-runtime.ts",
+    required: ["withDefaultHostStorage", "hostDbPath: session.hostDbPath", "librariesDir: session.librariesDir"],
+    forbidden: ["MANGOO_DB_PATH", "MANGOO_ROOT_PATH", "select_catalog_path"],
   },
   {
     file: "tools/dev/managed-library-harness.mjs",
-    required: ["MEGLE_HOST_DB_PATH", "MEGLE_LIBRARIES_DIR", "createAndActivateManagedLibrary"],
-    forbidden: ["MEGLE_DB_PATH", "MEGLE_ROOT_PATH", "adoptExisting"],
+    required: ["MANGOO_HOST_DB_PATH", "MANGOO_LIBRARIES_DIR", "createAndActivateManagedLibrary"],
+    forbidden: ["MANGOO_DB_PATH", "MANGOO_ROOT_PATH", "adoptExisting"],
   },
 ];
 

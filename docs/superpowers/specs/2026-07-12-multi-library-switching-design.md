@@ -5,7 +5,7 @@
 
 ## Goal
 
-Turn Megle's single fixed database into multiple switchable **libraries** (one library = one `.sqlite` file, each containing many root folders), show a centred loading card during app startup and library switching, and move library/root management into a dedicated switcher popup + Settings.
+Turn Mangoo's single fixed database into multiple switchable **libraries** (one library = one `.sqlite` file, each containing many root folders), show a centred loading card during app startup and library switching, and move library/root management into a dedicated switcher popup + Settings.
 
 ## Confirmed Product Decisions
 
@@ -25,17 +25,17 @@ Turn Megle's single fixed database into multiple switchable **libraries** (one l
 ```
 App start
   → main reads userData/libraries.json
-  → active library id → its dbPath → start Core (MEGLE_DB_PATH = dbPath)
+  → active library id → its dbPath → start Core (MANGOO_DB_PATH = dbPath)
   → (no libraries at all → "no library" onboarding: create / open)
 
 Switch library (user clicks a row in the switcher popup)
-  → renderer IPC: megle:switch-library(libraryId)
+  → renderer IPC: mangoo:switch-library(libraryId)
   → main: push phase "starting-core" → restartCoreForLibrary(newDbPath)
            → stop old Core (existing tree-kill) → wait for port release
            → build session reusing SAME bindAddress + SAME sessionToken, new dbPath
            → startCoreProcess → waitForCoreHealth  (push phase "opening-library")
            → update registry activeLibraryId + lastOpenedAt
-  → main IPC → renderer: megle:library-ready
+  → main IPC → renderer: mangoo:library-ready
   → renderer: useLibraryData re-initializes (phase "loading-media") → listRoots/loadMedia
            → phase "ready" → loading card fades out
 ```
@@ -44,24 +44,24 @@ Because port + token are reused, the renderer's injected `coreUrl`/`sessionToken
 
 ### Core (Rust) — zero change
 
-Core already starts from `MEGLE_DB_PATH`, opens the DB, and runs `apply_migrations()`. `apply_migrations` runs `INITIAL_MIGRATION` (all base tables) unconditionally then numbered migrations gated by `migration_applied(n)` (`crates/core/src/db/mod.rs:623`), so a **brand-new empty `.sqlite` is fully migrated on first open**. Multi-library therefore needs no Core changes: creating a library = main process picks a new file path and starts Core there; Core builds the schema. No new API paths, tables, or indexes → OpenAPI/schema checks unaffected.
+Core already starts from `MANGOO_DB_PATH`, opens the DB, and runs `apply_migrations()`. `apply_migrations` runs `INITIAL_MIGRATION` (all base tables) unconditionally then numbered migrations gated by `migration_applied(n)` (`crates/core/src/db/mod.rs:623`), so a **brand-new empty `.sqlite` is fully migrated on first open**. Multi-library therefore needs no Core changes: creating a library = main process picks a new file path and starts Core there; Core builds the schema. No new API paths, tables, or indexes → OpenAPI/schema checks unaffected.
 
 ### Electron main process — main work
 
 - **New `apps/desktop/src/library-registry.ts`** — read/write `userData/libraries.json`; CRUD libraries; set active; validate `dbPath` existence (`available` flag). Pure logic, unit-testable.
 - **`main.ts` Core lifecycle** — the write-once `coreSession`/`coreReadyPromise` become restartable. Add `restartCoreForLibrary(dbPath)`: stop old Core (existing `stopCoreProcessTree`), wait for the bind port to be re-bindable (guards the known probe-and-close race), build a session reusing the same `bindAddress` + `sessionToken` with the new `dbPath`, `startCoreProcess`, `waitForCoreHealth`, push load phases over IPC.
-- **New IPC handlers** — `listLibraries`, `getActiveLibraryId`, `switchLibrary`, `createLibrary`, `openLibrary`, `removeLibraryFromList`, `renameLibrary`, `pickLibraryFile`, `pickNewLibraryPath`, plus the `megle:library-load-phase` event push.
+- **New IPC handlers** — `listLibraries`, `getActiveLibraryId`, `switchLibrary`, `createLibrary`, `openLibrary`, `removeLibraryFromList`, `renameLibrary`, `pickLibraryFile`, `pickNewLibraryPath`, plus the `mangoo:library-load-phase` event push.
 - **`preload.cjs`** — expose the new bridge methods.
 - **Cold start** — read registry → active dbPath → existing startup flow (off-screen → shell-ready → reveal, now revealing to a loading card). No libraries → "no library" onboarding.
 
 ### Renderer non-UI
 
-- **`useLibraryData`** — add a "re-initialize" entry point (reuse `loadLibrary`) triggered by the `megle:library-ready` IPC so a switch clears and reloads roots/media.
-- **`apps/web/src/core/desktop.ts`** — extend `MegleDesktopBridge` type + wrapper with the new methods and the phase subscription.
+- **`useLibraryData`** — add a "re-initialize" entry point (reuse `loadLibrary`) triggered by the `mangoo:library-ready` IPC so a switch clears and reloads roots/media.
+- **`apps/web/src/core/desktop.ts`** — extend `MangooDesktopBridge` type + wrapper with the new methods and the phase subscription.
 
 ## Frozen Interfaces (UI depends on these — freeze first to unblock parallel UI work)
 
-### Bridge methods (`window.megleDesktop` / `MegleDesktopBridge`)
+### Bridge methods (`window.mangooDesktop` / `MangooDesktopBridge`)
 
 ```ts
 listLibraries(): Promise<LibrarySummary[]>
@@ -98,7 +98,7 @@ type LibraryLoadPhase =
   | { kind: "error"; message: string };
 ```
 
-### Root management — reuse existing `@megle/core-client`
+### Root management — reuse existing `@mangoo/core-client`
 
 `addRoot` / `removeRoot` / `enqueueScan` / `listRoots` already exist. The switcher popup's "add folder" / "remove folder" call these **only for the active library**; inactive rows keep the buttons greyed out. No new root interface.
 

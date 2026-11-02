@@ -17,7 +17,7 @@ interface PreferenceMessage {
   value: unknown;
 }
 
-const CHANNEL_NAME = "megle-preferences";
+const CHANNEL_NAME = "mangoo-preferences";
 
 // A stable per-window id so a window ignores the echo of its own broadcasts.
 const SOURCE_ID = `${Date.now().toString(36)}-${Math.round(performance.now()).toString(36)}`;

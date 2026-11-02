@@ -1,5 +1,5 @@
 {
-  "name": "@megle/notification-contract",
+  "name": "@mangoo/notification-contract",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -15,7 +15,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@megle/core-client": "*"
+    "@mangoo/core-client": "*"
   },
   "devDependencies": {
     "typescript": "^5.6.0"

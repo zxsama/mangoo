@@ -1,3 +1,5 @@
+import { resolveLibraryCreationPaths } from "./library-creation-paths.js";
+import type { ResolveLibraryCreationPathsRequest } from "@mangoo/notification-contract";
 import {
   app,
   BrowserWindow,
@@ -30,8 +32,9 @@ import {
 } from "./desktop-ipc-permissions.js";
 import { desktopLogger, processLogBuffer } from "./desktop-logger.js";
 import { parseFolderPickerRequest, showFolderPicker } from "./folder-picker.js";
-import { openEntraAppRegistrationPage } from "./entra-app-registration.js";
-import { openExternalAuthorizationUrl } from "./oauth-authorization-url.js";
+import { createCoreClient } from "@mangoo/core-client/node";
+import { notificationPluginEntries, resolveNotificationPluginIntent } from "./plugin-notification-views.js";
+import { openPluginExternalLink, parsePluginExternalLinkInput } from "./plugin-external-link.js";
 import {
   OAuthReturnFocusEntitlements,
   restoreOAuthReturnFocus
@@ -74,7 +77,7 @@ import { createNotificationService, type NotificationService } from "./notificat
 import { runRecoverableNotificationShutdown } from "./notification-shutdown.js";
 import { createNotificationStore, notificationDatabasePath } from "./notification-store.js";
 import type { NotificationCompactSnapshot } from "./notification-types.js";
-import type { NotificationWindowIntent } from "@megle/notification-contract";
+import type { NotificationWindowIntent } from "@mangoo/notification-contract";
 import {
   NATIVE_WINDOW_WARMUP_MS,
   createSecondaryWindowRevealState,
@@ -86,8 +89,8 @@ import { SecondaryWindowOpeningCoordinator } from "./secondary-window-opening.js
 import {
   configurePackagedRuntime,
   mainWindowSkipsTaskbarDuringBootstrap,
-  packagedApplicationIdentity,
-  packagedWindowIconPath,
+  applicationIdentity,
+  windowIconPath,
   rendererUrlForSession,
   withDefaultHostStorage
 } from "./product-runtime.js";
@@ -104,7 +107,7 @@ const mediaFocusCoordinator = new MediaFocusCoordinator();
 const emitMainStartupReady = createStartupLogEmitter(
   desktopLogger,
   "main",
-  "Megle desktop ready"
+  "Mangoo desktop ready"
 );
 const rendererStartupEmitters = new WeakMap<WebContents, StartupLogEmitter>();
 type SecondaryWindowRole = "settings" | "plugins" | "notifications";
@@ -148,7 +151,7 @@ const secondaryWindowPositions: Record<SecondaryWindowRole, SecondaryWindowPosit
 };
 const SECONDARY_WINDOW_CONFIGS: Record<SecondaryWindowRole, SecondaryWindowConfig> = {
   settings: {
-    title: "Megle 设置",
+    title: "Mangoo 设置",
     route: "#/settings",
     width: 900,
     height: 640,
@@ -156,7 +159,7 @@ const SECONDARY_WINDOW_CONFIGS: Record<SecondaryWindowRole, SecondaryWindowConfi
     minHeight: 420
   },
   plugins: {
-    title: "Megle Plugins",
+    title: "Mangoo Plugins",
     route: "#/plugins",
     width: 1040,
     height: 720,
@@ -164,7 +167,7 @@ const SECONDARY_WINDOW_CONFIGS: Record<SecondaryWindowRole, SecondaryWindowConfi
     minHeight: 500
   },
   notifications: {
-    title: "Megle 通知中心",
+    title: "Mangoo 通知中心",
     route: "#/notifications",
     width: 1040,
     height: 720,
@@ -254,10 +257,10 @@ function coreLogHandlerForSession(session: CoreSession) {
   const emitCoreStartupReady = createStartupLogEmitter(
     desktopLogger,
     "core",
-    "Megle Core ready"
+    "Mangoo Core ready"
   );
   return (source: "core", level: Parameters<typeof desktopLogger.log>[1], message: string, metadata?: Readonly<Record<string, unknown>>) => {
-    if (level === "info" && message === "Megle Core ready" && metadata?.eventKind === "startup_ready") {
+    if (level === "info" && message === "Mangoo Core ready" && metadata?.eventKind === "startup_ready") {
       emitCoreStartupReady(metadata);
       return;
     }
@@ -272,7 +275,7 @@ function pushLibraryPhase(phase: DesktopLibraryLoadPhase): void {
   // to every renderer so settings/plugin requests do not remain on stale state.
   for (const win of [mainWindow, ...Object.values(secondaryWindows)]) {
     if (win && !win.isDestroyed()) {
-      win.webContents.send("megle:library-load-phase", phase);
+      win.webContents.send("mangoo:library-load-phase", phase);
     }
   }
 }
@@ -423,7 +426,7 @@ async function activeHostLibrary(
   session: CoreSession
 ): Promise<{ id: string; name: string } | null> {
   const response = await fetch(`${session.baseUrl}/libraries/active`, {
-    headers: { "x-megle-session": session.sessionToken }
+    headers: { "x-mangoo-session": session.sessionToken }
   });
   if (!response.ok) throw new Error(`Core active Library lookup failed: ${response.status}`);
   const body = await response.json() as {
@@ -485,8 +488,8 @@ function formatProcessLogExport(
 }
 
 
-ipcMain.handle("megle:pick-folder", async (event, rawRequest?: unknown) => {
-  requireDesktopIpcAccess(event, "megle:pick-folder");
+ipcMain.handle("mangoo:pick-folder", async (event, rawRequest?: unknown) => {
+  requireDesktopIpcAccess(event, "mangoo:pick-folder");
   const request = rawRequest === undefined ? null : parseFolderPickerRequest(rawRequest);
   if (rawRequest !== undefined && !request) {
     throw new Error("Invalid folder picker request");
@@ -495,8 +498,8 @@ ipcMain.handle("megle:pick-folder", async (event, rawRequest?: unknown) => {
   return showFolderPicker(dialog.showOpenDialog.bind(dialog), owner, request);
 });
 
-ipcMain.handle("megle:diagnostics", async (event) => {
-  requireDesktopIpcAccess(event, "megle:diagnostics");
+ipcMain.handle("mangoo:diagnostics", async (event) => {
+  requireDesktopIpcAccess(event, "mangoo:diagnostics");
   const session = coreSession;
   return {
     ffmpegAvailable: await detectFfmpeg(),
@@ -505,13 +508,13 @@ ipcMain.handle("megle:diagnostics", async (event) => {
   };
 });
 
-ipcMain.handle("megle:window-minimize", (event) => {
-  requireDesktopIpcAccess(event, "megle:window-minimize");
+ipcMain.handle("mangoo:window-minimize", (event) => {
+  requireDesktopIpcAccess(event, "mangoo:window-minimize");
   windowForIpcEvent(event)?.minimize();
 });
 
-ipcMain.handle("megle:window-maximize", (event) => {
-  requireDesktopIpcAccess(event, "megle:window-maximize");
+ipcMain.handle("mangoo:window-maximize", (event) => {
+  requireDesktopIpcAccess(event, "mangoo:window-maximize");
   const window = windowForIpcEvent(event);
   if (!window) return false;
   if (window.isMaximized()) {
@@ -522,18 +525,18 @@ ipcMain.handle("megle:window-maximize", (event) => {
   return true;
 });
 
-ipcMain.handle("megle:window-close", (event) => {
-  requireDesktopIpcAccess(event, "megle:window-close");
+ipcMain.handle("mangoo:window-close", (event) => {
+  requireDesktopIpcAccess(event, "mangoo:window-close");
   windowForIpcEvent(event)?.close();
 });
 
-ipcMain.handle("megle:window-is-maximized", (event) => {
-  requireDesktopIpcAccess(event, "megle:window-is-maximized");
+ipcMain.handle("mangoo:window-is-maximized", (event) => {
+  requireDesktopIpcAccess(event, "mangoo:window-is-maximized");
   return windowForIpcEvent(event)?.isMaximized() ?? false;
 });
 
-ipcMain.handle("megle:window-get-bounds", (event) => {
-  requireDesktopIpcAccess(event, "megle:window-get-bounds");
+ipcMain.handle("mangoo:window-get-bounds", (event) => {
+  requireDesktopIpcAccess(event, "mangoo:window-get-bounds");
   const bounds = windowForIpcEvent(event)?.getBounds();
   if (!bounds) {
     return null;
@@ -541,8 +544,8 @@ ipcMain.handle("megle:window-get-bounds", (event) => {
   return bounds;
 });
 
-ipcMain.handle("megle:window-set-position", (event, x: number, y: number) => {
-  requireDesktopIpcAccess(event, "megle:window-set-position");
+ipcMain.handle("mangoo:window-set-position", (event, x: number, y: number) => {
+  requireDesktopIpcAccess(event, "mangoo:window-set-position");
   const window = windowForIpcEvent(event);
   if (!window) return false;
   window.setPosition(Math.round(x), Math.round(y));
@@ -550,12 +553,12 @@ ipcMain.handle("megle:window-set-position", (event, x: number, y: number) => {
 });
 
 ipcMain.handle(
-  "megle:window-begin-drag",
+  "mangoo:window-begin-drag",
   (
     event,
     payload: { clientX: number; screenX: number; screenY: number; titlebarOffsetY: number; viewportWidth: number }
   ) => {
-    requireDesktopIpcAccess(event, "megle:window-begin-drag");
+    requireDesktopIpcAccess(event, "mangoo:window-begin-drag");
     const window = windowForIpcEvent(event);
     if (!window) return null;
 
@@ -600,8 +603,8 @@ ipcMain.handle(
   }
 );
 
-ipcMain.handle("megle:window-drag-move", (event) => {
-  requireDesktopIpcAccess(event, "megle:window-drag-move");
+ipcMain.handle("mangoo:window-drag-move", (event) => {
+  requireDesktopIpcAccess(event, "mangoo:window-drag-move");
   const window = windowForIpcEvent(event);
   if (!window || !activeWindowDrag || activeWindowDrag.windowId !== window.id) return false;
   const cursor = screen.getCursorScreenPoint();
@@ -612,16 +615,16 @@ ipcMain.handle("megle:window-drag-move", (event) => {
   return true;
 });
 
-ipcMain.handle("megle:window-end-drag", (event) => {
-  requireDesktopIpcAccess(event, "megle:window-end-drag");
+ipcMain.handle("mangoo:window-end-drag", (event) => {
+  requireDesktopIpcAccess(event, "mangoo:window-end-drag");
   const window = windowForIpcEvent(event);
   if (!window || activeWindowDrag?.windowId !== window.id) return false;
   activeWindowDrag = null;
   return true;
 });
 
-ipcMain.handle("megle:shell-reveal-path", (event, targetPath: string) => {
-  requireDesktopIpcAccess(event, "megle:shell-reveal-path");
+ipcMain.handle("mangoo:shell-reveal-path", (event, targetPath: string) => {
+  requireDesktopIpcAccess(event, "mangoo:shell-reveal-path");
   if (typeof targetPath !== "string" || targetPath.trim().length === 0) {
     return false;
   }
@@ -629,8 +632,8 @@ ipcMain.handle("megle:shell-reveal-path", (event, targetPath: string) => {
   return true;
 });
 
-ipcMain.handle("megle:shell-open-path", async (event, targetPath: string) => {
-  requireDesktopIpcAccess(event, "megle:shell-open-path");
+ipcMain.handle("mangoo:shell-open-path", async (event, targetPath: string) => {
+  requireDesktopIpcAccess(event, "mangoo:shell-open-path");
   if (typeof targetPath !== "string" || targetPath.trim().length === 0) {
     return false;
   }
@@ -638,8 +641,8 @@ ipcMain.handle("megle:shell-open-path", async (event, targetPath: string) => {
   return error.length === 0;
 });
 
-ipcMain.handle("megle:clipboard-write-text", (event, text: string) => {
-  requireDesktopIpcAccess(event, "megle:clipboard-write-text");
+ipcMain.handle("mangoo:clipboard-write-text", (event, text: string) => {
+  requireDesktopIpcAccess(event, "mangoo:clipboard-write-text");
   if (typeof text !== "string") {
     return false;
   }
@@ -647,8 +650,8 @@ ipcMain.handle("megle:clipboard-write-text", (event, text: string) => {
   return true;
 });
 
-ipcMain.handle("megle:shell-ready", async (event) => {
-  requireDesktopIpcAccess(event, "megle:shell-ready");
+ipcMain.handle("mangoo:shell-ready", async (event) => {
+  requireDesktopIpcAccess(event, "mangoo:shell-ready");
   const window = mainWindow;
   if (!window || window.isDestroyed()) {
     return false;
@@ -672,26 +675,26 @@ ipcMain.handle("megle:shell-ready", async (event) => {
   }
 });
 
-ipcMain.handle("megle:open-settings-window", async (event) => {
-  requireDesktopIpcAccess(event, "megle:open-settings-window");
+ipcMain.handle("mangoo:open-settings-window", async (event) => {
+  requireDesktopIpcAccess(event, "mangoo:open-settings-window");
   await openSecondaryWindow("settings");
   return true;
 });
 
-ipcMain.handle("megle:close-settings-window", (event) => {
-  requireDesktopIpcAccess(event, "megle:close-settings-window");
+ipcMain.handle("mangoo:close-settings-window", (event) => {
+  requireDesktopIpcAccess(event, "mangoo:close-settings-window");
   closeSecondaryWindow("settings");
   return true;
 });
 
-ipcMain.handle("megle:open-plugins-window", async (event) => {
-  requireDesktopIpcAccess(event, "megle:open-plugins-window");
+ipcMain.handle("mangoo:open-plugins-window", async (event) => {
+  requireDesktopIpcAccess(event, "mangoo:open-plugins-window");
   await openSecondaryWindow("plugins");
   return true;
 });
 
-ipcMain.handle("megle:close-plugins-window", (event) => {
-  requireDesktopIpcAccess(event, "megle:close-plugins-window");
+ipcMain.handle("mangoo:close-plugins-window", (event) => {
+  requireDesktopIpcAccess(event, "mangoo:close-plugins-window");
   closeSecondaryWindow("plugins");
   return true;
 });
@@ -801,6 +804,31 @@ ipcMain.handle(NOTIFICATION_IPC_CHANNELS.dismissManagedRoot, async (event, input
   return (await ensureNotificationService()).dismissManagedRoot(target.libraryId, target.operationId, target.rootUuid, target.inventoryRevision);
 });
 
+ipcMain.handle("mangoo:notification-plugin-entries", async (event) => {
+  requireDesktopIpcAccess(event, "mangoo:notification-plugin-entries");
+  const session = coreSession ?? await ensureCoreReady();
+  const client = createCoreClient({ baseUrl: session.baseUrl, sessionToken: session.sessionToken });
+  const plugins = await client.listPlugins();
+  requireDesktopIpcAccess(event, "mangoo:notification-plugin-entries");
+  if (coreSession !== session) return [];
+  return notificationPluginEntries(plugins.items);
+});
+
+ipcMain.handle("mangoo:open-notification-plugin-view", async (event, input: unknown) => {
+  requireDesktopIpcAccess(event, "mangoo:open-notification-plugin-view");
+  const session = coreSession ?? await ensureCoreReady();
+  const client = createCoreClient({ baseUrl: session.baseUrl, sessionToken: session.sessionToken });
+  const intent = await resolveNotificationPluginIntent(input, client);
+  await openSecondaryWindow("plugins");
+  const current = await resolveNotificationPluginIntent(input, client);
+  requireDesktopIpcAccess(event, "mangoo:open-notification-plugin-view");
+  if (coreSession !== session || current.lifecycleEpoch !== intent.lifecycleEpoch || current.contextRevision !== intent.contextRevision) throw new Error("Plugin notification context changed");
+  const window = secondaryWindows.plugins;
+  if (!window || window.isDestroyed()) return false;
+  window.webContents.send("mangoo:plugin-view-intent", intent);
+  return true;
+});
+
 ipcMain.handle(NOTIFICATION_IPC_CHANNELS.reviewManagedRoot, async (event, input: unknown) => {
   requireNotificationIpcAccess(event, NOTIFICATION_IPC_CHANNELS.reviewManagedRoot);
   const target = parseManagedRootNotificationTarget(input);
@@ -814,7 +842,7 @@ ipcMain.handle(NOTIFICATION_IPC_CHANNELS.reviewManagedRoot, async (event, input:
   if (!validation.ok) return validation;
   const session = coreSession ?? await ensureCoreReady();
   const activeResponse = await fetch(`${session.baseUrl}/libraries/active`, {
-    headers: { "x-megle-session": session.sessionToken }
+    headers: { "x-mangoo-session": session.sessionToken }
   });
   if (!activeResponse.ok) return { ok: false, message: "Unable to read the active Library" };
   const active = await activeResponse.json() as {
@@ -830,8 +858,8 @@ ipcMain.handle(NOTIFICATION_IPC_CHANNELS.reviewManagedRoot, async (event, input:
       {
         method: "POST",
         headers: {
-          "x-megle-session": session.sessionToken,
-          "x-megle-context-revision": String(active.contextRevision)
+          "x-mangoo-session": session.sessionToken,
+          "x-mangoo-context-revision": String(active.contextRevision)
         }
       }
     );
@@ -847,24 +875,16 @@ ipcMain.handle(NOTIFICATION_IPC_CHANNELS.reviewManagedRoot, async (event, input:
   }
   const rootResponse = await fetch(
     `${session.baseUrl}/libraries/${encodeURIComponent(target.libraryId)}/sync-folders/${encodeURIComponent(target.rootUuid)}`,
-    { headers: { "x-megle-session": session.sessionToken } }
+    { headers: { "x-mangoo-session": session.sessionToken } }
   );
   if (!rootResponse.ok) return { ok: false, message: "The synchronized folder is no longer available" };
-  await openSecondaryWindow("settings");
-  const window = secondaryWindows.settings;
+  // Historical Core notifications have no plugin/view identifier. Preserve
+  // their target validation, but route to the generic plugin manager rather
+  // than resurrecting a built-in synchronized-folder settings page.
+  await openSecondaryWindow("plugins");
+  const window = secondaryWindows.plugins;
   if (!window || window.isDestroyed()) {
-    return { ok: false, message: "Settings could not be opened" };
-  }
-  const intent: NotificationWindowIntent = {
-    page: "sync-folders",
-    libraryUuid: target.libraryId,
-    rootUuid: target.rootUuid
-  };
-  const readiness = secondaryWindowReadiness.settings;
-  if (readiness?.windowId === window.id && !readiness.revealState.settled) {
-    pendingSecondaryWindowIntents.settings = intent;
-  } else {
-    window.webContents.send(NOTIFICATION_IPC_CHANNELS.windowIntent, intent);
+    return { ok: false, message: "Plugins could not be opened" };
   }
   return { ok: true, message: null };
 });
@@ -903,7 +923,7 @@ ipcMain.handle(NOTIFICATION_IPC_CHANNELS.logsExport, async (event, input: unknow
   const owner = windowForIpcEvent(event);
   const defaultPath = path.join(
     app.getPath("documents"),
-    `megle-process-logs-${new Date().toISOString().replaceAll(":", "-")}.txt`
+    `mangoo-process-logs-${new Date().toISOString().replaceAll(":", "-")}.txt`
   );
   const options = {
     defaultPath,
@@ -967,7 +987,7 @@ ipcMain.on(NOTIFICATION_IPC_CHANNELS.rendererLogs, (event, input: unknown) => {
     for (const entry of parseRendererLogEntries(input)) {
       if (
         entry.level === "info" &&
-        entry.message === "Megle renderer ready" &&
+        entry.message === "Mangoo renderer ready" &&
         entry.metadata?.eventKind === "startup_ready"
       ) {
         let emitStartupReady = rendererStartupEmitters.get(event.sender);
@@ -975,7 +995,7 @@ ipcMain.on(NOTIFICATION_IPC_CHANNELS.rendererLogs, (event, input: unknown) => {
           emitStartupReady = createStartupLogEmitter(
             desktopLogger,
             "renderer",
-            "Megle renderer ready"
+            "Mangoo renderer ready"
           );
           rendererStartupEmitters.set(event.sender, emitStartupReady);
         }
@@ -989,11 +1009,11 @@ ipcMain.on(NOTIFICATION_IPC_CHANNELS.rendererLogs, (event, input: unknown) => {
       }
     }
   } catch (error) {
-    desktopLogger.warn("main", "[megle] rejected renderer log batch:", error);
+    desktopLogger.warn("main", "[mangoo] rejected renderer log batch:", error);
   }
 });
 
-ipcMain.handle("megle:secondary-window-ready", async (event, role: unknown) => {
+ipcMain.handle("mangoo:secondary-window-ready", async (event, role: unknown) => {
   if (!isSecondaryWindowRole(role)) return false;
   const window = windowForIpcEvent(event);
   if (!window || secondaryWindows[role] !== window) return false;
@@ -1009,7 +1029,7 @@ ipcMain.handle("megle:secondary-window-ready", async (event, role: unknown) => {
   return readiness.revealState.result;
 });
 
-ipcMain.handle("megle:visual-capture-page", async (event) => {
+ipcMain.handle("mangoo:visual-capture-page", async (event) => {
   const window = windowForIpcEvent(event);
   if (!isVisualHarnessEnabled() || !window) {
     return null;
@@ -1034,12 +1054,12 @@ ipcMain.handle("megle:visual-capture-page", async (event) => {
   return image.toPNG().toString("base64");
 });
 
-ipcMain.handle("megle:get-library-load-phase", (event) => {
-  requireDesktopIpcAccess(event, "megle:get-library-load-phase");
+ipcMain.handle("mangoo:get-library-load-phase", (event) => {
+  requireDesktopIpcAccess(event, "mangoo:get-library-load-phase");
   return libraryLoadState.snapshot();
 });
-ipcMain.handle("megle:retry-library-load", async (event) => {
-  requireDesktopIpcAccess(event, "megle:retry-library-load");
+ipcMain.handle("mangoo:retry-library-load", async (event) => {
+  requireDesktopIpcAccess(event, "mangoo:retry-library-load");
   try {
     const recoveredSession = await ensureCoreReady();
     await coreLifecycleQueue.enqueue(async (signal) => {
@@ -1056,14 +1076,19 @@ ipcMain.handle("megle:retry-library-load", async (event) => {
     return { ok: true };
   } catch (error) {
     const message = `Library retry failed: ${String(error)}`;
-    desktopLogger.error("main", "[megle] library retry failed:", error);
+    desktopLogger.error("main", "[mangoo] library retry failed:", error);
     pushLibraryPhase({ kind: "error", message });
     return { ok: false, error: message };
   }
 });
 
-ipcMain.handle("megle:pick-new-library-path", async (event, defaultName?: string) => {
-  requireDesktopIpcAccess(event, "megle:pick-new-library-path");
+ipcMain.handle("mangoo:resolve-library-creation-paths", (event, input: ResolveLibraryCreationPathsRequest) => {
+  requireDesktopIpcAccess(event, "mangoo:resolve-library-creation-paths");
+  return resolveLibraryCreationPaths(app.getPath("documents"), input);
+});
+
+ipcMain.handle("mangoo:pick-new-library-path", async (event, defaultName?: string) => {
+  requireDesktopIpcAccess(event, "mangoo:pick-new-library-path");
   const safeName = (defaultName ?? "Library")
     .replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ")
     .replace(/[. ]+$/g, "")
@@ -1071,9 +1096,9 @@ ipcMain.handle("megle:pick-new-library-path", async (event, defaultName?: string
   // Documents may be redirected into OneDrive by Known Folder Move. Keep the
   // managed-library default outside that implicit sync root; Core still owns
   // the authoritative cloud-root/reparse validation at preflight and commit.
-  const suggestedRoot = path.join(app.getPath("home"), "Megle Libraries", safeName);
+  const suggestedRoot = path.join(app.getPath("home"), "Mangoo Libraries", safeName);
   const options = {
-    title: "Choose an empty folder for this Megle library",
+    title: "Choose an empty folder for this Mangoo library",
     defaultPath: suggestedRoot,
     properties: ["openDirectory", "createDirectory"] as ("openDirectory" | "createDirectory")[]
   };
@@ -1084,38 +1109,34 @@ ipcMain.handle("megle:pick-new-library-path", async (event, defaultName?: string
   return result.canceled ? null : (result.filePaths[0] ?? null);
 });
 
-ipcMain.handle("megle:open-external-authorization-url", async (event, authorizationUrl: unknown) => {
-  requireDesktopIpcAccess(event, "megle:open-external-authorization-url");
+ipcMain.handle("mangoo:open-plugin-external-link", async (event, input: unknown) => {
+  requireDesktopIpcAccess(event, "mangoo:open-plugin-external-link");
+  const request = parsePluginExternalLinkInput(input);
+  if (!request) return { ok: false, error: "external_browser_rejected" } as const;
   const originatingWindow = windowForIpcEvent(event);
   if (!originatingWindow) {
     return { ok: false, error: "external_browser_open_failed" } as const;
   }
-  const attemptEpoch = beginOAuthReturnFocusAttempt(event.sender);
-  return openExternalAuthorizationUrl(
-    authorizationUrl,
+  const session = coreSession ?? await ensureCoreReady();
+  const client = createCoreClient({ baseUrl: session.baseUrl, sessionToken: session.sessionToken });
+  const attemptEpoch = request.kind === "authorization" ? beginOAuthReturnFocusAttempt(event.sender) : null;
+  const isCurrent = () => coreSession === session
+    && !event.sender.isDestroyed() && !originatingWindow.isDestroyed()
+    && (attemptEpoch === null || oauthReturnFocusNavigationEpochs.get(event.sender.id) === attemptEpoch);
+  return openPluginExternalLink(
+    request,
+    client.resolvePluginExternalLink,
     (url) => shell.openExternal(url),
     {
-      emulatorAuthority: app.isPackaged ? undefined : process.env.MEGLE_ONEDRIVE_AUTHORITY
-    },
-    () => {
-      if (
-        !event.sender.isDestroyed()
-        && !originatingWindow.isDestroyed()
-        && oauthReturnFocusNavigationEpochs.get(event.sender.id) === attemptEpoch
-      ) {
-        oauthReturnFocusEntitlements.grant(event.sender.id);
-      }
+      allowLoopback: !app.isPackaged && process.env.MANGOO_PLUGIN_ALLOW_LOOPBACK_AUTH === "1",
+      isCurrent,
+      onAuthorizationOpened: () => oauthReturnFocusEntitlements.grant(event.sender.id),
     }
   );
 });
 
-ipcMain.handle("megle:open-entra-app-registration-page", async (event) => {
-  requireDesktopIpcAccess(event, "megle:open-entra-app-registration-page");
-  return openEntraAppRegistrationPage((url) => shell.openExternal(url));
-});
-
-ipcMain.handle("megle:request-oauth-return-focus", (event) => {
-  requireDesktopIpcAccess(event, "megle:request-oauth-return-focus");
+ipcMain.handle("mangoo:request-oauth-return-focus", (event) => {
+  requireDesktopIpcAccess(event, "mangoo:request-oauth-return-focus");
   if (!oauthReturnFocusEntitlements.consume(event.sender.id)) return false;
   const originatingWindow = windowForIpcEvent(event);
   if (!originatingWindow) return false;
@@ -1132,10 +1153,10 @@ async function createWindow(): Promise<void> {
   launchWindowPlacement = placement;
   launchWindowMaximized = state.maximized;
   windowStatePersistenceEnabled = false;
-  const windowIcon = packagedWindowIconPath(app.isPackaged, process.resourcesPath);
+  const windowIcon = windowIconPath(app.isPackaged, process.resourcesPath);
 
   mainWindow = new BrowserWindow({
-    title: runId ? `Megle ${runId}` : "Megle",
+    title: runId ? `Mangoo ${runId}` : "Mangoo",
     width: placement.width,
     height: placement.height,
     x: bootstrapPlacement.x,
@@ -1146,7 +1167,7 @@ async function createWindow(): Promise<void> {
     transparent: false,
     backgroundColor: "#00000000",
     roundedCorners: true,
-    icon: windowIcon,
+    ...(windowIcon ? { icon: windowIcon } : {}),
     show: true,
     frame: false,
     skipTaskbar: mainWindowSkipsTaskbarDuringBootstrap(app.isPackaged),
@@ -1155,14 +1176,15 @@ async function createWindow(): Promise<void> {
       contextIsolation: true,
       nodeIntegration: false,
       additionalArguments: [
-        `--megle-core-url=${session.baseUrl}`,
-        `--megle-session-token=${session.sessionToken}`,
-        `--megle-window=main`,
-        ...(isVisualHarnessEnabled() ? ["--megle-visual-harness=1"] : [])
+        `--mangoo-core-url=${session.baseUrl}`,
+        `--mangoo-session-token=${session.sessionToken}`,
+        `--mangoo-window=main`,
+        ...(isVisualHarnessEnabled() ? ["--mangoo-visual-harness=1"] : [])
       ]
     }
   });
   const window = mainWindow;
+  installVisualFixtureLifecycle(window);
   const releaseIpcTargetLifecycle = notificationIpcTargetLifecycle.track(window.webContents);
   applyWindowMaterial(window);
   shellReadyVisibleWindowId = null;
@@ -1237,13 +1259,13 @@ async function createWindow(): Promise<void> {
     mainWindow = null;
   });
 
-  const rendererUrl = process.env.MEGLE_WEB_URL ?? rendererUrlForSession(session);
+  const rendererUrl = process.env.MANGOO_WEB_URL ?? rendererUrlForSession(session);
   try {
     await window.loadURL(rendererUrl);
     armShellReadyFailureFallback(window);
   } catch (error) {
     await revealMainWindowForLaunchFailure(window, "loadURL-rejected");
-    desktopLogger.warn("main", "[megle] desktop renderer loadURL rejected:", error);
+    desktopLogger.warn("main", "[mangoo] desktop renderer loadURL rejected:", error);
   }
 }
 
@@ -1281,7 +1303,7 @@ async function createSecondaryWindow(
   const config = SECONDARY_WINDOW_CONFIGS[role];
   const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
   const position = resolveSecondaryWindowPosition(role, parent, config);
-  const windowIcon = packagedWindowIconPath(app.isPackaged, process.resourcesPath);
+  const windowIcon = windowIconPath(app.isPackaged, process.resourcesPath);
   const window = new BrowserWindow({
     title: config.title,
     width: config.width,
@@ -1297,7 +1319,7 @@ async function createSecondaryWindow(
     transparent: false,
     backgroundColor: "#00000000",
     roundedCorners: true,
-    icon: windowIcon,
+    ...(windowIcon ? { icon: windowIcon } : {}),
     show: false,
     frame: false,
     skipTaskbar: false,
@@ -1306,13 +1328,14 @@ async function createSecondaryWindow(
       contextIsolation: true,
       nodeIntegration: false,
       additionalArguments: [
-        `--megle-core-url=${session.baseUrl}`,
-        `--megle-session-token=${session.sessionToken}`,
-        `--megle-window=${role}`,
-        ...(isVisualHarnessEnabled() ? ["--megle-visual-harness=1"] : [])
+        `--mangoo-core-url=${session.baseUrl}`,
+        `--mangoo-session-token=${session.sessionToken}`,
+        `--mangoo-window=${role}`,
+        ...(isVisualHarnessEnabled() ? ["--mangoo-visual-harness=1"] : [])
       ]
     }
   });
+  installVisualFixtureLifecycle(window);
   const releaseIpcTargetLifecycle = notificationIpcTargetLifecycle.track(window.webContents);
   secondaryWindows[role] = window;
   secondaryWindowReadiness[role] = {
@@ -1374,13 +1397,13 @@ async function createSecondaryWindow(
     );
   });
 
-  const rendererUrl = process.env.MEGLE_WEB_URL
-    ? `${process.env.MEGLE_WEB_URL}${config.route}`
+  const rendererUrl = process.env.MANGOO_WEB_URL
+    ? `${process.env.MANGOO_WEB_URL}${config.route}`
     : rendererUrlForSession(session, config.route);
   try {
     await window.loadURL(rendererUrl);
   } catch (error) {
-    desktopLogger.warn("main", `[megle] ${role} window loadURL rejected:`, error);
+    desktopLogger.warn("main", `[mangoo] ${role} window loadURL rejected:`, error);
     destroyFailedSecondaryWindow(
       role,
       window,
@@ -1501,7 +1524,7 @@ function revealSecondaryWindowWhenReady(
   if (warmupToken === null) return;
   void warmSecondaryWindowNativeHost(role, window, readiness, warmupToken)
     .catch((error) => {
-      desktopLogger.warn("main", `[megle] ${role} native window warm-up failed:`, error);
+      desktopLogger.warn("main", `[mangoo] ${role} native window warm-up failed:`, error);
       forceSecondaryWindowReveal(role, window);
     })
     .finally(() => {
@@ -1630,7 +1653,7 @@ async function currentHealthyCoreSession(signal: AbortSignal): Promise<CoreSessi
     );
   } catch (error) {
     throwIfLifecycleAborted(signal);
-    desktopLogger.warn("main", "[megle] current Core health recheck failed; restarting tracked process:", error);
+    desktopLogger.warn("main", "[mangoo] current Core health recheck failed; restarting tracked process:", error);
     return null;
   }
   throwIfLifecycleAborted(signal);
@@ -1664,7 +1687,7 @@ async function startCoreSession(signal: AbortSignal, generation: number): Promis
       // A failed pending child may still own the bind port. Do not launch a
       // second child while it is retained for the next switch or shutdown.
       coreReadyPromise = null;
-      desktopLogger.warn("main", "[megle] pending Core cleanup failed before startup; retaining process for retry:", error);
+      desktopLogger.warn("main", "[mangoo] pending Core cleanup failed before startup; retaining process for retry:", error);
       throw error;
     }
 
@@ -1688,7 +1711,7 @@ async function startCoreSession(signal: AbortSignal, generation: number): Promis
       pendingCoreProcess = null;
       coreSession = session;
       if (attempt > 1) {
-        desktopLogger.info("main", `[megle] Core startup recovered on attempt ${attempt}/${maxAttempts}`);
+        desktopLogger.info("main", `[mangoo] Core startup recovered on attempt ${attempt}/${maxAttempts}`);
       }
       return session;
     } catch (error) {
@@ -1698,7 +1721,7 @@ async function startCoreSession(signal: AbortSignal, generation: number): Promis
           await stopPendingCoreProcess();
         } catch (stopError) {
           cleanupFailed = true;
-          desktopLogger.warn("main", "[megle] pending Core cleanup failed; retaining process for retry:", stopError);
+          desktopLogger.warn("main", "[mangoo] pending Core cleanup failed; retaining process for retry:", stopError);
         }
       }
       if (coreProcess === pendingProcess) coreProcess = null;
@@ -1714,7 +1737,7 @@ async function startCoreSession(signal: AbortSignal, generation: number): Promis
       if (attempt < maxAttempts) {
         desktopLogger.warn(
           "main",
-          `[megle] Core startup attempt ${attempt}/${maxAttempts} failed; retrying with a fresh session/port:`,
+          `[mangoo] Core startup attempt ${attempt}/${maxAttempts} failed; retrying with a fresh session/port:`,
           error
         );
         continue;
@@ -1723,7 +1746,7 @@ async function startCoreSession(signal: AbortSignal, generation: number): Promis
       coreReadyPromise = null;
       desktopLogger.error(
         "main",
-        `[megle] Core startup attempt ${attempt}/${maxAttempts} failed; no retries remain:`,
+        `[mangoo] Core startup attempt ${attempt}/${maxAttempts} failed; no retries remain:`,
         error
       );
       throw error;
@@ -1767,24 +1790,51 @@ async function stopDesktopCoreProcesses(): Promise<void> {
 
 function shouldRetryAutoCoreStartup(): boolean {
   return (
-    process.env.MEGLE_CORE_EXTERNAL !== "1" &&
-    !process.env.MEGLE_CORE_ADDR?.trim() &&
-    !process.env.MEGLE_CORE_URL?.trim()
+    process.env.MANGOO_CORE_EXTERNAL !== "1" &&
+    !process.env.MANGOO_CORE_ADDR?.trim() &&
+    !process.env.MANGOO_CORE_URL?.trim()
   );
+}
+
+function installVisualFixtureLifecycle(window: BrowserWindow): void {
+  if (!isVisualHarnessEnabled()) return;
+  window.webContents.on("did-create-window", (child, details) => {
+    if (window.isDestroyed()) return;
+    const parentUrl = window.webContents.getURL();
+    const isFixtureUrl = (value: string): boolean => {
+      try {
+        const parent = new URL(parentUrl);
+        const candidate = new URL(value);
+        return (parent.protocol === "http:" || parent.protocol === "https:") &&
+          candidate.origin === parent.origin &&
+          candidate.pathname.startsWith("/tests/fixtures/");
+      } catch {
+        return false;
+      }
+    };
+    if (!isFixtureUrl(details.url)) return;
+    child.webContents.once("did-finish-load", () => {
+      if (window.isDestroyed() || child.isDestroyed() || child.webContents.isDestroyed()) return;
+      if (!isFixtureUrl(child.webContents.getURL())) return;
+      // Electron script-opened fixtures can report visible/focused while their
+      // input widget remains unshown. Explicit show initializes native input.
+      child.show();
+    });
+  });
 }
 
 function isVisualHarnessEnabled(): boolean {
   return (
-    process.env.MEGLE_VISUAL_HARNESS === "1" ||
-    process.argv.some((arg) => arg === "--megle-visual-harness=1")
+    process.env.MANGOO_VISUAL_HARNESS === "1" ||
+    process.argv.some((arg) => arg === "--mangoo-visual-harness=1")
   );
 }
 
 function visualHarnessRunId(): string | null {
-  const fromEnv = process.env.MEGLE_VISUAL_RUN_ID?.trim();
+  const fromEnv = process.env.MANGOO_VISUAL_RUN_ID?.trim();
   if (fromEnv) return fromEnv;
-  const arg = process.argv.find((item) => item.startsWith("--megle-visual-run-id="));
-  return arg ? arg.slice("--megle-visual-run-id=".length) : null;
+  const arg = process.argv.find((item) => item.startsWith("--mangoo-visual-run-id="));
+  return arg ? arg.slice("--mangoo-visual-run-id=".length) : null;
 }
 
 async function waitForRendererFrame(window: BrowserWindow) {
@@ -1862,7 +1912,7 @@ async function revealMainWindowForLaunchFailure(
   }
   const didReveal = await revealMainWindow(window);
   if (didReveal) {
-    desktopLogger.warn("main", `[megle] revealing window after renderer startup failure: ${reason}`);
+    desktopLogger.warn("main", `[mangoo] revealing window after renderer startup failure: ${reason}`);
   }
   return didReveal;
 }
@@ -2163,11 +2213,11 @@ async function detectFfmpeg(): Promise<boolean> {
 }
 
 function resolvePluginsDir(): string {
-  const fromEnv = process.env.MEGLE_PLUGINS_DIR;
+  const fromEnv = process.env.MANGOO_PLUGINS_DIR;
   if (fromEnv && fromEnv.length > 0) {
     return fromEnv;
   }
-  const profile = process.env.MEGLE_CORE_PROFILE === "release" ? "release" : "debug";
+  const profile = process.env.MANGOO_CORE_PROFILE === "release" ? "release" : "debug";
   return path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),
     "..",
@@ -2184,12 +2234,10 @@ configurePackagedRuntime({
   resourcesPath: process.resourcesPath,
   parentPid: process.pid
 });
-const packagedIdentity = packagedApplicationIdentity(app.isPackaged);
-if (packagedIdentity) {
-  app.setName(packagedIdentity.name);
-  if (packagedIdentity.appUserModelId) {
-    app.setAppUserModelId(packagedIdentity.appUserModelId);
-  }
+const identity = applicationIdentity();
+app.setName(identity.name);
+if (identity.appUserModelId) {
+  app.setAppUserModelId(identity.appUserModelId);
 }
 
 const hasSingleInstanceLock = !app.isPackaged || app.requestSingleInstanceLock();
@@ -2211,7 +2259,7 @@ if (hasSingleInstanceLock) app
   .whenReady()
   .then(async () => {
     void ensureNotificationService().catch((error) => {
-      desktopLogger.warn("main", "[megle] notification service startup degraded:", error);
+      desktopLogger.warn("main", "[mangoo] notification service startup degraded:", error);
     });
     await prepareColdLibraryStartup({
       ensureCoreReady,
@@ -2232,15 +2280,15 @@ async function wakeCoreSync(reason: "foreground" | "network"): Promise<void> {
   try {
     await fetch(`${session.baseUrl}/sync/wake?reason=${reason}`, {
       method: "POST",
-      headers: { "x-megle-session": session.sessionToken }
+      headers: { "x-mangoo-session": session.sessionToken }
     });
   } catch (error) {
-    desktopLogger.warn("main", "[megle] sync wake failed:", error);
+    desktopLogger.warn("main", "[mangoo] sync wake failed:", error);
   }
 }
 
 function handleDesktopStartupFailure(error: unknown): void {
-  desktopLogger.error("main", "[megle] desktop startup failed:", error);
+  desktopLogger.error("main", "[mangoo] desktop startup failed:", error);
   requestDesktopShutdown(1);
 }
 
@@ -2266,26 +2314,26 @@ function requestDesktopShutdown(exitCode: number): void {
   });
   shutdownPromise = shutdown;
   void shutdown.catch((error) => {
-    desktopLogger.error("main", "[megle] Core shutdown failed; retaining process for retry:", error);
+    desktopLogger.error("main", "[mangoo] Core shutdown failed; retaining process for retry:", error);
     if (shutdownPromise === shutdown) shutdownPromise = null;
   });
 }
 
 async function maybeAutoAddRoot(session: CoreSession): Promise<void> {
-  const target = process.env.MEGLE_AUTO_ADD_ROOT?.trim();
+  const target = process.env.MANGOO_AUTO_ADD_ROOT?.trim();
   if (!target) return;
   try {
     let bootstrapRootId: number | null = null;
     const activeResponse = await fetch(`${session.baseUrl}/libraries/active`, {
       headers: {
-        "x-megle-session": session.sessionToken
+        "x-mangoo-session": session.sessionToken
       }
     });
     if (!activeResponse.ok) {
       const text = await activeResponse.text();
       desktopLogger.warn(
         "main",
-        `[megle] MEGLE_AUTO_ADD_ROOT could not read active Library (${activeResponse.status}): ${text}`
+        `[mangoo] MANGOO_AUTO_ADD_ROOT could not read active Library (${activeResponse.status}): ${text}`
       );
       return;
     }
@@ -2294,31 +2342,34 @@ async function maybeAutoAddRoot(session: CoreSession): Promise<void> {
       contextRevision?: unknown;
     };
     if (typeof active.contextRevision !== "number") {
-      desktopLogger.warn("main", "[megle] MEGLE_AUTO_ADD_ROOT active Library revision is unavailable");
+      desktopLogger.warn("main", "[mangoo] MANGOO_AUTO_ADD_ROOT active Library revision is unavailable");
       return;
     }
     let contextRevision = active.contextRevision;
     if (active.library == null) {
-      // MEGLE_AUTO_ADD_ROOT is a development/visual-harness seam. Host mode no
+      // MANGOO_AUTO_ADD_ROOT is a development/visual-harness seam. Host mode no
       // longer creates an implicit Default catalog, so establish an explicit
       // managed Library before adding the fixture's existing media directory.
-      const managedRoot =
-        process.env.MEGLE_AUTO_LIBRARY_ROOT?.trim() ||
-        path.join(path.dirname(target), ".megle-managed-library");
+      const placementBase =
+        process.env.MANGOO_AUTO_LIBRARY_BASE?.trim() ||
+        path.join(path.dirname(target), ".mangoo-managed-library");
+      const databasePath = path.join(placementBase, "Database");
+      const defaultContentPath = path.join(placementBase, "Files");
+      const contentRoots = [{ path: defaultContentPath, createIfMissing: true }];
       const libraryName = path.basename(target) || "Development Library";
       const preflightResponse = await fetch(`${session.baseUrl}/libraries/preflight`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          "x-megle-session": session.sessionToken
+          "x-mangoo-session": session.sessionToken
         },
-        body: JSON.stringify({ name: libraryName, managedRoot })
+        body: JSON.stringify({ name: libraryName, databasePath, contentRoots })
       });
       if (!preflightResponse.ok) {
         const text = await preflightResponse.text();
         desktopLogger.warn(
           "main",
-          `[megle] MEGLE_AUTO_ADD_ROOT preflight failed (${preflightResponse.status}): ${text}`
+          `[mangoo] MANGOO_AUTO_ADD_ROOT preflight failed (${preflightResponse.status}): ${text}`
         );
         return;
       }
@@ -2327,18 +2378,19 @@ async function maybeAutoAddRoot(session: CoreSession): Promise<void> {
         preflightToken?: unknown;
       };
       if (preflight.ok !== true) {
-        desktopLogger.warn("main", "[megle] MEGLE_AUTO_ADD_ROOT managed Library preflight was rejected");
+        desktopLogger.warn("main", "[mangoo] MANGOO_AUTO_ADD_ROOT managed Library preflight was rejected");
         return;
       }
       const createResponse = await fetch(`${session.baseUrl}/libraries`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          "x-megle-session": session.sessionToken
+          "x-mangoo-session": session.sessionToken
         },
         body: JSON.stringify({
           name: libraryName,
-          managedRoot,
+          databasePath,
+          contentRoots,
           initialMode: "local-only",
           preflightToken:
             typeof preflight.preflightToken === "string" ? preflight.preflightToken : null,
@@ -2349,35 +2401,35 @@ async function maybeAutoAddRoot(session: CoreSession): Promise<void> {
         const text = await createResponse.text();
         desktopLogger.warn(
           "main",
-          `[megle] MEGLE_AUTO_ADD_ROOT Library creation failed (${createResponse.status}): ${text}`
+          `[mangoo] MANGOO_AUTO_ADD_ROOT Library creation failed (${createResponse.status}): ${text}`
         );
         return;
       }
       await createResponse.json();
       const refreshedActiveResponse = await fetch(`${session.baseUrl}/libraries/active`, {
-        headers: { "x-megle-session": session.sessionToken }
+        headers: { "x-mangoo-session": session.sessionToken }
       });
       if (!refreshedActiveResponse.ok) {
-        desktopLogger.warn("main", "[megle] MEGLE_AUTO_ADD_ROOT could not refresh created Library context");
+        desktopLogger.warn("main", "[mangoo] MANGOO_AUTO_ADD_ROOT could not refresh created Library context");
         return;
       }
       const refreshedActive = (await refreshedActiveResponse.json()) as { contextRevision?: unknown };
       if (typeof refreshedActive.contextRevision !== "number") {
-        desktopLogger.warn("main", "[megle] MEGLE_AUTO_ADD_ROOT created Library revision is unavailable");
+        desktopLogger.warn("main", "[mangoo] MANGOO_AUTO_ADD_ROOT created Library revision is unavailable");
         return;
       }
       contextRevision = refreshedActive.contextRevision;
       const rootsResponse = await fetch(`${session.baseUrl}/roots`, {
-        headers: { "x-megle-session": session.sessionToken }
+        headers: { "x-mangoo-session": session.sessionToken }
       });
       if (rootsResponse.ok) {
         const roots = (await rootsResponse.json()) as { items?: Array<{ id?: unknown; path?: unknown }> };
-        const normalizedManagedRoot = path.resolve(managedRoot).toLowerCase();
+        const normalizedDefaultContentPath = path.resolve(defaultContentPath).toLowerCase();
         const bootstrapRoot = roots.items?.find(
           (item) =>
             typeof item.id === "number" &&
             typeof item.path === "string" &&
-            path.resolve(item.path).toLowerCase() === normalizedManagedRoot
+            path.resolve(item.path).toLowerCase() === normalizedDefaultContentPath
         );
         bootstrapRootId = typeof bootstrapRoot?.id === "number" ? bootstrapRoot.id : null;
       }
@@ -2386,24 +2438,24 @@ async function maybeAutoAddRoot(session: CoreSession): Promise<void> {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "x-megle-session": session.sessionToken,
-        "x-megle-context-revision": String(contextRevision)
+        "x-mangoo-session": session.sessionToken,
+        "x-mangoo-context-revision": String(contextRevision)
       },
       body: JSON.stringify({ path: target, displayName: path.basename(target) })
     });
     if (!response.ok) {
       const text = await response.text();
-      desktopLogger.warn("main", `[megle] MEGLE_AUTO_ADD_ROOT addRoot failed (${response.status}): ${text}`);
+      desktopLogger.warn("main", `[mangoo] MANGOO_AUTO_ADD_ROOT addRoot failed (${response.status}): ${text}`);
     } else {
       const addedRoot = (await response.json()) as { rootId?: unknown };
-      desktopLogger.info("main", `[megle] auto-added root ${target}`);
-      // A managed Library owns an initial root at its storage directory. The
+      desktopLogger.info("main", `[mangoo] auto-added root ${target}`);
+      // The harness creates an empty Files root alongside Database. The
       // development harness adds an existing media tree instead; retire the
       // empty bootstrap root before the renderer loads so it opens the fixture
       // users asked the harness to exercise, not an empty storage directory.
       if (bootstrapRootId === null && typeof addedRoot.rootId === "number") {
         const rootsResponse = await fetch(`${session.baseUrl}/roots`, {
-          headers: { "x-megle-session": session.sessionToken }
+          headers: { "x-mangoo-session": session.sessionToken }
         });
         if (rootsResponse.ok) {
           const roots = (await rootsResponse.json()) as { items?: Array<{ id?: unknown }> };
@@ -2420,8 +2472,8 @@ async function maybeAutoAddRoot(session: CoreSession): Promise<void> {
           retireResponse = await fetch(`${session.baseUrl}/roots/${bootstrapRootId}`, {
             method: "DELETE",
             headers: {
-              "x-megle-session": session.sessionToken,
-              "x-megle-context-revision": String(contextRevision)
+              "x-mangoo-session": session.sessionToken,
+              "x-mangoo-context-revision": String(contextRevision)
             }
           });
           if (retireResponse.ok || retireResponse.status !== 500 || Date.now() >= deadline) break;
@@ -2432,13 +2484,13 @@ async function maybeAutoAddRoot(session: CoreSession): Promise<void> {
           const text = await retireResponse.text();
           desktopLogger.warn(
             "main",
-            `[megle] MEGLE_AUTO_ADD_ROOT could not retire bootstrap root (${retireResponse.status}): ${text}`
+            `[mangoo] MANGOO_AUTO_ADD_ROOT could not retire bootstrap root (${retireResponse.status}): ${text}`
           );
         } else {
           const deadline = Date.now() + 10_000;
           while (Date.now() < deadline) {
             const rootsResponse = await fetch(`${session.baseUrl}/roots`, {
-              headers: { "x-megle-session": session.sessionToken }
+              headers: { "x-mangoo-session": session.sessionToken }
             });
             if (rootsResponse.ok) {
               const roots = (await rootsResponse.json()) as { items?: Array<{ id?: unknown }> };
@@ -2450,7 +2502,7 @@ async function maybeAutoAddRoot(session: CoreSession): Promise<void> {
       }
     }
   } catch (error) {
-    desktopLogger.warn("main", "[megle] MEGLE_AUTO_ADD_ROOT request failed:", error);
+    desktopLogger.warn("main", "[mangoo] MANGOO_AUTO_ADD_ROOT request failed:", error);
   }
 }
 
@@ -2483,7 +2535,7 @@ app.on("before-quit", (event) => {
       try {
         await persistWindowState();
       } catch (error) {
-        desktopLogger.warn("main", "[megle] window state persistence failed during shutdown:", error);
+        desktopLogger.warn("main", "[mangoo] window state persistence failed during shutdown:", error);
       } finally {
         requestDesktopShutdown(0);
       }

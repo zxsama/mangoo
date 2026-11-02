@@ -1,4 +1,4 @@
-# Megle Architecture
+# Mangoo Architecture
 
 ## 总体形态
 
@@ -39,7 +39,7 @@
 ## 进程模型
 
 ```text
-Megle.exe
+Mangoo.exe
   |
   |-- UI Renderer
   |     - React
@@ -51,7 +51,7 @@ Megle.exe
   |     - native dialogs
   |     - app updates
   |
-  |-- megle-core.exe
+  |-- mangoo-core.exe
         - API server on localhost / named pipe
         - SQLite
         - index workers
@@ -77,7 +77,7 @@ Desktop main
   bounded local process-log buffer
           |
           v
-Preload @megle/notification-contract
+Preload @mangoo/notification-contract
   snapshots + paged history + actions + subscriptions
           |
           v
@@ -207,7 +207,7 @@ Web notification popover/window
 缓存策略：
 
 - 原图不复制。
-- 缩略图和预览图放在 Megle cache 目录。
+- 缩略图和预览图放在 Mangoo cache 目录。
 - 缓存 key 基于 `root_id + folder_id + file name + size + mtime` 或稳定文件身份。
 - 缩略图生成采用优先队列：
   - 当前视口最高优先级。
@@ -268,7 +268,7 @@ Web notification popover/window
 
 ## 文件操作
 
-因为 Megle 映射真实目录，文件操作必须谨慎。
+因为 Mangoo 映射真实目录，文件操作必须谨慎。
 
 重命名：
 

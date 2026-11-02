@@ -82,7 +82,7 @@ pub fn capture_checkpoint_fence(
     // the live WAL immediately while guaranteeing that every later query sees
     // exactly the same projection/truth/event snapshot.
     let snapshot_path =
-        std::env::temp_dir().join(format!("megle-checkpoint-{}.sqlite", checkpoint_uuid));
+        std::env::temp_dir().join(format!("mangoo-checkpoint-{}.sqlite", checkpoint_uuid));
     let mut snapshot = Connection::open(&snapshot_path)?;
     rusqlite::backup::Backup::new(connection, &mut snapshot)?.run_to_completion(
         64,
@@ -232,6 +232,41 @@ fn complete_portable_projection(
     // Root sentinels can precede their canonical location event. Supply only a
     // derived anchor, matching their bootstrap location, so the shared name and
     // parent legalization sees the same namespace as ordinary inbox projection.
+    let mut root_ids = projection
+        .roots
+        .iter()
+        .map(|v| v.root_uuid)
+        .collect::<std::collections::HashSet<_>>();
+    let mut folder_ids = projection
+        .folders
+        .iter()
+        .map(|v| v.uuid)
+        .collect::<std::collections::HashSet<_>>();
+    let mut file_ids = projection
+        .files
+        .iter()
+        .map(|v| v.uuid)
+        .collect::<std::collections::HashSet<_>>();
+    let mut metadata_ids = projection
+        .metadata
+        .iter()
+        .map(|v| v.asset_uuid)
+        .collect::<std::collections::HashSet<_>>();
+    let mut tag_ids = projection
+        .tags
+        .iter()
+        .map(|v| v.uuid)
+        .collect::<std::collections::HashSet<_>>();
+    let mut membership_ids = projection
+        .memberships
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let roots_by_entity = state
+        .roots
+        .values()
+        .flat_map(|root| [(root.root_uuid, root), (root.root_folder_uuid, root)])
+        .collect::<std::collections::HashMap<_, _>>();
     let mut location_state = state.clone();
     for root in state.roots.values() {
         let entity = location_state
@@ -243,6 +278,7 @@ fn complete_portable_projection(
             entity.locations.insert(
                 revision_uuid,
                 LocationRevision {
+                    preserve_legal_name: false,
                     revision_uuid,
                     parent_uuid: Some(root.library_root_uuid),
                     name: root.requested_name.clone(),
@@ -272,22 +308,14 @@ fn complete_portable_projection(
         .values()
         .filter(|root| root.lifecycle == "active")
     {
-        if !projection
-            .roots
-            .iter()
-            .any(|item| item.root_uuid == root.root_uuid)
-        {
+        if root_ids.insert(root.root_uuid) {
             projection.roots.push(RootProjectionSnapshot {
                 root_uuid: root.root_uuid,
                 root_folder_uuid: root.root_folder_uuid,
                 display_name: root.materialized_name.clone(),
             });
         }
-        if !projection
-            .folders
-            .iter()
-            .any(|item| item.uuid == root.root_folder_uuid)
-        {
+        if folder_ids.insert(root.root_folder_uuid) {
             projection.folders.push(FolderSnapshot {
                 uuid: root.root_folder_uuid,
                 root_uuid: root.root_uuid,
@@ -311,11 +339,7 @@ fn complete_portable_projection(
         let mut cursor = parent;
         let mut seen = std::collections::BTreeSet::new();
         let root = loop {
-            if let Some(root) = state
-                .roots
-                .values()
-                .find(|root| root.root_folder_uuid == cursor || root.root_uuid == cursor)
-            {
+            if let Some(root) = roots_by_entity.get(&cursor) {
                 break (root.lifecycle == "active").then_some(root.root_uuid);
             }
             if !seen.insert(cursor) {
@@ -331,18 +355,15 @@ fn complete_portable_projection(
         };
         let Some(root_uuid) = root else { continue };
         if let Some(content) = entity.winning_content() {
-            if !projection.files.iter().any(|item| item.uuid == *uuid) {
+            if file_ids.insert(*uuid) {
                 projection.files.push(FileSnapshot {
                     uuid: *uuid,
                     root_uuid,
                     folder_uuid: parent,
                     name: location.display_name.clone(),
-                    ext: entity
-                        .fields
-                        .get("extension")
-                        .and_then(|field| field.value.as_str())
-                        .unwrap_or_default()
-                        .into(),
+                    ext: crate::decode::formats::lowercase_extension(Path::new(
+                        &location.display_name,
+                    )),
                     size: i64::try_from(
                         content
                             .byte_length
@@ -351,13 +372,15 @@ fn complete_portable_projection(
                     mtime: content.source_mtime_ms.unwrap_or(0),
                     ctime: None,
                     status: "active".into(),
-                    media_kind: None,
+                    media_kind: crate::decode::formats::media_kind_for_extension(
+                        &crate::decode::formats::lowercase_extension(Path::new(
+                            &location.display_name,
+                        )),
+                    )
+                    .map(ToOwned::to_owned),
                 });
             }
-            if !projection
-                .metadata
-                .iter()
-                .any(|item| item.asset_uuid == *uuid)
+            if metadata_ids.insert(*uuid)
                 && ["rating", "favorite", "note"]
                     .iter()
                     .any(|field| entity.fields.contains_key(*field))
@@ -382,7 +405,7 @@ fn complete_portable_projection(
                 });
             }
             for tag in entity.live_set_members("tags") {
-                if !projection.memberships.contains(&(*uuid, tag)) {
+                if membership_ids.insert((*uuid, tag)) {
                     projection.memberships.push((*uuid, tag));
                 }
             }
@@ -391,7 +414,7 @@ fn complete_portable_projection(
             .get("entity-kind")
             .and_then(|field| field.value.as_str())
             == Some("folder")
-            && !projection.folders.iter().any(|item| item.uuid == *uuid)
+            && folder_ids.insert(*uuid)
         {
             projection.folders.push(FolderSnapshot {
                 uuid: *uuid,
@@ -410,7 +433,7 @@ fn complete_portable_projection(
                 .get("entity-kind")
                 .and_then(|field| field.value.as_str())
                 == Some("tag")
-            && !projection.tags.iter().any(|tag| tag.uuid == *uuid)
+            && tag_ids.insert(*uuid)
         {
             projection.tags.push(TagSnapshot {
                 uuid: *uuid,
@@ -587,7 +610,7 @@ fn capture_recovery_snapshot(connection: &Connection) -> anyhow::Result<CatalogR
         });
     }
     let portable_complete: bool = connection.query_row(
-        "SELECT NOT EXISTS(SELECT 1 FROM sync_publication_intents WHERE state IN ('pending-hash','pending-manifest','ready','failed')) AND NOT EXISTS(SELECT 1 FROM media_publication_jobs WHERE phase NOT IN ('event-published','cancelled','archived'))",
+        "SELECT NOT EXISTS(SELECT 1 FROM sync_file_seed_progress) AND NOT EXISTS(SELECT 1 FROM sync_publication_intents WHERE state IN ('pending-hash','pending-manifest','ready','failed')) AND NOT EXISTS(SELECT 1 FROM media_publication_jobs WHERE phase NOT IN ('event-published','cancelled','archived'))",
         [],
         |row| row.get(0),
     )?;
@@ -1809,7 +1832,7 @@ mod tests {
         )
         .unwrap();
         let directory =
-            std::env::temp_dir().join(format!("megle-checkpoint-{}", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("mangoo-checkpoint-{}", uuid::Uuid::now_v7()));
         let path = build_checkpoint(connection, &fence, &directory).unwrap();
         assert!(path.exists());
         let restored = load_and_validate_checkpoint(connection, fence.checkpoint_uuid).unwrap();
@@ -1844,7 +1867,7 @@ mod tests {
             .unwrap();
         let library = uuid::Uuid::from_slice(&library).unwrap();
         let directory = std::env::temp_dir().join(format!(
-            "megle-descriptor-bootstrap-{}",
+            "mangoo-descriptor-bootstrap-{}",
             uuid::Uuid::now_v7()
         ));
         let first =
@@ -1952,7 +1975,7 @@ mod tests {
         )
         .unwrap();
         let directory =
-            std::env::temp_dir().join(format!("megle-multi-root-{}", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("mangoo-multi-root-{}", uuid::Uuid::now_v7()));
         let path = build_checkpoint(database.connection_for_fsops(), &fence, &directory).unwrap();
         let checkpoint: Checkpoint = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(checkpoint.state.roots.len(), 2);
@@ -2079,7 +2102,9 @@ mod tests {
                 mtime: 1,
                 ctime: None,
                 status: "active".into(),
-                media_kind: None,
+                // These are classified images, so retain media presentation
+                // while exercising actor ordering and final-name collisions.
+                media_kind: Some("image".into()),
             });
             original.metadata.push(MetadataSnapshot {
                 asset_uuid: assets[index],
@@ -2096,7 +2121,7 @@ mod tests {
             color: Some("#112233".into()),
         });
         let directory =
-            std::env::temp_dir().join(format!("megle-checkpoint-order-{}", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("mangoo-checkpoint-order-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&directory).unwrap();
         let recovery_database = Database::open_in_memory().unwrap();
         recovery_database.apply_migrations().unwrap();
@@ -2349,7 +2374,7 @@ mod tests {
             .execute("UPDATE tags SET name='after' WHERE id=?1", [tag.id])
             .unwrap();
         let directory =
-            std::env::temp_dir().join(format!("megle-checkpoint-race-{}", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("mangoo-checkpoint-race-{}", uuid::Uuid::now_v7()));
         build_checkpoint(connection, &fence, &directory).unwrap();
         let checkpoint = load_and_validate_checkpoint(connection, fence.checkpoint_uuid).unwrap();
         assert_eq!(
@@ -2463,7 +2488,7 @@ mod tests {
         )
         .unwrap();
         let directory =
-            std::env::temp_dir().join(format!("megle-checkpoint-work-{}", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("mangoo-checkpoint-work-{}", uuid::Uuid::now_v7()));
         build_checkpoint(connection, &fence, &directory).unwrap();
         let checkpoint = load_and_validate_checkpoint(connection, fence.checkpoint_uuid).unwrap();
         assert!(!checkpoint.recovery.portable_complete);
@@ -2585,7 +2610,7 @@ mod tests {
         )
         .unwrap();
         let library_dir =
-            std::env::temp_dir().join(format!("megle-media-index-{}", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("mangoo-media-index-{}", uuid::Uuid::now_v7()));
         let checkpoint_dir = library_dir.join("sync-spool").join("checkpoints");
         build_checkpoint(connection, &fence, &checkpoint_dir).unwrap();
         let checkpoint = load_and_validate_checkpoint(connection, fence.checkpoint_uuid).unwrap();

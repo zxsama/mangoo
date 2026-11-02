@@ -1,5 +1,5 @@
 // End-to-end real load test for the disclosure-scan priority flow:
-// 1. Spawn megle-core with a known session token + dynamic data dir.
+// 1. Spawn mangoo-core with a known session token + dynamic data dir.
 // 2. addRoot pointing at the real Stable Diffusion outputs directory.
 // 3. Measure add-root -> first visible media before the root scan completes.
 // 4. Switch between real folders during the active scan.
@@ -22,20 +22,20 @@ import {
 } from "./managed-library-harness.mjs";
 
 const TOKEN = "real-load-test-token";
-const ADDR = process.env.MEGLE_REAL_LOAD_CORE_ADDR ?? "127.0.0.1:47391";
+const ADDR = process.env.MANGOO_REAL_LOAD_CORE_ADDR ?? "127.0.0.1:47391";
 const BASE = `http://${ADDR}/api`;
 const ROOT_PATH = normalizeRootPath(
-  process.env.MEGLE_REAL_LOAD_ROOT ??
+  process.env.MANGOO_REAL_LOAD_ROOT ??
     "G:/AI_Painter/stable-diffusion/stable-diffusion-webui/outputs"
 );
-const VISIBLE_LIMIT = Number(process.env.MEGLE_REAL_LOAD_VISIBLE_LIMIT ?? 24);
-const PRIORITY_SCOPE_COUNT = Number(process.env.MEGLE_REAL_LOAD_PRIORITY_SCOPE_COUNT ?? 4);
+const VISIBLE_LIMIT = Number(process.env.MANGOO_REAL_LOAD_VISIBLE_LIMIT ?? 24);
+const PRIORITY_SCOPE_COUNT = Number(process.env.MANGOO_REAL_LOAD_PRIORITY_SCOPE_COUNT ?? 4);
 const PRIORITY_SCOPE_PAGE_LIMIT = 1 + PRIORITY_SCOPE_COUNT * 2;
-const SWITCH_SAMPLE_LIMIT = Number(process.env.MEGLE_REAL_LOAD_SWITCH_LIMIT ?? 24);
-const SCAN_TIMEOUT_MS = Number(process.env.MEGLE_REAL_LOAD_SCAN_TIMEOUT_MS ?? 300_000);
-const DISCLOSURE_TIMEOUT_MS = Number(process.env.MEGLE_REAL_LOAD_DISCLOSURE_TIMEOUT_MS ?? 120_000);
-const THUMBNAIL_TIMEOUT_MS = Number(process.env.MEGLE_REAL_LOAD_THUMBNAIL_TIMEOUT_MS ?? 90_000);
-const THUMBNAIL_POLL_INTERVAL_MS = Number(process.env.MEGLE_REAL_LOAD_THUMBNAIL_POLL_INTERVAL_MS ?? 100);
+const SWITCH_SAMPLE_LIMIT = Number(process.env.MANGOO_REAL_LOAD_SWITCH_LIMIT ?? 24);
+const SCAN_TIMEOUT_MS = Number(process.env.MANGOO_REAL_LOAD_SCAN_TIMEOUT_MS ?? 300_000);
+const DISCLOSURE_TIMEOUT_MS = Number(process.env.MANGOO_REAL_LOAD_DISCLOSURE_TIMEOUT_MS ?? 120_000);
+const THUMBNAIL_TIMEOUT_MS = Number(process.env.MANGOO_REAL_LOAD_THUMBNAIL_TIMEOUT_MS ?? 90_000);
+const THUMBNAIL_POLL_INTERVAL_MS = Number(process.env.MANGOO_REAL_LOAD_THUMBNAIL_POLL_INTERVAL_MS ?? 100);
 const MEDIA_EXTENSIONS = new Set([
   ".avif",
   ".avi",
@@ -187,7 +187,7 @@ async function fetchJson<T>(apiPath: string, init: RequestInit = {}): Promise<T>
 
 async function fetchResponse(apiPath: string, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers);
-  headers.set("x-megle-session", TOKEN);
+  headers.set("x-mangoo-session", TOKEN);
   if (init.body && !headers.has("content-type")) {
     headers.set("content-type", "application/json");
   }
@@ -206,7 +206,7 @@ async function fetchThumbnailBlob(
   return {
     bytes: new Uint8Array(await response.arrayBuffer()),
     contentType: response.headers.get("content-type"),
-    servedBy: response.headers.get("x-megle-served-by")
+    servedBy: response.headers.get("x-mangoo-served-by")
   };
 }
 
@@ -693,7 +693,7 @@ async function verifyOriginalPreview(media: MediaRecord): Promise<{ elapsedMs: n
   const startedAt = Date.now();
   const response = await fetchResponse(`/media/${media.id}/preview`);
   const contentLength = Number(response.headers.get("content-length"));
-  const servedBy = response.headers.get("x-megle-served-by");
+  const servedBy = response.headers.get("x-mangoo-served-by");
   const cacheControl = response.headers.get("cache-control");
   const contentType = response.headers.get("content-type");
   await response.body?.cancel();
@@ -744,20 +744,20 @@ async function main() {
   const expectedFiles = await countMediaFiles(ROOT_PATH);
   log(`Source dir: ${ROOT_PATH} (${expectedFiles} supported media files, recursive)`);
 
-  const dataDir = await mkdtemp(path.join(tmpdir(), "megle-real-load-"));
+  const dataDir = await mkdtemp(path.join(tmpdir(), "mangoo-real-load-"));
   const managedRoot = path.join(dataDir, "library");
   log(`Data dir: ${dataDir}`);
 
   const env = {
     ...process.env,
-    MEGLE_SESSION_TOKEN: TOKEN,
-    MEGLE_CORE_ADDR: ADDR,
+    MANGOO_SESSION_TOKEN: TOKEN,
+    MANGOO_CORE_ADDR: ADDR,
     ...managedLibraryHostEnv(dataDir),
     RUST_LOG: "warn"
   };
 
-  log("Spawning megle-core...");
-  const core = spawnManaged("cargo", ["run", "--release", "-q", "-p", "megle-core"], {
+  log("Spawning mangoo-core...");
+  const core = spawnManaged("cargo", ["run", "--release", "-q", "-p", "mangoo-core"], {
     cwd: process.cwd(),
     env
   });
@@ -1025,7 +1025,7 @@ async function main() {
     process.off("SIGINT", handleStopSignal);
     process.off("SIGTERM", handleStopSignal);
     await stop();
-    if (process.env.MEGLE_KEEP_DATA !== "1") {
+    if (process.env.MANGOO_KEEP_DATA !== "1") {
       try {
         await rm(dataDir, { recursive: true, force: true });
         log(`Cleaned ${dataDir}`);
@@ -1033,13 +1033,13 @@ async function main() {
         // ignore
       }
     } else {
-      log(`MEGLE_KEEP_DATA=1, keeping ${dataDir}`);
+      log(`MANGOO_KEEP_DATA=1, keeping ${dataDir}`);
     }
   }
 }
 
 const entrypoint =
-  process.env.MEGLE_REAL_LOAD_TEST_LIFECYCLE_SELF_TEST === "1" ? runLifecycleSelfTest : main;
+  process.env.MANGOO_REAL_LOAD_TEST_LIFECYCLE_SELF_TEST === "1" ? runLifecycleSelfTest : main;
 
 entrypoint().catch((error) => {
   // eslint-disable-next-line no-console

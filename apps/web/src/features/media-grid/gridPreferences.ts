@@ -1,4 +1,4 @@
-const LIBRARY_GRID_PREFERENCES_STORAGE_KEY = "megle.library.grid-preferences";
+const LIBRARY_GRID_PREFERENCES_STORAGE_KEY = "mangoo.library.grid-preferences";
 
 // One unified set of grid controls shared by BOTH the media tile grid and the
 // folder cover grid (they used to be two parallel sets). Only the folder edge

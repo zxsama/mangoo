@@ -1,10 +1,10 @@
-# Megle Acrylic Frosted Glass Terminology Design
+# Mangoo Acrylic Frosted Glass Terminology Design
 
 Updated: 2026-07-24
 
 ## 1. Purpose
 
-Megle's current documentation positions the interface as a "Liquid Glass" design. That label is now too closely tied to an Apple-specific visual direction and no longer describes Megle's Windows-first desktop material accurately.
+Mangoo's current documentation positions the interface as a "Liquid Glass" design. That label is now too closely tied to an Apple-specific visual direction and no longer describes Mangoo's Windows-first desktop material accurately.
 
 This change updates the current design positioning to a layered acrylic frosted-glass language without changing the implemented UI, code identifiers, file paths, tests, or runtime behavior.
 
@@ -33,7 +33,7 @@ Update current authoritative descriptions in:
 - `docs/open-questions.md`
 - `docs/component-library-review.md`
 - `docs/final-solution.md`
-- `docs/superpowers/specs/2026-05-16-megle-ui-liquid-glass-design.md`
+- `docs/superpowers/specs/2026-05-16-mangoo-ui-liquid-glass-design.md`
 
 The existing canonical specification filename is preserved so links remain stable. Its title and natural-language positioning will use the approved acrylic frosted-glass terminology.
 

@@ -111,15 +111,15 @@ class, so every preview lane (canvas, `<img>`, `<video>`) is covered:
 | 双线性 Bilinear | `auto` | `none` |
 | 最近邻 Nearest neighbour | `pixelated` | `none` |
 | RGBA (default) | `auto` | `none` |
-| RGB | `auto` | `url("#megle-channel-rgb")` |
-| R / G / B / A | `auto` | `url("#megle-channel-<c>")` |
+| RGB | `auto` | `url("#mangoo-channel-rgb")` |
+| R / G / B / A | `auto` | `url("#mangoo-channel-<c>")` |
 
 Button present in the titlebar (`[data-titlebar-control="preview-render"]`), all
 five matrices defined in the hidden SVG, and the RGBA default applies no filter
 at all.
 
 **The alpha claim, verified through the shipped filter** (not just the Task 1
-probe). A 50%-alpha red pixel drawn through `#megle-channel-rgb`:
+probe). A 50%-alpha red pixel drawn through `#mangoo-channel-rgb`:
 
 ```json
 { "rgbView":   [255, 0, 0, 255], "rawStoredRGBPreserved": true,

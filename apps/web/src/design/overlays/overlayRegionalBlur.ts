@@ -353,7 +353,7 @@ export function createOverlayRegionalBlurController(
 
   const regionalFilterSupported = () => (
     typeof view.CSS?.supports === "function" &&
-    view.CSS.supports("filter", 'url("#megle-overlay-regional-blur-support")')
+    view.CSS.supports("filter", 'url("#mangoo-overlay-regional-blur-support")')
   );
 
   const materialSettings = () => {
@@ -535,7 +535,7 @@ export function createOverlayRegionalBlurController(
         const target = targetById.get(plan.targetId);
         if (!target) throw new Error(`regional blur target is missing: ${plan.targetId}`);
         return {
-          filterId: `megle-overlay-regional-blur-${sequence}-${graphRevision}-${index}`,
+          filterId: `mangoo-overlay-regional-blur-${sequence}-${graphRevision}-${index}`,
           plan,
           target
         };

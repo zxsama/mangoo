@@ -8,11 +8,11 @@
 // Run from repo root:
 //   node tools/dev/desktop-interaction-test.mjs
 // Env:
-//   MEGLE_INTERACTION_ROOT     library to add (default Y:\Repository\Billfish\Artists)
-//   MEGLE_INTERACTION_OPS      number of operations (default 60)
-//   MEGLE_INTERACTION_PORT     CDP debug port (default 9240)
-//   MEGLE_INTERACTION_WARMUP_MS   wait before driving (default 18000)
-//   MEGLE_KEEP_DATA=1          keep the temp DB + screenshots
+//   MANGOO_INTERACTION_ROOT     library to add (default Y:\Repository\Billfish\Artists)
+//   MANGOO_INTERACTION_OPS      number of operations (default 60)
+//   MANGOO_INTERACTION_PORT     CDP debug port (default 9240)
+//   MANGOO_INTERACTION_WARMUP_MS   wait before driving (default 18000)
+//   MANGOO_KEEP_DATA=1          keep the temp DB + screenshots
 import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import path from "node:path";
@@ -20,11 +20,11 @@ import { setTimeout as delay } from "node:timers/promises";
 import { connectCdp, resolvePageWsUrl } from "./cdp-client.mjs";
 import { managedLibraryHostEnv } from "./managed-library-harness.mjs";
 
-const ROOT = (process.env.MEGLE_INTERACTION_ROOT ?? "Y:/Repository/Billfish/Artists").replace(/\\/g, "/");
-const OPS = Number(process.env.MEGLE_INTERACTION_OPS ?? 60);
-const PORT = Number(process.env.MEGLE_INTERACTION_PORT ?? 9240);
-const WARMUP_MS = Number(process.env.MEGLE_INTERACTION_WARMUP_MS ?? 18000);
-const KEEP = process.env.MEGLE_KEEP_DATA === "1";
+const ROOT = (process.env.MANGOO_INTERACTION_ROOT ?? "Y:/Repository/Billfish/Artists").replace(/\\/g, "/");
+const OPS = Number(process.env.MANGOO_INTERACTION_OPS ?? 60);
+const PORT = Number(process.env.MANGOO_INTERACTION_PORT ?? 9240);
+const WARMUP_MS = Number(process.env.MANGOO_INTERACTION_WARMUP_MS ?? 18000);
+const KEEP = process.env.MANGOO_KEEP_DATA === "1";
 const DATA_DIR = path.join(process.cwd(), ".tmp", "interaction-test");
 const MANAGED_ROOT = path.join(DATA_DIR, "library");
 const SHOT_DIR = path.join(DATA_DIR, "shots");
@@ -43,10 +43,10 @@ const dev = spawn("npm", ["run", "dev"], {
   cwd: process.cwd(),
   env: {
     ...process.env,
-    MEGLE_REMOTE_DEBUG: "1",
-    MEGLE_REMOTE_DEBUG_PORT: String(PORT),
-    MEGLE_AUTO_ADD_ROOT: ROOT,
-    MEGLE_AUTO_LIBRARY_ROOT: MANAGED_ROOT,
+    MANGOO_REMOTE_DEBUG: "1",
+    MANGOO_REMOTE_DEBUG_PORT: String(PORT),
+    MANGOO_AUTO_ADD_ROOT: ROOT,
+    MANGOO_AUTO_LIBRARY_BASE: MANAGED_ROOT,
     ...managedLibraryHostEnv(DATA_DIR)
   },
   stdio: ["ignore", "pipe", "pipe"],
@@ -60,7 +60,7 @@ async function stop() {
   for (const args of [
     ["/PID", String(dev.pid), "/T", "/F"],
     ["/F", "/IM", "electron.exe", "/T"],
-    ["/F", "/IM", "megle-core.exe", "/T"]
+    ["/F", "/IM", "mangoo-core.exe", "/T"]
   ]) {
     await new Promise((res) => {
       const k = spawn("taskkill", args, { stdio: "ignore" });
@@ -369,6 +369,6 @@ main()
         rmSync(`${DB_PATH}-shm`, { force: true });
       } catch {}
     } else {
-      log(`MEGLE_KEEP_DATA=1, kept ${DATA_DIR}`);
+      log(`MANGOO_KEEP_DATA=1, kept ${DATA_DIR}`);
     }
   });

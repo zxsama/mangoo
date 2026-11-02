@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - MSVC toolchain on Windows. To run cargo when not on PATH: `export PATH="$HOME/.cargo/bin:$PATH"`.
-- Every task ends green on `cargo test -p megle-core` (or the specific test named). Full gate `npm test` runs once at the end (Task 6).
+- Every task ends green on `cargo test -p mangoo-core` (or the specific test named). Full gate `npm test` runs once at the end (Task 6).
 - `rustfmt` must pass: `cargo fmt --all --check`. Run `cargo fmt --all` before each commit.
 - Debug logging uses the existing `crate::debug_log!` macro ONLY (gated by the global debug flag, default off). Do NOT add a new logging framework or `println!`/`eprintln!`.
 - Do NOT change SQLite PRAGMA tuning (`wal_autocheckpoint=0`, `journal_size_limit=64MiB`, `synchronous=NORMAL`).
@@ -71,7 +71,7 @@ fn wal_size_bytes_reports_zero_for_in_memory_and_reads_file_wal() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p megle-core wal_size_bytes_reports_zero -- --nocapture`
+Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p mangoo-core wal_size_bytes_reports_zero -- --nocapture`
 Expected: FAIL — `no method named wal_size_bytes found for struct Database`.
 
 - [ ] **Step 3: Implement `wal_size_bytes`**
@@ -96,7 +96,7 @@ pub fn wal_size_bytes(&self) -> u64 {
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p megle-core wal_size_bytes_reports_zero -- --nocapture`
+Run: `cargo test -p mangoo-core wal_size_bytes_reports_zero -- --nocapture`
 Expected: PASS.
 
 - [ ] **Step 5: Add the WAL-size checkpoint debug log**
@@ -121,7 +121,7 @@ In `crates/core/src/db/writer.rs`, replace the checkpoint block in `run_writer_a
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo fmt --all
-cargo test -p megle-core wal_size_bytes_reports_zero
+cargo test -p mangoo-core wal_size_bytes_reports_zero
 git add crates/core/src/db/mod.rs crates/core/src/db/writer.rs
 git commit -m "feat(core): add wal_size_bytes + log WAL size after each checkpoint pass"
 ```
@@ -188,7 +188,7 @@ Note: `seed_one_pending_thumbnail_task`, `publish_thumbnail_for_test`, and `ctx`
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p megle-core thumbnail_publish_routes_through_writer -- --nocapture`
+Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p mangoo-core thumbnail_publish_routes_through_writer -- --nocapture`
 Expected: FAIL — helpers/`publish_thumbnail_for_test` not defined.
 
 - [ ] **Step 3: Thread `writer` into the thumbnail leaf + route the publish**
@@ -239,12 +239,12 @@ Expected: FAIL — helpers/`publish_thumbnail_for_test` not defined.
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p megle-core thumbnail_publish_routes_through_writer -- --nocapture`
+Run: `cargo test -p mangoo-core thumbnail_publish_routes_through_writer -- --nocapture`
 Expected: PASS.
 
 - [ ] **Step 5: Run the whole tasks module to catch regressions**
 
-Run: `cargo test -p megle-core --lib tasks`
+Run: `cargo test -p mangoo-core --lib tasks`
 Expected: PASS (existing thumbnail/scheduler tests still green).
 
 - [ ] **Step 6: Format, commit**
@@ -305,7 +305,7 @@ async fn scan_commits_through_writer_keep_wal_bounded() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p megle-core scan_commits_through_writer -- --nocapture`
+Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p mangoo-core scan_commits_through_writer -- --nocapture`
 Expected: FAIL — helpers / writer field on options not defined.
 
 - [ ] **Step 3: Add optional writer to scan options + route the commit**
@@ -347,12 +347,12 @@ Initialize `writer: None` everywhere `ScanWriteOptions`/`ScanRootOptions` is con
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p megle-core scan_commits_through_writer -- --nocapture`
+Run: `cargo test -p mangoo-core scan_commits_through_writer -- --nocapture`
 Expected: PASS.
 
 - [ ] **Step 5: Run the scan module tests**
 
-Run: `cargo test -p megle-core --lib scan`
+Run: `cargo test -p mangoo-core --lib scan`
 Expected: PASS (existing scan tests use `writer: None` and still commit inline).
 
 - [ ] **Step 6: Format, commit**
@@ -401,7 +401,7 @@ async fn watcher_upserts_route_through_writer_and_land() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p megle-core watcher_upserts_route_through_writer -- --nocapture`
+Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p mangoo-core watcher_upserts_route_through_writer -- --nocapture`
 Expected: FAIL — helper not defined (and, before Step 3, upsert still on `state.database`).
 
 - [ ] **Step 3: Route the upsert through the writer**
@@ -423,12 +423,12 @@ In `upsert_media_file` (`crates/core/src/watch/mod.rs:258`), replace the two dir
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p megle-core watcher_upserts_route_through_writer -- --nocapture`
+Run: `cargo test -p mangoo-core watcher_upserts_route_through_writer -- --nocapture`
 Expected: PASS.
 
 - [ ] **Step 5: Run the watch module tests**
 
-Run: `cargo test -p megle-core --lib watch`
+Run: `cargo test -p mangoo-core --lib watch`
 Expected: PASS.
 
 - [ ] **Step 6: Format, commit**
@@ -460,7 +460,7 @@ Add to `mod tests` in `crates/core/src/db/writer.rs`:
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sustained_blob_writes_through_writer_keep_wal_bounded() {
     use crate::db::Database;
-    let dir = std::env::temp_dir().join(format!("megle-wal-bound-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("mangoo-wal-bound-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let db_path = dir.join("bound.sqlite");
     let _ = std::fs::remove_file(&db_path);
@@ -511,14 +511,14 @@ async fn sustained_blob_writes_through_writer_keep_wal_bounded() {
 
 - [ ] **Step 2: Run test to verify it passes (with the fix in place)**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p megle-core sustained_blob_writes_through_writer -- --nocapture`
+Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p mangoo-core sustained_blob_writes_through_writer -- --nocapture`
 Expected: PASS.
 
 - [ ] **Step 3: Sanity-check it would fail without checkpointing**
 
 Temporarily comment out the `database.run_wal_checkpoint_pass()` call in `run_writer_actor`, re-run the test, and confirm it FAILS (WAL grows past the bound). Then restore the checkpoint call. This proves the test actually guards the behavior.
 
-Run: `cargo test -p megle-core sustained_blob_writes_through_writer -- --nocapture`
+Run: `cargo test -p mangoo-core sustained_blob_writes_through_writer -- --nocapture`
 Expected: FAIL while checkpoint is commented out; PASS after restoring.
 
 - [ ] **Step 4: Format, commit**

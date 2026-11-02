@@ -152,9 +152,9 @@ const pluginsWindow = read("apps/web/src/features/plugins/PluginsWindow.tsx");
 const pluginCard = read("apps/web/src/features/plugins/PluginCard.tsx");
 const pluginDetail = read("apps/web/src/features/plugins/PluginDetail.tsx");
 const statusPill = read("apps/web/src/features/plugins/StatusPill.tsx");
-const oneDriveAccountSetup = read("apps/web/src/features/plugins/OneDriveAccountSetup.tsx");
-const oneDriveSetupWizard = read("apps/web/src/features/plugins/OneDriveSetupWizard.tsx");
-const oneDriveManifestTemplate = read("bundled-plugins/com.megle.onedrive/plugin.template.json");
+const pluginAccountSetup = read("apps/web/src/features/plugins/PluginAccountSetup.tsx");
+const pluginSetupWizard = read("apps/web/src/features/plugins/PluginSetupWizard.tsx");
+const configurableProviderFixture = JSON.parse(read("contracts/plugins/fixtures/valid-configurable-provider-v2.json"));
 const notificationWindow = read("apps/web/src/features/notifications/NotificationWindow.tsx");
 const notificationStatusView = read("apps/web/src/features/notifications/NotificationStatusView.tsx");
 const notificationHistoryView = read("apps/web/src/features/notifications/NotificationHistoryView.tsx");
@@ -174,6 +174,7 @@ const interfaceStyle = read("apps/web/src/features/settings/interfaceStyle.ts");
 const contextMenu = read("apps/web/src/features/file-ops/ContextMenu.tsx");
 const librarySwitcher = read("apps/web/src/features/library/LibrarySwitcher.tsx");
 const libraryGlyph = read("apps/web/src/features/library/libraryGlyph.tsx");
+const libraryAppearanceEditor = read("apps/web/src/features/library/LibraryAppearanceEditor.tsx");
 const desktopBridge = read("apps/web/src/core/desktop.ts");
 const coreClientContract = read("packages/core-client/src/generated-contract.ts");
 const coreClient = read("packages/core-client/src/client.ts");
@@ -292,9 +293,9 @@ for (const value of [
 }
 
 for (const [source, value, message] of [
-  [desktopMain, 'ipcMain.handle("megle:shell-ready"', "desktop main must expose a megle:shell-ready IPC handshake before the window can become visible"],
+  [desktopMain, 'ipcMain.handle("mangoo:shell-ready"', "desktop main must expose a mangoo:shell-ready IPC handshake before the window can become visible"],
   [preload, "notifyShellReady", "desktop preload must own the notifyShellReady bridge surface"],
-  [desktopBridge, "notifyDesktopShellReady", "desktop bridge helper must expose notifyDesktopShellReady so renderer code stays off window.megleDesktop"],
+  [desktopBridge, "notifyDesktopShellReady", "desktop bridge helper must expose notifyDesktopShellReady so renderer code stays off window.mangooDesktop"],
   [webMain, "notifyDesktopShellReady", "web entrypoint must notify desktop shell readiness before React effects can miss the startup timeout"],
   [app, "notifyDesktopShellReady", "App must notify desktop shell readiness after the shell mounts"]
 ]) {
@@ -735,32 +736,32 @@ for (const forbidden of [
 
 for (const [selector, checks, message] of [
   [
-    ".megle-overlay-scrollbar",
+    ".mangoo-overlay-scrollbar",
     [/position:\s*fixed/, /pointer-events:\s*auto/, /z-index:\s*240/, /opacity:\s*0/],
     "custom overlay scrollbar rail must be fixed, non-layout, pointer-interactive, and hidden by default"
   ],
   [
-    ".megle-overlay-scrollbar-thumb",
+    ".mangoo-overlay-scrollbar-thumb",
     [/pointer-events:\s*none/],
     "custom overlay scrollbar thumb must not receive pointer input while hidden"
   ],
   [
-    '.megle-overlay-scrollbar[data-scrollbar-visible="true"] .megle-overlay-scrollbar-thumb',
+    '.mangoo-overlay-scrollbar[data-scrollbar-visible="true"] .mangoo-overlay-scrollbar-thumb',
     [/pointer-events:\s*auto/],
     "custom overlay scrollbar thumb must receive pointer input while visible"
   ],
   [
-    '.megle-overlay-scrollbar[data-scrollbar-visible="true"] .megle-overlay-scrollbar-thumb',
+    '.mangoo-overlay-scrollbar[data-scrollbar-visible="true"] .mangoo-overlay-scrollbar-thumb',
     [/opacity:\s*0\.5/],
     "custom overlay scrollbar thumb must show at 50 percent opacity while the pointer is in the panel"
   ],
   [
-    '.megle-overlay-scrollbar[data-scrollbar-hover="true"] .megle-overlay-scrollbar-thumb',
+    '.mangoo-overlay-scrollbar[data-scrollbar-hover="true"] .mangoo-overlay-scrollbar-thumb',
     [/opacity:\s*0\.75/],
     "custom overlay scrollbar thumb must show at 75 percent opacity while hovered"
   ],
   [
-    '.megle-overlay-scrollbar[data-scrollbar-dragging="true"] .megle-overlay-scrollbar-thumb',
+    '.mangoo-overlay-scrollbar[data-scrollbar-dragging="true"] .mangoo-overlay-scrollbar-thumb',
     [/opacity:\s*1/],
     "custom overlay scrollbar thumb must show at full opacity only while dragged"
   ]
@@ -1380,7 +1381,9 @@ if (!centralPreviewStage) {
     "ChevronLeft",
     "ChevronRight",
     "central-preview-control",
-    "lucide-react"
+    "lucide-react",
+    "@phosphor-icons/react",
+    "design/icons"
   ]) {
     if (centralPreviewStage.includes(value)) {
       fail(`central preview must not render title/nav/close controls inside the stage: found ${value}`);
@@ -1522,20 +1525,20 @@ for (const value of [
 }
 
 for (const value of [
-  "OneDriveSetupWizard",
-  "配置 OneDrive",
-  "onedrive-connection-status",
+  "PluginSetupWizard",
+  "presentation?.setupLabel",
+  "plugin-connection-status",
   "重新配置",
   "切换账号",
   "退出账号"
 ]) {
-  if (!oneDriveAccountSetup.includes(value)) {
-    fail(`OneDrive concise setup entry contract missing ${value}`);
+  if (!pluginAccountSetup.includes(value)) {
+    fail(`Plugin concise setup entry contract missing ${value}`);
   }
 }
 for (const retiredValue of ["配置状态", "configurationStatus", "configurationStatusDescription"]) {
-  if (oneDriveAccountSetup.includes(retiredValue)) {
-    fail(`OneDrive setup must keep connection state in one location; found ${retiredValue}`);
+  if (pluginAccountSetup.includes(retiredValue)) {
+    fail(`Plugin setup must keep connection state in one location; found ${retiredValue}`);
   }
 }
 if (!statusPill.includes('ready: "Enable"')) {
@@ -1545,79 +1548,96 @@ if (pluginDetail.includes("账号或资源库仍引用此 Provider 时无法移�
   fail("PluginDetail must show the dependency explanation only after a rejected removal");
 }
 for (const retiredAction of [">登录 Microsoft 账号<", ">继续登录<", ">重新连接<"]) {
-  if (oneDriveAccountSetup.includes(retiredAction)) {
-    fail(`OneDrive primary setup action must remain stable; found ${retiredAction}`);
+  if (pluginAccountSetup.includes(retiredAction)) {
+    fail(`Plugin primary setup action must remain stable; found ${retiredAction}`);
   }
 }
 for (const value of [
-  "配置 OneDrive 应用",
-  "配置进度",
-  "注册并配置应用",
-  "新注册应用程序",
-  "保存 Client ID",
-  "登录验证",
-  "应用程序(客户端) ID",
-  "任何 Entra ID 租户 + 个人 Microsoft 帐户",
-  "Authentication (Preview) → 设置 → 允许公共客户端流 → 已启用",
-  "Files.ReadWrite.AppFolder",
-  "http://localhost/plugin-auth/callback",
-  "移动和桌面应用程序",
-  "允许公共客户端流",
-  "应用注册 → 新注册 → 新注册应用程序",
-  "Authentication (Preview) → 重定向 URI 配置 → 添加重定向 URI → 移动和桌面应用程序 → 重定向 URI",
-  "API 权限 → 添加权限 → Microsoft Graph → 委托的权限 → Files.ReadWrite.AppFolder → 添加权限",
-  "OverlayField",
-  "data-overlay-scroll-container",
-  "manual-response-uri",
-  "clientIdValid",
-  "allConfigurationChecksComplete",
-  "ModalSurface"
+  "配置进度", "配置说明", "保存配置", "登录验证", "presentation?.setupSteps",
+  "presentation?.helpLinks.map", "auth.openHelp(link.id)", "authentication?.manualRedirectUri",
+  "authentication.loopbackRedirectPath", "visibleConfigurationFields", "configurationFieldError",
+  "lockedFields.includes(field.id)", "auth.configurationPlan", "auth.confirmConfiguration()",
+  "auth.remoteAvailable", "OverlayField", "data-overlay-scroll-container", "manual-response-uri",
+  "allConfigurationChecksComplete", "ModalSurface"
 ]) {
-  if (!oneDriveSetupWizard.includes(value)) {
-    fail(`OneDrive sequential wizard contract missing ${value}`);
+  if (!pluginSetupWizard.includes(value)) fail(`Generic plugin sequential wizard contract missing ${value}`);
+}
+for (const value of ["com.mangoo.onedrive", "login.microsoftonline.com", "entra.microsoft.com", "Files.ReadWrite.AppFolder"]) {
+  if ([pluginSetupWizard, pluginAccountSetup, pluginDetail, pluginCard].some((source) => source.includes(value))) fail(`Shared plugin UI must use declarations instead of vendor coupling: ${value}`);
+}
+const setupContributions = configurableProviderFixture.contributions;
+if (
+  !Array.isArray(setupContributions?.configuration) ||
+  setupContributions.configuration.length < 1 ||
+  setupContributions.configuration.length > 8 ||
+  !setupContributions.configuration.some((field) => !field.hidden && !field.debugOnly) ||
+  !setupContributions.configuration.every((field) =>
+    ["uuid", "text", "choice", "https-url", "loopback-url"].includes(field.format))
+) {
+  fail("Generic setup fixture must retain bounded typed configuration fields and a visible editor");
+}
+const setupAuthentication = setupContributions?.authentication;
+if (
+  !setupAuthentication?.modes?.includes("loopback") ||
+  !setupAuthentication.modes.includes("manual-response-uri") ||
+  setupAuthentication.modes.length > 3 ||
+  !Array.isArray(setupAuthentication.authorizationHosts) ||
+  setupAuthentication.authorizationHosts.length < 1 ||
+  setupAuthentication.authorizationHosts.length > 8 ||
+  !setupAuthentication.manualRedirectUri || !setupAuthentication.loopbackRedirectPath
+) {
+  fail("Generic setup fixture must retain bounded authentication declarations for both completion modes");
+}
+const setupPresentation = setupContributions?.presentation;
+if (
+  !setupPresentation?.setupLabel || !setupPresentation.accountLabel ||
+  !Array.isArray(setupPresentation.helpLinks) ||
+  setupPresentation.helpLinks.length < 1 || setupPresentation.helpLinks.length > 4 ||
+  !Array.isArray(setupPresentation.setupSteps) ||
+  setupPresentation.setupSteps.length < 1 || setupPresentation.setupSteps.length > 8 ||
+  !setupPresentation.setupSteps.every((step) => step.helpLinkId === null ||
+    setupPresentation.helpLinks.some((link) => link.id === step.helpLinkId))
+) {
+  fail("Generic setup fixture must retain bounded help links and sequential setup instructions");
+}
+for (const retiredValue of ["Mangoo OneDrive Sync Provider", "启用 OneDrive", "批准所需权限", "不要选择", "不要创建", "User.Read", '"创建应用"', '"配置应用"']) {
+  if (pluginSetupWizard.includes(retiredValue) || pluginAccountSetup.includes(retiredValue)) {
+    fail(`Plugin retired setup contract must be absent: ${retiredValue}`);
   }
 }
-for (const retiredValue of ["Megle OneDrive Sync Provider", "启用 OneDrive", "批准所需权限", "不要选择", "不要创建", "User.Read", '"创建应用"', '"配置应用"']) {
-  if (oneDriveSetupWizard.includes(retiredValue) || oneDriveAccountSetup.includes(retiredValue)) {
-    fail(`OneDrive retired setup contract must be absent: ${retiredValue}`);
+for (const retiredValue of ["检查配置", "确认并继续", "配置将发生变化", "配置有效", "修改 Client ID", "plugin-client-id-card", "粘贴后，Mangoo 会先检查格式和配置影响。"]) {
+  if (pluginSetupWizard.includes(retiredValue) || stylesForChecks.includes(retiredValue)) {
+    fail(`Plugin wizard must not retain intermediate configuration presentation: ${retiredValue}`);
   }
 }
-for (const retiredValue of ["检查配置", "确认并继续", "配置将发生变化", "配置有效", "修改 Client ID", "onedrive-client-id-card", "粘贴后，Megle 会先检查格式和配置影响。"]) {
-  if (oneDriveSetupWizard.includes(retiredValue) || stylesForChecks.includes(retiredValue)) {
-    fail(`OneDrive wizard must not retain intermediate Client ID presentation: ${retiredValue}`);
-  }
+if (pluginSetupWizard.includes("Windows 使用本机浏览器自动回调。")) {
+  fail("Plugin wizard must not retain the Windows callback helper sentence");
 }
-if (oneDriveSetupWizard.includes("Windows 使用本机浏览器自动回调。")) {
-  fail("OneDrive wizard must not retain the Windows callback helper sentence");
-}
-if (!oneDriveManifestTemplate.includes('"name": "OneDrive Sync"')) {
-  fail("OneDrive bundled manifest must expose the concise display name");
-}
-if (/<button\b/.test(oneDriveSetupWizard) || /<button\b/.test(oneDriveAccountSetup)) {
-  fail("OneDrive independent actions must use LiquidGlassButton rather than legacy raw buttons");
+if (/<button\b/.test(pluginSetupWizard) || /<button\b/.test(pluginAccountSetup)) {
+  fail("Plugin independent actions must use LiquidGlassButton rather than legacy raw buttons");
 }
 for (const value of [
   "grid-template-rows: auto auto minmax(0, 1fr) auto",
   "height: min(640px, calc(100vh - 40px))",
   "grid-template-columns: repeat(4, minmax(0, 1fr))",
-  ".onedrive-setup-actions",
+  ".plugin-setup-actions",
   "justify-content: flex-end",
-  ".onedrive-setup-body[data-step=\"1\"]",
-  ".onedrive-setup-body:is([data-step=\"2\"], [data-step=\"4\"])",
-  ".onedrive-setup-client-id .overlay-field-control",
-  ".onedrive-setup-client-id .overlay-field-control:focus-within",
-  ".onedrive-setup-client-id .overlay-field-control:has(.overlay-field-input[aria-invalid=\"true\"])",
-  ".onedrive-setup-client-id .overlay-field[data-disabled=\"true\"] .overlay-field-control",
-  ".onedrive-client-id-input::placeholder",
-  ".onedrive-setup-client-id .overlay-field-error",
+  ".plugin-setup-body:is([data-step=\"1\"], [data-step=\"2\"], [data-step=\"3\"])",
+  ".plugin-setup-body[data-step=\"4\"]",
+  ".plugin-setup-configuration .overlay-field-control",
+  ".plugin-setup-configuration .overlay-field-control:focus-within",
+  ".plugin-setup-configuration .overlay-field-control:has(.overlay-field-input[aria-invalid=\"true\"])",
+  ".plugin-setup-configuration .overlay-field[data-disabled=\"true\"] .overlay-field-control",
+  ".plugin-configuration-input::placeholder",
+  ".plugin-setup-configuration .overlay-field-error",
   "appearance: none"
 ]) {
   if (!stylesForChecks.includes(value)) {
-    fail(`OneDrive stable wizard shell contract missing ${value}`);
+    fail(`Plugin stable wizard shell contract missing ${value}`);
   }
 }
-if (/type=["']password["']|client.?secret[^\n]{0,120}<input/i.test(oneDriveSetupWizard)) {
-  fail("OneDrive self-managed setup must not accept passwords or Client Secrets");
+if (/type=["']password["']|client.?secret[^\n]{0,120}<input/i.test(pluginSetupWizard)) {
+  fail("Plugin self-managed setup must not accept passwords or Client Secrets");
 }
 if (liquidGlassSurface.includes('".plugin-card"') || liquidGlassSurface.includes('".plugin-disclosure-summary"')) {
   fail("plugin navigation and disclosure summaries must not be registered as global pointer-glow owners");
@@ -1677,9 +1697,9 @@ for (const selector of [
     fail(`${selector} must limit feedback to disclosure text and chevron`);
   }
 }
-for (const retiredValue of ["预览更改", "收起高级配置", "onedrive-config-summary", "onedrive-auth-state", "配置 Client ID", "Megle 内置应用配置"]) {
-  if (oneDriveAccountSetup.includes(retiredValue)) {
-    fail(`OneDrive primary view must not render duplicate or obsolete presentation ${retiredValue}`);
+for (const retiredValue of ["预览更改", "收起高级配置", "plugin-config-summary", "plugin-auth-state", "配置 Client ID", "Mangoo 内置应用配置"]) {
+  if (pluginAccountSetup.includes(retiredValue)) {
+    fail(`Plugin primary view must not render duplicate or obsolete presentation ${retiredValue}`);
   }
 }
 
@@ -1865,6 +1885,7 @@ const migratedOverlaySourceEntries = [
   ["SearchBar", searchBar],
   ["LibrarySwitcher", librarySwitcher],
   ["libraryGlyph", libraryGlyph],
+  ["LibraryAppearanceEditor", libraryAppearanceEditor],
   ["ContextMenu", contextMenu],
   ["RenameDialog", renameDialog],
   ["MoveDialog", moveDialog],
@@ -1886,6 +1907,9 @@ for (const [label, source] of migratedOverlaySourceEntries) {
 }
 
 const migratedHoverFamilies = [
+  ".library-appearance-editor",
+  ".library-icon-picker-cell",
+  ".library-icon-picker-swatch",
   ".overlay-menu-item",
   ".filter-menu-item",
   ".library-switcher-row",
@@ -1901,7 +1925,7 @@ const migratedOverlayCssFamilies = [
   ".sort-menu-root",
   ".layout-menu-root",
   ".library-switcher",
-  ".library-icon-picker--overlay",
+  ".library-appearance-editor",
   ".context-menu",
   ".file-operation-dialog",
   ".notification-popover"
@@ -2314,7 +2338,7 @@ for (const selector of [
 }
 
 for (const value of [
-  "megle.interfaceStyle",
+  "mangoo.interfaceStyle",
   "DEFAULT_INTERFACE_STYLE",
   "windowCornerRadius",
   "panelControlCornerRadius",
@@ -2628,7 +2652,7 @@ if (!shortcutBindings) {
   fail("editable shortcut binding model missing");
 } else {
   for (const value of [
-    "megle.shortcutBindings.v1",
+    "mangoo.shortcutBindings.v1",
     "focusSearch",
     "renameSelected",
     "recycleDelete",
@@ -2950,7 +2974,7 @@ for (const selector of [
   }
 
   const focusBlocks = cssBlocksForExactSelector(stylesForChecks, `${selector}:focus-visible`);
-  if (!focusBlocks.some((block) => latestDeclarationValue(block, "outline")?.startsWith("2px solid"))) {
+  if (!focusBlocks.some((block) => latestDeclarationValue(block, "outline")?.startsWith("1px solid"))) {
     fail(`${selector} must retain a visible keyboard-focus outline after static border removal`);
   }
 }
@@ -2975,7 +2999,7 @@ if (/fractalNoise/.test(stylesForChecks)) {
 }
 
 if (
-  !stylesForChecks.includes("megle-blue-noise-dither") ||
+  !stylesForChecks.includes("mangoo-blue-noise-dither") ||
   !stylesForChecks.includes("feConvolveMatrix") ||
   !stylesForChecks.includes("type='turbulence'") ||
   !stylesForChecks.includes("numOctaves='1'")
@@ -3186,6 +3210,7 @@ const sidebarPointerScopeClasses = [
   ".library-switcher-main",
   ".library-switcher-actions",
   ".library-icon-picker-cell",
+  ".library-icon-picker-swatch",
   ".library-switcher-remove-menu-item",
   ".library-switcher-footer",
   ".shell-titlebar-primary-actions",
@@ -3218,9 +3243,8 @@ if (treePointerPseudoBlocks.some(({ block }) => latestDeclarationValue(block, "f
 }
 
 const treeHoverContentSelectors = [
-  ".tree-item:hover > .tree-disclosure",
-  ".tree-item:hover > .tree-label",
-  ".tree-item:hover > .tree-media-count"
+  ".tree-label:hover",
+  ".tree-label:hover > .tree-media-count"
 ];
 for (const selector of treeHoverContentSelectors) {
   const blocks = cssBlocksForExactSelector(stylesForChecks, selector);
@@ -3242,7 +3266,7 @@ for (const selector of treeHoverContentSelectors) {
 
 for (const selector of [
   ".tree-item .tree-disclosure:active:not(:disabled)",
-  ".tree-item .tree-label:active:not(:disabled)"
+  ".tree-item:not(.selected) .tree-label:active:not(:disabled)"
 ]) {
   const blocks = cssBlocksForExactSelector(stylesForChecks, selector);
   if (
@@ -3254,6 +3278,36 @@ for (const selector of [
   ) {
     fail(`${selector} must suppress only the pressed background while inheriting global press scale motion`);
   }
+}
+
+// Folder content owns selection, focus and pointer paint; the caret is a
+// separate action whose foreground retains the folder identity color.
+for (const selector of [".tree-item.selected", '.tree-item[data-tree-locate-highlight="true"]', '.tree-list .tree-item[role="treeitem"][data-tree-sticky-pinned="true"]']) {
+  for (const block of cssBlocksForExactSelector(stylesForChecks, selector)) {
+    if (hasNonTransparentBackground(block) || hasNonNoneDeclaration(block, "box-shadow") || hasNonNoneDeclaration(block, "animation")) {
+      fail(`tree row paint must exclude the disclosure slot: ${selector}`);
+    }
+  }
+}
+if (!librarySidebar.includes('data-interactive-pointer-target-selector=".tree-label"')) {
+  fail("tree pointer geometry must resolve to the content button, excluding disclosure");
+}
+if (!cssBlocksForExactSelector(stylesForChecks, ".tree-item.selected > .tree-label").some(hasNonTransparentBackground)
+  || !cssBlocksForExactSelector(stylesForChecks, '.tree-item[data-tree-locate-highlight="true"] > .tree-label').some((block) => latestDeclarationValue(block, "animation") !== null)) {
+  fail("tree selection and locate feedback must remain visible on the content button");
+}
+if (!cssBlocksForExactSelector(stylesForChecks, ".tree-disclosure").some((block) => latestDeclarationValue(block, "color") === "var(--tree-identity-color, #ffffff)")) {
+  fail("tree disclosure must follow its own folder identity color");
+}
+for (const selector of [".tree-guides", ".tree-guide"]) {
+  if (!cssBlocksForExactSelector(stylesForChecks, selector).some((block) => latestDeclarationValue(block, "pointer-events") === "none")) {
+    fail(`${selector} must never intercept folder input`);
+  }
+}
+if (!cssBlocksForExactSelector(stylesForChecks, '.tree-guide[data-tree-guide-last="true"]::after').some((block) => latestDeclarationValue(block, "content") === '""')
+  || cssBlocksForExactSelector(stylesForChecks, '.tree-guide[data-tree-guide-connector="true"]::after').length > 0
+  || cssBlocksForExactSelector(stylesForChecks, '.tree-guide::after').length > 0) {
+  fail("tree horizontal guides must be limited to the terminal bend of each sibling group");
 }
 
 if (!settingsView.includes("settings-style-slider-control")) {
@@ -3305,26 +3359,54 @@ if (glassBackdropBlocks.some((block) => /(?<![\w-])filter\s*:\s*url\(/.test(bloc
   fail("liquid glass backdrop must not apply an isolating filter: url() (breaks backdrop-filter compositing over acrylic)");
 }
 
+// The native border owns the static stroke; the pseudo-element is only the
+// shared localized pointer gradient, never a second frame or bevel.
 const glassStructureBorderBlocks = cssBlocksForExactSelector(stylesForChecks, ".liquid-glass::after");
-if (
-  !glassStructureBorderBlocks.some(
-    (block) =>
-      /border:\s*1px\s+solid\s+var\(--glass-border-current\)/.test(block) &&
-      /inset\s+0\s+1px\s+0\s+var\(--glass-inner-light\)/.test(block) &&
-      /inset\s+0\s+-1px\s+0\s+rgba\(255,\s*255,\s*255,\s*0\.06\)/.test(block)
-  )
-) {
-  fail("liquid glass structural edge highlights must be drawn on the unfiltered border layer");
+if (!glassStructureBorderBlocks.some((block) =>
+  latestDeclarationValue(block, "border") === "0" && latestDeclarationValue(block, "box-shadow") === "none"
+) || !cssBlocksForExactSelector(stylesForChecks, ".liquid-glass").some((block) =>
+  latestDeclarationValue(block, "border") === "1px solid var(--glass-border-current)"
+)) {
+  fail("liquid glass must own one native border with no pseudo-element frame or bevel");
+}
+if (!cssBlocksForExactSelector(stylesForChecks, ':where(button, [role="button"])').some((block) =>
+  latestDeclarationValue(block, "border") === "1px solid var(--glass-border)"
+)) fail("default buttons must replace the browser outset bevel with a single solid border");
+const sharedFocusBlocks = cssBlocksForExactSelector(stylesForChecks,
+  ':where(button, [role="button"], input, select, textarea):focus-visible');
+if (!sharedFocusBlocks.some((block) =>
+  latestDeclarationValue(block, "outline") === "1px solid var(--interactive-focus)" &&
+  latestDeclarationValue(block, "outline-offset") === "-1px" &&
+  latestDeclarationValue(block, "box-shadow") === null
+)) fail("shared keyboard focus must replace the same one-pixel boundary without a shadow ring");
+for (const [name, css] of [["styles", stylesForChecks], ["overlays", overlayStylesForChecks]]) {
+  if (/border(?:-style)?\s*:[^;]*(?:outset|inset|double|groove|ridge)/.test(css)) fail(`${name} must not reintroduce native composite border styles`);
+  for (const match of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    if (!/:focus(?:-visible|-within)?\b/.test(match[1])) continue;
+    const outline = latestDeclarationValue(match[2], "outline");
+    if (outline && !/^(?:0|none)$/.test(outline) &&
+      (!/^1px solid /.test(outline) || latestDeclarationValue(match[2], "outline-offset") !== "-1px")) {
+      fail(`${name} focus must use one inward 1px boundary: ${match[1].trim()}`);
+    }
+  }
+  for (const declaration of css.matchAll(/(?:box-shadow|--[\w-]*shadow)\s*:\s*([^;]+);/g)) {
+    const layers = declaration[1].split(/,(?![^()]*\))/);
+    for (const layer of layers) {
+      if (/\binset\b/.test(layer) || /(?:^|\s)0(?:px)?\s+0(?:px)?\s+0(?:px)?\s+(?!100vmax)[1-9]/.test(layer)) {
+        fail(`${name} must not draw inset bevels or zero-blur control shadow rings: ${layer.trim()}`);
+      }
+    }
+  }
 }
 
 const glassLensBlocks = cssBlocksForExactSelector(stylesForChecks, ".liquid-glass-lens");
-if (!glassLensBlocks.some((block) => /filter:\s*url\("#megle-liquid-glass-edge"\)/.test(block))) {
+if (!glassLensBlocks.some((block) => /filter:\s*url\("#mangoo-liquid-glass-edge"\)/.test(block))) {
   fail("liquid glass lens layer must keep SVG edge/refraction filter active");
 }
 
 for (const value of [
-  'id="megle-liquid-glass-refraction"',
-  'id="megle-liquid-glass-edge"',
+  'id="mangoo-liquid-glass-refraction"',
+  'id="mangoo-liquid-glass-edge"',
   "feDisplacementMap"
 ]) {
   if (!liquidGlassSurface.includes(value)) {
@@ -3434,7 +3516,7 @@ for (const value of [
   "feDisplacementMap",
   "feTurbulence",
   "feColorMatrix",
-  "megle-liquid-glass-refraction"
+  "mangoo-liquid-glass-refraction"
 ]) {
   if (!liquidGlassSurface.includes(value)) {
     fail(`liquid glass primitive must define SVG refraction/displacement filter: missing ${value}`);
@@ -3551,8 +3633,8 @@ for (const [label, source, tones] of ctaFiles) {
   }
 }
 
-if (onboardingHero.includes("Welcome to Megle")) {
-  fail("Onboarding empty state must not render the boxed Welcome to Megle header");
+if (onboardingHero.includes("Welcome to Mangoo")) {
+  fail("Onboarding empty state must not render the boxed Welcome to Mangoo header");
 }
 
 if (onboardingHero.includes("LiquidGlassSurface") || onboardingHero.includes("onboarding-hero-card")) {
@@ -3661,16 +3743,8 @@ const workbenchColumnAfterShadow = latestDeclarationValueAcrossBlocks(
   workbenchColumnAfterBlocks,
   "box-shadow"
 );
-if (
-  workbenchColumnAfterBlocks.length === 0 ||
-  workbenchColumnAfterShadow === null ||
-  !/inset\s+0\s+1px\s+0\s+var\(--glass-inner-light\)/i.test(workbenchColumnAfterShadow) ||
-  !/inset\s+0\s+-1px\s+0\s+rgba\(255,\s*255,\s*255,\s*0\.06\)/i.test(
-    workbenchColumnAfterShadow
-  ) ||
-  /inset\s+0\s+0\s+\d+px/i.test(workbenchColumnAfterShadow)
-) {
-  fail("structural pane dividers must keep the top/bottom 1px highlights without a broad four-edge inset glow");
+if (workbenchColumnAfterBlocks.length === 0 || workbenchColumnAfterShadow !== "none") {
+  fail("structural pane dividers must use the native stroke without inset highlights");
 }
 
 for (const selector of [

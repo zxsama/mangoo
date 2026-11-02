@@ -141,7 +141,7 @@ Client rules:
 
 - Update OpenAPI first.
 - Update generated contract/client/types.
-- `apps/web` must call these through `@megle/core-client`, not raw `fetch`.
+- `apps/web` must call these through `@mangoo/core-client`, not raw `fetch`.
 
 ## UI Plan
 
@@ -269,7 +269,7 @@ Schema:
 
 ### Real Desktop Pressure Tests
 
-Use `D:\Megle\start-desktop.cmd` with `Y:\Repository\Billfish\Artists`.
+Use `D:\Mangoo\start-desktop.cmd` with `Y:\Repository\Billfish\Artists`.
 
 Cold-cache scenarios:
 

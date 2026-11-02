@@ -129,6 +129,36 @@ impl SyncCoordinator {
         }
     }
 
+    fn begin_library_work(
+        &self,
+        library_uuid: &str,
+    ) -> anyhow::Result<Option<super::provider::ProviderWork>> {
+        let Some(descriptor) = self.registry.library(library_uuid)? else {
+            return Ok(None);
+        };
+        if crate::library_manager::verify_descriptor_identity(&descriptor).is_err() {
+            self.registry.isolate_unavailable_library(library_uuid)?;
+            return Ok(None);
+        }
+        let Some(binding) = self.registry.binding_transport(library_uuid, "library")? else {
+            return Ok(None);
+        };
+        if !matches!(
+            binding.state.as_str(),
+            "preparing" | "capturing" | "seed_ready" | "publishing" | "active" | "restoring"
+        ) {
+            return Ok(None);
+        }
+        if self
+            .registry
+            .require_ready_sync_provider(&binding.plugin_id, &binding.account_uuid)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        Ok(self.providers.begin_work(&binding.plugin_id).ok())
+    }
+
     pub fn provider_manager(&self) -> super::provider::ProviderManager {
         self.providers.clone()
     }
@@ -138,6 +168,9 @@ impl SyncCoordinator {
         library_uuid: &str,
         root_uuid: uuid::Uuid,
     ) -> anyhow::Result<(crate::sync_folders::RootSnapshot, Option<String>)> {
+        let _work = self
+            .begin_library_work(library_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("provider-not-ready"))?;
         let binding = self
             .registry
             .binding_transport(library_uuid, "library")?
@@ -249,6 +282,9 @@ impl SyncCoordinator {
     pub async fn reconcile_pending_unbinds(&self) -> anyhow::Result<usize> {
         let mut completed = 0usize;
         for plan in self.registry.pending_unbind_reconciliations()? {
+            let Ok(work) = self.providers.begin_work(&plan.plugin_id) else {
+                continue;
+            };
             let Some(provider) = self
                 .providers
                 .resolve(&plan.plugin_id, &plan.account_uuid)?
@@ -280,6 +316,7 @@ impl SyncCoordinator {
                 Ok::<(), anyhow::Error>(())
             }
             .await;
+            work.check_current()?;
             match visibility {
                 Ok(()) => {
                     self.registry
@@ -301,6 +338,9 @@ impl SyncCoordinator {
     pub async fn reconcile_pending_root_visibility(&self) -> anyhow::Result<usize> {
         let mut completed = 0usize;
         for pending in self.registry.pending_root_visibility_reconciliations()? {
+            let Ok(work) = self.providers.begin_work(&pending.provider_id) else {
+                continue;
+            };
             let Some(provider) = self
                 .providers
                 .resolve(&pending.provider_id, &pending.account_uuid)?
@@ -349,6 +389,7 @@ impl SyncCoordinator {
                     }
                 }
             }
+            work.check_current()?;
             if let Some(error) = retry_error {
                 self.registry.retry_root_visibility_reconciliation(
                     &pending.operation_uuid,
@@ -537,26 +578,36 @@ impl SyncCoordinator {
                 if let Some((library_uuid, path, writer)) = active.as_ref() {
                     task_in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                     let _guard = SchedulerTurnGuard(std::sync::Arc::clone(&task_in_flight));
-                    match coordinator
-                        .run_active_metadata_turn(library_uuid, path, writer)
-                        .await
-                    {
-                        Ok(result) if !result.capture_pending => {
-                            let _ = coordinator
-                                .registry
-                                .record_sync_turn_success(library_uuid, true);
+                    let lifecycle = coordinator.begin_library_work(library_uuid).ok().flatten();
+                    if let Some(lifecycle) = lifecycle {
+                        match coordinator
+                            .run_active_metadata_turn(library_uuid, path, writer)
+                            .await
+                        {
+                            Ok(result)
+                                if !result.capture_pending && lifecycle.check_current().is_ok() =>
+                            {
+                                let _ = coordinator
+                                    .registry
+                                    .record_sync_turn_success(library_uuid, true);
+                            }
+                            Ok(_) => {}
+                            Err(error) if lifecycle.check_current().is_ok() => {
+                                let code = normalize_sync_error_code(&error);
+                                let _ = coordinator
+                                    .registry
+                                    .record_sync_turn_error(library_uuid, &code);
+                                tracing::warn!(%error,%library_uuid,"active sync metadata turn failed");
+                            }
+                            Err(_) => {}
                         }
-                        Ok(_) => {}
-                        Err(error) => {
-                            let code = normalize_sync_error_code(&error);
-                            let _ = coordinator
-                                .registry
-                                .record_sync_turn_error(library_uuid, &code);
-                            tracing::warn!(%error,%library_uuid,"active sync metadata turn failed");
+                        if lifecycle.check_current().is_ok() {
+                            if let Err(error) =
+                                coordinator.refresh_pending_metrics(library_uuid, path)
+                            {
+                                tracing::warn!(%error,"refresh sync pending metrics failed");
+                            }
                         }
-                    }
-                    if let Err(error) = coordinator.refresh_pending_metrics(library_uuid, path) {
-                        tracing::warn!(%error,"refresh sync pending metrics failed");
                     }
                 }
 
@@ -595,25 +646,29 @@ impl SyncCoordinator {
                         };
                         let Some(_permit) = permit else { return };
                         let path = library.local_data_dir.join("catalog.sqlite");
+                        let Some(lifecycle) = coordinator.begin_library_work(&library.library_uuid).ok().flatten() else { return };
                         match coordinator
                             .run_library_metadata_turn(&library.library_uuid, &path)
                             .await
                         {
-                            Ok(result) if !result.capture_pending => {
+                            Ok(result) if !result.capture_pending && lifecycle.check_current().is_ok() => {
                                 let _ = coordinator
                                     .registry
                                     .record_sync_turn_success(&library.library_uuid, false);
                             }
                             Ok(_) => {}
-                            Err(error) => {
+                            Err(error) if lifecycle.check_current().is_ok() => {
                                 let code = normalize_sync_error_code(&error);
                                 let _ = coordinator
                                     .registry
                                     .record_sync_turn_error(&library.library_uuid, &code);
                                 tracing::warn!(%error,library_uuid=%library.library_uuid,"dormant sync metadata turn failed");
                             }
+                            Err(_) => {}
                         }
-                        if let Err(error) = coordinator.refresh_pending_metrics(&library.library_uuid,&path) { tracing::warn!(%error,"refresh sync pending metrics failed"); }
+                        if lifecycle.check_current().is_ok() {
+                            if let Err(error) = coordinator.refresh_pending_metrics(&library.library_uuid,&path) { tracing::warn!(%error,"refresh sync pending metrics failed"); }
+                        }
                     });
                 }
                 while let Some(result) = metadata_turns.join_next().await {
@@ -628,14 +683,21 @@ impl SyncCoordinator {
                 if let Some((library_uuid, path, writer)) = active.as_ref() {
                     task_in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                     let _guard = SchedulerTurnGuard(std::sync::Arc::clone(&task_in_flight));
-                    if let Err(error) = coordinator
-                        .run_active_media_turn(library_uuid, path, writer)
-                        .await
-                    {
-                        tracing::warn!(%error,%library_uuid,"active sync media turn failed");
-                    }
-                    if let Err(error) = coordinator.refresh_pending_metrics(library_uuid, path) {
-                        tracing::warn!(%error,"refresh sync pending metrics failed");
+                    let lifecycle = coordinator.begin_library_work(library_uuid).ok().flatten();
+                    if let Some(lifecycle) = lifecycle {
+                        if let Err(error) = coordinator
+                            .run_active_media_turn(library_uuid, path, writer)
+                            .await
+                        {
+                            tracing::warn!(%error,%library_uuid,"active sync media turn failed");
+                        }
+                        if lifecycle.check_current().is_ok() {
+                            if let Err(error) =
+                                coordinator.refresh_pending_metrics(library_uuid, path)
+                            {
+                                tracing::warn!(%error,"refresh sync pending metrics failed");
+                            }
+                        }
                     }
                 }
                 let mut media_turns = tokio::task::JoinSet::new();
@@ -650,13 +712,16 @@ impl SyncCoordinator {
                             return;
                         }
                         let path = library.local_data_dir.join("catalog.sqlite");
+                        let Some(lifecycle) = coordinator.begin_library_work(&library.library_uuid).ok().flatten() else { return };
                         if let Err(error) = coordinator
                             .run_dormant_media_turn(&library.library_uuid, &path)
                             .await
                         {
                             tracing::warn!(%error,library_uuid=%library.library_uuid,"dormant sync media turn failed");
                         }
-                        if let Err(error) = coordinator.refresh_pending_metrics(&library.library_uuid,&path) { tracing::warn!(%error,"refresh sync pending metrics failed"); }
+                        if lifecycle.check_current().is_ok() {
+                            if let Err(error) = coordinator.refresh_pending_metrics(&library.library_uuid,&path) { tracing::warn!(%error,"refresh sync pending metrics failed"); }
+                        }
                     });
                 }
                 while let Some(result) = media_turns.join_next().await {
@@ -682,6 +747,9 @@ impl SyncCoordinator {
             .await
             .map_err(|_| anyhow::anyhow!("sync metadata budget closed"))?;
         for transport in self.registry.provider_root_transports()? {
+            let Ok(work) = self.providers.begin_work(&transport.plugin_id) else {
+                continue;
+            };
             let Some(provider) = self
                 .providers
                 .resolve(&transport.plugin_id, &transport.account_uuid)?
@@ -694,6 +762,7 @@ impl SyncCoordinator {
             let mut pages = 0usize;
             let mut reset_attempted = false;
             loop {
+                work.check_current()?;
                 pages += 1;
                 if pages > 1024 {
                     anyhow::bail!("provider root pagination exceeded the per-turn safety limit");
@@ -755,6 +824,7 @@ impl SyncCoordinator {
                     .await?;
                     discovered.push(candidate);
                 }
+                work.check_current()?;
                 page_token = page.page_token.clone();
                 completed_cursor = page.completed_cursor.clone().or(completed_cursor);
                 if let Some(next_page) = page_token.as_deref() {
@@ -815,6 +885,12 @@ impl SyncCoordinator {
         library_uuid: &str,
         catalog_path: &Path,
     ) -> anyhow::Result<SyncTurnResult> {
+        let Some(work) = self.begin_library_work(library_uuid)? else {
+            return Ok(SyncTurnResult {
+                capture_pending: true,
+                ..Default::default()
+            });
+        };
         let _metadata_permit = self.metadata_budget.acquire().await?;
         if self.registry.sync_capture_boundary_pending(library_uuid)? {
             return Ok(SyncTurnResult {
@@ -833,22 +909,27 @@ impl SyncCoordinator {
         }
         let runtime = DormantSyncRuntime::new(library_uuid, catalog_path, self.leases.clone());
         let root_bindings = self.catalog_root_binding_records(library_uuid)?;
+        work.check_current()?;
         let (host_vector, host_metadata) = self.registry.host_checkpoint_snapshot(library_uuid)?;
         let spool_dir = catalog_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("sync-spool");
+        work.check_current()?;
         self.apply_host_spool(&spool_dir)?;
         let published_for_catalog = published.clone();
         let _apply_permit = self.apply_budget.acquire().await?;
+        let apply_work = work.clone();
         let result = runtime
             .run_turn(move |database| {
+                apply_work.check_current()?;
                 Self::project_root_binding_records(database, root_bindings)?;
                 commit_published_segments(database.connection_for_fsops(), &published_for_catalog)?;
                 perform_turn(database, host_vector, host_metadata, spool_dir)
             })
             .await
             .context("apply dormant Catalog turn")?;
+        work.check_current()?;
         self.reconcile_remote_root_inventory(library_uuid, catalog_path)
             .context("reconcile remote synchronized-root inventory")?;
         self.finish_seed_if_ready(library_uuid, &result)
@@ -973,12 +1054,14 @@ impl SyncCoordinator {
             )
             .context("materialize multi-root staging Catalog")?;
         } else {
+            let content = self.registry.restore_content_paths(library_uuid)?;
+            let content = content.first().context("restore-content-target-missing")?;
             super::persistence::materialize_staging_catalog(
                 checkpoint,
                 &staging,
                 uuid::Uuid::parse_str(&descriptor.root_uuid)?,
                 self.registry.device_uuid()?,
-                &descriptor.managed_root,
+                Path::new(content),
             )
             .context("materialize staging Catalog")?;
         }
@@ -1027,6 +1110,12 @@ impl SyncCoordinator {
         catalog_path: &Path,
         writer: &crate::db::DbWriter,
     ) -> anyhow::Result<SyncTurnResult> {
+        let Some(work) = self.begin_library_work(library_uuid)? else {
+            return Ok(SyncTurnResult {
+                capture_pending: true,
+                ..Default::default()
+            });
+        };
         let _metadata_permit = self.metadata_budget.acquire().await?;
         // Enable/retry commits Host intent before its asynchronous Catalog capture.
         // This is a waiting boundary, not a failed capture or permission to seed.
@@ -1039,22 +1128,27 @@ impl SyncCoordinator {
         let published = self
             .provider_transport_turn(library_uuid, catalog_path)
             .await?;
+        work.check_current()?;
         let (host_vector, host_metadata) = self.registry.host_checkpoint_snapshot(library_uuid)?;
         let root_bindings = self.catalog_root_binding_records(library_uuid)?;
         let spool_dir = catalog_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("sync-spool");
+        work.check_current()?;
         self.apply_host_spool(&spool_dir)?;
         let published_for_catalog = published.clone();
         let _apply_permit = self.apply_budget.acquire().await?;
+        let apply_work = work.clone();
         let result = writer
             .write_authoritative_without_wake(move |database| {
+                apply_work.check_current()?;
                 Self::project_root_binding_records(database, root_bindings)?;
                 commit_published_segments(database.connection_for_fsops(), &published_for_catalog)?;
                 perform_turn(database, host_vector, host_metadata, spool_dir)
             })
             .await?;
+        work.check_current()?;
         self.reconcile_remote_root_inventory(library_uuid, catalog_path)?;
         self.finish_seed_if_ready(library_uuid, &result)?;
         self.commit_host_published_frontier(library_uuid, &published)?;
@@ -1067,6 +1161,12 @@ impl SyncCoordinator {
         library_uuid: &str,
         writer: &crate::db::DbWriter,
     ) -> anyhow::Result<()> {
+        let Some(lifecycle) = self.begin_library_work(library_uuid)? else {
+            return Ok(());
+        };
+        let admitted = lifecycle.clone();
+        let writer =
+            writer.with_write_admission(std::sync::Arc::new(move || admitted.check_current()));
         let roots = self.registry.pending_root_reconciliations()?;
         for (_, root_uuid) in roots
             .into_iter()
@@ -1102,6 +1202,7 @@ impl SyncCoordinator {
                         )
                     })
                     .await;
+                lifecycle.check_current()?;
                 match applied {
                     Ok(()) => self
                         .registry
@@ -1199,6 +1300,9 @@ impl SyncCoordinator {
         library_uuid: &str,
         catalog_path: &Path,
     ) -> anyhow::Result<()> {
+        let Some(_work) = self.begin_library_work(library_uuid)? else {
+            return Ok(());
+        };
         let _media_permit = self.media_budget.acquire().await?;
         let database = crate::db::Database::open(catalog_path)?;
         database.apply_migrations()?;
@@ -1328,6 +1432,10 @@ impl SyncCoordinator {
         library_uuid: &str,
         catalog_path: &Path,
     ) -> anyhow::Result<()> {
+        let Some(lifecycle) = self.begin_library_work(library_uuid)? else {
+            return Ok(());
+        };
+        lifecycle.check_current()?;
         self.refresh_pending_metrics(library_uuid, catalog_path)?;
         let database = crate::db::Database::open(catalog_path)?;
         let connection = database.connection_for_fsops();
@@ -1399,7 +1507,10 @@ impl SyncCoordinator {
             };
             let database = crate::db::Database::open(catalog_path)?;
             database.apply_migrations()?;
-            let writer = crate::db::DbWriter::spawn(database);
+            let admitted = lifecycle.clone();
+            let writer = crate::db::DbWriter::spawn(database).with_write_admission(
+                std::sync::Arc::new(move || admitted.check_current().map_err(anyhow::Error::from)),
+            );
             let publish = writer
                 .write_authoritative(move |database| {
                     database
@@ -1420,6 +1531,9 @@ impl SyncCoordinator {
         catalog_path: &Path,
         writer: &crate::db::DbWriter,
     ) -> anyhow::Result<()> {
+        let Some(_work) = self.begin_library_work(library_uuid)? else {
+            return Ok(());
+        };
         let _media_permit = self.media_budget.acquire().await?;
         let scheduler_writer = writer.without_authoritative_commit_wake();
         self.run_media_turn(library_uuid, catalog_path, &scheduler_writer)
@@ -1450,6 +1564,8 @@ impl SyncCoordinator {
         else {
             return Ok(());
         };
+        let work = self.providers.begin_work(&binding.plugin_id)?;
+        let writer = writer.with_write_admission(std::sync::Arc::new(move || work.check_current()));
         let library_data_root = catalog_path.parent().unwrap_or_else(|| Path::new("."));
         let object_root = library_data_root.join("media-objects");
         let workers = {
@@ -2231,7 +2347,7 @@ fn perform_turn(
     let apply_transaction_micros = apply_started.elapsed().as_micros() as u64;
     advance_bulk_turn(connection)?;
     let portable_checkpoint = latest_portable_checkpoint(connection)?;
-    let pending: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sync_publication_intents WHERE state IN ('pending-hash','pending-manifest','ready','failed')) OR EXISTS(SELECT 1 FROM media_publication_jobs WHERE phase NOT IN ('event-published','cancelled','archived'))",[],|row|row.get(0))?;
+    let pending: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM sync_file_seed_progress) OR EXISTS(SELECT 1 FROM sync_publication_intents WHERE state IN ('pending-hash','pending-manifest','ready','failed')) OR EXISTS(SELECT 1 FROM media_publication_jobs WHERE phase NOT IN ('event-published','cancelled','archived'))",[],|row|row.get(0))?;
     let current: Option<(Vec<u8>,i64)> = connection.query_row("SELECT checkpoint_uuid,capture_local_mutation_generation FROM sync_checkpoints WHERE state='ready' ORDER BY rowid DESC LIMIT 1",[],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
     let matches = if let Some((id, generation)) = &current {
         let local_generation: i64 = connection.query_row(
@@ -2348,6 +2464,43 @@ fn commit_published_segments(
         )?;
     transaction.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn publish_test_catalog_segments(
+    writer: &crate::db::DbWriter,
+    provider: &dyn super::provider::SyncProvider,
+    context: &super::provider::TransportContext,
+    spool: PathBuf,
+) -> anyhow::Result<()> {
+    let segments=writer.write_authoritative(move |db| {
+        while seal_next_outbox_segment(db.connection_for_fsops(),&spool)? {}
+        let mut query=db.connection_for_fsops().prepare("SELECT segment_uuid,actor_epoch,last_seq,spool_path FROM sync_segments WHERE state='sealed' ORDER BY actor_epoch,first_seq")?;
+        let segments=query.query_map([],|row|Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,u64>(2)?,row.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(segments)
+    }).await?;
+    let mut published = Vec::new();
+    for (id, actor, last_seq, path) in segments {
+        let bytes = std::fs::read(path)?;
+        let hash = super::codec::sha256(&bytes);
+        let key = format!("segments/{}.json", hex_hash(&hash));
+        provider
+            .object_put_immutable(context, &key, &bytes, hash)
+            .await?;
+        published.push(PublishedSegment {
+            segment_uuid: id
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid segment id"))?,
+            actor_epoch: uuid::Uuid::from_slice(&actor)?,
+            last_seq,
+            object_key: key,
+        });
+    }
+    writer
+        .write_authoritative(move |db| {
+            commit_published_segments(db.connection_for_fsops(), &published)
+        })
+        .await
 }
 
 fn seal_next_outbox_segment(
@@ -2576,8 +2729,24 @@ mod tests {
 
     #[tokio::test]
     async fn descriptor_refresh_enrolled_roots_media_discovery_and_idle() {
-        let base =
-            std::env::temp_dir().join(format!("megle-descriptor-refresh-{}", uuid::Uuid::now_v7()));
+        fn storage_marker(path: &std::path::Path, library: uuid::Uuid, root: uuid::Uuid) -> String {
+            std::fs::create_dir_all(path).unwrap();
+            crate::library_path::atomic_write_marker_guarded(
+                &crate::library_path::SafeDirectory::open(path).unwrap(),
+                &crate::library_path::LibraryMarker {
+                    format_version: crate::library_path::STORAGE_FORMAT_VERSION,
+                    library_uuid: library.to_string(),
+                    root_uuid: root.to_string(),
+                    state: crate::library_path::MarkerState::Committed,
+                    creation_txn_uuid: uuid::Uuid::now_v7().to_string(),
+                },
+            )
+            .unwrap()
+        }
+        let base = std::env::temp_dir().join(format!(
+            "mangoo-descriptor-refresh-{}",
+            uuid::Uuid::now_v7()
+        ));
         std::fs::create_dir_all(&base).unwrap();
         let library = uuid::Uuid::now_v7();
         let library_root = uuid::Uuid::now_v7();
@@ -2593,11 +2762,11 @@ mod tests {
                     icon: None,
                     color: None,
                     local_data_dir: base.join("catalog"),
-                    managed_root: base.join("managed"),
+                    managed_root: base.join("catalog"),
                     lifecycle_state: "ready".into(),
                     binding_state: "local-only".into(),
                     availability: "available".into(),
-                    marker_identity: "fixture".into(),
+                    marker_identity: storage_marker(&base.join("catalog"), library, library_root),
                 },
             )
             .unwrap();
@@ -3040,11 +3209,11 @@ mod tests {
                     icon: None,
                     color: None,
                     local_data_dir: restore_root.clone(),
-                    managed_root: restore_root.join("managed"),
+                    managed_root: restore_root.clone(),
                     lifecycle_state: "ready".into(),
                     binding_state: "local-only".into(),
                     availability: "available".into(),
-                    marker_identity: "fixture".into(),
+                    marker_identity: storage_marker(&restore_root, library, library_root),
                 },
             )
             .unwrap();
@@ -3652,7 +3821,7 @@ mod tests {
     #[tokio::test]
     async fn unbind_reconciliation_requires_observable_remote_descriptor() {
         let base = std::env::temp_dir().join(format!(
-            "megle-unbind-reconciliation-{}",
+            "mangoo-unbind-reconciliation-{}",
             uuid::Uuid::now_v7()
         ));
         std::fs::create_dir_all(&base).unwrap();
@@ -3733,7 +3902,7 @@ mod tests {
     #[tokio::test]
     async fn inactive_scheduler_is_cancellable_and_joinable() {
         let base = std::env::temp_dir().join(format!(
-            "megle-sync-scheduler-cancel-{}",
+            "mangoo-sync-scheduler-cancel-{}",
             uuid::Uuid::now_v7()
         ));
         std::fs::create_dir_all(&base).unwrap();
@@ -3752,7 +3921,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_media_binding_remains_fenced_against_late_turns() {
         let base = std::env::temp_dir().join(format!(
-            "megle-media-binding-cancel-{}",
+            "mangoo-media-binding-cancel-{}",
             uuid::Uuid::now_v7()
         ));
         std::fs::create_dir_all(&base).unwrap();
@@ -4075,7 +4244,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "invoked by tools/bench/sync-protocol-bench.mjs"]
     async fn sync_protocol_acceptance_probe() {
-        let base = std::env::temp_dir().join(format!("megle-sync-bench-{}", uuid::Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-sync-bench-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&base).unwrap();
         let host = Arc::new(HostRegistry::open(base.join("host.sqlite")).unwrap());
         let leases = RuntimeLeases::default();
@@ -4287,7 +4456,7 @@ mod tests {
             .unwrap();
         let database = Database::open(&path).unwrap();
         database.apply_migrations().unwrap();
-        let asset_count = std::env::var("MEGLE_SYNC_BENCH_ASSETS")
+        let asset_count = std::env::var("MANGOO_SYNC_BENCH_ASSETS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1_000_000);
@@ -4649,11 +4818,11 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper for abrupt kill probe"]
     fn sync_protocol_kill_child() {
-        let Some(path) = std::env::var_os("MEGLE_SYNC_KILL_DB").map(PathBuf::from) else {
+        let Some(path) = std::env::var_os("MANGOO_SYNC_KILL_DB").map(PathBuf::from) else {
             return;
         };
-        let marker = PathBuf::from(std::env::var_os("MEGLE_SYNC_KILL_MARKER").unwrap());
-        let stop_at = std::env::var("MEGLE_SYNC_KILL_STOP_AT")
+        let marker = PathBuf::from(std::env::var_os("MANGOO_SYNC_KILL_MARKER").unwrap());
+        let stop_at = std::env::var("MANGOO_SYNC_KILL_STOP_AT")
             .ok()
             .and_then(|v| v.parse::<u64>().ok());
         let database = Database::open(&path).unwrap();
@@ -4712,15 +4881,15 @@ mod tests {
     #[test]
     #[ignore = "subprocess helper for deterministic sync fault matrix"]
     fn sync_protocol_fault_child() {
-        let Some(path) = std::env::var_os("MEGLE_SYNC_FAULT_DB").map(PathBuf::from) else {
+        let Some(path) = std::env::var_os("MANGOO_SYNC_FAULT_DB").map(PathBuf::from) else {
             return;
         };
-        let scenario = std::env::var("MEGLE_SYNC_FAULT_SCENARIO").unwrap();
+        let scenario = std::env::var("MANGOO_SYNC_FAULT_SCENARIO").unwrap();
         let database = Database::open(&path).unwrap();
         database.apply_migrations().unwrap();
         let root = database
             .add_root(NewRoot {
-                path: "D:/Fault".into(),
+                path: path.parent().unwrap().to_string_lossy().into_owned(),
                 display_name: "Fault".into(),
             })
             .unwrap();
@@ -4737,7 +4906,7 @@ mod tests {
                     .upsert_folder(crate::db::FolderUpsert {
                         root_id: root,
                         parent_id: None,
-                        name: "Fault".into(),
+                        name: String::new(),
                         path_hash: "fault-folder".into(),
                         mtime: Some(1),
                     })
@@ -4768,7 +4937,11 @@ mod tests {
                         .unwrap();
                 } else {
                     let intent = database
-                        .create_sync_publication_intent(file, "D:/Fault/fault.jpg", 1)
+                        .create_sync_publication_intent(
+                            file,
+                            &path.parent().unwrap().join("fault.jpg").to_string_lossy(),
+                            1,
+                        )
                         .unwrap();
                     database.bind_fake_sync_manifest(intent, [7; 32]).unwrap();
                 }
@@ -4788,7 +4961,7 @@ mod tests {
                     .upsert_folder(crate::db::FolderUpsert {
                         root_id: root,
                         parent_id: None,
-                        name: "Fault".into(),
+                        name: String::new(),
                         path_hash: "fault-media-folder".into(),
                         mtime: Some(source_mtime),
                     })
@@ -5010,7 +5183,7 @@ mod tests {
         let exe = std::env::current_exe().unwrap();
         for (scenario, point) in cases {
             let base = std::env::temp_dir().join(format!(
-                "megle-sync-fault-{scenario}-{}",
+                "mangoo-sync-fault-{scenario}-{}",
                 uuid::Uuid::now_v7()
             ));
             std::fs::create_dir_all(&base).unwrap();
@@ -5024,10 +5197,10 @@ mod tests {
                     "--nocapture",
                     "--test-threads=1",
                 ])
-                .env("MEGLE_SYNC_FAULT_DB", &db_path)
-                .env("MEGLE_SYNC_FAULT_SCENARIO", scenario)
-                .env("MEGLE_SYNC_FAULTPOINT", point)
-                .env("MEGLE_SYNC_FAULT_MARKER", &marker)
+                .env("MANGOO_SYNC_FAULT_DB", &db_path)
+                .env("MANGOO_SYNC_FAULT_SCENARIO", scenario)
+                .env("MANGOO_SYNC_FAULTPOINT", point)
+                .env("MANGOO_SYNC_FAULT_MARKER", &marker)
                 .spawn()
                 .unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -5089,12 +5262,30 @@ mod tests {
                     }
                     "media-materialization" => {
                         let managed_root = base.join("managed-root");
-                        let staging = managed_root
-                            .join(".megle-staging")
-                            .join(format!("{}.partial", uuid::Uuid::from_u128(7).simple()));
+                        let staging_prefix =
+                            format!(".mangoo-work-{}-", uuid::Uuid::from_u128(7).simple());
+                        let staging_directories = std::fs::read_dir(&managed_root)
+                            .unwrap()
+                            .map(|entry| entry.unwrap())
+                            .filter(|entry| {
+                                entry.file_type().unwrap().is_dir()
+                                    && entry
+                                        .file_name()
+                                        .to_string_lossy()
+                                        .starts_with(&staging_prefix)
+                            })
+                            .map(|entry| entry.path())
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            staging_directories.len(),
+                            1,
+                            "expected one owned staging directory at {point}"
+                        );
+                        let staging = staging_directories[0].join("payload.partial");
                         let target = managed_root.join("fault-media.jpg");
-                        assert!(
-                            staging.exists(),
+                        assert_eq!(
+                            std::fs::read(&staging).unwrap(),
+                            b"verified",
                             "verified staging was not durable at {point}"
                         );
                         assert!(!target.exists(), "partial media target escaped at {point}");
@@ -5198,7 +5389,7 @@ mod tests {
     #[test]
     #[ignore = "invoked by tools/bench/sync-protocol-bench.mjs"]
     fn sync_protocol_abrupt_kill_replay_probe() {
-        let base = std::env::temp_dir().join(format!("megle-sync-kill-{}", uuid::Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-sync-kill-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&base).unwrap();
         let path = base.join("catalog.sqlite");
         let marker = base.join("committed.marker");
@@ -5213,10 +5404,10 @@ mod tests {
                     "--nocapture",
                     "--test-threads=1",
                 ])
-                .env("MEGLE_SYNC_KILL_DB", &path)
-                .env("MEGLE_SYNC_KILL_MARKER", &marker);
+                .env("MANGOO_SYNC_KILL_DB", &path)
+                .env("MANGOO_SYNC_KILL_MARKER", &marker);
             if let Some(stop) = stop {
-                command.env("MEGLE_SYNC_KILL_STOP_AT", stop.to_string());
+                command.env("MANGOO_SYNC_KILL_STOP_AT", stop.to_string());
             }
             command.spawn().unwrap()
         };

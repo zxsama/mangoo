@@ -1,4 +1,4 @@
-import type { DesktopFolderPickerRequest } from "@megle/notification-contract";
+import type { DesktopFolderPickerRequest } from "@mangoo/notification-contract";
 
 export interface FolderPickerDialogOptions {
   properties: ["openDirectory"];

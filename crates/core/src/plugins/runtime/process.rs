@@ -16,13 +16,21 @@ pub struct ChildProcess {
     _job: WindowsJob,
 }
 impl ChildProcess {
-    pub fn spawn_verified(
+    pub async fn spawn_verified(
         executable: &VerifiedExecutable,
         spec: &LaunchSpec,
     ) -> std::io::Result<Self> {
+        Self::spawn_verified_with_memory_limit(executable, spec, None).await
+    }
+
+    pub async fn spawn_verified_with_memory_limit(
+        executable: &VerifiedExecutable,
+        spec: &LaunchSpec,
+        memory_limit: Option<usize>,
+    ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&spec.runtime_dir)?;
         #[cfg(unix)]
-        let mut cmd = unix_verified_command(executable, &spec.safe_env)?;
+        let mut cmd = unix_verified_command(executable, &spec.safe_env, memory_limit)?;
         #[cfg(not(unix))]
         let mut cmd = Command::new(executable.path());
         cmd.current_dir(&spec.runtime_dir)
@@ -41,10 +49,11 @@ impl ChildProcess {
         }
         let mut child = cmd.spawn()?;
         #[cfg(windows)]
-        let job = match WindowsJob::attach_verified_and_resume(&child, executable) {
+        let job = match WindowsJob::attach_verified_and_resume(&child, executable, memory_limit) {
             Ok(job) => job,
             Err(error) => {
-                let _ = child.start_kill();
+                child.kill().await?;
+                child.wait().await?;
                 return Err(error);
             }
         };
@@ -111,6 +120,7 @@ fn platform_runtime_env() -> std::collections::HashMap<String, String> {
 fn unix_verified_command(
     executable: &VerifiedExecutable,
     safe_env: &HashMap<String, String>,
+    memory_limit: Option<usize>,
 ) -> std::io::Result<Command> {
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
@@ -134,6 +144,15 @@ fn unix_verified_command(
     let mut command = Command::new("/bin/false");
     unsafe {
         command.pre_exec(move || {
+            if let Some(bytes) = memory_limit {
+                let limit = libc::rlimit {
+                    rlim_cur: bytes as libc::rlim_t,
+                    rlim_max: bytes as libc::rlim_t,
+                };
+                if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
             if libc::setpgid(0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -166,6 +185,7 @@ impl WindowsJob {
     fn attach_verified_and_resume(
         child: &Child,
         executable: &VerifiedExecutable,
+        memory_limit: Option<usize>,
     ) -> std::io::Result<Self> {
         use windows_sys::Win32::System::JobObjects::*;
         use windows_sys::Win32::System::Threading::{
@@ -179,6 +199,12 @@ impl WindowsJob {
             }
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
             info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if let Some(bytes) = memory_limit {
+                info.BasicLimitInformation.LimitFlags |=
+                    JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+                info.ProcessMemoryLimit = bytes;
+                info.BasicLimitInformation.ActiveProcessLimit = 1;
+            }
             let process = OpenProcess(
                 PROCESS_QUERY_LIMITED_INFORMATION
                     | PROCESS_SET_QUOTA
@@ -263,7 +289,7 @@ pub fn is_bundled_root(path: &Path) -> bool {
     }
     #[cfg(unix)]
     {
-        path == Path::new("/opt/megle/plugins")
+        path == Path::new("/opt/mangoo/plugins")
             || std::env::current_exe()
                 .ok()
                 .and_then(|exe| exe.parent().map(|p| p.join("bundled-plugins")))
@@ -282,7 +308,7 @@ mod tests {
 
     fn test_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "megle_{name}_{}_{}",
+            "mangoo_{name}_{}_{}",
             std::process::id(),
             uuid::Uuid::now_v7()
         ))
@@ -313,14 +339,15 @@ mod tests {
                 safe_env: HashMap::new(),
             },
         )
+        .await
         .unwrap();
         assert!(child.wait().await.unwrap().success());
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(windows)]
-    #[test]
-    fn swap_at_spawn_is_rejected_before_resume() {
+    #[tokio::test]
+    async fn swap_at_spawn_is_rejected_before_resume() {
         let root = test_root("verified_spawn");
         let runtime = root.join("runtime");
         std::fs::create_dir_all(&runtime).unwrap();
@@ -337,7 +364,8 @@ mod tests {
                 runtime_dir: runtime,
                 safe_env: HashMap::new(),
             },
-        );
+        )
+        .await;
         assert!(result.is_err());
         let _ = std::fs::remove_dir_all(root);
     }

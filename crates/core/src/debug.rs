@@ -3,7 +3,7 @@
 //! Diagnostic instrumentation (writer-actor tracing, per-step timing of the
 //! thumbnail-cache enqueue, startup self-tests) stays permanently in the code
 //! but is silent unless the operator turns it on. Flip it on with the
-//! `MEGLE_DEBUG` environment variable (`MEGLE_DEBUG=1`); leave it unset in
+//! `MANGOO_DEBUG` environment variable (`MANGOO_DEBUG=1`); leave it unset in
 //! production. This is deliberately a single global gate — every diagnostic in
 //! Core routes through [`enabled()`] / [`debug_log!`] so there is exactly one
 //! knob to reason about, rather than scattered ad-hoc `eprintln!`s that get
@@ -12,12 +12,12 @@
 use std::sync::OnceLock;
 
 /// Whether verbose Core debug instrumentation is enabled. Read once from the
-/// `MEGLE_DEBUG` env var on first use and cached, so hot paths pay only an
+/// `MANGOO_DEBUG` env var on first use and cached, so hot paths pay only an
 /// atomic load. Any non-empty value other than `0`/`false` counts as enabled.
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("MEGLE_DEBUG")
+        std::env::var("MANGOO_DEBUG")
             .ok()
             .map(|value| {
                 let value = value.trim();
@@ -28,13 +28,13 @@ pub fn enabled() -> bool {
 }
 
 /// Emit a debug line to stderr, but only when the master switch is on. Prefixed
-/// with `[megle-debug]` so it is greppable and obviously not a user-facing log.
+/// with `[mangoo-debug]` so it is greppable and obviously not a user-facing log.
 /// Arguments are only evaluated when debug is enabled.
 #[macro_export]
 macro_rules! debug_log {
     ($($arg:tt)*) => {
         if $crate::debug::enabled() {
-            eprintln!("[megle-debug] {}", format!($($arg)*));
+            eprintln!("[mangoo-debug] {}", format!($($arg)*));
         }
     };
 }
@@ -48,6 +48,6 @@ pub fn timed<T>(label: &str, op: impl FnOnce() -> T) -> T {
     }
     let start = std::time::Instant::now();
     let value = op();
-    eprintln!("[megle-debug] {label}: {}ms", start.elapsed().as_millis());
+    eprintln!("[mangoo-debug] {label}: {}ms", start.elapsed().as_millis());
     value
 }

@@ -210,9 +210,11 @@ function evaluatePreload(role: "main" | "settings" | "plugins" | "notifications"
     deferred: ReturnType<typeof deferred<unknown>>;
   }> = [];
   const sent: Array<[string, ...unknown[]]> = [];
+  const calls: Array<[string, ...unknown[]]> = [];
   let exposed: Record<string, unknown> | null = null;
   const ipcRenderer = {
     invoke(channel: string, ...args: unknown[]) {
+      calls.push([channel, ...args]);
       if (channel !== channels.logsSubscribe) return Promise.resolve(true);
       const pending = deferred<unknown>();
       invokes.push({ channel, args, deferred: pending });
@@ -233,7 +235,7 @@ function evaluatePreload(role: "main" | "settings" | "plugins" | "notifications"
   const source = `${readFileSync(fileURLToPath(channelsUrl), "utf8")}\n${readFileSync(fileURLToPath(preloadUrl), "utf8")}`;
   vm.runInNewContext(source, {
     module: { exports: {} },
-    process: { argv: [`--megle-window=${role}`] },
+    process: { argv: [`--mangoo-window=${role}`] },
     require(id: string) {
       if (id !== "electron") throw new Error(`unexpected preload require: ${id}`);
       return {
@@ -247,7 +249,7 @@ function evaluatePreload(role: "main" | "settings" | "plugins" | "notifications"
     }
   });
   assert.ok(exposed);
-  return { bridge: exposed, invokes, listeners, sent };
+  return { bridge: exposed, invokes, listeners, sent, calls };
 }
 
 test("preload log setup survives StrictMode cleanup, rapid filters, and late invoke completion", async () => {
@@ -362,15 +364,11 @@ test("notifications preload exposes only notification, log, and common window ca
   assert.equal(typeof mainBridge.updateMediaFocusStage, "function");
   assert.equal(typeof mainBridge.shell, "object");
   assert.equal(
-    typeof (mainBridge.shell as { openExternalAuthorizationUrl?: unknown }).openExternalAuthorizationUrl,
+    typeof (mainBridge.shell as { openPluginExternalLink?: unknown }).openPluginExternalLink,
     "function"
   );
   assert.equal(
     typeof (mainBridge.shell as { requestOAuthReturnFocus?: unknown }).requestOAuthReturnFocus,
-    "function"
-  );
-  assert.equal(
-    typeof (mainBridge.shell as { openEntraAppRegistrationPage?: unknown }).openEntraAppRegistrationPage,
     "function"
   );
   assert.equal("switchLibrary" in settingsBridge, false);
@@ -383,18 +381,41 @@ test("notifications preload exposes only notification, log, and common window ca
 test("Main role permissions reject notification senders for library and shell IPC", () => {
   assert.ok(permissionsModule, "desktop IPC role permissions must exist");
   for (const channel of [
-    "megle:retry-library-load",
-    "megle:pick-new-library-path",
-    "megle:shell-reveal-path",
-    "megle:shell-open-path",
-    "megle:open-external-authorization-url",
-    "megle:open-entra-app-registration-page",
-    "megle:request-oauth-return-focus"
+    "mangoo:retry-library-load",
+    "mangoo:pick-new-library-path",
+    "mangoo:shell-reveal-path",
+    "mangoo:shell-open-path",
+    "mangoo:open-plugin-external-link",
+    "mangoo:request-oauth-return-focus"
   ]) {
     assert.equal(permissionsModule.canAccessDesktopIpc("notifications", channel), false);
     assert.equal(permissionsModule.canAccessDesktopIpc("main", channel), true);
     assert.equal(permissionsModule.canAccessDesktopIpc("settings", channel), true);
   }
+});
+
+test("restricted preload routes only narrow notification plugin IPC and buffers plugin-window intent", async () => {
+  const notifications = evaluatePreload("notifications");
+  const list = notifications.bridge.listNotificationPluginEntries as () => Promise<unknown>;
+  const open = notifications.bridge.openNotificationPluginView as (input: unknown) => Promise<unknown>;
+  const request = { pluginId: "org.example.extension", viewId: "status", libraryUuid: null };
+  await list(); await open(request);
+  assert.deepEqual(notifications.calls, [["mangoo:notification-plugin-entries"], ["mangoo:open-notification-plugin-view", request]]);
+  for (const channel of ["mangoo:notification-plugin-entries", "mangoo:open-notification-plugin-view"]) {
+    assert.equal(permissionsModule.canAccessDesktopIpc("notifications", channel), true);
+    for (const role of [null, "main", "settings", "plugins"]) assert.equal(permissionsModule.canAccessDesktopIpc(role, channel), false);
+  }
+  for (const forbidden of ["coreUrl", "sessionToken", "getLibraryPhase", "shell", "onPluginViewIntent", "openPluginsWindow"]) assert.equal(forbidden in notifications.bridge, false);
+  const plugins = evaluatePreload("plugins");
+  const cold = { ...request, lifecycleEpoch: 1, contextRevision: 2 };
+  const received: unknown[] = [];
+  for (const listener of plugins.listeners.get("mangoo:plugin-view-intent") ?? []) listener({}, cold);
+  const subscribe = plugins.bridge.onPluginViewIntent as (callback: (intent: unknown) => void) => () => void;
+  const stop = subscribe((intent) => received.push(intent));
+  const warm = { ...cold, lifecycleEpoch: 2 };
+  for (const listener of plugins.listeners.get("mangoo:plugin-view-intent") ?? []) listener({}, warm);
+  assert.deepEqual(received, [cold, warm]);
+  stop();
 });
 
 test("secondary window opening is single-flight per role and recovers after load failure", async () => {
@@ -473,8 +494,8 @@ test("Library lifecycle is absent from Desktop IPC and owned by Core Host", () =
   const root = fileURLToPath(new URL("../../..", import.meta.url));
   const main = readFileSync(`${root}/apps/desktop/src/main.ts`, "utf8");
   const executableMain = main.replace(/\/\*[\s\S]*?\*\//g, "");
-  assert.doesNotMatch(executableMain, /libraries\.json|restartCoreForLibrary|megle:open-library|megle:delete-library-file/);
-  assert.match(main, /megle:pick-new-library-path/);
+  assert.doesNotMatch(executableMain, /libraries\.json|restartCoreForLibrary|mangoo:open-library|mangoo:delete-library-file/);
+  assert.match(main, /mangoo:pick-new-library-path/);
 });
 
 test("hardening source contract uses shared DTOs, sender authorization, and failed-window cleanup", () => {
@@ -488,19 +509,19 @@ test("hardening source contract uses shared DTOs, sender authorization, and fail
 
   assert.equal(existsSync(contractPath), true);
   const contract = existsSync(contractPath) ? read("packages/notification-contract/src/index.ts") : "";
-  assert.match(contract, /import type \{[\s\S]*NotificationOperationSnapshot[\s\S]*\} from "@megle\/core-client\/generated-contract"/);
+  assert.match(contract, /import type \{[\s\S]*NotificationOperationSnapshot[\s\S]*\} from "@mangoo\/core-client\/generated-contract"/);
   assert.match(contract, /interface NotificationIpcBridge/);
   assert.doesNotMatch(contract, /onLogs/);
-  assert.match(desktopTypes, /from "@megle\/notification-contract"/);
-  assert.match(webDesktop, /from "@megle\/notification-contract"/);
+  assert.match(desktopTypes, /from "@mangoo\/notification-contract"/);
+  assert.match(webDesktop, /from "@mangoo\/notification-contract"/);
   assert.doesNotMatch(webDesktop, /interface DesktopNotificationOperation/);
 
-  assert.match(main, /`--megle-window=main`/);
+  assert.match(main, /`--mangoo-window=main`/);
   for (const channel of [
-    "megle:pick-new-library-path",
-    "megle:shell-reveal-path",
-    "megle:shell-open-path",
-    "megle:open-external-authorization-url"
+    "mangoo:pick-new-library-path",
+    "mangoo:shell-reveal-path",
+    "mangoo:shell-open-path",
+    "mangoo:open-plugin-external-link"
   ]) {
     assert.match(main, new RegExp(`requireDesktopIpcAccess\\(event, "${channel}"\\)`));
   }

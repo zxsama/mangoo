@@ -1,5 +1,5 @@
-// Inspect the running Megle UI through CDP. Captures:
-// 1. window.megleDesktop bridge presence
+// Inspect the running Mangoo UI through CDP. Captures:
+// 1. window.mangooDesktop bridge presence
 // 2. number of media tiles in the DOM
 // 3. number of <img> elements rendered
 // 4. console errors / network failures
@@ -52,7 +52,7 @@ ws.on("open", async () => {
 
   const evalSnippet = `
     (function() {
-      const bridge = window.megleDesktop ?? null;
+      const bridge = window.mangooDesktop ?? null;
       const tiles = document.querySelectorAll(".media-tile").length;
       const tiles_ready = document.querySelectorAll(".tile-thumb-ready").length;
       const tiles_loading = document.querySelectorAll(".tile-thumb-loading").length;

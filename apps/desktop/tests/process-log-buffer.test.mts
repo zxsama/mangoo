@@ -128,7 +128,7 @@ test("redacts session tokens and sensitive paths from text and metadata", () => 
   const line = buffer.append(
     "main",
     "error",
-    "token=secret-value path=C:\\Users\\84460\\Megle\\library.sqlite",
+    "token=secret-value path=C:\\Users\\84460\\Mangoo\\library.sqlite",
     circular
   );
 
@@ -138,7 +138,7 @@ test("redacts session tokens and sensitive paths from text and metadata", () => 
   assert.equal(line?.metadata?.sessionToken, "[redacted]");
   assert.equal(line?.metadata?.filePath, "[redacted]");
   assert.equal((line?.metadata?.circular as string | undefined), "[circular]");
-  assert.equal(sanitizeProcessLogMessage("MEGLE_SESSION_TOKEN=abc"), "MEGLE_SESSION_TOKEN=[redacted]");
+  assert.equal(sanitizeProcessLogMessage("MANGOO_SESSION_TOKEN=abc"), "MANGOO_SESSION_TOKEN=[redacted]");
 });
 
 test("uses the same recursive redaction for structured messages and metadata", async () => {
@@ -161,24 +161,24 @@ test("uses the same recursive redaction for structured messages and metadata", a
   assert.equal(JSON.stringify(line.metadata).includes("bearer-secret"), false);
 });
 
-test("redacts x-megle-session and synonymous headers in nested objects and raw text", async () => {
+test("redacts x-mangoo-session and synonymous headers in nested objects and raw text", async () => {
   const secrets = [
-    "megle-secret",
-    "megle-token-secret",
+    "mangoo-secret",
+    "mangoo-token-secret",
     "session-token-secret",
     "authorization-secret",
     "proxy-secret",
     "cookie-secret",
     "api-key-secret",
     "env-secret",
-    "raw-megle-secret",
+    "raw-mangoo-secret",
     "raw-auth-secret"
   ];
   const payload = {
     nested: {
       headers: {
-        "x-megle-session": secrets[0],
-        "X-Megle-Session-Token": secrets[1],
+        "x-mangoo-session": secrets[0],
+        "X-Mangoo-Session-Token": secrets[1],
         "x-session-token": secrets[2],
         Authorization: `Bearer ${secrets[3]}`,
         "Proxy-Authorization": `Basic ${secrets[4]}`,
@@ -186,7 +186,7 @@ test("redacts x-megle-session and synonymous headers in nested objects and raw t
         "X-Api-Key": secrets[6]
       }
     },
-    list: [{ MEGLE_SESSION_TOKEN: secrets[7] }]
+    list: [{ MANGOO_SESSION_TOKEN: secrets[7] }]
   };
   const buffer = new ProcessLogBuffer();
   const logger = new DesktopLogger({ buffer, console: { info: () => undefined, warn: () => undefined } });
@@ -194,7 +194,7 @@ test("redacts x-megle-session and synonymous headers in nested objects and raw t
   logger.info("renderer", payload);
   logger.warn(
     "renderer",
-    `X-Megle-Session: ${secrets[8]}\nAuthorization: Bearer ${secrets[9]}`
+    `X-Mangoo-Session: ${secrets[8]}\nAuthorization: Bearer ${secrets[9]}`
   );
   await logger.flush();
 
@@ -218,7 +218,7 @@ test("redacts sensitive header tuples in nested metadata and JSON messages while
   ];
   const payload = {
     headers: [
-      ["x-megle-session", secrets[0]],
+      ["x-mangoo-session", secrets[0]],
       ["Authorization", secrets[1]],
       ["Cookie", secrets[2]],
       ["X-Api-Key", secrets[3]],
@@ -227,7 +227,7 @@ test("redacts sensitive header tuples in nested metadata and JSON messages while
     nested: {
       headers: [
         ["x-session-token", secrets[4]],
-        ["MEGLE_SESSION_TOKEN", secrets[5]],
+        ["MANGOO_SESSION_TOKEN", secrets[5]],
         ["accept", "image/png"]
       ]
     },
@@ -251,7 +251,7 @@ test("redacts sensitive header tuples in nested metadata and JSON messages while
     assert.equal(exported.includes(secret), false);
   }
   assert.deepEqual(metadata.headers, [
-    ["x-megle-session", "[redacted]"],
+    ["x-mangoo-session", "[redacted]"],
     ["Authorization", "[redacted]"],
     ["Cookie", "[redacted]"],
     ["X-Api-Key", "[redacted]"],
@@ -259,7 +259,7 @@ test("redacts sensitive header tuples in nested metadata and JSON messages while
   ]);
   assert.deepEqual((metadata.nested as Record<string, unknown>).headers, [
     ["x-session-token", "[redacted]"],
-    ["MEGLE_SESSION_TOKEN", "[redacted]"],
+    ["MANGOO_SESSION_TOKEN", "[redacted]"],
     ["accept", "image/png"]
   ]);
   assert.deepEqual(metadata.ordinary, ["kept", ["name", "value"]]);
@@ -658,7 +658,7 @@ test("parses structured Core tracing JSON and preserves legacy text", () => {
         failure_kind: "permanent",
         error: "decode failed"
       },
-      target: "megle_core::tasks"
+      target: "mangoo_core::tasks"
     }),
     "warn"
   );
@@ -673,7 +673,7 @@ test("parses structured Core tracing JSON and preserves legacy text", () => {
       relativePath: "Artists\\Portraits\\a.jpg",
       failureKind: "permanent",
       error: "decode failed",
-      target: "megle_core::tasks"
+      target: "mangoo_core::tasks"
     }
   });
   assert.deepEqual(parseCoreProcessLogLine("legacy warning", "warn"), {

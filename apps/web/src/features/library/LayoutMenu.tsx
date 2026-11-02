@@ -3,8 +3,8 @@ import {
   LayoutGrid,
   LayoutList,
   LayoutPanelTop,
-  type LucideIcon
-} from "lucide-react";
+  type AppIcon
+} from "../../design/icons";
 import { useRef } from "react";
 import {
   AnchoredOverlay,
@@ -26,7 +26,7 @@ interface LayoutMenuProps {
   titlebarControlId?: string;
 }
 
-const LAYOUT_ICON: Record<LibraryLayoutMode, LucideIcon> = {
+const LAYOUT_ICON: Record<LibraryLayoutMode, AppIcon> = {
   adaptive: LayoutPanelTop,
   waterfall: GalleryVerticalEnd,
   grid: LayoutGrid,
@@ -72,7 +72,7 @@ export function LayoutMenu({
         tone="control"
         type="button"
       >
-        <TriggerIcon aria-hidden="true" size={14} />
+        <TriggerIcon aria-hidden="true" size={14} weight={open ? "fill" : "regular"} />
         {iconOnly ? null : <span>{selectedLabel}</span>}
       </LiquidGlassButton>
 
@@ -100,7 +100,7 @@ export function LayoutMenu({
             return (
               <OverlayMenuItem
                 aria-selected={selected}
-                icon={<OptionIcon aria-hidden="true" size={14} />}
+                icon={<OptionIcon aria-hidden="true" size={14} weight={selected ? "fill" : "regular"} />}
                 key={option.value}
                 onClick={() => handleSelect(option.value)}
                 role="option"

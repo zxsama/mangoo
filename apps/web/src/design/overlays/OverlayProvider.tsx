@@ -14,6 +14,7 @@ import {
   closeOverlayRoot,
   createOverlayStackState,
   openOverlayRoot,
+  overlayLayerZIndexes,
   popOverlayLayer,
   pushOverlayLayer,
   topOverlayLayer,
@@ -36,6 +37,7 @@ import type {
   OverlayRootId,
   OverlayStackApi
 } from "./overlayTypes";
+import { resolveOverlayScrollbarOwner } from "./overlayScrollbarOwner";
 
 const OverlayStackContext = createContext<OverlayStackApi | null>(null);
 
@@ -47,7 +49,8 @@ const OverlayFamilyFocusContext = createContext<OverlayFamilyFocusApi | null>(nu
 
 function targetBelongsToLayer(layer: OverlayLayerRegistration, target: EventTarget | null): boolean {
   if (!(target instanceof Node)) return false;
-  return Boolean(layer.surface?.contains(target) || layer.trigger?.contains(target));
+  const owner = resolveOverlayScrollbarOwner(target) ?? target;
+  return Boolean(layer.surface?.contains(owner) || layer.trigger?.contains(owner));
 }
 
 function restoreLayerFocus(layer: OverlayLayerRegistration, reason: OverlayDismissReason): void {
@@ -74,6 +77,15 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
 
   useLayoutEffect(() => {
     regionalBlurControllerRef.current?.setLayers(state.layers);
+    const indexes = overlayLayerZIndexes(state.layers);
+    state.layers.forEach((layer, index) => {
+      const surface = layer.surface;
+      surface?.style.setProperty("--overlay-stack-z-index", String(indexes[index]));
+      // A modal's fixed backdrop is its outer stacking context.
+      surface?.closest<HTMLElement>(".overlay-modal-backdrop")?.style.setProperty(
+        "--overlay-stack-z-index", String(indexes[index])
+      );
+    });
   }, [state.layers]);
 
   const commitState = useCallback((next: OverlayStackState) => {
@@ -87,12 +99,16 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
   ): boolean => {
     const current = stateRef.current;
     if (!current.layers.some((item) => item.id === layer.id)) return false;
+    if (current.layers.some((item) => item.isDismissLocked?.())) return false;
 
     let next = popOverlayLayer(current, layer.id);
     if (next.layers.length === 0) {
       next = closeOverlayRoot(next);
     }
     commitState(next);
+    for (const descendant of [...current.layers].reverse()) {
+      if (descendant !== layer && !next.layers.includes(descendant)) descendant.onDismiss();
+    }
     layer.onDismiss();
     if (stateRef.current === next) {
       restoreLayerFocus(layer, reason);
@@ -103,6 +119,7 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
   const openRoot = useCallback((rootId: OverlayRootId) => {
     const current = stateRef.current;
     if (current.activeRootId === rootId) return;
+    if (current.layers.some((item) => item.isDismissLocked?.())) return;
 
     const previousLayers = [...current.layers].reverse();
     commitState(openOverlayRoot(current, rootId));
@@ -124,6 +141,7 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
     }
 
     const rootLayer = current.layers.find((layer) => layer.kind === "root") ?? null;
+    if (current.layers.some((item) => item.isDismissLocked?.())) return;
     const next = closeOverlayRoot(current, rootId);
     commitState(next);
     for (const layer of [...current.layers].reverse()) {
@@ -179,6 +197,9 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
           cleaned = closeOverlayRoot(cleaned);
         }
         commitState(cleaned);
+        for (const descendant of [...current.layers].reverse()) {
+          if (descendant !== layer && !cleaned.layers.includes(descendant)) descendant.onDismiss();
+        }
         restoreLayerFocus(layer, "programmatic");
       });
     };
@@ -209,6 +230,7 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
           reason === "visibility-hidden"
         ) {
           const transientLayers = current.layers.filter((item) => item.dismissOnWindowBlur);
+          if (current.layers.some((item) => item.isDismissLocked?.())) return false;
           if (transientLayers.length === 0) return false;
           commitState(closeTransientOverlayLayers(current));
           for (const transientLayer of [...transientLayers].reverse()) {
@@ -230,7 +252,13 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
     closeRoot,
     isRootOpen: (rootId) => state.activeRootId === rootId,
     registerLayer,
-    dismissTop
+    dismissTop,
+    getContainingLayer: (trigger) => {
+      const layer = [...stateRef.current.layers].reverse().find(
+        (candidate) => candidate.surface?.contains(trigger)
+      );
+      return layer ? { id: layer.id, rootId: layer.rootId } : null;
+    }
   }), [closeRoot, dismissTop, openRoot, registerLayer, state.activeRootId]);
 
   const familyFocusApi = useMemo<OverlayFamilyFocusApi>(() => ({
@@ -266,9 +294,14 @@ export function useOverlayStack(): OverlayStackApi {
 }
 
 export function useOverlayFamilyFocus(): OverlayFamilyFocusApi {
-  const value = useContext(OverlayFamilyFocusContext);
+  const value = useOptionalOverlayFamilyFocus();
   if (!value) {
     throw new Error("useOverlayFamilyFocus must be used within OverlayProvider");
   }
   return value;
+}
+
+/** Optional family coordination for independently usable focus primitives. */
+export function useOptionalOverlayFamilyFocus(): OverlayFamilyFocusApi | null {
+  return useContext(OverlayFamilyFocusContext);
 }

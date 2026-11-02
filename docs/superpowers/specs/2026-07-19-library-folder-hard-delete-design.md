@@ -41,7 +41,7 @@ Problems this design fixes:
 - **Two-step confirmation** naming the permanently-lost data types.
 
 **Non-goals**
-- **Disk files are never touched.** Megle maps folders; it does not own them.
+- **Disk files are never touched.** Mangoo maps folders; it does not own them.
   "Remove from library" ≠ "delete files" (that is the separate recycle-bin
   fsops flow). Not in scope.
 - No undo/restore of a hard delete.

@@ -11,58 +11,74 @@ export interface CoreSession {
 }
 
 export async function createCoreSession(): Promise<CoreSession> {
-  const isExternalCore = process.env.MEGLE_CORE_EXTERNAL === "1";
-  const configuredBaseUrl = process.env.MEGLE_CORE_URL;
-  const configuredBindAddress = process.env.MEGLE_CORE_ADDR;
+  const isExternalCore = process.env.MANGOO_CORE_EXTERNAL === "1";
+  const configuredBaseUrl = process.env.MANGOO_CORE_URL;
+  const configuredBindAddress = process.env.MANGOO_CORE_ADDR;
   const sessionToken = isExternalCore
-    ? requireEnv("MEGLE_SESSION_TOKEN", "MEGLE_SESSION_TOKEN is required when MEGLE_CORE_EXTERNAL=1")
-    : (process.env.MEGLE_SESSION_TOKEN ?? crypto.randomBytes(32).toString("base64url"));
+    ? requireEnv("MANGOO_SESSION_TOKEN", "MANGOO_SESSION_TOKEN is required when MANGOO_CORE_EXTERNAL=1")
+    : (process.env.MANGOO_SESSION_TOKEN ?? crypto.randomBytes(32).toString("base64url"));
 
   if (isExternalCore) {
     return {
-      baseUrl: requireEnv("MEGLE_CORE_URL", "MEGLE_CORE_URL is required when MEGLE_CORE_EXTERNAL=1"),
+      baseUrl: requireEnv("MANGOO_CORE_URL", "MANGOO_CORE_URL is required when MANGOO_CORE_EXTERNAL=1"),
       bindAddress: configuredBindAddress ?? "external",
-      hostDbPath: process.env.MEGLE_HOST_DB_PATH,
-      librariesDir: process.env.MEGLE_LIBRARIES_DIR,
+      hostDbPath: process.env.MANGOO_HOST_DB_PATH,
+      librariesDir: process.env.MANGOO_LIBRARIES_DIR,
       sessionToken,
       allowedOrigin:
-        process.env.MEGLE_ALLOWED_ORIGIN ?? process.env.MEGLE_WEB_URL ?? "http://127.0.0.1:5173"
+        process.env.MANGOO_ALLOWED_ORIGIN ?? process.env.MANGOO_WEB_URL ?? "http://127.0.0.1:5173"
     };
   }
 
   const urlEndpoint = configuredBaseUrl ? endpointFromCoreUrl(configuredBaseUrl) : undefined;
   const bindAddress = configuredBindAddress
-    ? normalizeBindAddress(configuredBindAddress, "MEGLE_CORE_ADDR")
+    ? normalizeBindAddress(configuredBindAddress, "MANGOO_CORE_ADDR")
     : (urlEndpoint?.bindAddress ?? `127.0.0.1:${await chooseLoopbackPort()}`);
 
   if (configuredBindAddress && urlEndpoint && endpointKey(bindAddress) !== endpointKey(urlEndpoint.bindAddress)) {
-    throw new Error("MEGLE_CORE_ADDR and MEGLE_CORE_URL must point to the same host/port");
+    throw new Error("MANGOO_CORE_ADDR and MANGOO_CORE_URL must point to the same host/port");
   }
 
   const baseUrl = configuredBaseUrl ?? `http://${bindAddress}/api`;
-  const packagedRendererOrigin = process.env.MEGLE_SERVE_WEB === "1"
+  const packagedRendererOrigin = process.env.MANGOO_SERVE_WEB === "1"
     ? `http://${bindAddress}`
     : undefined;
 
   return {
     baseUrl,
     bindAddress,
-    hostDbPath: process.env.MEGLE_HOST_DB_PATH,
-    librariesDir: process.env.MEGLE_LIBRARIES_DIR,
+    hostDbPath: process.env.MANGOO_HOST_DB_PATH,
+    librariesDir: process.env.MANGOO_LIBRARIES_DIR,
     sessionToken,
     allowedOrigin:
-      process.env.MEGLE_ALLOWED_ORIGIN ??
-      process.env.MEGLE_WEB_URL ??
+      process.env.MANGOO_ALLOWED_ORIGIN ??
+      process.env.MANGOO_WEB_URL ??
       packagedRendererOrigin ??
       "http://127.0.0.1:5173"
   };
 }
 
 async function chooseLoopbackPort(): Promise<number> {
+  // OS ephemeral ranges can include Chromium-blocked ports (e.g. 2049).
+  // Both packaged pages and renderer API requests need a browser-usable port.
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 128; attempt += 1) {
+    try {
+      return await probeLoopbackPort(crypto.randomInt(49152, 65536));
+    } catch (error) {
+      if (!(error instanceof Error) || !("code" in error) ||
+          (error.code !== "EACCES" && error.code !== "EADDRINUSE")) throw error;
+      lastError = error;
+    }
+  }
+  throw new Error("Could not allocate a browser-usable loopback Core port after 128 attempts", { cause: lastError });
+}
+
+async function probeLoopbackPort(candidate: number): Promise<number> {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
+    server.listen(candidate, "127.0.0.1", () => {
       const address = server.address();
       if (!address || typeof address === "string") {
         server.close();
@@ -86,7 +102,7 @@ function endpointFromCoreUrl(value: string): { bindAddress: string } {
   const parsed = new URL(value);
   const port = parsed.port || defaultPortForProtocol(parsed.protocol);
   return {
-    bindAddress: formatBindAddress(normalizeLoopbackHost(parsed.hostname), port, "MEGLE_CORE_URL")
+    bindAddress: formatBindAddress(normalizeLoopbackHost(parsed.hostname), port, "MANGOO_CORE_URL")
   };
 }
 

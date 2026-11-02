@@ -765,7 +765,7 @@ for (const value of [
   "openPluginsWindow?:",
   "closePluginsWindow?:",
   'window.open(',
-  '"megle-plugins"'
+  '"mangoo-plugins"'
 ]) {
   if (!desktopAdapter.includes(value)) {
     fail(`desktop bridge must expose a safe Plugins window API/fallback: missing ${value}`);
@@ -823,11 +823,11 @@ if (!existsSync(path.join(root, coreClientPackagePath))) {
   fail("packages/core-client must be a real workspace package");
 } else {
   const coreClientPackageJson = readJson(coreClientPackagePath);
-  if (coreClientPackageJson.name !== "@megle/core-client") {
-    fail("packages/core-client package name must be @megle/core-client");
+  if (coreClientPackageJson.name !== "@mangoo/core-client") {
+    fail("packages/core-client package name must be @mangoo/core-client");
   }
   if (!coreClientPackageJson.scripts?.check) {
-    fail("@megle/core-client must expose a package boundary check");
+    fail("@mangoo/core-client must expose a package boundary check");
   }
 }
 
@@ -835,8 +835,8 @@ if (!packageJson.workspaces?.includes("packages/core-client")) {
   fail("root workspaces must include packages/core-client");
 }
 
-if (webPackageJson.dependencies?.["@megle/core-client"] !== "*") {
-  fail("apps/web must depend on @megle/core-client through the root workspace");
+if (webPackageJson.dependencies?.["@mangoo/core-client"] !== "*") {
+  fail("apps/web must depend on @mangoo/core-client through the root workspace");
 }
 
 if (
@@ -1017,8 +1017,8 @@ if (/OriginalFallbackThumbnail[\s\S]*?useEffect\(\(\)\s*=>[\s\S]*?\},\s*\[[^\]]*
 if (/function\s+OriginalFallbackThumbnail[\s\S]*?return\s+preloadImageObjectUrl\(objectUrl\);/.test(mediaGrid)) {
   fail("OriginalFallbackThumbnail must mount the original-preview image as soon as the blob URL is available");
 }
-if (!/function\s+OriginalFallbackThumbnail[\s\S]*?if\s*\(\s*error\s*&&\s*!src\s*\)[\s\S]*?tile-thumb-failed/.test(mediaGrid)) {
-  fail("OriginalFallbackThumbnail failed original-preview fallback must resolve to a failed tile, not stay in loading");
+if (!/function\s+OriginalFallbackThumbnail[\s\S]*?if\s*\(\s*error\s*\)[\s\S]*?tile-thumb-failed[\s\S]*?<FileFormatArtwork/.test(mediaGrid)) {
+  fail("OriginalFallbackThumbnail must render file artwork after decode failure even when a failed object URL is present");
 }
 if (/function\s+ReadyThumbnail[\s\S]*?return\s+preloadImageObjectUrl\(objectUrl\);/.test(mediaGrid)) {
   fail("ReadyThumbnail must mount the generated thumbnail image as soon as the blob URL is available");
@@ -1262,8 +1262,12 @@ if (
 if (/disabled:\s*library\.loading\s*\|\|\s*library\.loadingMoreMedia/.test(libraryView)) {
   fail("Folder cover loading must continue while media load-more is running");
 }
-if (/previewPlaceholderDataUrl/.test(subfolderStrip)) {
-  fail("Folder covers must not depend on low-resolution placeholder data; they need decoded thumbnail/original preview blobs");
+if (
+  !/thumbnail\.state === "ready"[\s\S]*?requestThumbnailBlob/.test(subfolderStrip) ||
+  !/mediaPreviewKind\(coverMediaItem\) !== "original-image"\) return null/.test(subfolderStrip) ||
+  !/if \(\(!src \|\| failed\) && coverMediaItem\)[\s\S]*?previewPlaceholderDataUrl[\s\S]*?<FileFormatArtwork/.test(subfolderStrip)
+) {
+  fail("Folder covers must prefer ready content, restrict original fallback to supported images, then show embedded placeholder or bundled file artwork");
 }
 if (!/requestThumbnailBlob/.test(subfolderStrip) || !/requestOriginalPreviewBlob/.test(subfolderStrip)) {
   fail("Folder cover cards must load a real image blob, falling back from thumbnail to original preview when needed");
@@ -1488,20 +1492,50 @@ if (!/setSelectedFolder\(folder\)/.test(librarySidebar)) {
   fail("LibrarySidebar must pass the full FolderRecord when selecting folders");
 }
 if (
-  !/root\.mediaCount\.toLocaleString\(\)/.test(librarySidebar) ||
-  !/folder\.mediaCount\.toLocaleString\(\)/.test(librarySidebar) ||
+  !/\(root\.fileCount \?\? root\.mediaCount\)\.toLocaleString\(\)/.test(librarySidebar) ||
+  !/\(folder\.fileCount \?\? folder\.mediaCount\)\.toLocaleString\(\)/.test(librarySidebar) ||
   !/className="tree-media-count"/.test(librarySidebar)
 ) {
-  fail("LibrarySidebar must render Core-provided recursive media counts for root and folder rows");
+  fail("LibrarySidebar must render Core-provided recursive file counts with legacy fallback for root and folder rows");
 }
-if (/data-pointer-glow="off"/.test(librarySidebar)) {
-  fail("LibrarySidebar controls and tree rows must remain unified pointer-highlight targets");
+const sidebarSyntax = ts.createSourceFile("LibrarySidebar.tsx", librarySidebar, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+const sidebarPointerOwners = [];
+const sidebarPointerOptOuts = [];
+const sidebarAttribute = (node, name) => node.attributes.properties.find((attribute) =>
+  ts.isJsxAttribute(attribute) && attribute.name.getText(sidebarSyntax) === name
+)?.initializer;
+const sidebarAttributeText = (node, name) => {
+  const value = sidebarAttribute(node, name);
+  return value && ts.isStringLiteral(value) ? value.text : undefined;
+};
+function inspectSidebarPointerTargets(node) {
+  if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
+    if (sidebarAttribute(node, "data-interactive-pointer-target-selector")) sidebarPointerOwners.push(node);
+    if (sidebarAttributeText(node, "data-pointer-glow") === "off") sidebarPointerOptOuts.push(node);
+  }
+  ts.forEachChild(node, inspectSidebarPointerTargets);
+}
+inspectSidebarPointerTargets(sidebarSyntax);
+if (sidebarPointerOwners.length !== 2 || sidebarPointerOwners.some((node) => {
+  const content = ts.isJsxElement(node.parent) && node.parent.children.find((child) =>
+    ts.isJsxElement(child) && sidebarAttributeText(child.openingElement, "className") === "tree-label"
+  );
+  return sidebarAttributeText(node, "data-interactive-pointer-target-selector") !== ".tree-label"
+    || !content || content.openingElement.tagName.getText(sidebarSyntax) !== "button"
+    || sidebarAttributeText(content.openingElement, "data-pointer-glow") === "off";
+}) || sidebarPointerOptOuts.length !== 2 || sidebarPointerOptOuts.some((node) =>
+  node.tagName.getText(sidebarSyntax) !== "button" || sidebarAttributeText(node, "className") !== "tree-disclosure"
+)) {
+  fail("Root and folder rows must route the shared pointer highlight to their content button; only separate disclosure buttons opt out");
 }
 for (const value of [
   "folderShowsOpenIcon",
   "isFolderKnownChildless",
   "aria-expanded={knownChildless ? undefined : expanded}",
-  "expanded && !knownChildless"
+  "const expanded = !knownChildless && library.expandedFolderIds.has(folder.id)",
+  "const expandable = rootFolderId !== null && !knownChildless",
+  "const expanded = expandable && library.expandedFolderIds.has(rootFolderId)",
+  "aria-expanded={expandable ? expanded : undefined}"
 ]) {
   if (!librarySidebar.includes(value)) {
     fail(`LibrarySidebar must separate leaf selection visuals from real parent expansion: missing ${value}`);
@@ -1708,11 +1742,11 @@ if (
 if (!existsSync(path.join(root, mediaResourcesPath))) {
   fail("web thumbnail resource helper must live behind apps/web/src/core/mediaResources.ts");
 }
-if (!/import\s+type\s+{[\s\S]*ThumbnailResponse[\s\S]*}\s+from\s+"@megle\/core-client"/.test(mediaResources)) {
-  fail("mediaResources must use the @megle/core-client ThumbnailResponse contract");
+if (!/import\s+type\s+{[\s\S]*ThumbnailResponse[\s\S]*}\s+from\s+"@mangoo\/core-client"/.test(mediaResources)) {
+  fail("mediaResources must use the @mangoo/core-client ThumbnailResponse contract");
 }
 if (!/createCoreClient\(\)[\s\S]*?getThumbnail\(/.test(mediaResources)) {
-  fail("mediaResources must request thumbnail state through @megle/core-client getThumbnail");
+  fail("mediaResources must request thumbnail state through @mangoo/core-client getThumbnail");
 }
 if (!/inFlightThumbnailRequests/.test(mediaResources) || !/thumbnailResourceCache/.test(mediaResources)) {
   fail("mediaResources must coalesce in-flight thumbnail requests and cache state by media id");
@@ -1740,19 +1774,32 @@ if (
   fail("mediaResources original preview signatures must use stable file identity and exclude thumbnail state");
 }
 if (
-  !/const\s+mediaSignature\s*=\s*mediaFileContentSignature\(mediaRecord\);/.test(
+  !/const\s+mediaSignature\s*=\s*mediaPreviewContentSignature\(mediaRecord\);/.test(
     mediaResources
   ) ||
-  !/function\s+originalPreviewRequestKey\(mediaRecord:\s*MediaRecord\):\s*string\s*\{\s*return\s+\[mediaCacheEpoch,\s*mediaFileContentSignature\(mediaRecord\),\s*"original"\]\.join\(":\"\);\s*\}/.test(
+  !/function\s+originalPreviewRequestKey\(mediaRecord:\s*MediaRecord\):\s*string\s*\{\s*return\s+\[mediaCacheEpoch,\s*mediaPreviewContentSignature\(mediaRecord\),\s*"original"\]\.join\(":\"\);\s*\}/.test(
     mediaResources
   )
 ) {
-  fail("mediaResources original preview requests must be keyed by stable file signatures (+ library epoch), not thumbnail state signatures");
+  fail("mediaResources preview requests must use the preview signature plus library epoch");
+}
+const mediaPreviewContentSignatureBlock = sourceMatch(
+  mediaResources,
+  /export\s+function\s+mediaPreviewContentSignature\s*\([\s\S]*?\n\}/
+);
+if (
+  !mediaPreviewContentSignatureBlock ||
+  !/mediaPreviewKind\(mediaRecord\)\s*===\s*"static-thumbnail"/.test(mediaPreviewContentSignatureBlock) ||
+  !/mediaRecord\.presentation\?\.generation/.test(mediaPreviewContentSignatureBlock) ||
+  !/:\s*mediaFileContentSignature\(mediaRecord\);/.test(mediaPreviewContentSignatureBlock) ||
+  /thumbnailState|mediaContentSignature\(/.test(mediaPreviewContentSignatureBlock)
+) {
+  fail("preview identity must preserve builtin file signatures and include only capability generation for decoder output, never thumbnail state");
 }
 if (
   !/captureOriginalFallbackObjectUrlToken\(item\)/.test(mediaGrid) ||
   !/readCachedOriginalFallbackObjectUrl\(fallbackToken\)/.test(mediaGrid) ||
-  !/const\s+originalVersionKey\s*=\s*mediaFileContentSignature\(media\);/.test(mediaPreview) ||
+  !/const\s+originalVersionKey\s*=\s*mediaPreviewContentSignature\(media\);/.test(mediaPreview) ||
   !/`folder-cover:\$\{mediaFileContentSignature\(coverMediaItem\)\}`/.test(subfolderStrip)
 ) {
   fail("UI original-preview object URL keys must use stable file signatures so thumbnail state polling does not restart image loads");
@@ -2102,7 +2149,7 @@ if (
   // renderedOnly (persist only already-rendered thumbnails), wired through
   // useLibraryData and applied in the App shell. The union literal is the
   // shared contract type; previewPreferences re-exports it (single source).
-  !/import type \{ ThumbnailGenerationMode \} from "@megle\/core-client"/.test(previewPreferences) ||
+  !/import type \{ ThumbnailGenerationMode \} from "@mangoo\/core-client"/.test(previewPreferences) ||
   !/export type \{ ThumbnailGenerationMode \}/.test(previewPreferences) ||
   !/DEFAULT_THUMBNAIL_GENERATION_MODE[^=]*=\s*"renderedOnly"/.test(previewPreferences) ||
   !/"renderedOnly"\s*\|\s*"allPersist"\s*\|\s*"cacheOnly"/.test(coreClientContract) ||
@@ -2179,12 +2226,12 @@ if (
   fail("MediaPreview must apply explicit contained dimensions to fixed-frame inspector images");
 }
 if (
-  !/source\s*===\s*"thumbnail"[\s\S]*preferOriginalWhilePending[\s\S]*media\.kind\s*===\s*"image"[\s\S]*thumbnail\?\.state\s*!==\s*"failed"[\s\S]*thumbnail\?\.state\s*!==\s*"skipped_small"/.test(
+  !/source\s*===\s*"thumbnail"[\s\S]*preferOriginalWhilePending[\s\S]*previewKind\s*===\s*"original-image"[\s\S]*thumbnail\?\.state\s*!==\s*"failed"[\s\S]*thumbnail\?\.state\s*!==\s*"skipped_small"/.test(
     mediaPreview
   ) ||
   !/source="original"[\s\S]*versionKey=\{originalVersionKey\}/.test(mediaPreview)
 ) {
-  fail("MediaPreview thumbnail mode must only use original-preview fallback for pending image inspector previews");
+  fail("MediaPreview inspector original fallback must require Core original-image presentation and a nonterminal pending thumbnail");
 }
 if (!centralPreviewStage.includes('source="original"')) {
   fail("CentralPreviewStage must request original media bytes through MediaPreview");
@@ -2567,13 +2614,13 @@ for (const filePath of walk(webSrc)) {
   const contents = readFileSync(filePath, "utf8");
 
   if (/\bfetch\s*\(/.test(contents)) {
-    fail(`raw fetch is not allowed in web source; use @megle/core-client or document an explicit non-Core exception: ${relative}`);
+    fail(`raw fetch is not allowed in web source; use @mangoo/core-client or document an explicit non-Core exception: ${relative}`);
   }
   if (contents.includes("node:fs") || contents.includes("electron")) {
     fail(`web source must not import filesystem/electron APIs: ${relative}`);
   }
   if (
-    contents.includes("window.megleDesktop") &&
+    contents.includes("window.mangooDesktop") &&
     relative !== desktopAdapterPath
   ) {
     fail(`desktop preload bridge access must stay in ${desktopAdapterPath}: ${relative}`);
@@ -2590,7 +2637,7 @@ for (const filePath of walk(webSrc)) {
   }
 }
 
-for (const value of ["@megle/core-client", "createCoreClient"]) {
+for (const value of ["@mangoo/core-client", "createCoreClient"]) {
   const found = walk(webSrc).some((filePath) => readFileSync(filePath, "utf8").includes(value));
   if (!found) {
     fail(`web core boundary must import ${value}`);

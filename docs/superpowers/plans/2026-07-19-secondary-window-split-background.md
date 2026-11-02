@@ -170,7 +170,7 @@ Keep every existing sizing, spacing, scrolling, and navigation-state declaration
 Run:
 
 ```powershell
-npm --workspace @megle/web run typecheck
+npm --workspace @mangoo/web run typecheck
 npm run check:ui-design
 ```
 
@@ -249,7 +249,7 @@ Keep all existing conditions and handlers, but change the body hierarchy to:
             <p className="plugins-empty-title">No plugins discovered yet.</p>
             <p className="plugins-empty-hint">
               Drop a plugin folder under{" "}
-              <code className="dialog-code">MEGLE_PLUGINS_DIR</code> and click Re-scan.
+              <code className="dialog-code">MANGOO_PLUGINS_DIR</code> and click Re-scan.
             </p>
           </div>
         ) : (
@@ -390,9 +390,9 @@ Expected: all PASS.
 - [ ] **Step 2: Run the OS-backdrop desktop visual harness**
 
 ```powershell
-$env:MEGLE_VISUAL_OS_BACKDROP='1'
+$env:MANGOO_VISUAL_OS_BACKDROP='1'
 node .tmp\visual-check\desktop-ui-regression.mjs
-Remove-Item Env:\MEGLE_VISUAL_OS_BACKDROP
+Remove-Item Env:\MANGOO_VISUAL_OS_BACKDROP
 ```
 
 Expected: PASS with Settings and Plugins opening through the normal secondary-window lifecycle.

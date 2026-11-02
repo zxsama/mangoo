@@ -164,7 +164,7 @@ export const processLogBuffer = new ProcessLogBuffer();
 // Repository/dev runs still mirror logs (including piped visual harnesses);
 // only the packaged GUI suppresses a console sink when no terminal exists.
 const isPackagedWindowsGuiProcess =
-  process.platform === "win32" && path.basename(process.execPath).toLowerCase() === "megle.exe";
+  process.platform === "win32" && path.basename(process.execPath).toLowerCase() === "mangoo.exe";
 const desktopConsole =
   !isPackagedWindowsGuiProcess || process.stdout?.isTTY || process.stderr?.isTTY ? console : {};
 export const desktopLogger = new DesktopLogger({ buffer: processLogBuffer, console: desktopConsole });

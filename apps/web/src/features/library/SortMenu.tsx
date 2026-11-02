@@ -1,4 +1,4 @@
-import { ArrowDownUp } from "lucide-react";
+import { ArrowDownUp } from "../../design/icons";
 import { useRef } from "react";
 import {
   AnchoredOverlay,

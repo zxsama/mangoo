@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import path from "node:path";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { describe, it } from "node:test";
 import {
   configurePackagedRuntime,
   mainWindowSkipsTaskbarDuringBootstrap,
-  MEGLE_APP_USER_MODEL_ID,
-  packagedApplicationIdentity,
-  packagedWindowIconPath,
+  MANGOO_APP_USER_MODEL_ID,
+  applicationIdentity,
+  windowIconPath,
   rendererUrlForSession,
   withDefaultHostStorage
 } from "../src/product-runtime.ts";
@@ -14,46 +16,46 @@ import {
 describe("packaged desktop runtime", () => {
   it("points Core, web, and Providers at packaged resources", () => {
     const env: NodeJS.ProcessEnv = {
-      MEGLE_ALLOWED_ORIGIN: "http://127.0.0.1:4173",
-      MEGLE_CORE_ADDR: "127.0.0.1:4173",
-      MEGLE_CORE_PROFILE: "release",
-      MEGLE_CORE_URL: "http://127.0.0.1:4173/api",
-      MEGLE_WEB_URL: "http://127.0.0.1:4173"
+      MANGOO_ALLOWED_ORIGIN: "http://127.0.0.1:4173",
+      MANGOO_CORE_ADDR: "127.0.0.1:4173",
+      MANGOO_CORE_PROFILE: "release",
+      MANGOO_CORE_URL: "http://127.0.0.1:4173/api",
+      MANGOO_WEB_URL: "http://127.0.0.1:4173"
     };
     configurePackagedRuntime(
-      { isPackaged: true, resourcesPath: "C:\\Megle\\resources", parentPid: 4242 },
+      { isPackaged: true, resourcesPath: "C:\\Mangoo\\resources", parentPid: 4242 },
       env
     );
 
-    assert.equal(env.MEGLE_CORE_BINARY, path.join("C:\\Megle\\resources", "core", "megle-core.exe"));
+    assert.equal(env.MANGOO_CORE_BINARY, path.join("C:\\Mangoo\\resources", "core", "mangoo-core.exe"));
     assert.equal(
-      env.MEGLE_PLUGINS_DIR,
-      path.join("C:\\Megle\\resources", "core", "bundled-plugins")
+      env.MANGOO_PLUGINS_DIR,
+      path.join("C:\\Mangoo\\resources", "core", "bundled-plugins")
     );
-    assert.equal(env.MEGLE_WEB_DIR, path.join("C:\\Megle\\resources", "web"));
-    assert.equal(env.MEGLE_SERVE_WEB, "1");
-    assert.equal(env.MEGLE_PARENT_PID, "4242");
-    assert.equal(env.MEGLE_ALLOWED_ORIGIN, undefined);
-    assert.equal(env.MEGLE_CORE_ADDR, undefined);
-    assert.equal(env.MEGLE_CORE_PROFILE, undefined);
-    assert.equal(env.MEGLE_CORE_URL, undefined);
-    assert.equal(env.MEGLE_WEB_URL, undefined);
+    assert.equal(env.MANGOO_WEB_DIR, path.join("C:\\Mangoo\\resources", "web"));
+    assert.equal(env.MANGOO_SERVE_WEB, "1");
+    assert.equal(env.MANGOO_PARENT_PID, "4242");
+    assert.equal(env.MANGOO_ALLOWED_ORIGIN, undefined);
+    assert.equal(env.MANGOO_CORE_ADDR, undefined);
+    assert.equal(env.MANGOO_CORE_PROFILE, undefined);
+    assert.equal(env.MANGOO_CORE_URL, undefined);
+    assert.equal(env.MANGOO_WEB_URL, undefined);
   });
 
   it("leaves development and external-Core environments unchanged", () => {
-    const developmentEnv: NodeJS.ProcessEnv = { MEGLE_WEB_URL: "http://127.0.0.1:5173" };
+    const developmentEnv: NodeJS.ProcessEnv = { MANGOO_WEB_URL: "http://127.0.0.1:5173" };
     configurePackagedRuntime(
-      { isPackaged: false, resourcesPath: "C:\\Megle\\resources", parentPid: 10 },
+      { isPackaged: false, resourcesPath: "C:\\Mangoo\\resources", parentPid: 10 },
       developmentEnv
     );
-    assert.deepEqual(developmentEnv, { MEGLE_WEB_URL: "http://127.0.0.1:5173" });
+    assert.deepEqual(developmentEnv, { MANGOO_WEB_URL: "http://127.0.0.1:5173" });
 
-    const externalEnv: NodeJS.ProcessEnv = { MEGLE_CORE_EXTERNAL: "1", MEGLE_WEB_URL: "https://example.test" };
+    const externalEnv: NodeJS.ProcessEnv = { MANGOO_CORE_EXTERNAL: "1", MANGOO_WEB_URL: "https://example.test" };
     configurePackagedRuntime(
-      { isPackaged: true, resourcesPath: "C:\\Megle\\resources", parentPid: 11 },
+      { isPackaged: true, resourcesPath: "C:\\Mangoo\\resources", parentPid: 11 },
       externalEnv
     );
-    assert.deepEqual(externalEnv, { MEGLE_CORE_EXTERNAL: "1", MEGLE_WEB_URL: "https://example.test" });
+    assert.deepEqual(externalEnv, { MANGOO_CORE_EXTERNAL: "1", MANGOO_WEB_URL: "https://example.test" });
   });
 
   it("loads the renderer from the Core origin and keeps hash routes", () => {
@@ -65,18 +67,33 @@ describe("packaged desktop runtime", () => {
       rendererUrlForSession({ baseUrl: "http://127.0.0.1:49152/api" }, "#/settings"),
       "http://127.0.0.1:49152/#/settings"
     );
-    assert.equal(MEGLE_APP_USER_MODEL_ID, "com.megle.desktop");
-    assert.deepEqual(packagedApplicationIdentity(true, "win32"), {
-      name: "Megle",
-      appUserModelId: MEGLE_APP_USER_MODEL_ID
+  });
+
+  it("uses the Mangoo identity in both development and packaged startup", () => {
+    assert.equal(MANGOO_APP_USER_MODEL_ID, "com.mangoo.desktop");
+    assert.deepEqual(applicationIdentity("win32"), {
+      name: "Mangoo",
+      appUserModelId: MANGOO_APP_USER_MODEL_ID
     });
-    assert.deepEqual(packagedApplicationIdentity(true, "linux"), { name: "Megle" });
-    assert.equal(packagedApplicationIdentity(false, "win32"), undefined);
+    assert.deepEqual(applicationIdentity("linux"), { name: "Mangoo" });
+  });
+
+  it("keeps the packaged icon in the resource directory", () => {
     assert.equal(
-      packagedWindowIconPath(true, "C:\\Megle\\resources"),
-      path.join("C:\\Megle\\resources", "icon.png")
+      windowIconPath(true, "C:\\Mangoo\\resources", "unused-development-path"),
+      path.join("C:\\Mangoo\\resources", "icon.png")
     );
-    assert.equal(packagedWindowIconPath(false, "C:\\Megle\\resources"), undefined);
+  });
+
+  it("uses the generated development icon only when it exists", (context) => {
+    const desktopPath = mkdtempSync(path.join(tmpdir(), "mangoo desktop icon "));
+    context.after(() => rmSync(desktopPath, { recursive: true, force: true }));
+    assert.equal(windowIconPath(false, "unused-resources-path", desktopPath), undefined);
+    mkdirSync(path.join(desktopPath, "build"));
+    const iconPath = path.join(desktopPath, "build", "icon.png");
+    writeFileSync(iconPath, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLttAAAAABJRU5ErkJggg==", "base64"));
+    assert.equal(windowIconPath(false, "unused-resources-path", desktopPath), iconPath);
+    assert.equal(path.isAbsolute(windowIconPath(false, "unused-resources-path", desktopPath)!), true);
   });
 
   it("keeps the packaged main window registered with the taskbar during bootstrap", () => {
@@ -92,25 +109,25 @@ describe("packaged desktop runtime", () => {
       allowedOrigin: "http://127.0.0.1:49152"
     };
 
-    assert.deepEqual(withDefaultHostStorage(baseSession, "C:\\Users\\Megle"), {
+    assert.deepEqual(withDefaultHostStorage(baseSession, "C:\\Users\\Mangoo"), {
       ...baseSession,
-      hostDbPath: path.join("C:\\Users\\Megle", "host", "host.sqlite"),
-      librariesDir: path.join("C:\\Users\\Megle", "host", "libraries")
+      hostDbPath: path.join("C:\\Users\\Mangoo", "host", "host.sqlite"),
+      librariesDir: path.join("C:\\Users\\Mangoo", "host", "libraries")
     });
 
     assert.deepEqual(
       withDefaultHostStorage(
         {
           ...baseSession,
-          hostDbPath: "D:\\Megle\\.data\\host\\host.sqlite",
-          librariesDir: "D:\\Megle\\.data\\host\\libraries"
+          hostDbPath: "D:\\Custom Profile\\host.sqlite",
+          librariesDir: "E:\\Custom Libraries"
         },
-        "C:\\Users\\Megle"
+        "C:\\Users\\Mangoo"
       ),
       {
         ...baseSession,
-        hostDbPath: "D:\\Megle\\.data\\host\\host.sqlite",
-        librariesDir: "D:\\Megle\\.data\\host\\libraries"
+        hostDbPath: "D:\\Custom Profile\\host.sqlite",
+        librariesDir: "E:\\Custom Libraries"
       }
     );
   });

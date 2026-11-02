@@ -70,7 +70,7 @@
 未来浏览器扩展流程：
 
 1. 浏览器扩展选择图片/页面资源。
-2. 扩展发送到本机 Megle Native Host 或 Megle Core。
+2. 扩展发送到本机 Mangoo Native Host 或 Mangoo Core。
 3. 用户选择真实目录保存。
 4. Core 保存文件到指定目录。
 5. watcher/indexer 自动入库。
@@ -79,7 +79,7 @@
 
 ```json
 {
-  "id": "com.megle.decoder.raw",
+  "id": "com.mangoo.decoder.raw",
   "name": "RAW Decoder",
   "version": "0.1.0",
   "engine": "process",
@@ -108,9 +108,9 @@ Docker 形态：
 docker run
   -v /media/photos:/library/photos:ro
   -v /media/videos:/library/videos:ro
-  -v megle-data:/data
+  -v mangoo-data:/data
   -p 8080:8080
-  megle/server
+  mangoo/server
 ```
 
 Web 版必须补充：

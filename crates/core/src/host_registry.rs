@@ -34,9 +34,17 @@ const HOST_MIGRATION_0016: &str = include_str!("../host_migrations/0016_remote_r
 const HOST_MIGRATION_0017: &str =
     include_str!("../host_migrations/0017_restore_action_contracts.sql");
 const HOST_MIGRATION_0018: &str = include_str!("../host_migrations/0018_descriptor_snapshots.sql");
+const HOST_MIGRATION_0019: &str = include_str!("../host_migrations/0019_plugin_lifecycle.sql");
+const HOST_MIGRATION_0020: &str = include_str!("../host_migrations/0020_plugin_contributions.sql");
+const HOST_MIGRATION_0021: &str =
+    include_str!("../host_migrations/0021_library_registration_visibility.sql");
+const HOST_MIGRATION_0022: &str =
+    include_str!("../host_migrations/0022_separated_library_storage.sql");
 
-pub const ONEDRIVE_SECRET_NAMESPACE: &str = "microsoft-onedrive";
-pub const ONEDRIVE_CREDENTIAL_PURPOSE: &str = "oauth-v1";
+#[cfg(test)]
+pub const CONFIGURABLE_SECRET_NAMESPACE: &str = "configurable-sync";
+#[cfg(test)]
+pub const CONFIGURABLE_CREDENTIAL_PURPOSE: &str = "session-v1";
 
 fn cache_remote_descriptor(
     transaction: &rusqlite::Transaction<'_>,
@@ -123,17 +131,33 @@ fn cache_remote_descriptor(
     Ok(())
 }
 
-fn enqueue_onedrive_secret_retirements(
+pub(crate) fn enqueue_plugin_secret_retirements(
     transaction: &rusqlite::Transaction<'_>,
     plugin_id: &str,
     account_uuid: &str,
     primary_secret_ref: Option<&str>,
     now: i64,
 ) -> anyhow::Result<()> {
-    if let Some(secret_ref) = primary_secret_ref {
-        transaction.execute("INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,0,?7,?7,?7)", params![uuid::Uuid::now_v7().to_string(),plugin_id,account_uuid,secret_ref,ONEDRIVE_SECRET_NAMESPACE,ONEDRIVE_CREDENTIAL_PURPOSE,now])?;
-    }
-    transaction.execute("INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) SELECT lower(hex(randomblob(16))),plugin_id,account_uuid,secret_ref,namespace,purpose,0,?1,?1,?1 FROM plugin_secret_handles WHERE plugin_id=?2 AND account_uuid=?3", params![now, plugin_id, account_uuid])?;
+    transaction.execute("INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) SELECT lower(hex(randomblob(16))),plugin_id,account_uuid,secret_ref,namespace,purpose,0,?1,?1,?1 FROM plugin_secret_handles WHERE plugin_id=?2 AND account_uuid=?3 AND (role='scoped' OR secret_ref=?4)", params![now, plugin_id, account_uuid,primary_secret_ref])?;
+    Ok(())
+}
+
+/// Sign-out/configuration invalidation supersedes account-switch rollback.
+/// Retire its saved primary in the same transaction that clears the account,
+/// so startup cannot restore an authorization explicitly invalidated by the user.
+pub(crate) fn retire_plugin_auth_rollback(
+    transaction: &rusqlite::Transaction<'_>,
+    plugin_id: &str,
+    now: i64,
+) -> anyhow::Result<()> {
+    transaction.execute(
+        "INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) SELECT lower(hex(randomblob(16))),h.plugin_id,h.account_uuid,h.secret_ref,h.namespace,h.purpose,0,?2,?2,?2 FROM plugin_secret_handles h JOIN plugin_auth_flow_ownership f ON f.plugin_id=h.plugin_id AND f.prior_secret_ref=h.secret_ref WHERE h.plugin_id=?1",
+        params![plugin_id, now],
+    )?;
+    transaction.execute(
+        "DELETE FROM plugin_auth_flow_ownership WHERE plugin_id=?1",
+        [plugin_id],
+    )?;
     Ok(())
 }
 
@@ -373,7 +397,9 @@ pub struct SyncRestorePlan {
     pub account_uuid: String,
     pub library_uuid: String,
     pub name: String,
-    pub managed_root: String,
+    pub database_path: String,
+    pub placement_base: String,
+    pub content_paths: Vec<String>,
     pub state: String,
     pub phase: String,
     pub catalog_ready: bool,
@@ -452,6 +478,14 @@ pub struct LibraryDescriptor {
 }
 
 #[derive(Debug, Clone)]
+pub struct LibraryOpenIntent {
+    pub descriptor: LibraryDescriptor,
+    pub root_identity: String,
+    pub local_identity: Option<String>,
+    pub catalog_identity: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct HostSnapshot {
     pub active_library_uuid: Option<String>,
     pub context_revision: u64,
@@ -476,9 +510,20 @@ pub struct CreationRecovery {
     pub color: Option<String>,
     pub resolved_root: PathBuf,
     pub staging_dir: PathBuf,
-    pub created_root: bool,
     pub root_identity: Option<String>,
-    pub staging_identity: Option<String>,
+    pub layout_version: u32,
+    pub final_storage_path: Option<PathBuf>,
+    pub content_roots_json: String,
+    pub owned_artifacts_json: String,
+    pub phase: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OwnedCreationArtifact {
+    pub path: PathBuf,
+    pub identity: String,
+    pub directory: bool,
+    pub role: String,
 }
 
 #[derive(Debug, Clone)]
@@ -491,13 +536,15 @@ pub struct RemovalRecovery {
     pub root_quarantine: Option<PathBuf>,
     pub local_quarantine: Option<PathBuf>,
     pub root_quarantine_identity: Option<String>,
-    pub local_quarantine_identity: Option<String>,
     pub phase: String,
+    pub layout_version: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostPluginProjection {
+    pub contributions: Option<crate::plugins::contributions::PluginContributions>,
+    pub lifecycle_epoch: i64,
     pub plugin_id: String,
     pub name: String,
     pub selected_version: String,
@@ -519,27 +566,6 @@ pub struct HostPluginProjection {
     pub compatibility_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OneDriveConfiguration {
-    pub source: String,
-    pub configured: bool,
-    pub read_only: bool,
-    pub revision: u64,
-    pub error_code: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OneDriveConfigurationPlan {
-    pub plan_uuid: String,
-    pub expected_revision: u64,
-    pub effective_changed: bool,
-    pub affected_libraries: u64,
-    pub requires_confirmation: bool,
-    pub expires_at: i64,
-}
-
 #[derive(Debug, Clone)]
 pub struct CredentialRetirement {
     pub retirement_uuid: String,
@@ -549,26 +575,6 @@ pub struct CredentialRetirement {
     pub namespace: String,
     pub purpose: String,
     pub attempts: u32,
-}
-
-#[derive(Debug)]
-pub struct OneDriveConfigurationCommit {
-    pub fences: Vec<BindingFence>,
-    pub effective_changed: bool,
-}
-
-const ONEDRIVE_PLUGIN_ID: &str = "com.megle.onedrive";
-
-fn normalized_client_id(value: Option<&str>) -> anyhow::Result<Option<String>> {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-    let parsed =
-        uuid::Uuid::parse_str(value).map_err(|_| anyhow::anyhow!("invalid-onedrive-client-id"))?;
-    if parsed.is_nil() {
-        anyhow::bail!("invalid-onedrive-client-id");
-    }
-    Ok(Some(parsed.hyphenated().to_string()))
 }
 
 pub struct RegisterBundledPlugin<'a> {
@@ -591,6 +597,35 @@ pub struct PluginRuntimeLaunch {
     pub entry_sha256: [u8; 32],
     pub account_uuid: String,
     pub account_generation: i64,
+    pub lifecycle_epoch: i64,
+    pub granted_permissions: Vec<crate::plugins::manifest::Permission>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DecoderRuntimeLaunch {
+    pub plugin_id: String,
+    pub version: String,
+    pub manifest_json: String,
+    pub install_root: PathBuf,
+    pub lifecycle_epoch: i64,
+    pub granted_permissions: Vec<crate::plugins::manifest::Permission>,
+}
+
+impl DecoderRuntimeLaunch {
+    pub fn fingerprint(&self) -> String {
+        format!("{}:{}", self.version, self.lifecycle_epoch)
+    }
+}
+
+/// Local UI loading does not require an account or a running Provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginUiSource {
+    pub plugin_id: String,
+    pub version: String,
+    pub manifest_json: String,
+    pub install_root: PathBuf,
+    pub lifecycle_epoch: i64,
+    pub requested_permissions: Vec<crate::plugins::manifest::Permission>,
     pub granted_permissions: Vec<crate::plugins::manifest::Permission>,
 }
 
@@ -600,6 +635,7 @@ impl PluginRuntimeLaunch {
             &self.version,
             &self.account_uuid,
             self.account_generation,
+            self.lifecycle_epoch,
             &self.granted_permissions,
         )
     }
@@ -609,11 +645,12 @@ fn plugin_runtime_launch_fingerprint(
     version: &str,
     account_uuid: &str,
     account_generation: i64,
+    lifecycle_epoch: i64,
     granted_permissions: &[crate::plugins::manifest::Permission],
 ) -> String {
     let grants =
         serde_json::to_string(granted_permissions).unwrap_or_else(|_| "invalid-grants".to_owned());
-    format!("{version}:{account_uuid}:{account_generation}:{grants}")
+    format!("{version}:{account_uuid}:{account_generation}:{lifecycle_epoch}:{grants}")
 }
 
 fn sync_operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncOperation> {
@@ -628,6 +665,30 @@ fn sync_operation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncOper
     })
 }
 
+fn collect_reserved_content_paths(value: &serde_json::Value, paths: &mut Vec<PathBuf>) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (name, value) in fields {
+                if matches!(name.as_str(), "path" | "targetPath" | "normalizedPath") {
+                    if let Some(path) = value.as_str() {
+                        if Path::new(path).is_absolute() {
+                            paths.push(path.into());
+                        }
+                    }
+                } else {
+                    collect_reserved_content_paths(value, paths);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_reserved_content_paths(item, paths);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn restore_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncRestorePlan> {
     Ok(SyncRestorePlan {
         restore_uuid: row.get(0)?,
@@ -635,7 +696,15 @@ fn restore_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncRestor
         account_uuid: row.get(2)?,
         library_uuid: row.get(3)?,
         name: row.get(4)?,
-        managed_root: row.get(5)?,
+        database_path: row.get::<_, Option<String>>(15)?.unwrap_or_default(),
+        placement_base: row.get::<_, Option<String>>(16)?.unwrap_or_default(),
+        content_paths: serde_json::from_str(&row.get::<_, String>(17)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                17,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
         state: row.get(6)?,
         phase: row.get(7)?,
         catalog_ready: row.get::<_, i64>(8)? != 0,
@@ -656,7 +725,7 @@ fn restore_plans_for_operation_in_transaction(
     transaction: &rusqlite::Connection,
     operation_uuid: &str,
 ) -> anyhow::Result<Vec<SyncRestorePlan>> {
-    let mut statement = transaction.prepare("SELECT restore_uuid,operation_uuid,account_uuid,library_uuid,name,managed_root,state,phase,catalog_ready,media_items_done,media_items_total,media_bytes_done,media_bytes_total,error_code,updated_at FROM sync_restore_plans WHERE operation_uuid=?1 ORDER BY created_at,restore_uuid")?;
+    let mut statement = transaction.prepare("SELECT restore_uuid,operation_uuid,account_uuid,library_uuid,name,managed_root,state,phase,catalog_ready,media_items_done,media_items_total,media_bytes_done,media_bytes_total,error_code,updated_at,database_path,placement_base,content_paths_json FROM sync_restore_plans WHERE operation_uuid=?1 ORDER BY created_at,restore_uuid")?;
     let plans = statement
         .query_map([operation_uuid], restore_plan_from_row)?
         .collect::<Result<Vec<_>, _>>()
@@ -940,7 +1009,7 @@ fn plugin_runtime_launch_matches(
 ) -> anyhow::Result<bool> {
     let current = connection
         .query_row(
-            "SELECT i.selected_version,i.enabled_intent,i.requested_permissions_json,i.granted_permissions_json,a.account_uuid,a.generation,r.state FROM plugin_installations i JOIN plugin_accounts a ON a.plugin_id=i.plugin_id JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id WHERE i.plugin_id=?1",
+            "SELECT i.selected_version,i.enabled_intent,i.requested_permissions_json,i.granted_permissions_json,a.account_uuid,a.generation,r.state,i.lifecycle_epoch FROM plugin_installations i JOIN plugin_accounts a ON a.plugin_id=i.plugin_id JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id WHERE i.plugin_id=?1 AND r.stop_pending=0",
             [plugin_id],
             |row| {
                 Ok((
@@ -951,6 +1020,7 @@ fn plugin_runtime_launch_matches(
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
                 ))
             },
         )
@@ -963,6 +1033,7 @@ fn plugin_runtime_launch_matches(
         account_uuid,
         account_generation,
         state,
+        lifecycle_epoch,
     )) = current
     else {
         return Ok(false);
@@ -973,8 +1044,13 @@ fn plugin_runtime_launch_matches(
     Ok(enabled
         && state != "configuration-required"
         && permissions_match(&requested, &granted)
-        && plugin_runtime_launch_fingerprint(&version, &account_uuid, account_generation, &granted)
-            == expected_fingerprint)
+        && plugin_runtime_launch_fingerprint(
+            &version,
+            &account_uuid,
+            account_generation,
+            lifecycle_epoch,
+            &granted,
+        ) == expected_fingerprint)
 }
 
 #[derive(Debug, Clone)]
@@ -1241,7 +1317,7 @@ pub struct RootComparisonItemRecord {
 }
 
 pub struct HostRegistry {
-    connection: Mutex<Connection>,
+    pub(crate) connection: Mutex<Connection>,
 }
 
 fn permissions_match(
@@ -1254,7 +1330,67 @@ fn permissions_match(
             .all(|permission| granted.contains(permission))
 }
 
-fn pause_plugin_bindings_in_transaction(
+pub(crate) fn invalidate_plugin_remote_scope_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    plugin_id: &str,
+) -> anyhow::Result<()> {
+    // Publication evidence survives transport restarts, but not remote identity
+    // or effective configuration changes. Invalidate it in that same Host
+    // transaction; ordinary pause/disable must retain it.
+    transaction.execute(
+        "DELETE FROM provider_object_receipts WHERE library_uuid IN (SELECT library_uuid FROM library_sync_bindings WHERE plugin_id=?1)",
+        [plugin_id],
+    )?;
+    transaction.execute(
+        "UPDATE library_sync_bindings SET published_through_seq=0 WHERE plugin_id=?1",
+        [plugin_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM provider_binding_cursors WHERE library_uuid IN (SELECT library_uuid FROM library_sync_bindings WHERE plugin_id=?1)",
+        [plugin_id],
+    )?;
+    for table in [
+        "provider_account_root_cursors",
+        "provider_remote_libraries",
+        "provider_remote_descriptor_heads",
+        "provider_verified_descriptors",
+    ] {
+        transaction.execute(
+            &format!("DELETE FROM {table} WHERE account_uuid IN (SELECT account_uuid FROM plugin_accounts WHERE plugin_id=?1)"),
+            [plugin_id],
+        )?;
+    }
+    let now = unix_timestamp_millis();
+    transaction.execute(
+        "UPDATE sync_unbind_plans SET state='failed',last_error_code='remote-scope-changed',updated_at=?2 WHERE state='planned' AND (plugin_id=?1 OR account_uuid IN (SELECT account_uuid FROM plugin_accounts WHERE plugin_id=?1) OR library_uuid IN (SELECT library_uuid FROM library_sync_bindings WHERE plugin_id=?1))",
+        params![plugin_id, now],
+    )?;
+    transaction.execute(
+        "UPDATE sync_reconnect_plans SET state='failed',updated_at=?2 WHERE state='planned' AND (account_uuid IN (SELECT account_uuid FROM plugin_accounts WHERE plugin_id=?1) OR library_uuid IN (SELECT library_uuid FROM library_sync_bindings WHERE plugin_id=?1))",
+        params![plugin_id, now],
+    )?;
+    Ok(())
+}
+
+fn remote_identity_requires_invalidation(
+    transaction: &rusqlite::Transaction<'_>,
+    plugin_id: &str,
+    current: Option<&str>,
+    incoming: Option<&str>,
+) -> anyhow::Result<bool> {
+    if let Some(current) = current {
+        return Ok(Some(current) != incoming);
+    }
+    // A historical binding without a retained remote identity cannot establish
+    // that its publication evidence belongs to the newly authenticated scope.
+    Ok(transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM library_sync_bindings WHERE plugin_id=?1)",
+        [plugin_id],
+        |row| row.get(0),
+    )?)
+}
+
+pub(crate) fn pause_plugin_bindings_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
     plugin_id: &str,
 ) -> anyhow::Result<Vec<BindingFence>> {
@@ -1303,7 +1439,7 @@ fn commit_plugin_probation_in_transaction(
     };
     let now = unix_timestamp_millis();
     transaction.execute("UPDATE plugin_versions SET state=CASE WHEN version=?1 THEN 'known-good' WHEN state='known-good' THEN 'retired' ELSE state END WHERE plugin_id=?2",params![version,plugin_id])?;
-    transaction.execute("UPDATE plugin_installations SET selected_version=?1,known_good_version=?1,updated_at=?2 WHERE plugin_id=?3",params![version,now,plugin_id])?;
+    transaction.execute("UPDATE plugin_installations SET selected_version=?1,known_good_version=?1,lifecycle_epoch=lifecycle_epoch+1,updated_at=?2 WHERE plugin_id=?3",params![version,now,plugin_id])?;
     transaction.execute(
         "UPDATE plugin_version_journal SET phase='committed',updated_at=?1 WHERE journal_uuid=?2",
         params![now, journal_uuid],
@@ -1338,13 +1474,77 @@ fn rollback_plugin_probation_in_transaction(
         .ok_or_else(|| anyhow::anyhow!("plugin-known-good-missing"))?;
     let now = unix_timestamp_millis();
     transaction.execute("UPDATE plugin_versions SET state=CASE WHEN version=?1 THEN 'rejected' WHEN version=?2 THEN 'known-good' ELSE state END WHERE plugin_id=?3",params![candidate,fallback,plugin_id])?;
-    transaction.execute("UPDATE plugin_installations SET selected_version=?1,known_good_version=?1,updated_at=?2 WHERE plugin_id=?3",params![fallback,now,plugin_id])?;
-    transaction.execute("UPDATE plugin_runtime_state SET state='starting',last_error_code=?1,updated_at=?2 WHERE plugin_id=?3",params![error_code,now,plugin_id])?;
+    transaction.execute("UPDATE plugin_installations SET selected_version=?1,known_good_version=?1,lifecycle_epoch=lifecycle_epoch+1,updated_at=?2 WHERE plugin_id=?3",params![fallback,now,plugin_id])?;
+    transaction.execute("UPDATE plugin_runtime_state SET state=CASE WHEN (SELECT enabled_intent FROM plugin_installations WHERE plugin_id=?3)=1 THEN 'starting' ELSE 'disabled' END,stop_pending=1,session_id=NULL,last_error_code=?1,updated_at=?2 WHERE plugin_id=?3",params![error_code,now,plugin_id])?;
     transaction.execute("UPDATE plugin_version_journal SET phase='rolled-back',error_code=?1,updated_at=?2 WHERE journal_uuid=?3",params![error_code,now,journal_uuid])?;
     pause_plugin_bindings_in_transaction(transaction, plugin_id)
 }
 
+fn ensure_restore_libraries_absent<'a>(
+    connection: &Connection,
+    libraries: impl IntoIterator<Item = &'a str>,
+) -> anyhow::Result<()> {
+    let mut submitted = std::collections::BTreeSet::new();
+    for library_uuid in libraries {
+        if !submitted.insert(library_uuid) {
+            bail!("duplicate-restore-library");
+        }
+        if connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM libraries WHERE library_uuid=?1)",
+            [library_uuid],
+            |row| row.get::<_, bool>(0),
+        )? {
+            bail!("library-already-present");
+        }
+    }
+    Ok(())
+}
+
+// The creation transaction is the restore plan UUID, also embedded in the
+// on-disk Library marker. UUID/path coincidence alone never grants cleanup.
+fn ensure_restore_cleanup_owned(
+    connection: &Connection,
+    restore_uuid: &str,
+    library_uuid: &str,
+) -> anyhow::Result<()> {
+    let plan: Option<bool> = connection.query_row(
+        "SELECT catalog_ready FROM sync_restore_plans WHERE restore_uuid=?1 AND library_uuid=?2",
+        params![restore_uuid, library_uuid],
+        |row| row.get(0),
+    ).optional()?;
+    match plan {
+        None => bail!("restore-not-found"),
+        Some(true) => bail!("restore-action-not-allowed"),
+        Some(false) => {}
+    }
+    let unrelated: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM libraries l WHERE l.library_uuid=?2 AND NOT EXISTS(SELECT 1 FROM library_creation_journal j JOIN sync_restore_plans p ON p.restore_uuid=j.txn_uuid AND p.library_uuid=j.library_uuid WHERE p.restore_uuid=?1 AND j.phase IN ('created','restore-cancelling') AND j.library_uuid=l.library_uuid AND j.root_uuid=l.root_uuid AND j.resolved_root=l.managed_root AND j.marker_identity=l.marker_identity))",
+        params![restore_uuid, library_uuid],
+        |row| row.get(0),
+    )?;
+    if unrelated {
+        bail!("restore-ownership-mismatch");
+    }
+    let unrelated_binding: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_root_bindings b WHERE b.library_uuid=?2 AND NOT EXISTS(SELECT 1 FROM sync_restore_root_plans p WHERE p.restore_uuid=?1 AND p.root_uuid=b.root_uuid AND p.local_binding_uuid=b.local_binding_uuid AND p.binding_generation=b.binding_generation AND p.target_path=b.local_path))",
+        params![restore_uuid, library_uuid],
+        |row| row.get(0),
+    )?;
+    if unrelated_binding {
+        bail!("restore-ownership-mismatch");
+    }
+    Ok(())
+}
+
 impl HostRegistry {
+    pub fn ensure_restore_libraries_absent<'a>(
+        &self,
+        libraries: impl IntoIterator<Item = &'a str>,
+    ) -> anyhow::Result<()> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_restore_libraries_absent(&connection, libraries)
+    }
+
     pub fn replay_restore_operation(
         &self,
         token: &str,
@@ -1394,6 +1594,17 @@ impl HostRegistry {
         request: &serde_json::Value,
         plans: &[RestorePlanInput],
     ) -> anyhow::Result<(bool, Vec<SyncRestorePlan>)> {
+        // Persist the actual canonical placement once; constructor retries use it verbatim.
+        let plans = plans
+            .iter()
+            .map(|plan| {
+                let mut plan = plan.clone();
+                plan.managed_root =
+                    crate::library_path::inspect_directory_path(&plan.managed_root, true)
+                        .map_err(|reason| anyhow::anyhow!(reason.as_str()))?;
+                Ok(plan)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let now = unix_timestamp_millis();
         let request_json = serde_json::to_string(request)?;
         let request_hash = crate::sync_folders::request_hash(request)?;
@@ -1430,6 +1641,12 @@ impl HostRegistry {
             transaction.commit()?;
             return Ok((false, existing));
         }
+        // Replay owns the already-created shell. A new operation must claim an entirely
+        // absent aggregate before consuming its token or recording any plans.
+        ensure_restore_libraries_absent(
+            &transaction,
+            plans.iter().map(|plan| plan.library_uuid.as_str()),
+        )?;
         let changed = transaction.execute(
             "UPDATE sync_restore_preflights SET state='claimed',operation_uuid=?1,request_hash=?2,consumed_at=?3 WHERE token=?4 AND request_json=?5 AND request_hash=?2 AND state='ready' AND expires_at>=?3",
             params![operation_uuid,request_hash,now,token,request_json],
@@ -1442,7 +1659,7 @@ impl HostRegistry {
             params![operation_uuid,request_json,now],
         )?;
         let mut recorded = Vec::with_capacity(plans.len());
-        for plan in plans {
+        for plan in &plans {
             let remote: Option<(Vec<u8>, String)> = transaction
                 .query_row(
                     "SELECT descriptor_sha256,name FROM provider_remote_libraries WHERE account_uuid=?1 AND library_uuid=?2 AND compatible=1",
@@ -1453,10 +1670,28 @@ impl HostRegistry {
             let (descriptor_sha256, name) =
                 remote.ok_or_else(|| anyhow::anyhow!("remote-library-not-restorable"))?;
             let restore_uuid = uuid::Uuid::now_v7().to_string();
+            let database_path = plan.managed_root.join("Database");
+            let content_paths: Vec<String> = if plan.restore_mode == "legacy-library" {
+                vec![plan
+                    .managed_root
+                    .join("Files")
+                    .to_string_lossy()
+                    .into_owned()]
+            } else {
+                plan.roots
+                    .iter()
+                    .filter_map(|root| {
+                        root.selected_binding
+                            .as_ref()
+                            .map(|binding| binding.local_path.clone())
+                    })
+                    .collect()
+            };
             transaction.execute(
                 "INSERT INTO sync_restore_plans(restore_uuid,operation_uuid,account_uuid,library_uuid,name,managed_root,descriptor_sha256,state,phase,restore_mode,inventory_fence,request_hash,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'restoring','operation-and-plans-recorded',?8,?9,?10,?11,?11)",
                 params![restore_uuid,operation_uuid,plan.account_uuid,plan.library_uuid,name,plan.managed_root.to_string_lossy(),descriptor_sha256,plan.restore_mode,plan.inventory_fence,request_hash,now],
             )?;
+            transaction.execute("UPDATE sync_restore_plans SET database_path=?2,placement_base=?3,content_paths_json=?4 WHERE restore_uuid=?1", params![restore_uuid,database_path.to_string_lossy(),plan.managed_root.to_string_lossy(),serde_json::to_string(&content_paths)?])?;
             for root in &plan.roots {
                 let binding = root.selected_binding.as_ref();
                 transaction.execute(
@@ -1470,7 +1705,9 @@ impl HostRegistry {
                 account_uuid: plan.account_uuid.clone(),
                 library_uuid: plan.library_uuid.clone(),
                 name,
-                managed_root: plan.managed_root.to_string_lossy().into_owned(),
+                database_path: database_path.to_string_lossy().into_owned(),
+                placement_base: plan.managed_root.to_string_lossy().into_owned(),
+                content_paths: content_paths.clone(),
                 state: "restoring".into(),
                 phase: "operation-and-plans-recorded".into(),
                 catalog_ready: false,
@@ -1563,6 +1800,7 @@ impl HostRegistry {
             )
             .optional()?
             .context("library-not-found")?;
+        let managed_root = transaction.query_row("SELECT placement_base FROM sync_restore_plans WHERE library_uuid=?1 AND placement_base IS NOT NULL ORDER BY created_at DESC LIMIT 1", [library_uuid], |row| row.get::<_, String>(0)).optional()?.unwrap_or_else(|| Path::new(&managed_root).parent().unwrap_or(Path::new(&managed_root)).to_string_lossy().into_owned());
         let now = unix_timestamp_millis();
         let canonical = crate::sync_folders::canonical_path_key(Path::new(&managed_root));
         transaction.execute(
@@ -4400,7 +4638,7 @@ impl HostRegistry {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let row = connection
             .query_row(
-                "SELECT i.enabled_intent,r.state,a.auth_state,r.capabilities_json FROM plugin_installations i JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id JOIN plugin_accounts a ON a.plugin_id=i.plugin_id WHERE i.plugin_id=?1 AND a.account_uuid=?2",
+                "SELECT i.enabled_intent,CASE WHEN r.stop_pending=1 THEN 'stopping' ELSE r.state END,a.auth_state,r.capabilities_json FROM plugin_installations i JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id JOIN plugin_accounts a ON a.plugin_id=i.plugin_id WHERE i.plugin_id=?1 AND a.account_uuid=?2",
                 params![plugin_id, account_uuid],
                 |row| {
                     Ok((
@@ -4487,6 +4725,13 @@ impl HostRegistry {
         generation: i64,
     ) -> anyhow::Result<()> {
         let changed = self.connection.lock().unwrap_or_else(|p| p.into_inner()).execute("UPDATE plugin_accounts SET secret_ref=?1,auth_state=?2,generation=?3,updated_at=?4 WHERE plugin_id=?5", params![secret_ref,auth_state,generation,unix_timestamp_millis(),plugin_id])?;
+        if let (Some(reference), Some(scope)) = (
+            secret_ref,
+            self.plugin_contributions(plugin_id)?.primary_credential,
+        ) {
+            self.connection.lock().unwrap().execute("INSERT OR IGNORE INTO plugin_secret_handles(plugin_id,account_uuid,secret_ref,namespace,purpose,role,created_at) SELECT plugin_id,account_uuid,?2,?3,?4,'primary',?5 FROM plugin_accounts WHERE plugin_id=?1",params![plugin_id,reference,scope.namespace,scope.purpose,unix_timestamp_millis()])?;
+        }
+
         if changed != 1 {
             anyhow::bail!("plugin-account-not-found");
         }
@@ -4517,17 +4762,28 @@ impl HostRegistry {
             params![plugin_id, secret_ref],
             |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional()?;
-        if let Some((account_uuid, old_secret_ref)) =
-            replaced.filter(|_| plugin_id == ONEDRIVE_PLUGIN_ID)
-        {
+        if let Some((account_uuid, old_secret_ref)) = replaced {
             let now = unix_timestamp_millis();
-            enqueue_onedrive_secret_retirements(
-                &transaction,
-                plugin_id,
-                &account_uuid,
-                Some(&old_secret_ref),
-                now,
-            )?;
+            let prior: Option<Option<String>> = transaction
+                .query_row(
+                    "SELECT prior_secret_ref FROM plugin_auth_flow_ownership WHERE plugin_id=?1",
+                    [plugin_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(prior) = prior {
+                if prior.as_deref() != Some(old_secret_ref.as_str()) {
+                    transaction.execute("INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) SELECT lower(hex(randomblob(16))),plugin_id,account_uuid,secret_ref,namespace,purpose,0,?4,?4,?4 FROM plugin_secret_handles WHERE plugin_id=?1 AND account_uuid=?2 AND secret_ref=?3",params![plugin_id,account_uuid,old_secret_ref,now])?;
+                }
+            } else {
+                enqueue_plugin_secret_retirements(
+                    &transaction,
+                    plugin_id,
+                    &account_uuid,
+                    Some(&old_secret_ref),
+                    now,
+                )?;
+            }
         }
         let changed = transaction.execute(
             "UPDATE plugin_accounts SET secret_ref=?1,auth_state=?2,updated_at=?3 WHERE plugin_id=?4",
@@ -4535,6 +4791,12 @@ impl HostRegistry {
         )?;
         if changed != 1 {
             return Ok(false);
+        }
+        if let (Some(reference), Some(scope)) = (
+            secret_ref,
+            crate::plugin_configuration::declarations(&transaction, plugin_id)?.primary_credential,
+        ) {
+            transaction.execute("INSERT OR IGNORE INTO plugin_secret_handles(plugin_id,account_uuid,secret_ref,namespace,purpose,role,created_at) SELECT plugin_id,account_uuid,?2,?3,?4,'primary',?5 FROM plugin_accounts WHERE plugin_id=?1",params![plugin_id,reference,scope.namespace,scope.purpose,unix_timestamp_millis()])?;
         }
         transaction.commit()?;
         Ok(true)
@@ -4547,10 +4809,6 @@ impl HostRegistry {
     ) -> anyhow::Result<Option<Vec<BindingFence>>> {
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
-        transaction.execute(
-            "UPDATE plugin_auth_flow_ownership SET state='cancelling' WHERE plugin_id=?1",
-            [plugin_id],
-        )?;
         let retiring: Option<(String, String)> = transaction
             .query_row(
                 "SELECT account_uuid,secret_ref FROM plugin_accounts WHERE plugin_id=?1 AND generation=?2 AND secret_ref IS NOT NULL",
@@ -4558,10 +4816,8 @@ impl HostRegistry {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        if let Some((account_uuid, secret_ref)) =
-            retiring.filter(|_| plugin_id == ONEDRIVE_PLUGIN_ID)
-        {
-            enqueue_onedrive_secret_retirements(
+        if let Some((account_uuid, secret_ref)) = retiring {
+            enqueue_plugin_secret_retirements(
                 &transaction,
                 plugin_id,
                 &account_uuid,
@@ -4576,8 +4832,9 @@ impl HostRegistry {
         if changed != 1 {
             return Ok(None);
         }
+        retire_plugin_auth_rollback(&transaction, plugin_id, unix_timestamp_millis())?;
         transaction.execute(
-            "UPDATE library_sync_bindings SET state='paused',last_error_code='authorization-required',retry_after=NULL,poll_after=NULL,transport_generation=transport_generation+1,updated_at=?1 WHERE plugin_id=?2 AND state <> 'unbinding'",
+            "UPDATE library_sync_bindings SET state='paused',plugin_suspended_state=NULL,last_error_code='authorization-required',retry_after=NULL,poll_after=NULL,transport_generation=transport_generation+1,updated_at=?1 WHERE plugin_id=?2 AND state <> 'unbinding'",
             params![unix_timestamp_millis(), plugin_id],
         )?;
         let fences = {
@@ -4616,8 +4873,12 @@ impl HostRegistry {
             [plugin_id],
         )?;
         transaction.execute(
-            "UPDATE plugin_runtime_state SET state='starting',pid=NULL,session_id=NULL,started_at=NULL,backoff_until=NULL,last_error_code=NULL,last_error_detail=NULL,updated_at=?1 WHERE plugin_id=?2",
+            "UPDATE plugin_runtime_state SET state=CASE WHEN (SELECT enabled_intent FROM plugin_installations i WHERE i.plugin_id=?2)=1 THEN 'starting' ELSE 'disabled' END,stop_pending=1,pid=NULL,session_id=NULL,started_at=NULL,backoff_until=NULL,last_error_code=NULL,last_error_detail=NULL,updated_at=?1 WHERE plugin_id=?2",
             params![unix_timestamp_millis(), plugin_id],
+        )?;
+        transaction.execute(
+            "UPDATE plugin_installations SET lifecycle_epoch=lifecycle_epoch+1 WHERE plugin_id=?1",
+            [plugin_id],
         )?;
         Self::bump_sync_status_revision(&transaction)?;
         transaction.commit()?;
@@ -4655,7 +4916,7 @@ impl HostRegistry {
             [plugin_id],
         )?;
         transaction.execute(
-            "UPDATE plugin_runtime_state SET state='degraded',pid=NULL,session_id=NULL,started_at=NULL,backoff_until=NULL,last_error_code='authorization-required',last_error_detail='Microsoft authorization is required',updated_at=?1 WHERE plugin_id=?2",
+            "UPDATE plugin_runtime_state SET state='degraded',pid=NULL,session_id=NULL,started_at=NULL,backoff_until=NULL,last_error_code='authorization-required',last_error_detail='Provider authorization is required',updated_at=?1 WHERE plugin_id=?2",
             params![unix_timestamp_millis(), plugin_id],
         )?;
         transaction.commit()?;
@@ -4673,197 +4934,6 @@ impl HostRegistry {
             )
             .optional()
             .map_err(Into::into)
-    }
-
-    pub fn onedrive_configuration(&self) -> anyhow::Result<OneDriveConfiguration> {
-        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
-        let (host_override, revision): (Option<String>, i64) = connection.query_row(
-            "SELECT host_override_client_id,revision FROM onedrive_configuration WHERE singleton=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let environment =
-            normalized_client_id(std::env::var("MEGLE_ONEDRIVE_CLIENT_ID").ok().as_deref());
-        let (source, configured, error_code) = match environment {
-            Ok(Some(_)) => ("environment", true, None),
-            Err(_) => (
-                "environment",
-                false,
-                Some("invalid-onedrive-client-id".to_owned()),
-            ),
-            Ok(None) => match normalized_client_id(host_override.as_deref()) {
-                Ok(Some(_)) => ("host-override", true, None),
-                Err(_) => (
-                    "host-override",
-                    false,
-                    Some("invalid-onedrive-client-id".to_owned()),
-                ),
-                Ok(None) => (
-                    "missing",
-                    false,
-                    Some("onedrive-client-id-missing".to_owned()),
-                ),
-            },
-        };
-        Ok(OneDriveConfiguration {
-            source: source.into(),
-            configured,
-            read_only: source == "environment",
-            revision: revision as u64,
-            error_code,
-        })
-    }
-
-    fn effective_onedrive_client_id_for_override(
-        &self,
-        host_override: Option<&str>,
-    ) -> anyhow::Result<Option<String>> {
-        if let Some(value) =
-            normalized_client_id(std::env::var("MEGLE_ONEDRIVE_CLIENT_ID").ok().as_deref())?
-        {
-            return Ok(Some(value));
-        }
-        if let Some(value) = normalized_client_id(host_override)? {
-            return Ok(Some(value));
-        }
-        Ok(None)
-    }
-
-    pub fn effective_onedrive_client_id(&self) -> anyhow::Result<Option<String>> {
-        let host_override: Option<String> = self
-            .connection
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .query_row(
-                "SELECT host_override_client_id FROM onedrive_configuration WHERE singleton=1",
-                [],
-                |row| row.get(0),
-            )?;
-        self.effective_onedrive_client_id_for_override(host_override.as_deref())
-    }
-
-    pub fn plan_onedrive_configuration(
-        &self,
-        requested_override: Option<&str>,
-        expected_revision: u64,
-    ) -> anyhow::Result<OneDriveConfigurationPlan> {
-        if std::env::var("MEGLE_ONEDRIVE_CLIENT_ID")
-            .ok()
-            .is_some_and(|value| !value.trim().is_empty())
-        {
-            anyhow::bail!("onedrive-configuration-environment-locked");
-        }
-        let requested = normalized_client_id(requested_override)?;
-        let now = unix_timestamp_millis();
-        let expires_at = now + 5 * 60 * 1000;
-        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
-        let transaction = connection.transaction()?;
-        let (current, revision): (Option<String>, i64) = transaction.query_row(
-            "SELECT host_override_client_id,revision FROM onedrive_configuration WHERE singleton=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if revision as u64 != expected_revision {
-            anyhow::bail!("onedrive-configuration-revision-conflict");
-        }
-        let current_effective =
-            self.effective_onedrive_client_id_for_override(current.as_deref())?;
-        let requested_effective =
-            self.effective_onedrive_client_id_for_override(requested.as_deref())?;
-        let effective_changed = current_effective != requested_effective;
-        let affected_libraries: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM library_sync_bindings WHERE plugin_id=?1",
-            [ONEDRIVE_PLUGIN_ID],
-            |row| row.get(0),
-        )?;
-        let authenticated: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM plugin_accounts WHERE plugin_id=?1 AND auth_state='authenticated')", [ONEDRIVE_PLUGIN_ID], |row| row.get(0)
-        )?;
-        let plan_uuid = uuid::Uuid::now_v7().to_string();
-        let requires_confirmation = effective_changed && (authenticated || affected_libraries > 0);
-        transaction.execute(
-            "INSERT INTO onedrive_configuration_plans(plan_uuid,expected_revision,requested_override,effective_changed,affected_libraries,requires_confirmation,expires_at,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![plan_uuid,revision,requested,effective_changed,affected_libraries,requires_confirmation,expires_at,now],
-        )?;
-        transaction.commit()?;
-        Ok(OneDriveConfigurationPlan {
-            plan_uuid,
-            expected_revision,
-            effective_changed,
-            affected_libraries: affected_libraries as u64,
-            requires_confirmation,
-            expires_at,
-        })
-    }
-
-    pub fn commit_onedrive_configuration(
-        &self,
-        plan_uuid: &str,
-        expected_revision: u64,
-        confirmed: bool,
-    ) -> anyhow::Result<OneDriveConfigurationCommit> {
-        let now = unix_timestamp_millis();
-        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
-        let transaction = connection.transaction()?;
-        let (plan_revision, requested, changed, requires_confirmation, expires_at): (i64,Option<String>,bool,bool,i64) = transaction.query_row(
-            "SELECT expected_revision,requested_override,effective_changed,requires_confirmation,expires_at FROM onedrive_configuration_plans WHERE plan_uuid=?1", [plan_uuid],
-            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
-        ).optional()?.ok_or_else(|| anyhow::anyhow!("onedrive-configuration-plan-invalid"))?;
-        if expires_at < now {
-            anyhow::bail!("onedrive-configuration-plan-expired");
-        }
-        if plan_revision as u64 != expected_revision {
-            anyhow::bail!("onedrive-configuration-revision-conflict");
-        }
-        if requires_confirmation && !confirmed {
-            anyhow::bail!("onedrive-configuration-confirmation-required");
-        }
-        let current_revision: i64 = transaction.query_row(
-            "SELECT revision FROM onedrive_configuration WHERE singleton=1",
-            [],
-            |row| row.get(0),
-        )?;
-        if current_revision as u64 != expected_revision {
-            anyhow::bail!("onedrive-configuration-revision-conflict");
-        }
-        let fences = if changed {
-            transaction.execute(
-                "UPDATE plugin_auth_flow_ownership SET state='cancelling' WHERE plugin_id=?1",
-                [ONEDRIVE_PLUGIN_ID],
-            )?;
-            let fences = pause_plugin_bindings_in_transaction(&transaction, ONEDRIVE_PLUGIN_ID)?;
-            let retiring: Option<(String, String)> = transaction
-                .query_row(
-                    "SELECT account_uuid,secret_ref FROM plugin_accounts WHERE plugin_id=?1 AND secret_ref IS NOT NULL",
-                    [ONEDRIVE_PLUGIN_ID],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            if let Some((account_uuid, secret_ref)) = retiring {
-                enqueue_onedrive_secret_retirements(
-                    &transaction,
-                    ONEDRIVE_PLUGIN_ID,
-                    &account_uuid,
-                    Some(&secret_ref),
-                    now,
-                )?;
-            }
-            transaction.execute("UPDATE onedrive_configuration SET host_override_client_id=?1,revision=revision+1,updated_at=?2 WHERE singleton=1", params![requested,now])?;
-            transaction.execute("UPDATE plugin_accounts SET secret_ref=NULL,stable_account_identity=NULL,account_kind=NULL,auth_state='authorization-required',generation=generation+1,updated_at=?1 WHERE plugin_id=?2", params![now,ONEDRIVE_PLUGIN_ID])?;
-            transaction.execute("UPDATE plugin_runtime_state SET state='starting',pid=NULL,session_id=NULL,last_error_code=NULL,last_error_detail=NULL,updated_at=?1 WHERE plugin_id=?2", params![now,ONEDRIVE_PLUGIN_ID])?;
-            fences
-        } else {
-            Vec::new()
-        };
-        transaction.execute(
-            "DELETE FROM onedrive_configuration_plans WHERE plan_uuid=?1",
-            [plan_uuid],
-        )?;
-        transaction.commit()?;
-        Ok(OneDriveConfigurationCommit {
-            fences,
-            effective_changed: changed,
-        })
     }
 
     pub fn due_credential_retirements(
@@ -4990,7 +5060,17 @@ impl HostRegistry {
         let Some((namespace, purpose)) = pending else {
             return Ok(false);
         };
-        transaction.execute("INSERT OR IGNORE INTO plugin_secret_handles(plugin_id,account_uuid,secret_ref,namespace,purpose,created_at) VALUES (?1,?2,?3,?4,?5,?6)", params![plugin_id,account_uuid,secret_ref,namespace,purpose,unix_timestamp_millis()])?;
+        let declaration = crate::plugin_configuration::declarations(&transaction, plugin_id)?;
+        let role = if declaration
+            .primary_credential
+            .as_ref()
+            .is_some_and(|scope| scope.namespace == namespace && scope.purpose == purpose)
+        {
+            "primary"
+        } else {
+            "scoped"
+        };
+        transaction.execute("INSERT OR IGNORE INTO plugin_secret_handles(plugin_id,account_uuid,secret_ref,namespace,purpose,created_at,role) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![plugin_id,account_uuid,secret_ref,namespace,purpose,unix_timestamp_millis(),role])?;
         transaction.execute("DELETE FROM plugin_secret_creations WHERE plugin_id=?1 AND account_uuid=?2 AND secret_ref=?3", params![plugin_id,account_uuid,secret_ref])?;
         transaction.commit()?;
         Ok(true)
@@ -5008,6 +5088,9 @@ impl HostRegistry {
         let transaction = connection.transaction()?;
         if needs_retirement {
             transaction.execute("INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) SELECT lower(hex(randomblob(16))),plugin_id,account_uuid,secret_ref,namespace,purpose,0,?1,?1,?1 FROM plugin_secret_creations WHERE plugin_id=?2 AND account_uuid=?3 AND secret_ref=?4", params![now,plugin_id,account_uuid,secret_ref])?;
+            transaction.execute("INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) SELECT lower(hex(randomblob(16))),plugin_id,account_uuid,secret_ref,namespace,purpose,0,?1,?1,?1 FROM plugin_secret_handles WHERE plugin_id=?2 AND account_uuid=?3 AND secret_ref=?4", params![now,plugin_id,account_uuid,secret_ref])?;
+        } else {
+            transaction.execute("DELETE FROM plugin_secret_handles WHERE plugin_id=?1 AND account_uuid=?2 AND secret_ref=?3", params![plugin_id,account_uuid,secret_ref])?;
         }
         transaction.execute("DELETE FROM plugin_secret_creations WHERE plugin_id=?1 AND account_uuid=?2 AND secret_ref=?3", params![plugin_id,account_uuid,secret_ref])?;
         transaction.commit()?;
@@ -5226,22 +5309,14 @@ impl HostRegistry {
             .optional()?
             .flatten();
         let fences = if auth_state == "authenticated"
-            && current.as_deref() != stable_identity
-            && current.is_some()
-        {
+            && remote_identity_requires_invalidation(
+                &transaction,
+                plugin_id,
+                current.as_deref(),
+                stable_identity,
+            )? {
             let fences = pause_plugin_bindings_in_transaction(&transaction, plugin_id)?;
-            transaction.execute(
-                "DELETE FROM provider_binding_cursors WHERE library_uuid IN (SELECT library_uuid FROM library_sync_bindings WHERE plugin_id=?1)",
-                [plugin_id],
-            )?;
-            transaction.execute(
-                "DELETE FROM provider_account_root_cursors WHERE account_uuid=(SELECT account_uuid FROM plugin_accounts WHERE plugin_id=?1)",
-                [plugin_id],
-            )?;
-            transaction.execute(
-                "DELETE FROM provider_remote_libraries WHERE account_uuid=(SELECT account_uuid FROM plugin_accounts WHERE plugin_id=?1)",
-                [plugin_id],
-            )?;
+            invalidate_plugin_remote_scope_in_transaction(&transaction, plugin_id)?;
             fences
         } else {
             Vec::new()
@@ -5263,10 +5338,24 @@ impl HostRegistry {
         flow_id: &str,
         supervisor_session: &str,
     ) -> anyhow::Result<bool> {
-        Ok(self.connection.lock().unwrap_or_else(|p| p.into_inner()).execute(
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let retired:Option<(String,Option<String>)>=transaction.query_row("SELECT a.account_uuid,f.prior_secret_ref FROM plugin_auth_flow_ownership f JOIN plugin_accounts a ON a.plugin_id=f.plugin_id WHERE f.plugin_id=?1 AND f.flow_id=?2 AND f.supervisor_session=?3 AND f.state<>'cancelling' AND a.secret_ref IS NOT f.prior_secret_ref",params![plugin_id,flow_id,supervisor_session],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        if let Some((account, prior)) = retired {
+            enqueue_plugin_secret_retirements(
+                &transaction,
+                plugin_id,
+                &account,
+                prior.as_deref(),
+                unix_timestamp_millis(),
+            )?;
+        }
+        let changed=transaction.execute(
             "DELETE FROM plugin_auth_flow_ownership WHERE plugin_id=?1 AND flow_id=?2 AND supervisor_session=?3 AND state <> 'cancelling'",
             params![plugin_id,flow_id,supervisor_session],
-        )? == 1)
+        )? == 1;
+        transaction.commit()?;
+        Ok(changed)
     }
 
     pub fn discard_plugin_auth_flow(
@@ -5307,16 +5396,19 @@ impl HostRegistry {
         ).optional()?;
         if let Some((account_uuid, secret_ref)) = current
             .filter(|(_, secret_ref)| Some(secret_ref.as_str()) != prior_secret_ref.as_deref())
-            .filter(|_| plugin_id == ONEDRIVE_PLUGIN_ID)
         {
             transaction.execute(
-                "INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,0,?7,?7,?7)",
-                params![uuid::Uuid::now_v7().to_string(),plugin_id,account_uuid,secret_ref,ONEDRIVE_SECRET_NAMESPACE,ONEDRIVE_CREDENTIAL_PURPOSE,now],
+                "INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) SELECT lower(hex(randomblob(16))),plugin_id,account_uuid,secret_ref,namespace,purpose,0,?4,?4,?4 FROM plugin_secret_handles WHERE plugin_id=?1 AND account_uuid=?2 AND secret_ref=?3",
+                params![plugin_id,account_uuid,secret_ref,now],
             )?;
         }
         transaction.execute(
             "UPDATE plugin_accounts SET auth_state=?1,display_name=?2,account_kind=?3,secret_ref=?4,stable_account_identity=?5,last_error=NULL,updated_at=?6 WHERE plugin_id=?7",
             params![auth_state,display_name,account_kind,prior_secret_ref,prior_stable_identity,now,plugin_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM plugin_credential_retirements WHERE plugin_id=?1 AND secret_ref=?2",
+            params![plugin_id, prior_secret_ref],
         )?;
         transaction.execute(
             "DELETE FROM plugin_auth_flow_ownership WHERE plugin_id=?1",
@@ -5330,9 +5422,10 @@ impl HostRegistry {
         let now = unix_timestamp_millis();
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM plugin_credential_retirements WHERE EXISTS(SELECT 1 FROM plugin_auth_flow_ownership f WHERE f.plugin_id=plugin_credential_retirements.plugin_id AND f.prior_secret_ref=plugin_credential_retirements.secret_ref)",[])?;
         transaction.execute(
-            "INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) SELECT lower(hex(randomblob(16))),a.plugin_id,a.account_uuid,a.secret_ref,?1,?2,0,?3,?3,?3 FROM plugin_accounts a JOIN plugin_auth_flow_ownership f ON f.plugin_id=a.plugin_id WHERE a.plugin_id=?4 AND a.secret_ref IS NOT NULL AND a.secret_ref IS NOT f.prior_secret_ref",
-            params![ONEDRIVE_SECRET_NAMESPACE, ONEDRIVE_CREDENTIAL_PURPOSE, now, ONEDRIVE_PLUGIN_ID],
+            "INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) SELECT lower(hex(randomblob(16))),a.plugin_id,a.account_uuid,a.secret_ref,h.namespace,h.purpose,0,?1,?1,?1 FROM plugin_accounts a JOIN plugin_auth_flow_ownership f ON f.plugin_id=a.plugin_id JOIN plugin_secret_handles h ON h.plugin_id=a.plugin_id AND h.account_uuid=a.account_uuid AND h.secret_ref=a.secret_ref WHERE a.secret_ref IS NOT NULL AND a.secret_ref IS NOT f.prior_secret_ref",
+            params![now],
         )?;
         let changed = transaction.execute(
             "UPDATE plugin_accounts SET auth_state=COALESCE((SELECT prior_auth_state FROM plugin_auth_flow_ownership f WHERE f.plugin_id=plugin_accounts.plugin_id),auth_state),display_name=(SELECT prior_display_name FROM plugin_auth_flow_ownership f WHERE f.plugin_id=plugin_accounts.plugin_id),account_kind=(SELECT prior_account_kind FROM plugin_auth_flow_ownership f WHERE f.plugin_id=plugin_accounts.plugin_id),secret_ref=(SELECT prior_secret_ref FROM plugin_auth_flow_ownership f WHERE f.plugin_id=plugin_accounts.plugin_id),stable_account_identity=(SELECT prior_stable_account_identity FROM plugin_auth_flow_ownership f WHERE f.plugin_id=plugin_accounts.plugin_id),updated_at=?1 WHERE plugin_id IN (SELECT plugin_id FROM plugin_auth_flow_ownership)",
@@ -5348,8 +5441,6 @@ impl HostRegistry {
         secret_store_available: bool,
     ) -> anyhow::Result<usize> {
         let now = unix_timestamp_millis();
-        let onedrive_configuration = self.onedrive_configuration()?;
-        let onedrive_configured = onedrive_configuration.configured;
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
         let rows = {
@@ -5388,13 +5479,13 @@ impl HostRegistry {
                 (
                     "configuration-required",
                     Some("secret-store-unavailable"),
-                    Some("MEGLE_SECRET_KEY_FILE is missing or invalid"),
+                    Some("MANGOO_SECRET_KEY_FILE is missing or invalid"),
                 )
-            } else if plugin_id == "com.megle.onedrive" && !onedrive_configured {
+            } else if !crate::plugin_configuration::configured(&transaction, &plugin_id)? {
                 (
                     "configuration-required",
-                    Some("onedrive-client-id-missing"),
-                    Some("Microsoft public client ID is not configured"),
+                    Some("plugin-configuration-required"),
+                    Some("Provider configuration is incomplete"),
                 )
             } else {
                 ("starting", None, None)
@@ -5408,6 +5499,7 @@ impl HostRegistry {
         Ok(changed)
     }
 
+    #[cfg(test)]
     pub fn pause_plugin_bindings(&self, plugin_id: &str) -> anyhow::Result<Vec<BindingFence>> {
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
@@ -5415,10 +5507,74 @@ impl HostRegistry {
         transaction.commit()?;
         Ok(fences)
     }
+    /// Current binding wins over detached/restore provenance. This small lookup
+    /// is used under API UI admission, not the global sync status projection.
+    pub fn plugin_ui_library_owner(
+        &self,
+        library_uuid: &str,
+    ) -> anyhow::Result<Option<(Option<String>, Option<String>, String)>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        connection.query_row(
+            "SELECT COALESCE(b.plugin_id,u.plugin_id,a.plugin_id),COALESCE(b.account_uuid,u.account_uuid,r.account_uuid),COALESCE(l.binding_state,'restore-pending') FROM (SELECT ?1 AS library_uuid) target LEFT JOIN libraries l ON l.library_uuid=target.library_uuid LEFT JOIN library_sync_bindings b ON b.library_uuid=target.library_uuid LEFT JOIN sync_unbind_plans u ON u.plan_uuid=(SELECT plan_uuid FROM sync_unbind_plans WHERE library_uuid=target.library_uuid AND state IN ('cutover','reconciling','complete') ORDER BY updated_at DESC LIMIT 1) LEFT JOIN sync_restore_plans r ON r.restore_uuid=(SELECT restore_uuid FROM sync_restore_plans WHERE library_uuid=target.library_uuid ORDER BY created_at DESC LIMIT 1) LEFT JOIN plugin_accounts a ON a.account_uuid=r.account_uuid WHERE l.library_uuid IS NOT NULL OR r.restore_uuid IS NOT NULL OR u.plan_uuid IS NOT NULL",
+            [library_uuid],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional().map_err(Into::into)
+    }
+
+    pub fn plugin_ui_plan_owner(
+        &self,
+        kind: &str,
+        plan_uuid: &str,
+    ) -> anyhow::Result<Option<(String, String, String)>> {
+        let sql = match kind {
+            "enable" => "SELECT library_uuid,plugin_id,account_uuid FROM sync_preflight_tokens WHERE token=?1",
+            "unbind" => "SELECT library_uuid,plugin_id,account_uuid FROM sync_unbind_plans WHERE plan_uuid=?1",
+            "reconnect" => "SELECT p.library_uuid,a.plugin_id,p.account_uuid FROM sync_reconnect_plans p JOIN plugin_accounts a ON a.account_uuid=p.account_uuid WHERE p.plan_uuid=?1",
+            _ => anyhow::bail!("unknown-plugin-ui-plan-kind"),
+        };
+        self.connection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .query_row(sql, [plan_uuid], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn plugin_ui_source(&self, plugin_id: &str) -> anyhow::Result<Option<PluginUiSource>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let source = connection.query_row(
+            "SELECT i.selected_version,v.manifest_json,i.install_root,i.lifecycle_epoch,i.requested_permissions_json,i.granted_permissions_json FROM plugin_installations i JOIN plugin_versions v ON v.plugin_id=i.plugin_id AND v.version=i.selected_version JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id WHERE i.plugin_id=?1 AND i.enabled_intent=1 AND r.stop_pending=0 AND r.state NOT IN ('disabled','stopping','incompatible','permission-required') AND i.trust_policy_id='embedded-v1'",
+            [plugin_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?)),
+        ).optional()?;
+        let Some((version, manifest_json, install_root, lifecycle_epoch, requested, granted)) =
+            source
+        else {
+            return Ok(None);
+        };
+        let requested_permissions: Vec<crate::plugins::manifest::Permission> =
+            serde_json::from_str(&requested)?;
+        let granted_permissions: Vec<crate::plugins::manifest::Permission> =
+            serde_json::from_str(&granted)?;
+        if !permissions_match(&requested_permissions, &granted_permissions) {
+            return Ok(None);
+        }
+        Ok(Some(PluginUiSource {
+            plugin_id: plugin_id.to_owned(),
+            version,
+            manifest_json,
+            install_root: PathBuf::from(install_root),
+            lifecycle_epoch,
+            requested_permissions,
+            granted_permissions,
+        }))
+    }
+
     pub fn plugin_runtime_launches(&self) -> anyhow::Result<Vec<PluginRuntimeLaunch>> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let mut statement = connection.prepare(
-            "SELECT i.plugin_id,i.selected_version,v.manifest_json,i.install_root,v.entry_sha256,a.account_uuid,a.generation,i.requested_permissions_json,i.granted_permissions_json FROM plugin_installations i JOIN plugin_versions v ON v.plugin_id=i.plugin_id AND v.version=i.selected_version JOIN plugin_accounts a ON a.plugin_id=i.plugin_id JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id WHERE i.enabled_intent=1 AND r.state <> 'configuration-required' AND NOT EXISTS(SELECT 1 FROM plugin_credential_retirements q WHERE q.plugin_id=i.plugin_id) ORDER BY i.plugin_id",
+            "SELECT i.plugin_id,i.selected_version,v.manifest_json,i.install_root,v.entry_sha256,a.account_uuid,a.generation,i.requested_permissions_json,i.granted_permissions_json,i.lifecycle_epoch FROM plugin_installations i JOIN plugin_versions v ON v.plugin_id=i.plugin_id AND v.version=i.selected_version JOIN plugin_accounts a ON a.plugin_id=i.plugin_id JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id WHERE i.enabled_intent=1 AND r.stop_pending=0 AND r.state <> 'configuration-required' AND NOT EXISTS(SELECT 1 FROM plugin_credential_retirements q WHERE q.plugin_id=i.plugin_id) ORDER BY i.plugin_id",
         )?;
         let rows = statement.query_map([], |row| {
             let hash: Vec<u8> = row.get(4)?;
@@ -5437,6 +5593,7 @@ impl HostRegistry {
                     })?,
                     account_uuid: row.get(5)?,
                     account_generation: row.get(6)?,
+                    lifecycle_epoch: row.get(9)?,
                     granted_permissions: Vec::new(),
                 },
                 row.get::<_, String>(7)?,
@@ -5457,6 +5614,67 @@ impl HostRegistry {
             }
         }
         Ok(launches)
+    }
+
+    /// Local decoders have no plugin_accounts row and never enter Provider launch enumeration.
+    pub fn decoder_runtime_launches(&self) -> anyhow::Result<Vec<DecoderRuntimeLaunch>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let mut statement = connection.prepare(
+            "SELECT i.plugin_id,i.selected_version,v.manifest_json,i.install_root,i.lifecycle_epoch,i.requested_permissions_json,i.granted_permissions_json FROM plugin_installations i JOIN plugin_versions v ON v.plugin_id=i.plugin_id AND v.version=i.selected_version JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id WHERE i.enabled_intent=1 AND r.stop_pending=0 AND i.trust_policy_id='embedded-v1' AND r.state NOT IN ('incompatible','permission-required','configuration-required') AND json_extract(v.manifest_json,'$.rpc.capabilities[0]')='file-decoder.v1' ORDER BY i.plugin_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                DecoderRuntimeLaunch {
+                    plugin_id: row.get(0)?,
+                    version: row.get(1)?,
+                    manifest_json: row.get(2)?,
+                    install_root: PathBuf::from(row.get::<_, String>(3)?),
+                    lifecycle_epoch: row.get(4)?,
+                    granted_permissions: Vec::new(),
+                },
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?;
+        let mut launches = Vec::new();
+        for row in rows {
+            let (mut launch, requested, granted) = row?;
+            let requested =
+                serde_json::from_str::<Vec<crate::plugins::manifest::Permission>>(&requested)?;
+            let granted =
+                serde_json::from_str::<Vec<crate::plugins::manifest::Permission>>(&granted)?;
+            if permissions_match(&requested, &granted) {
+                launch.granted_permissions = granted;
+                launches.push(launch);
+            }
+        }
+        Ok(launches)
+    }
+
+    pub fn record_decoder_runtime_state(
+        &self,
+        plugin_id: &str,
+        epoch: i64,
+        state: &str,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            matches!(
+                state,
+                "starting" | "ready" | "degraded" | "crashed-backoff" | "incompatible"
+            ),
+            "invalid decoder runtime state"
+        );
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE plugin_runtime_state SET state=?1,capabilities_json='[\"file-decoder.v1\"]',updated_at=?2 WHERE plugin_id=?3 AND stop_pending=0 AND EXISTS(SELECT 1 FROM plugin_installations i WHERE i.plugin_id=?3 AND i.enabled_intent=1 AND i.lifecycle_epoch=?4)",
+            params![state, unix_timestamp_millis(), plugin_id, epoch],
+        )?;
+        if changed != 0 {
+            Self::bump_sync_status_revision(&transaction)?;
+        }
+        transaction.commit()?;
+        Ok(changed == 1)
     }
 
     pub fn register_bundled_plugin(&self, plugin: RegisterBundledPlugin<'_>) -> anyhow::Result<()> {
@@ -5570,7 +5788,7 @@ impl HostRegistry {
         let granted_permissions_json = serde_json::to_string(&granted)?;
         let now = unix_timestamp_millis();
         let changed = transaction.execute(
-            "UPDATE plugin_installations SET granted_permissions_json=?1,updated_at=?2 WHERE plugin_id=?3",
+            "UPDATE plugin_installations SET granted_permissions_json=?1,lifecycle_epoch=lifecycle_epoch+1,updated_at=?2 WHERE plugin_id=?3",
             params![granted_permissions_json, now, plugin_id],
         )?;
         if changed != 1 {
@@ -5591,7 +5809,7 @@ impl HostRegistry {
             "starting"
         };
         transaction.execute(
-            "UPDATE plugin_runtime_state SET state=?1,pid=NULL,session_id=NULL,started_at=NULL,backoff_until=NULL,last_error_code=CASE WHEN ?1='configuration-required' THEN 'secret-store-unavailable' ELSE NULL END,last_error_detail=CASE WHEN ?1='configuration-required' THEN 'MEGLE_SECRET_KEY_FILE is missing or invalid' ELSE NULL END,updated_at=?2 WHERE plugin_id=?3",
+            "UPDATE plugin_runtime_state SET state=?1,stop_pending=1,pid=NULL,session_id=NULL,started_at=NULL,backoff_until=NULL,last_error_code=CASE WHEN ?1='configuration-required' THEN 'secret-store-unavailable' ELSE NULL END,last_error_detail=CASE WHEN ?1='configuration-required' THEN 'MANGOO_SECRET_KEY_FILE is missing or invalid' ELSE NULL END,updated_at=?2 WHERE plugin_id=?3",
             params![state, now, plugin_id],
         )?;
         let fences = pause_plugin_bindings_in_transaction(&transaction, plugin_id)?;
@@ -5618,7 +5836,7 @@ impl HostRegistry {
     pub fn list_host_plugins(&self) -> anyhow::Result<Vec<HostPluginProjection>> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let mut statement = connection.prepare(
-            "SELECT i.plugin_id,i.selected_version,i.known_good_version,i.enabled_intent,i.requested_permissions_json,i.granted_permissions_json,r.state,a.auth_state,a.account_uuid,a.display_name,r.backoff_until,r.last_healthy_at,r.last_error_code,r.last_error_detail,r.capabilities_json,a.account_kind,v.manifest_json FROM plugin_installations i JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id LEFT JOIN plugin_accounts a ON a.plugin_id=i.plugin_id LEFT JOIN plugin_versions v ON v.plugin_id=i.plugin_id AND v.version=i.selected_version ORDER BY i.plugin_id",
+            "SELECT i.plugin_id,i.selected_version,i.known_good_version,i.enabled_intent,i.requested_permissions_json,i.granted_permissions_json,CASE WHEN r.stop_pending=1 THEN 'stopping' ELSE r.state END,a.auth_state,a.account_uuid,a.display_name,r.backoff_until,r.last_healthy_at,r.last_error_code,r.last_error_detail,r.capabilities_json,a.account_kind,v.manifest_json,i.lifecycle_epoch FROM plugin_installations i JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id LEFT JOIN plugin_accounts a ON a.plugin_id=i.plugin_id LEFT JOIN plugin_versions v ON v.plugin_id=i.plugin_id AND v.version=i.selected_version ORDER BY i.plugin_id",
         )?;
         let rows = statement.query_map([], |row| {
             let plugin_id: String = row.get(0)?;
@@ -5627,6 +5845,12 @@ impl HostRegistry {
             let manifest_json: Option<String> = row.get(16)?;
             let name = selected_plugin_name(&plugin_id, manifest_json.as_deref());
             Ok(HostPluginProjection {
+                lifecycle_epoch: row.get(17)?,
+                contributions: manifest_json
+                    .as_ref()
+                    .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                    .and_then(|v| v.get("contributions").cloned())
+                    .and_then(|v| serde_json::from_value(v).ok()),
                 plugin_id,
                 name,
                 selected_version: row.get(1)?,
@@ -5672,13 +5896,17 @@ impl HostRegistry {
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
         let changed = transaction.execute(
-            "UPDATE plugin_installations SET enabled_intent=?1,updated_at=?2 WHERE plugin_id=?3",
+            "UPDATE plugin_installations SET enabled_intent=?1,lifecycle_epoch=lifecycle_epoch+1,updated_at=?2 WHERE plugin_id=?3",
             params![enabled, unix_timestamp_millis(), plugin_id],
         )?;
         if changed != 1 {
             anyhow::bail!("plugin-not-found");
         }
-        if enabled {
+        let decoder_only: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM plugin_installations i JOIN plugin_versions v ON v.plugin_id=i.plugin_id AND v.version=i.selected_version WHERE i.plugin_id=?1 AND json_extract(v.manifest_json,'$.rpc.capabilities[0]')='file-decoder.v1')",
+            [plugin_id], |row| row.get(0),
+        )?;
+        if enabled && !decoder_only {
             let now = unix_timestamp_millis();
             transaction.execute(
                 "INSERT INTO plugin_accounts(account_uuid,plugin_id,auth_state,generation,created_at,updated_at) SELECT ?1,?2,'authorization-required',1,?3,?3 WHERE NOT EXISTS(SELECT 1 FROM plugin_accounts WHERE plugin_id=?2)",
@@ -5715,9 +5943,197 @@ impl HostRegistry {
             "permission-required"
         };
         transaction.execute(
-            "UPDATE plugin_runtime_state SET state=?1,pid=NULL,session_id=NULL,started_at=NULL,backoff_until=NULL,last_error_code=CASE WHEN ?1='configuration-required' THEN 'secret-store-unavailable' ELSE NULL END,last_error_detail=CASE WHEN ?1='configuration-required' THEN 'MEGLE_SECRET_KEY_FILE is missing or invalid' ELSE NULL END,updated_at=?2 WHERE plugin_id=?3",
+            "UPDATE plugin_runtime_state SET state=?1,stop_pending=CASE WHEN ?1='disabled' THEN 1 ELSE 0 END,pid=NULL,session_id=NULL,started_at=NULL,backoff_until=NULL,last_error_code=CASE WHEN ?1='configuration-required' THEN 'secret-store-unavailable' ELSE NULL END,last_error_detail=CASE WHEN ?1='configuration-required' THEN 'MANGOO_SECRET_KEY_FILE is missing or invalid' ELSE NULL END,updated_at=?2 WHERE plugin_id=?3",
             params![state, unix_timestamp_millis(), plugin_id],
         )?;
+        if !enabled {
+            transaction.execute(
+                "UPDATE library_sync_bindings SET plugin_suspended_state=COALESCE(plugin_suspended_state,state),state='paused',transport_generation=transport_generation+1,updated_at=?1 WHERE plugin_id=?2 AND state IN ('preparing','capturing','seed_ready','publishing','active','restoring')",
+                params![unix_timestamp_millis(),plugin_id],
+            )?;
+        }
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn plugin_binding_fences(&self, plugin_id: &str) -> anyhow::Result<Vec<BindingFence>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let mut statement = connection.prepare("SELECT account_uuid,binding_epoch,transport_generation FROM library_sync_bindings WHERE plugin_id=?1")?;
+        let rows = statement
+            .query_map([plugin_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, u64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(account_uuid, epoch, next_transport_generation)| {
+                Ok(BindingFence {
+                    account_uuid,
+                    binding_epoch: uuid::Uuid::from_slice(&epoch)?,
+                    next_transport_generation,
+                })
+            })
+            .collect()
+    }
+
+    pub fn plugin_lifecycle_epoch(&self, plugin_id: &str) -> anyhow::Result<i64> {
+        Ok(self
+            .connection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .query_row(
+                "SELECT lifecycle_epoch FROM plugin_installations WHERE plugin_id=?1",
+                [plugin_id],
+                |row| row.get(0),
+            )?)
+    }
+
+    pub fn finish_plugin_stop(&self, plugin_id: &str) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        transaction.execute("UPDATE plugin_runtime_state SET stop_pending=0 WHERE plugin_id=?1 AND EXISTS(SELECT 1 FROM plugin_installations i WHERE i.plugin_id=?1 AND i.enabled_intent=0)", [plugin_id])?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn mark_plugin_stop_pending(&self, plugin_id: &str) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE plugin_runtime_state SET stop_pending=1 WHERE plugin_id=?1",
+            [plugin_id],
+        )?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// A restart uses a closed stop epoch followed by a distinct launch epoch.
+    /// The scheduler cannot admit the new launch until its predecessor is joined.
+    pub fn finish_plugin_runtime_restart(&self, plugin_id: &str) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE plugin_installations SET lifecycle_epoch=lifecycle_epoch+1 WHERE plugin_id=?1",
+            [plugin_id],
+        )?;
+        transaction.execute(
+            "UPDATE plugin_runtime_state SET stop_pending=0 WHERE plugin_id=?1",
+            [plugin_id],
+        )?;
+        Self::bump_sync_status_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn finish_plugin_runtime_restart_for_epoch(
+        &self,
+        plugin_id: &str,
+        stopped_epoch: i64,
+    ) -> anyhow::Result<bool> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE plugin_installations SET lifecycle_epoch=lifecycle_epoch+1 WHERE plugin_id=?1 AND lifecycle_epoch=?2 AND EXISTS(SELECT 1 FROM plugin_runtime_state r WHERE r.plugin_id=?1 AND r.stop_pending=1)",
+            params![plugin_id, stopped_epoch],
+        )? == 1;
+        if changed {
+            transaction.execute(
+                "UPDATE plugin_runtime_state SET stop_pending=0 WHERE plugin_id=?1",
+                [plugin_id],
+            )?;
+            Self::bump_sync_status_revision(&transaction)?;
+        }
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    pub fn resume_plugin_suspended_bindings(
+        &self,
+        plugin_id: &str,
+    ) -> anyhow::Result<Vec<uuid::Uuid>> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let ready: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM plugin_installations i JOIN plugin_runtime_state r USING(plugin_id) JOIN plugin_accounts a USING(plugin_id) WHERE i.plugin_id=?1 AND i.enabled_intent=1 AND r.state='ready' AND r.stop_pending=0 AND a.auth_state='authenticated')", [plugin_id], |row| row.get(0))?;
+        if !ready {
+            return Ok(Vec::new());
+        }
+        let epochs = {
+            let mut statement = transaction.prepare("SELECT binding_epoch FROM library_sync_bindings WHERE plugin_id=?1 AND state='paused' AND plugin_suspended_state IS NOT NULL")?;
+            let rows = statement
+                .query_map([plugin_id], |row| row.get::<_, Vec<u8>>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(|bytes| uuid::Uuid::from_slice(&bytes))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if !epochs.is_empty() {
+            transaction.execute("UPDATE library_sync_bindings SET state=plugin_suspended_state,plugin_suspended_state=NULL,poll_after=0,updated_at=?2 WHERE plugin_id=?1 AND state='paused' AND plugin_suspended_state IS NOT NULL", params![plugin_id,unix_timestamp_millis()])?;
+            Self::bump_sync_status_revision(&transaction)?;
+        }
+        transaction.commit()?;
+        Ok(epochs)
+    }
+
+    pub fn resume_binding(
+        &self,
+        library_uuid: &str,
+        expected: &BindingTransport,
+    ) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let ready: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM plugin_installations i JOIN plugin_runtime_state r USING(plugin_id) JOIN plugin_accounts a USING(plugin_id) WHERE i.plugin_id=?1 AND a.account_uuid=?2 AND i.enabled_intent=1 AND r.state='ready' AND r.stop_pending=0 AND a.auth_state='authenticated')", params![expected.plugin_id,expected.account_uuid], |row| row.get(0))?;
+        if !ready {
+            anyhow::bail!("provider-not-ready");
+        }
+        let (saved, checkpoint, capture): (Option<String>, Option<Vec<u8>>, Option<i64>) =
+            transaction.query_row(
+                "SELECT COALESCE(plugin_suspended_state,pause_resume_state),latest_checkpoint_uuid,capture_generation FROM library_sync_bindings WHERE library_uuid=?1 AND binding_epoch=?2 AND transport_generation=?3 AND state='paused'",
+                params![library_uuid, expected.binding_epoch.as_bytes().as_slice(), expected.transport_generation],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).optional()?.ok_or_else(|| anyhow::anyhow!("sync-action-not-allowed"))?;
+        // Legacy pauses have no recorded phase. Only durable receipts or a
+        // completed restore prove active state; an unfinished seed stays queued.
+        let phase = if let Some(saved) = saved {
+            saved
+        } else if let Some(checkpoint) = checkpoint {
+            let key = format!(
+                "checkpoints/{}.checkpoint",
+                uuid::Uuid::from_slice(&checkpoint)?
+            );
+            let published: bool = transaction.query_row(
+                "SELECT COUNT(*)=2 FROM provider_object_receipts WHERE library_uuid=?1 AND binding_epoch=?2 AND generation<=?3 AND object_key IN ('library-descriptor',?4) AND state IN ('created','already-exists-matching')",
+                params![library_uuid,expected.binding_epoch.as_bytes().as_slice(),expected.transport_generation,key],
+                |row| row.get(0),
+            )?;
+            if published { "active" } else { "seed_ready" }.to_owned()
+        } else if capture.is_none() && expected.remote_namespace.is_some() {
+            let state: Option<String> = transaction.query_row(
+                "SELECT state FROM sync_restore_plans WHERE library_uuid=?1 AND account_uuid=?2 ORDER BY created_at DESC LIMIT 1",
+                params![library_uuid,expected.account_uuid], |row| row.get(0),
+            ).optional()?;
+            match state.as_deref() {
+                Some("complete") => "active",
+                Some("restoring" | "catalog-ready" | "paused") => "restoring",
+                Some(_) => anyhow::bail!("sync-action-not-allowed"),
+                None => "preparing",
+            }
+            .to_owned()
+        } else if capture.is_some() {
+            "capturing".to_owned()
+        } else {
+            "preparing".to_owned()
+        };
+        transaction.execute(
+            "UPDATE library_sync_bindings SET state=?2,plugin_suspended_state=NULL,pause_resume_state=NULL,poll_after=0,updated_at=?3 WHERE library_uuid=?1",
+            params![library_uuid,phase,unix_timestamp_millis()],
+        )?;
+        Self::bump_sync_status_revision(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -5754,6 +6170,7 @@ impl HostRegistry {
         Ok(changed == 1)
     }
 
+    #[cfg(test)]
     pub fn update_plugin_account_identity_for_session(
         &self,
         plugin_id: &str,
@@ -5776,20 +6193,14 @@ impl HostRegistry {
         if !exists {
             return Ok(None);
         }
-        let fences = if current.as_deref() != stable_identity && current.is_some() {
+        let fences = if remote_identity_requires_invalidation(
+            &transaction,
+            plugin_id,
+            current.as_deref(),
+            stable_identity,
+        )? {
             let fences = pause_plugin_bindings_in_transaction(&transaction, plugin_id)?;
-            transaction.execute(
-                "DELETE FROM provider_binding_cursors WHERE library_uuid IN (SELECT library_uuid FROM library_sync_bindings WHERE plugin_id=?1)",
-                [plugin_id],
-            )?;
-            transaction.execute(
-                "DELETE FROM provider_account_root_cursors WHERE account_uuid=(SELECT account_uuid FROM plugin_accounts WHERE plugin_id=?1)",
-                [plugin_id],
-            )?;
-            transaction.execute(
-                "DELETE FROM provider_remote_libraries WHERE account_uuid=(SELECT account_uuid FROM plugin_accounts WHERE plugin_id=?1)",
-                [plugin_id],
-            )?;
+            invalidate_plugin_remote_scope_in_transaction(&transaction, plugin_id)?;
             fences
         } else {
             Vec::new()
@@ -5838,7 +6249,12 @@ impl HostRegistry {
         {
             anyhow::bail!("plugin-configuration-required");
         }
-        transaction.execute("UPDATE plugin_runtime_state SET state='starting',crash_count=0,backoff_until=NULL,last_error_code=NULL,last_error_detail=NULL,updated_at=?1 WHERE plugin_id=?2",params![unix_timestamp_millis(),plugin_id])?;
+        transaction.execute("UPDATE plugin_runtime_state SET state='starting',stop_pending=1,session_id=NULL,crash_count=0,backoff_until=NULL,last_error_code=NULL,last_error_detail=NULL,updated_at=?1 WHERE plugin_id=?2",params![unix_timestamp_millis(),plugin_id])?;
+        transaction.execute(
+            "UPDATE plugin_installations SET lifecycle_epoch=lifecycle_epoch+1 WHERE plugin_id=?1",
+            [plugin_id],
+        )?;
+        Self::bump_sync_status_revision(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -5999,9 +6415,9 @@ impl HostRegistry {
             params![journal_uuid,plugin_id,from_version,version,now],
         )?;
         tx.execute("UPDATE plugin_versions SET state=CASE WHEN version=?1 THEN 'candidate' WHEN state='selected' THEN 'known-good' ELSE state END WHERE plugin_id=?2",params![version,plugin_id])?;
-        tx.execute("UPDATE plugin_installations SET known_good_version=COALESCE(known_good_version,selected_version),selected_version=?1,requested_permissions_json=?2,updated_at=?3 WHERE plugin_id=?4",params![version,requested_json,now,plugin_id])?;
+        tx.execute("UPDATE plugin_installations SET lifecycle_epoch=lifecycle_epoch+1,known_good_version=COALESCE(known_good_version,selected_version),selected_version=?1,requested_permissions_json=?2,updated_at=?3 WHERE plugin_id=?4",params![version,requested_json,now,plugin_id])?;
         tx.execute(
-            "UPDATE plugin_runtime_state SET state=?1,pid=NULL,session_id=NULL,started_at=NULL,backoff_until=NULL,last_error_code=CASE WHEN ?1='configuration-required' THEN 'secret-store-unavailable' ELSE NULL END,last_error_detail=CASE WHEN ?1='configuration-required' THEN 'MEGLE_SECRET_KEY_FILE is missing or invalid' ELSE NULL END,updated_at=?2 WHERE plugin_id=?3",
+            "UPDATE plugin_runtime_state SET state=?1,stop_pending=1,pid=NULL,session_id=NULL,started_at=NULL,backoff_until=NULL,last_error_code=CASE WHEN ?1='configuration-required' THEN 'secret-store-unavailable' ELSE NULL END,last_error_detail=CASE WHEN ?1='configuration-required' THEN 'MANGOO_SECRET_KEY_FILE is missing or invalid' ELSE NULL END,updated_at=?2 WHERE plugin_id=?3",
             params![runtime_state, now, plugin_id],
         )?;
         let fences = pause_plugin_bindings_in_transaction(&tx, plugin_id)?;
@@ -6078,15 +6494,20 @@ impl HostRegistry {
         plugin_id: &str,
         expected_fingerprint: &str,
         error_code: &str,
-    ) -> anyhow::Result<Option<Vec<BindingFence>>> {
+    ) -> anyhow::Result<Option<(i64, Vec<BindingFence>)>> {
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let tx = connection.transaction()?;
         if !plugin_runtime_launch_matches(&tx, plugin_id, expected_fingerprint)? {
             return Ok(None);
         }
         let fences = rollback_plugin_probation_in_transaction(&tx, plugin_id, error_code)?;
+        let stopped_epoch = tx.query_row(
+            "SELECT lifecycle_epoch FROM plugin_installations WHERE plugin_id=?1",
+            [plugin_id],
+            |row| row.get(0),
+        )?;
         tx.commit()?;
-        Ok(Some(fences))
+        Ok(Some((stopped_epoch, fences)))
     }
 
     pub fn recover_plugin_version_journal(&self) -> anyhow::Result<usize> {
@@ -6100,6 +6521,8 @@ impl HostRegistry {
         };
         for plugin_id in &plugin_ids {
             self.rollback_plugin_probation(plugin_id, "startup-recovery")?;
+            // Startup owns no child from the previous Host process.
+            self.finish_plugin_runtime_restart(plugin_id)?;
         }
         Ok(plugin_ids.len())
     }
@@ -6426,8 +6849,11 @@ impl HostRegistry {
         published_through_seq: u64,
         object_key: &str,
     ) -> anyhow::Result<()> {
+        // Immutable publication receipts remain valid after same-scope transport
+        // restarts. Scope changes invalidate them atomically; the caller's
+        // current binding/generation fence must still match exactly.
         let changed = self.connection.lock().unwrap_or_else(|p| p.into_inner()).execute(
-            "UPDATE library_sync_bindings SET published_through_seq=MAX(published_through_seq,?1),updated_at=?2 WHERE library_uuid=?3 AND binding_epoch=?4 AND transport_generation=?5 AND EXISTS (SELECT 1 FROM provider_object_receipts r WHERE r.library_uuid=library_sync_bindings.library_uuid AND r.binding_epoch=library_sync_bindings.binding_epoch AND r.generation=?5 AND r.object_key=?6 AND r.state IN ('created','already-exists-matching'))",
+            "UPDATE library_sync_bindings SET published_through_seq=MAX(published_through_seq,?1),updated_at=?2 WHERE library_uuid=?3 AND binding_epoch=?4 AND transport_generation=?5 AND EXISTS (SELECT 1 FROM provider_object_receipts r WHERE r.library_uuid=library_sync_bindings.library_uuid AND r.binding_epoch=library_sync_bindings.binding_epoch AND r.generation<=?5 AND r.object_key=?6 AND r.state IN ('created','already-exists-matching'))",
             params![published_through_seq as i64,unix_timestamp_millis(),library_uuid,binding_epoch.as_bytes().as_slice(),transport_generation,object_key],
         )?;
         if changed != 1 {
@@ -6636,7 +7062,7 @@ impl HostRegistry {
     pub fn sync_bound_libraries(&self) -> anyhow::Result<Vec<LibraryDescriptor>> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let now = unix_timestamp_millis();
-        let mut statement=connection.prepare("SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','capturing','seed_ready','publishing','restoring') THEN 'synchronizing' ELSE 'synchronized' END,l.availability,l.marker_identity FROM libraries l JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid WHERE b.state IN ('preparing','capturing','seed_ready','publishing','active','restoring','error') AND COALESCE(b.retry_after,b.poll_after,0)<=?1 ORDER BY l.library_uuid")?;
+        let mut statement=connection.prepare("SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','capturing','seed_ready','publishing','restoring') THEN 'synchronizing' ELSE 'synchronized' END,l.availability,l.marker_identity FROM libraries l JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid WHERE l.marker_version=2 AND l.availability='available' AND b.state IN ('preparing','capturing','seed_ready','publishing','active','restoring','error') AND COALESCE(b.retry_after,b.poll_after,0)<=?1 ORDER BY l.library_uuid")?;
         let libraries = statement
             .query_map([now], descriptor_from_row)?
             .collect::<Result<_, _>>()?;
@@ -6787,9 +7213,29 @@ impl HostRegistry {
         if schema_version < 18 {
             connection.execute_batch(HOST_MIGRATION_0018)?;
         }
+        if schema_version < 19 {
+            connection.execute_batch(HOST_MIGRATION_0019)?;
+        }
+        if schema_version < 20 {
+            connection.execute_batch(HOST_MIGRATION_0020)?;
+        }
+        if schema_version < 21 {
+            connection.execute_batch(HOST_MIGRATION_0021)?;
+        }
+        if schema_version < 22 {
+            connection.execute_batch(HOST_MIGRATION_0022)?;
+        }
+        // A stopped Host has no surviving child. Complete a crashed stop locally.
+        connection.execute(
+            "UPDATE plugin_runtime_state SET stop_pending=0 WHERE stop_pending=1",
+            [],
+        )?;
         let now = unix_timestamp_millis();
         connection.execute("INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) SELECT lower(hex(randomblob(16))),plugin_id,account_uuid,secret_ref,namespace,purpose,0,?1,?1,?1 FROM plugin_secret_creations", [now])?;
         connection.execute("DELETE FROM plugin_secret_creations", [])?;
+        // A crash can occur after durable handle finalization but before the account
+        // adopts it. Preserve current/prior auth refs; retire only orphan primary refs.
+        connection.execute("INSERT OR IGNORE INTO plugin_credential_retirements(retirement_uuid,plugin_id,account_uuid,secret_ref,namespace,purpose,attempts,next_retry_at,created_at,updated_at) SELECT lower(hex(randomblob(16))),h.plugin_id,h.account_uuid,h.secret_ref,h.namespace,h.purpose,0,?1,?1,?1 FROM plugin_secret_handles h WHERE h.role='primary' AND NOT EXISTS(SELECT 1 FROM plugin_accounts a WHERE a.plugin_id=h.plugin_id AND a.account_uuid=h.account_uuid AND a.secret_ref=h.secret_ref) AND NOT EXISTS(SELECT 1 FROM plugin_auth_flow_ownership f WHERE f.plugin_id=h.plugin_id AND f.prior_secret_ref=h.secret_ref)", [now])?;
         connection.execute(
             "INSERT OR IGNORE INTO host_sync_local_state(singleton,device_uuid,stream_uuid,next_actor_seq,hlc_wall_ms,hlc_logical,capture_enabled,updated_at) VALUES (1,?1,?2,1,0,0,0,?3)",
             params![uuid::Uuid::now_v7().as_bytes().as_slice(), uuid::Uuid::now_v7().as_bytes().as_slice(), unix_timestamp_millis()],
@@ -7002,7 +7448,9 @@ impl HostRegistry {
             .map_err(Into::into)
     }
 
-    fn bump_sync_status_revision(transaction: &rusqlite::Transaction<'_>) -> anyhow::Result<u64> {
+    pub(crate) fn bump_sync_status_revision(
+        transaction: &rusqlite::Transaction<'_>,
+    ) -> anyhow::Result<u64> {
         transaction.execute(
             "UPDATE host_meta SET sync_status_revision=sync_status_revision+1 WHERE singleton=1",
             [],
@@ -7062,7 +7510,7 @@ impl HostRegistry {
         )?;
         let providers = {
             let mut statement = connection.prepare(
-                "SELECT i.plugin_id,a.account_uuid,a.display_name,a.account_kind,r.state,a.auth_state,r.last_healthy_at,r.last_error_code FROM plugin_installations i JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id JOIN plugin_accounts a ON a.plugin_id=i.plugin_id WHERE EXISTS (SELECT 1 FROM json_each(r.capabilities_json) WHERE value='sync-provider.v1') ORDER BY i.plugin_id",
+                "SELECT i.plugin_id,a.account_uuid,a.display_name,a.account_kind,CASE WHEN r.stop_pending=1 THEN 'stopping' ELSE r.state END,a.auth_state,r.last_healthy_at,r.last_error_code FROM plugin_installations i JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id JOIN plugin_accounts a ON a.plugin_id=i.plugin_id WHERE EXISTS (SELECT 1 FROM json_each(r.capabilities_json) WHERE value='sync-provider.v1') ORDER BY i.plugin_id",
             )?;
             let rows = statement
                 .query_map([], |row| {
@@ -7092,6 +7540,21 @@ impl HostRegistry {
                     phase = "restoring-media";
                     readiness = "catalog-ready";
                     actions = vec!["pause"];
+                }
+                let provider_id: Option<String> = row.get(2)?;
+                if provider_id.as_ref().is_some_and(|id| {
+                    !providers.iter().any(|provider| {
+                        &provider.plugin_id == id
+                            && provider.runtime_state == "ready"
+                            && provider.auth_state == "authenticated"
+                    })
+                }) {
+                    actions.retain(|action| {
+                        matches!(
+                            *action,
+                            "pause" | "unbind" | "cancel-before-catalog" | "resolve-conflicts"
+                        )
+                    });
                 }
                 let published: i64 = row.get::<_, Option<i64>>(10)?.unwrap_or(0);
                 let pending: i64 = row.get(11)?;
@@ -7241,7 +7704,7 @@ impl HostRegistry {
             )
             .context("remote-library-not-found")?;
         let mut hasher = Sha256::new();
-        hasher.update(b"megle-remote-root-inventory-v1\0");
+        hasher.update(b"mangoo-remote-root-inventory-v1\0");
         hasher.update(account_uuid.as_bytes());
         hasher.update(b"\0");
         hasher.update(library_uuid.as_bytes());
@@ -7273,7 +7736,12 @@ impl HostRegistry {
         )?;
         let items = statement
             .query_map(
-                params![account_uuid, library_uuid, cursor, i64::try_from(limit)?],
+                params![
+                    account_uuid,
+                    library_uuid,
+                    cursor,
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
                 |row| {
                     let materialized_name: String = row.get(5)?;
                     Ok(RemoteLibraryRootSummary {
@@ -7320,6 +7788,17 @@ impl HostRegistry {
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
         let request_json = serde_json::to_string(request)?;
+        let existing: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_orchestration_operations WHERE operation_uuid=?1)",
+            [operation_uuid],
+            |row| row.get(0),
+        )?;
+        if !existing && matches!(kind, "resume" | "retry" | "sync-now") {
+            let ready: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM library_sync_bindings b JOIN plugin_installations i USING(plugin_id) JOIN plugin_runtime_state r USING(plugin_id) JOIN plugin_accounts a ON a.account_uuid=b.account_uuid WHERE b.library_uuid=?1 AND i.enabled_intent=1 AND r.state='ready' AND r.stop_pending=0 AND a.auth_state='authenticated')", [library_uuid], |row|row.get(0))?;
+            if !ready {
+                anyhow::bail!("provider-not-ready");
+            }
+        }
         let inserted = transaction.execute("INSERT INTO sync_orchestration_operations(operation_uuid,library_uuid,kind,state,phase,request_json,created_at,updated_at) VALUES (?1,?2,?3,'running',?4,?5,?6,?6) ON CONFLICT(operation_uuid) DO NOTHING", params![operation_uuid,library_uuid,kind,phase,request_json,now])? != 0;
         if inserted {
             Self::bump_sync_status_revision(&transaction)?;
@@ -7358,6 +7837,7 @@ impl HostRegistry {
         Ok(operation)
     }
 
+    #[cfg(test)]
     pub fn set_binding_state(&self, library_uuid: &str, state: &str) -> anyhow::Result<()> {
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
@@ -7379,7 +7859,7 @@ impl HostRegistry {
         let next = generation
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("transport-generation-overflow"))?;
-        transaction.execute("UPDATE library_sync_bindings SET state='paused',transport_generation=?2,retry_after=NULL,poll_after=NULL,updated_at=?3 WHERE library_uuid=?1",params![library_uuid,next,unix_timestamp_millis()])?;
+        transaction.execute("UPDATE library_sync_bindings SET pause_resume_state=CASE WHEN state<>'paused' THEN state ELSE pause_resume_state END,plugin_suspended_state=NULL,state='paused',transport_generation=?2,retry_after=NULL,poll_after=NULL,updated_at=?3 WHERE library_uuid=?1",params![library_uuid,next,unix_timestamp_millis()])?;
         Self::bump_sync_status_revision(&transaction)?;
         transaction.commit()?;
         Ok(next)
@@ -7854,6 +8334,7 @@ impl HostRegistry {
             remote.ok_or_else(|| anyhow::anyhow!("remote-library-not-restorable"))?;
         let restore_uuid = uuid::Uuid::now_v7().to_string();
         transaction.execute("INSERT INTO sync_restore_plans(restore_uuid,operation_uuid,account_uuid,library_uuid,name,managed_root,descriptor_sha256,state,phase,restore_mode,inventory_fence,request_hash,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'restoring','operation-and-plans-recorded',?8,?9,?10,?11,?11)",params![restore_uuid,request.operation_uuid,request.account_uuid,request.library_uuid,remote_name,request.managed_root.to_string_lossy(),hash,request.restore_mode,request.inventory_fence,request.request_hash,now])?;
+        transaction.execute("UPDATE sync_restore_plans SET database_path=?2,placement_base=?3,content_paths_json=?4 WHERE restore_uuid=?1", params![restore_uuid, request.managed_root.join("Database").to_string_lossy(), request.managed_root.to_string_lossy(), serde_json::to_string(&vec![request.managed_root.join("Files").to_string_lossy().into_owned()])?])?;
         Self::bump_sync_status_revision(&transaction)?;
         transaction.commit()?;
         Ok(SyncRestorePlan {
@@ -7862,7 +8343,17 @@ impl HostRegistry {
             account_uuid: request.account_uuid.to_owned(),
             library_uuid: request.library_uuid.to_owned(),
             name: remote_name,
-            managed_root: request.managed_root.to_string_lossy().into_owned(),
+            database_path: request
+                .managed_root
+                .join("Database")
+                .to_string_lossy()
+                .into_owned(),
+            placement_base: request.managed_root.to_string_lossy().into_owned(),
+            content_paths: vec![request
+                .managed_root
+                .join("Files")
+                .to_string_lossy()
+                .into_owned()],
             state: "restoring".into(),
             phase: "catalog-restore".into(),
             catalog_ready: false,
@@ -7973,45 +8464,6 @@ impl HostRegistry {
             params![result.preflight_token,serde_json::to_string(request)?,request_hash,serde_json::to_string(&result)?,total_items as i64,total_bytes as i64,expires_at,now],
         )?;
         Ok(result)
-    }
-
-    #[cfg(test)]
-    pub fn claim_restore_preflight(
-        &self,
-        token: &str,
-        operation_uuid: &str,
-        request: &serde_json::Value,
-    ) -> anyhow::Result<bool> {
-        let now = unix_timestamp_millis();
-        let request_json = serde_json::to_string(request)?;
-        let request_hash = crate::sync_folders::request_hash(request)?;
-        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
-        let transaction = connection.transaction()?;
-        if let Some((existing_json, kind)) = transaction.query_row(
-            "SELECT request_json,kind FROM sync_orchestration_operations WHERE operation_uuid=?1",
-            [operation_uuid],
-            |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)),
-        ).optional()? {
-            if kind != "restore" || existing_json != request_json { bail!("idempotency-key-reused"); }
-            let claimed: Option<(String,String)> = transaction.query_row("SELECT COALESCE(operation_uuid,''),COALESCE(request_hash,'') FROM sync_restore_preflights WHERE token=?1",[token],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
-            if claimed.as_ref().is_none_or(|value| value.0 != operation_uuid || value.1 != request_hash) { bail!("restore-preflight-expired-or-changed"); }
-            transaction.commit()?;
-            return Ok(false);
-        }
-        let changed = transaction.execute(
-            "UPDATE sync_restore_preflights SET state='claimed',operation_uuid=?1,request_hash=?2,consumed_at=?3 WHERE token=?4 AND request_json=?5 AND request_hash=?2 AND state='ready' AND expires_at>=?3",
-            params![operation_uuid,request_hash,now,token,request_json],
-        )?;
-        if changed != 1 {
-            bail!("restore-preflight-expired-or-changed");
-        }
-        transaction.execute(
-            "INSERT INTO sync_orchestration_operations(operation_uuid,library_uuid,kind,state,phase,request_json,created_at,updated_at) VALUES (?1,NULL,'restore','running','operation-and-plans-recorded',?2,?3,?3)",
-            params![operation_uuid,request_json,now],
-        )?;
-        Self::bump_sync_status_revision(&transaction)?;
-        transaction.commit()?;
-        Ok(true)
     }
 
     pub fn complete_restore_preflight(
@@ -8208,7 +8660,7 @@ impl HostRegistry {
     }
 
     pub fn restore_plan(&self, restore_uuid: &str) -> anyhow::Result<Option<SyncRestorePlan>> {
-        self.connection.lock().unwrap_or_else(|p|p.into_inner()).query_row("SELECT restore_uuid,operation_uuid,account_uuid,library_uuid,name,managed_root,state,phase,catalog_ready,media_items_done,media_items_total,media_bytes_done,media_bytes_total,error_code,updated_at FROM sync_restore_plans WHERE restore_uuid=?1",[restore_uuid],|row|Ok(SyncRestorePlan{restore_uuid:row.get(0)?,operation_uuid:row.get(1)?,account_uuid:row.get(2)?,library_uuid:row.get(3)?,name:row.get(4)?,managed_root:row.get(5)?,state:row.get(6)?,phase:row.get(7)?,catalog_ready:row.get::<_,i64>(8)?!=0,media_items_done:row.get::<_,i64>(9)?.max(0) as u64,media_items_total:row.get::<_,Option<i64>>(10)?.map(|v|v.max(0) as u64),media_bytes_done:row.get::<_,i64>(11)?.max(0) as u64,media_bytes_total:row.get::<_,Option<i64>>(12)?.map(|v|v.max(0) as u64),error_code:row.get(13)?,updated_at:row.get(14)?})).optional().map_err(Into::into)
+        self.connection.lock().unwrap_or_else(|p|p.into_inner()).query_row("SELECT restore_uuid,operation_uuid,account_uuid,library_uuid,name,managed_root,state,phase,catalog_ready,media_items_done,media_items_total,media_bytes_done,media_bytes_total,error_code,updated_at,database_path,placement_base,content_paths_json FROM sync_restore_plans WHERE restore_uuid=?1",[restore_uuid],restore_plan_from_row).optional().map_err(Into::into)
     }
 
     pub fn restore_root_cleanup_entries(
@@ -8262,41 +8714,27 @@ impl HostRegistry {
         ).optional().map(|value| value.unwrap_or(false)).map_err(Into::into)
     }
 
-    #[cfg(test)]
-    pub fn restore_plans_for_operation(
-        &self,
-        operation_uuid: &str,
-    ) -> anyhow::Result<Vec<SyncRestorePlan>> {
+    pub fn restore_content_paths(&self, library_uuid: &str) -> anyhow::Result<Vec<String>> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
-        let mut statement = connection.prepare("SELECT restore_uuid,operation_uuid,account_uuid,library_uuid,name,managed_root,state,phase,catalog_ready,media_items_done,media_items_total,media_bytes_done,media_bytes_total,error_code,updated_at FROM sync_restore_plans WHERE operation_uuid=?1 ORDER BY created_at,restore_uuid")?;
-        let plans = statement
-            .query_map([operation_uuid], |row| {
-                Ok(SyncRestorePlan {
-                    restore_uuid: row.get(0)?,
-                    operation_uuid: row.get(1)?,
-                    account_uuid: row.get(2)?,
-                    library_uuid: row.get(3)?,
-                    name: row.get(4)?,
-                    managed_root: row.get(5)?,
-                    state: row.get(6)?,
-                    phase: row.get(7)?,
-                    catalog_ready: row.get::<_, i64>(8)? != 0,
-                    media_items_done: row.get::<_, i64>(9)?.max(0) as u64,
-                    media_items_total: row.get::<_, Option<i64>>(10)?.map(|v| v.max(0) as u64),
-                    media_bytes_done: row.get::<_, i64>(11)?.max(0) as u64,
-                    media_bytes_total: row.get::<_, Option<i64>>(12)?.map(|v| v.max(0) as u64),
-                    error_code: row.get(13)?,
-                    updated_at: row.get(14)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(anyhow::Error::from)?;
-        Ok(plans)
+        let json: String = connection.query_row("SELECT content_paths_json FROM sync_restore_plans WHERE library_uuid=?1 AND database_path IS NOT NULL ORDER BY created_at DESC LIMIT 1", [library_uuid], |row| row.get(0)).optional()?.context("restore-content-target-missing")?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    pub fn is_pending_restore_library(&self, library_uuid: &str) -> anyhow::Result<bool> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(connection.query_row("SELECT EXISTS(SELECT 1 FROM sync_restore_plans WHERE library_uuid=?1 AND database_path IS NOT NULL AND catalog_ready=0 AND state NOT IN ('cancelled','discarded','complete'))", [library_uuid], |row| row.get(0))?)
+    }
+
+    #[cfg(test)]
+    pub fn creation_artifacts(&self, txn: &str) -> anyhow::Result<Vec<OwnedCreationArtifact>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let json: String = connection.query_row("SELECT owned_artifacts_json FROM library_creation_journal WHERE txn_uuid=?1 AND layout_version=2", [txn], |row| row.get(0))?;
+        Ok(serde_json::from_str(&json)?)
     }
 
     pub fn pending_restore_recovery(&self) -> anyhow::Result<Vec<SyncRestorePlan>> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
-        let mut statement = connection.prepare("SELECT restore_uuid,operation_uuid,account_uuid,library_uuid,name,managed_root,state,phase,catalog_ready,media_items_done,media_items_total,media_bytes_done,media_bytes_total,error_code,updated_at FROM sync_restore_plans WHERE state IN ('planned','restoring','catalog-ready','paused','failed') ORDER BY created_at,restore_uuid")?;
+        let mut statement = connection.prepare("SELECT restore_uuid,operation_uuid,account_uuid,library_uuid,name,managed_root,state,phase,catalog_ready,media_items_done,media_items_total,media_bytes_done,media_bytes_total,error_code,updated_at,database_path,placement_base,content_paths_json FROM sync_restore_plans WHERE database_path IS NOT NULL AND state IN ('planned','restoring','catalog-ready','paused','failed') ORDER BY created_at,restore_uuid")?;
         let values = statement
             .query_map([], |row| {
                 Ok(SyncRestorePlan {
@@ -8305,7 +8743,17 @@ impl HostRegistry {
                     account_uuid: row.get(2)?,
                     library_uuid: row.get(3)?,
                     name: row.get(4)?,
-                    managed_root: row.get(5)?,
+                    database_path: row.get::<_, Option<String>>(15)?.unwrap_or_default(),
+                    placement_base: row.get::<_, Option<String>>(16)?.unwrap_or_default(),
+                    content_paths: serde_json::from_str(&row.get::<_, String>(17)?).map_err(
+                        |error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                17,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        },
+                    )?,
                     state: row.get(6)?,
                     phase: row.get(7)?,
                     catalog_ready: row.get::<_, i64>(8)? != 0,
@@ -8376,6 +8824,12 @@ impl HostRegistry {
             [restore_uuid],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
+        if state == "restoring" {
+            let ready: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM library_sync_bindings b JOIN plugin_installations i USING(plugin_id) JOIN plugin_runtime_state r USING(plugin_id) JOIN plugin_accounts a ON a.account_uuid=b.account_uuid WHERE b.library_uuid=?1 AND i.enabled_intent=1 AND r.state='ready' AND r.stop_pending=0 AND a.auth_state='authenticated')", [&library_uuid], |row|row.get(0))?;
+            if !ready {
+                anyhow::bail!("provider-not-ready");
+            }
+        }
         if state == "cancelled" && catalog_ready != 0 {
             anyhow::bail!("restore-action-not-allowed");
         }
@@ -8425,6 +8879,15 @@ impl HostRegistry {
         let now = unix_timestamp_millis();
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
+        ensure_restore_cleanup_owned(&transaction, restore_uuid, library_uuid)?;
+        transaction.execute(
+            "DELETE FROM local_root_bindings WHERE library_uuid=?2 AND EXISTS(SELECT 1 FROM sync_restore_root_plans p WHERE p.restore_uuid=?1 AND p.root_uuid=local_root_bindings.root_uuid AND p.local_binding_uuid=local_root_bindings.local_binding_uuid AND p.binding_generation=local_root_bindings.binding_generation)",
+            params![restore_uuid, library_uuid],
+        )?;
+        transaction.execute(
+            "UPDATE sync_restore_root_plans SET phase='compensated',updated_at=?2 WHERE restore_uuid=?1",
+            params![restore_uuid, now],
+        )?;
         transaction.execute(
             "UPDATE sync_restore_plans SET state='cancelled',phase='cancelled',updated_at=?2 WHERE restore_uuid=?1 AND library_uuid=?3 AND catalog_ready=0",
             params![restore_uuid, now, library_uuid],
@@ -8438,6 +8901,15 @@ impl HostRegistry {
         drop(connection);
         self.restore_plan(restore_uuid)?
             .ok_or_else(|| anyhow::anyhow!("restore-not-found"))
+    }
+
+    pub fn ensure_restore_cleanup_owned(
+        &self,
+        restore_uuid: &str,
+        library_uuid: &str,
+    ) -> anyhow::Result<()> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_restore_cleanup_owned(&connection, restore_uuid, library_uuid)
     }
 
     pub fn redacted_sync_diagnostics(
@@ -8456,6 +8928,10 @@ impl HostRegistry {
     }
 
     pub fn snapshot(&self) -> anyhow::Result<HostSnapshot> {
+        self.snapshot_with_visibility(false)
+    }
+
+    fn snapshot_with_visibility(&self, listed_only: bool) -> anyhow::Result<HostSnapshot> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let (active_library_uuid, context_revision) = connection.query_row(
             "SELECT active_library_uuid, context_revision FROM host_meta WHERE singleton = 1",
@@ -8463,16 +8939,139 @@ impl HostRegistry {
             |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
         )?;
         let mut statement = connection.prepare(
-            "SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','capturing','seed_ready','publishing') THEN 'synchronizing' WHEN b.state IN ('active','paused') THEN 'synchronized' ELSE l.binding_state END,l.availability,l.marker_identity FROM libraries l LEFT JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid ORDER BY COALESCE(l.last_opened_at,l.created_at) DESC,l.created_at DESC",
+            "SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','capturing','seed_ready','publishing') THEN 'synchronizing' WHEN b.state IN ('active','paused') THEN 'synchronized' ELSE l.binding_state END,l.availability,l.marker_identity FROM libraries l LEFT JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid WHERE (?1=0 OR NOT EXISTS(SELECT 1 FROM library_list_visibility v WHERE v.library_uuid=l.library_uuid AND v.hidden=1)) ORDER BY COALESCE(l.last_opened_at,l.created_at) DESC,l.created_at DESC",
         )?;
         let libraries = statement
-            .query_map([], descriptor_from_row)?
+            .query_map([listed_only as i64], descriptor_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(HostSnapshot {
             active_library_uuid,
             context_revision,
             libraries,
         })
+    }
+
+    pub fn is_library_listed(&self, library_uuid: &str) -> anyhow::Result<bool> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(connection.query_row("SELECT EXISTS(SELECT 1 FROM libraries l WHERE l.library_uuid=?1 AND NOT EXISTS(SELECT 1 FROM library_list_visibility v WHERE v.library_uuid=l.library_uuid AND v.hidden=1))", [library_uuid], |row| row.get(0))?)
+    }
+
+    pub fn listed_snapshot(&self) -> anyhow::Result<HostSnapshot> {
+        self.snapshot_with_visibility(true)
+    }
+
+    pub fn show_library(&self, library_uuid: &str) -> anyhow::Result<()> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        connection.execute(
+            "DELETE FROM library_list_visibility WHERE library_uuid=?1",
+            [library_uuid],
+        )?;
+        Ok(())
+    }
+
+    /// One SQLite commit is the recovery boundary: the old visible/active state
+    /// or the new hidden/non-active state survives, never a hidden active UUID.
+    pub fn forget_library(
+        &self,
+        library_uuid: &str,
+        expected_revision: u64,
+    ) -> anyhow::Result<u64> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let (active, revision): (Option<String>, i64) = transaction.query_row(
+            "SELECT active_library_uuid,context_revision FROM host_meta WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if revision as u64 != expected_revision {
+            bail!("stale-context-revision");
+        }
+        if !transaction.query_row("SELECT EXISTS(SELECT 1 FROM libraries WHERE library_uuid=?1 AND lifecycle_state='ready')", [library_uuid], |row| row.get::<_,bool>(0))? {
+            bail!("library-not-ready");
+        }
+        let next = if active.as_deref() == Some(library_uuid) {
+            revision
+                .checked_add(1)
+                .context("context revision exhausted")?
+        } else {
+            revision
+        };
+        transaction.execute("INSERT INTO library_list_visibility(library_uuid,hidden) VALUES (?1,1) ON CONFLICT(library_uuid) DO UPDATE SET hidden=1", [library_uuid])?;
+        if active.as_deref() == Some(library_uuid) {
+            transaction.execute("UPDATE host_meta SET active_library_uuid=NULL,context_revision=?1,activation_library_uuid=NULL,activation_revision=NULL WHERE singleton=1", [next])?;
+        }
+        transaction.commit()?;
+        Ok(next as u64)
+    }
+
+    pub fn begin_library_open(&self, intent: &LibraryOpenIntent) -> anyhow::Result<()> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let d = &intent.descriptor;
+        connection.execute("INSERT INTO library_open_journal(library_uuid,root_uuid,name,managed_root,local_data_dir,marker_identity,root_identity,phase,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'requested',?8)", params![d.library_uuid,d.root_uuid,d.name,d.managed_root.to_string_lossy(),d.local_data_dir.to_string_lossy(),d.marker_identity,intent.root_identity,unix_timestamp_millis()])?;
+        Ok(())
+    }
+
+    pub fn library_open_intents(&self) -> anyhow::Result<Vec<LibraryOpenIntent>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let mut statement = connection.prepare("SELECT library_uuid,root_uuid,name,local_data_dir,managed_root,marker_identity,root_identity,local_identity,catalog_identity FROM library_open_journal WHERE phase<>'committed'")?;
+        let intents = statement
+            .query_map([], |row| {
+                Ok(LibraryOpenIntent {
+                    descriptor: LibraryDescriptor {
+                        library_uuid: row.get(0)?,
+                        root_uuid: row.get(1)?,
+                        name: row.get(2)?,
+                        icon: None,
+                        color: None,
+                        local_data_dir: PathBuf::from(row.get::<_, String>(3)?),
+                        managed_root: PathBuf::from(row.get::<_, String>(4)?),
+                        lifecycle_state: "ready".into(),
+                        binding_state: "local-only".into(),
+                        availability: "available".into(),
+                        marker_identity: row.get(5)?,
+                    },
+                    root_identity: row.get(6)?,
+                    local_identity: row.get(7)?,
+                    catalog_identity: row.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(intents)
+    }
+
+    pub fn own_library_open_directory(
+        &self,
+        library_uuid: &str,
+        identity: &str,
+    ) -> anyhow::Result<()> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        if connection.execute("UPDATE library_open_journal SET local_identity=?2,phase='building' WHERE library_uuid=?1 AND phase='requested' AND local_identity IS NULL", params![library_uuid,identity])? != 1 { bail!("library-open-state-changed"); }
+        Ok(())
+    }
+
+    pub fn own_library_open_catalog(
+        &self,
+        library_uuid: &str,
+        identity: &str,
+    ) -> anyhow::Result<()> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        if connection.execute("UPDATE library_open_journal SET catalog_identity=?2 WHERE library_uuid=?1 AND phase='building' AND catalog_identity IS NULL", params![library_uuid,identity])? != 1 { bail!("library-open-state-changed"); }
+        Ok(())
+    }
+
+    pub fn commit_library_open(&self, descriptor: &LibraryDescriptor) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let d = descriptor;
+        if !transaction.query_row("SELECT EXISTS(SELECT 1 FROM library_open_journal WHERE library_uuid=?1 AND root_uuid=?2 AND managed_root=?3 AND local_data_dir=?4 AND marker_identity=?5 AND local_identity IS NOT NULL AND catalog_identity IS NOT NULL AND phase='building')", params![d.library_uuid,d.root_uuid,d.managed_root.to_string_lossy(),d.local_data_dir.to_string_lossy(),d.marker_identity], |row| row.get::<_,bool>(0))? { bail!("library-open-state-changed"); }
+        let now = unix_timestamp_millis();
+        transaction.execute("INSERT INTO libraries(library_uuid,root_uuid,name,local_data_dir,managed_root,lifecycle_state,binding_state,availability,marker_version,marker_identity,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,'ready','local-only','available',2,?6,?7,?7)", params![d.library_uuid,d.root_uuid,d.name,d.local_data_dir.to_string_lossy(),d.managed_root.to_string_lossy(),d.marker_identity,now])?;
+        transaction.execute(
+            "UPDATE library_open_journal SET phase='committed' WHERE library_uuid=?1",
+            [&d.library_uuid],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn library(&self, library_uuid: &str) -> anyhow::Result<Option<LibraryDescriptor>> {
@@ -8528,8 +9127,35 @@ impl HostRegistry {
     }
 
     pub fn begin_creation(&self, intent: &CreationIntent) -> anyhow::Result<()> {
+        self.begin_creation_internal(intent, None)
+    }
+
+    pub fn begin_restore_creation(
+        &self,
+        intent: &CreationIntent,
+        account_uuid: &str,
+    ) -> anyhow::Result<()> {
+        self.begin_creation_internal(intent, Some(account_uuid))
+    }
+
+    fn begin_creation_internal(
+        &self,
+        intent: &CreationIntent,
+        restore_account: Option<&str>,
+    ) -> anyhow::Result<()> {
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
+        ensure_restore_libraries_absent(&transaction, [intent.descriptor.library_uuid.as_str()])?;
+        if let Some(account_uuid) = restore_account {
+            let owned: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_restore_plans p JOIN sync_orchestration_operations o ON o.operation_uuid=p.operation_uuid WHERE p.restore_uuid=?1 AND p.library_uuid=?2 AND p.account_uuid=?3 AND p.database_path=?4 AND p.catalog_ready=0 AND p.state='restoring' AND o.kind='restore' AND o.state='running')",
+                params![intent.txn_uuid, intent.descriptor.library_uuid, account_uuid, intent.requested_root.to_string_lossy()],
+                |row| row.get(0),
+            )?;
+            if !owned {
+                bail!("restore-ownership-mismatch");
+            }
+        }
         let now = unix_timestamp_millis();
         transaction.execute(
             "INSERT INTO library_creation_journal(txn_uuid, library_uuid, root_uuid, name, icon, color, requested_root, resolved_root, local_staging_dir, phase, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'intent', ?10, ?10)",
@@ -8550,9 +9176,91 @@ impl HostRegistry {
         Ok(())
     }
 
+    pub fn record_creation_layout(
+        &self,
+        txn: &str,
+        database: &Path,
+        roots: &[crate::library_path::LibraryContentRootInput],
+    ) -> anyhow::Result<()> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        connection.execute("UPDATE library_creation_journal SET layout_version=2,final_storage_path=?2,content_roots_json=?3 WHERE txn_uuid=?1", params![txn, database.to_string_lossy(), serde_json::to_string(roots)?])?;
+        Ok(())
+    }
+
+    pub fn isolate_unavailable_library(&self, uuid: &str) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE libraries SET availability='unavailable' WHERE library_uuid=?1",
+            [uuid],
+        )?;
+        transaction.execute("UPDATE host_meta SET active_library_uuid=NULL,activation_library_uuid=NULL,activation_revision=NULL,context_revision=context_revision+1 WHERE singleton=1 AND active_library_uuid=?1", [uuid])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn pending_storage_paths(
+        &self,
+        skip_restore: Option<&str>,
+    ) -> anyhow::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let mut storage = Vec::new();
+        let mut content = Vec::new();
+        {
+            let mut query = connection.prepare("SELECT resolved_root,content_roots_json FROM library_creation_journal WHERE phase NOT IN ('created','rolled-back') UNION ALL SELECT managed_root,'[]' FROM library_open_journal WHERE phase<>'committed'")?;
+            for row in query.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })? {
+                let (path, json) = row?;
+                storage.push(PathBuf::from(path));
+                let roots: Vec<crate::library_path::LibraryContentRootInput> =
+                    serde_json::from_str(&json)?;
+                content.extend(roots.into_iter().map(|root| PathBuf::from(root.path)));
+            }
+        }
+        {
+            let mut query = connection.prepare("SELECT local_path FROM local_root_bindings UNION SELECT target_path FROM root_relocation_operations r JOIN root_operations o ON o.operation_uuid=r.operation_uuid WHERE o.phase NOT IN ('completed','cancelled','failed') UNION SELECT target_path FROM sync_restore_root_plans r JOIN sync_restore_plans p ON p.restore_uuid=r.restore_uuid WHERE r.selected=1 AND p.state NOT IN ('complete','discarded','cancelled') AND (?1 IS NULL OR p.restore_uuid<>?1)")?;
+            content.extend(
+                query
+                    .query_map([skip_restore], |row| {
+                        Ok(PathBuf::from(row.get::<_, String>(0)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
+        {
+            let mut query = connection.prepare("SELECT database_path,content_paths_json FROM sync_restore_plans WHERE database_path IS NOT NULL AND state NOT IN ('complete','discarded','cancelled') AND (?1 IS NULL OR restore_uuid<>?1)")?;
+            for row in query.query_map([skip_restore], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })? {
+                let (database, json) = row?;
+                storage.push(database.into());
+                content.extend(serde_json::from_str::<Vec<PathBuf>>(&json)?);
+            }
+        }
+        {
+            let mut query = connection.prepare("SELECT request_json FROM root_operations WHERE state NOT IN ('completed','cancelled') AND kind IN ('enroll','select','rebind','relocate','automatic-rename')")?;
+            for row in query.query_map([], |row| row.get::<_, String>(0))? {
+                let value: serde_json::Value = serde_json::from_str(&row?)?;
+                collect_reserved_content_paths(&value, &mut content);
+            }
+        }
+        Ok((storage, content))
+    }
+
+    pub fn record_creation_artifacts(
+        &self,
+        txn: &str,
+        artifacts: &[OwnedCreationArtifact],
+    ) -> anyhow::Result<()> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        connection.execute("UPDATE library_creation_journal SET owned_artifacts_json=?2,updated_at=?3 WHERE txn_uuid=?1 AND layout_version=2", params![txn, serde_json::to_string(artifacts)?, unix_timestamp_millis()])?;
+        Ok(())
+    }
+
     pub fn pending_creation_recovery(&self) -> anyhow::Result<Vec<CreationRecovery>> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
-        let mut statement = connection.prepare("SELECT txn_uuid, library_uuid, root_uuid, name, icon, color, resolved_root, local_staging_dir, phase, created_root, created_marker, root_identity, staging_identity FROM library_creation_journal WHERE phase NOT IN ('created','rolled-back') ORDER BY created_at")?;
+        let mut statement = connection.prepare("SELECT txn_uuid, library_uuid, root_uuid, name, icon, color, resolved_root, local_staging_dir, phase, created_root, created_marker, root_identity, staging_identity, layout_version, final_storage_path, content_roots_json, owned_artifacts_json FROM library_creation_journal WHERE phase NOT IN ('created','rolled-back') ORDER BY created_at")?;
         let rows = statement
             .query_map([], |row| {
                 Ok(CreationRecovery {
@@ -8564,9 +9272,12 @@ impl HostRegistry {
                     color: row.get(5)?,
                     resolved_root: PathBuf::from(row.get::<_, String>(6)?),
                     staging_dir: PathBuf::from(row.get::<_, String>(7)?),
-                    created_root: row.get::<_, i64>(9)? != 0,
                     root_identity: row.get(11)?,
-                    staging_identity: row.get(12)?,
+                    layout_version: row.get(13)?,
+                    final_storage_path: row.get::<_, Option<String>>(14)?.map(PathBuf::from),
+                    content_roots_json: row.get(15)?,
+                    owned_artifacts_json: row.get(16)?,
+                    phase: row.get(8)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -8575,7 +9286,7 @@ impl HostRegistry {
 
     pub fn pending_removal_recovery(&self) -> anyhow::Result<Vec<RemovalRecovery>> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
-        let mut statement = connection.prepare("SELECT txn_uuid, library_uuid, marker_identity, managed_root, local_data_dir, root_quarantine, local_quarantine, root_quarantine_identity, local_quarantine_identity, phase FROM library_removal_journal WHERE phase NOT IN ('complete','rolled-back') ORDER BY created_at")?;
+        let mut statement = connection.prepare("SELECT txn_uuid, library_uuid, marker_identity, managed_root, local_data_dir, root_quarantine, local_quarantine, root_quarantine_identity, local_quarantine_identity, phase, layout_version FROM library_removal_journal WHERE phase NOT IN ('complete','rolled-back') ORDER BY created_at")?;
         let rows = statement
             .query_map([], |row| {
                 Ok(RemovalRecovery {
@@ -8587,8 +9298,8 @@ impl HostRegistry {
                     root_quarantine: row.get::<_, Option<String>>(5)?.map(PathBuf::from),
                     local_quarantine: row.get::<_, Option<String>>(6)?.map(PathBuf::from),
                     root_quarantine_identity: row.get(7)?,
-                    local_quarantine_identity: row.get(8)?,
                     phase: row.get(9)?,
+                    layout_version: row.get(10)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -8666,9 +9377,17 @@ impl HostRegistry {
     ) -> anyhow::Result<()> {
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
+        let conflicting: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM libraries WHERE library_uuid=?1 AND (root_uuid<>?2 OR local_data_dir<>?3 OR managed_root<>?4 OR marker_identity<>?5))",
+            params![descriptor.library_uuid, descriptor.root_uuid, descriptor.local_data_dir.to_string_lossy(), descriptor.managed_root.to_string_lossy(), descriptor.marker_identity],
+            |row| row.get(0),
+        )?;
+        if conflicting {
+            bail!("library-already-present");
+        }
         let now = unix_timestamp_millis();
         transaction.execute(
-            "INSERT INTO libraries(library_uuid, root_uuid, name, icon, color, local_data_dir, managed_root, lifecycle_state, binding_state, availability, marker_version, marker_identity, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ready', 'local-only', 'available', 1, ?8, ?9, ?9) ON CONFLICT(library_uuid) DO UPDATE SET name=excluded.name, icon=excluded.icon, color=excluded.color, local_data_dir=excluded.local_data_dir, managed_root=excluded.managed_root, lifecycle_state='ready', binding_state='local-only', availability='available', marker_identity=excluded.marker_identity, updated_at=excluded.updated_at",
+            "INSERT INTO libraries(library_uuid, root_uuid, name, icon, color, local_data_dir, managed_root, lifecycle_state, binding_state, availability, marker_version, marker_identity, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ready', 'local-only', 'available', 2, ?8, ?9, ?9) ON CONFLICT(library_uuid) DO UPDATE SET name=excluded.name, icon=excluded.icon, color=excluded.color, local_data_dir=excluded.local_data_dir, managed_root=excluded.managed_root, lifecycle_state='ready', binding_state='local-only', availability='available', marker_version=2, marker_identity=excluded.marker_identity, updated_at=excluded.updated_at",
             params![descriptor.library_uuid, descriptor.root_uuid, descriptor.name, descriptor.icon, descriptor.color, descriptor.local_data_dir.to_string_lossy(), descriptor.managed_root.to_string_lossy(), descriptor.marker_identity, now],
         )?;
         transaction.execute(
@@ -8686,6 +9405,9 @@ impl HostRegistry {
     ) -> anyhow::Result<u64> {
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
+        if let Some(library_uuid) = library_uuid {
+            if transaction.query_row("SELECT EXISTS(SELECT 1 FROM library_list_visibility WHERE library_uuid=?1 AND hidden=1)", [library_uuid], |row| row.get::<_,bool>(0))? { bail!("library-not-listed"); }
+        }
         let (from_library_uuid, current): (Option<String>, i64) = transaction.query_row(
             "SELECT active_library_uuid, context_revision FROM host_meta WHERE singleton=1",
             [],
@@ -8761,13 +9483,14 @@ impl HostRegistry {
             params![descriptor.library_uuid, now],
         )?;
         transaction.execute(
-            "INSERT INTO library_removal_journal(txn_uuid, library_uuid, managed_root, local_data_dir, marker_identity, phase, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'requested', ?6, ?6)",
+            "INSERT INTO library_removal_journal(txn_uuid, library_uuid, managed_root, local_data_dir, marker_identity, phase, created_at, updated_at, layout_version) VALUES (?1, ?2, ?3, ?4, ?5, 'requested', ?6, ?6, 2)",
             params![txn_uuid, descriptor.library_uuid, descriptor.managed_root.to_string_lossy(), descriptor.local_data_dir.to_string_lossy(), descriptor.marker_identity, now],
         )?;
         transaction.commit()?;
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn update_removal_quarantine(
         &self,
         txn_uuid: &str,
@@ -9025,7 +9748,7 @@ fn selected_plugin_name(plugin_id: &str, manifest_json: Option<&str>) -> String 
         .unwrap_or_else(|| plugin_id.chars().take(128).collect())
 }
 
-fn unix_timestamp_millis() -> i64 {
+pub(crate) fn unix_timestamp_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -9042,11 +9765,16 @@ mod tests {
     use super::*;
 
     fn register_test_plugin(registry: &HostRegistry, plugin_id: &str, account_uuid: &str) {
+        let manifest_json = if plugin_id == "com.mangoo.configurable-sync" {
+            include_str!("../../../contracts/plugins/fixtures/valid-configurable-provider-v2.json")
+        } else {
+            r#"{"manifestVersion":2}"#
+        };
         registry
             .register_bundled_plugin(RegisterBundledPlugin {
                 plugin_id,
                 version: "1.0.0",
-                manifest_json: r#"{"manifestVersion":2}"#,
+                manifest_json,
                 entry_relative_path: "bin/provider",
                 entry_sha256: &[7; 32],
                 install_root: Path::new("bundled"),
@@ -9102,7 +9830,7 @@ mod tests {
 
     fn temp_registry_path() -> PathBuf {
         std::env::temp_dir().join(format!(
-            "megle-host-registry-{}.sqlite",
+            "mangoo-host-registry-{}.sqlite",
             uuid::Uuid::now_v7()
         ))
     }
@@ -9359,7 +10087,7 @@ mod tests {
                     |row| row.get::<_, i64>(0)
                 )
                 .unwrap(),
-            18
+            22
         );
         for table in [
             "provider_remote_descriptor_heads",
@@ -9864,10 +10592,10 @@ mod tests {
         let root_uuid = "00000000-0000-7000-8000-000000000102";
         let root_folder_uuid = "00000000-0000-7000-8000-000000000103";
         let original_binding_uuid = "00000000-0000-7000-8000-000000000104";
-        register_test_plugin(&registry, "com.megle.root-test", "account-root-test");
+        register_test_plugin(&registry, "com.mangoo.root-test", "account-root-test");
         register_test_library(&registry, library_uuid);
         registry
-            .begin_sync_binding(library_uuid, "com.megle.root-test", "account-root-test")
+            .begin_sync_binding(library_uuid, "com.mangoo.root-test", "account-root-test")
             .unwrap();
         {
             let connection = registry.connection.lock().unwrap();
@@ -10111,12 +10839,12 @@ mod tests {
         let registry = HostRegistry::open(&path).unwrap();
         let library_uuid = "00000000-0000-7000-8000-000000000151";
         let root_uuid = "00000000-0000-7000-8000-000000000152";
-        register_test_plugin(&registry, "com.megle.publish-test", "account-publish-test");
+        register_test_plugin(&registry, "com.mangoo.publish-test", "account-publish-test");
         register_test_library(&registry, library_uuid);
         registry
             .begin_sync_binding(
                 library_uuid,
-                "com.megle.publish-test",
+                "com.mangoo.publish-test",
                 "account-publish-test",
             )
             .unwrap();
@@ -10295,8 +11023,8 @@ mod tests {
             name: "Test Library".into(),
             icon: None,
             color: None,
-            local_data_dir: std::env::temp_dir().join(format!("megle-data-{library_uuid}")),
-            managed_root: std::env::temp_dir().join(format!("megle-root-{library_uuid}")),
+            local_data_dir: std::env::temp_dir().join(format!("mangoo-data-{library_uuid}")),
+            managed_root: std::env::temp_dir().join(format!("mangoo-root-{library_uuid}")),
             lifecycle_state: "ready".into(),
             binding_state: "local-only".into(),
             availability: "available".into(),
@@ -10533,7 +11261,7 @@ mod tests {
     fn orchestration_status_and_preflight_tokens_are_durable_and_idempotent() {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).unwrap();
-        register_test_plugin(&registry, "com.megle.sync", "account-sync");
+        register_test_plugin(&registry, "com.mangoo.sync", "account-sync");
         register_test_library(&registry, "library-sync");
 
         let before = registry.sync_status_snapshot().unwrap();
@@ -10541,14 +11269,25 @@ mod tests {
         assert_eq!(before.libraries[0].allowed_actions, vec!["enable"]);
 
         let token = registry
-            .create_sync_preflight_token("library-sync", "com.megle.sync", "account-sync", None)
+            .create_sync_preflight_token("library-sync", "com.mangoo.sync", "account-sync", None)
             .unwrap();
         registry
-            .consume_sync_preflight_token(&token, "library-sync", "com.megle.sync", "account-sync")
+            .consume_sync_preflight_token(&token, "library-sync", "com.mangoo.sync", "account-sync")
             .unwrap();
-        assert!(registry
-            .consume_sync_preflight_token(&token, "library-sync", "com.megle.sync", "account-sync",)
-            .is_err());
+        assert!(
+            registry
+                .consume_sync_preflight_token(
+                    &token,
+                    "library-sync",
+                    "com.mangoo.sync",
+                    "account-sync",
+                )
+                .is_err()
+        );
+
+        registry
+            .begin_sync_binding("library-sync", "com.mangoo.sync", "account-sync")
+            .unwrap();
 
         let operation = registry
             .begin_sync_operation_once(
@@ -10605,35 +11344,35 @@ mod tests {
     fn sync_enable_requires_ready_authenticated_compatible_provider_account() {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).expect("open host registry");
-        register_test_plugin(&registry, "com.megle.ready", "account-ready");
+        register_test_plugin(&registry, "com.mangoo.ready", "account-ready");
         registry
-            .set_plugin_intent("com.megle.ready", true, true)
+            .set_plugin_intent("com.mangoo.ready", true, true)
             .unwrap();
         registry
             .record_plugin_runtime_ready(
-                "com.megle.ready",
+                "com.mangoo.ready",
                 "session-ready",
                 &["sync-provider.v1".into()],
             )
             .unwrap();
 
         registry
-            .require_ready_sync_provider("com.megle.ready", "account-ready")
+            .require_ready_sync_provider("com.mangoo.ready", "account-ready")
             .unwrap();
         assert_eq!(
             registry
-                .require_ready_sync_provider("com.megle.ready", "wrong-account")
+                .require_ready_sync_provider("com.mangoo.ready", "wrong-account")
                 .unwrap_err()
                 .to_string(),
             "provider-account-not-found"
         );
 
         registry
-            .update_plugin_account_auth("com.megle.ready", "expired", None)
+            .update_plugin_account_auth("com.mangoo.ready", "expired", None)
             .unwrap();
         assert_eq!(
             registry
-                .require_ready_sync_provider("com.megle.ready", "account-ready")
+                .require_ready_sync_provider("com.mangoo.ready", "account-ready")
                 .unwrap_err()
                 .to_string(),
             "provider-account-not-authenticated"
@@ -10646,32 +11385,33 @@ mod tests {
     fn stale_runtime_launch_cannot_restore_ready_after_disable() {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).expect("open host registry");
-        register_test_plugin(&registry, "com.megle.stale", "account-stale");
+        register_test_plugin(&registry, "com.mangoo.stale", "account-stale");
         let fingerprint = registry.plugin_runtime_launches().unwrap()[0].fingerprint();
         assert!(registry
-            .plugin_runtime_launch_is_current("com.megle.stale", &fingerprint)
+            .plugin_runtime_launch_is_current("com.mangoo.stale", &fingerprint)
             .unwrap());
 
         registry
-            .set_plugin_intent("com.megle.stale", false, true)
+            .set_plugin_intent("com.mangoo.stale", false, true)
             .unwrap();
         assert!(!registry
-            .plugin_runtime_launch_is_current("com.megle.stale", &fingerprint)
+            .plugin_runtime_launch_is_current("com.mangoo.stale", &fingerprint)
             .unwrap());
         assert!(!registry
             .record_plugin_runtime_ready_for_launch(
-                "com.megle.stale",
+                "com.mangoo.stale",
                 &fingerprint,
                 "stale-session",
                 &["sync-provider.v1".into()],
             )
             .unwrap());
-        let plugin = registry.host_plugin("com.megle.stale").unwrap().unwrap();
-        assert_eq!(plugin.runtime_state, "disabled");
+        let plugin = registry.host_plugin("com.mangoo.stale").unwrap().unwrap();
+        assert_eq!(plugin.runtime_state, "stopping");
+        registry.finish_plugin_stop("com.mangoo.stale").unwrap();
         assert!(!plugin.enabled_intent);
         assert!(!registry
             .record_plugin_runtime_failure(
-                "com.megle.stale",
+                "com.mangoo.stale",
                 &fingerprint,
                 "crashed-backoff",
                 "stale-failure",
@@ -10681,7 +11421,7 @@ mod tests {
             .unwrap());
         assert_eq!(
             registry
-                .host_plugin("com.megle.stale")
+                .host_plugin("com.mangoo.stale")
                 .unwrap()
                 .unwrap()
                 .runtime_state,
@@ -10693,24 +11433,432 @@ mod tests {
     }
 
     #[test]
+    fn plugin_lifecycle_epoch_and_suspension_survive_restart_without_resuming_user_pause() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        register_test_plugin(&registry, "lifecycle", "account");
+        let phases = [
+            "preparing",
+            "capturing",
+            "seed_ready",
+            "publishing",
+            "active",
+            "restoring",
+            "paused",
+            "error",
+            "compatibility_locked",
+            "unbinding",
+        ];
+        for (index, phase) in phases.iter().enumerate() {
+            let id = format!("library-{index}");
+            register_test_library(&registry, &id);
+            registry
+                .begin_sync_binding(&id, "lifecycle", "account")
+                .unwrap();
+            registry.set_binding_state(&id, phase).unwrap();
+        }
+        let original = registry.plugin_runtime_launches().unwrap()[0].clone();
+        registry
+            .set_plugin_intent("lifecycle", false, true)
+            .unwrap();
+        assert!(registry
+            .resume_binding(
+                "library-4",
+                &registry
+                    .binding_transport("library-4", "library")
+                    .unwrap()
+                    .unwrap()
+            )
+            .is_err());
+        for status in registry.sync_status_snapshot().unwrap().libraries {
+            assert!(!status.allowed_actions.iter().any(|action| matches!(
+                action.as_str(),
+                "resume" | "retry" | "sync-now" | "reconnect"
+            )));
+        }
+        let revision = registry.sync_status_snapshot().unwrap().revision;
+        for kind in ["resume", "retry", "sync-now"] {
+            assert!(registry
+                .begin_sync_operation_once(
+                    &uuid::Uuid::now_v7().to_string(),
+                    Some("library-4"),
+                    kind,
+                    "active",
+                    &serde_json::json!({})
+                )
+                .is_err());
+        }
+        assert_eq!(registry.sync_status_snapshot().unwrap().revision, revision);
+        let disabled_epoch = registry.plugin_lifecycle_epoch("lifecycle").unwrap();
+        drop(registry);
+        let registry = HostRegistry::open(&path).unwrap();
+        assert_eq!(
+            registry.plugin_lifecycle_epoch("lifecycle").unwrap(),
+            disabled_epoch
+        );
+        assert_eq!(
+            registry
+                .host_plugin("lifecycle")
+                .unwrap()
+                .unwrap()
+                .runtime_state,
+            "disabled"
+        );
+        assert!(registry
+            .resume_plugin_suspended_bindings("lifecycle")
+            .unwrap()
+            .is_empty());
+        registry.set_plugin_intent("lifecycle", true, true).unwrap();
+        let current = registry.plugin_runtime_launches().unwrap()[0].clone();
+        assert!(current.lifecycle_epoch > disabled_epoch);
+        assert_eq!(current.account_generation, original.account_generation);
+        assert!(!registry
+            .plugin_runtime_launch_is_current("lifecycle", &original.fingerprint())
+            .unwrap());
+        assert!(!registry
+            .record_plugin_runtime_ready_for_launch(
+                "lifecycle",
+                &original.fingerprint(),
+                "stale",
+                &["sync-provider.v1".into()]
+            )
+            .unwrap());
+        registry
+            .record_plugin_runtime_ready_for_launch(
+                "lifecycle",
+                &current.fingerprint(),
+                "new",
+                &["sync-provider.v1".into()],
+            )
+            .unwrap();
+        assert_eq!(
+            registry
+                .resume_plugin_suspended_bindings("lifecycle")
+                .unwrap()
+                .len(),
+            6
+        );
+        for (index, phase) in phases.iter().enumerate() {
+            assert_eq!(
+                registry
+                    .binding_transport(&format!("library-{index}"), "library")
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                *phase
+            );
+        }
+        assert!(registry
+            .resume_plugin_suspended_bindings("lifecycle")
+            .unwrap()
+            .is_empty());
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn plugin_lifecycle_stopping_rejects_launch_identity_and_runtime_admission() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        register_test_plugin(&registry, "stopping", "stopping-account");
+        let launch = registry.plugin_runtime_launches().unwrap().remove(0);
+        registry.mark_plugin_stop_pending("stopping").unwrap();
+        assert!(registry.plugin_runtime_launches().unwrap().is_empty());
+        assert!(!registry
+            .plugin_runtime_launch_is_current("stopping", &launch.fingerprint())
+            .unwrap());
+        assert!(registry
+            .require_runtime_provider("stopping", "stopping-account")
+            .is_err());
+        assert!(!registry
+            .record_plugin_runtime_ready_for_launch(
+                "stopping",
+                &launch.fingerprint(),
+                "late-session",
+                &["sync-provider.v1".into()]
+            )
+            .unwrap());
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn plugin_lifecycle_restart_mutations_publish_stopping_atomically() {
+        for command in ["retry", "grants", "signout"] {
+            let path = temp_registry_path();
+            let registry = HostRegistry::open(&path).unwrap();
+            register_test_plugin(&registry, "stopping", "stopping-account");
+            match command {
+                "retry" => registry.retry_plugin_runtime("stopping", true).unwrap(),
+                "grants" => {
+                    registry.set_plugin_grants("stopping", "[]", true).unwrap();
+                }
+                "signout" => {
+                    let generation = registry
+                        .plugin_account_secret("stopping")
+                        .unwrap()
+                        .unwrap()
+                        .generation;
+                    registry
+                        .sign_out_plugin_account("stopping", generation)
+                        .unwrap()
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                registry
+                    .host_plugin("stopping")
+                    .unwrap()
+                    .unwrap()
+                    .runtime_state,
+                "stopping",
+                "{command}"
+            );
+            assert!(registry.plugin_runtime_launches().unwrap().is_empty());
+            drop(registry);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn plugin_lifecycle_legacy_resume_requires_durable_publication_evidence() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        register_test_plugin(&registry, "legacy", "account");
+        register_test_library(&registry, "library");
+        let (epoch, _) = registry
+            .begin_sync_binding("library", "legacy", "account")
+            .unwrap();
+        for (capture, checkpoint, expected) in [
+            (None, None, "preparing"),
+            (Some(7), None, "capturing"),
+            (Some(7), Some(uuid::Uuid::now_v7()), "seed_ready"),
+        ] {
+            registry.connection.lock().unwrap().execute(
+                "UPDATE library_sync_bindings SET state='paused',pause_resume_state=NULL,plugin_suspended_state=NULL,capture_generation=?1,latest_checkpoint_uuid=?2,published_through_seq=19 WHERE library_uuid='library'",
+                params![capture,checkpoint.map(|value|value.as_bytes().to_vec())],
+            ).unwrap();
+            let transport = registry
+                .binding_transport("library", "library")
+                .unwrap()
+                .unwrap();
+            registry.resume_binding("library", &transport).unwrap();
+            assert_eq!(
+                registry
+                    .binding_transport("library", "library")
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                expected
+            );
+            if let Some(checkpoint) = checkpoint {
+                for key in [
+                    "library-descriptor".to_owned(),
+                    format!("checkpoints/{checkpoint}.checkpoint"),
+                ] {
+                    registry
+                        .record_provider_receipt(
+                            "library", epoch, 1, &key, None, &[4; 32], "created",
+                        )
+                        .unwrap();
+                }
+                registry.set_binding_state("library", "paused").unwrap();
+                let transport = registry
+                    .binding_transport("library", "library")
+                    .unwrap()
+                    .unwrap();
+                registry.resume_binding("library", &transport).unwrap();
+                assert_eq!(
+                    registry
+                        .binding_transport("library", "library")
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    "active"
+                );
+            }
+        }
+        // Explicit user pause has priority even if the provider suspended it first.
+        registry.set_binding_state("library", "capturing").unwrap();
+        registry.set_plugin_intent("legacy", false, true).unwrap();
+        registry.pause_binding("library").unwrap();
+        registry.finish_plugin_stop("legacy").unwrap();
+        registry.set_plugin_intent("legacy", true, true).unwrap();
+        registry
+            .record_plugin_runtime_ready("legacy", "new", &["sync-provider.v1".to_owned()])
+            .unwrap();
+        assert!(registry
+            .resume_plugin_suspended_bindings("legacy")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            registry
+                .binding_transport("library", "library")
+                .unwrap()
+                .unwrap()
+                .state,
+            "paused"
+        );
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn plugin_lifecycle_migration_preserves_populated_account_and_intent() {
+        let path = temp_registry_path();
+        {
+            let connection = Connection::open(&path).unwrap();
+            for migration in [
+                HOST_MIGRATION_0001,
+                HOST_MIGRATION_0002,
+                HOST_MIGRATION_0003,
+                HOST_MIGRATION_0004,
+                HOST_MIGRATION_0005,
+                HOST_MIGRATION_0006,
+                HOST_MIGRATION_0007,
+                HOST_MIGRATION_0008,
+                HOST_MIGRATION_0009,
+                HOST_MIGRATION_0010,
+                HOST_MIGRATION_0011,
+                HOST_MIGRATION_0012,
+                HOST_MIGRATION_0013,
+                HOST_MIGRATION_0014,
+                HOST_MIGRATION_0015,
+                HOST_MIGRATION_0016,
+                HOST_MIGRATION_0017,
+                HOST_MIGRATION_0018,
+            ] {
+                connection.execute_batch(migration).unwrap();
+            }
+            connection.execute_batch("INSERT INTO plugin_installations(plugin_id,manifest_version,selected_version,enabled_intent,install_root,trust_policy_id,requested_permissions_json,granted_permissions_json,created_at,updated_at) VALUES('legacy',2,'1',0,'fixture','test','[]','[]',1,1); INSERT INTO plugin_runtime_state(plugin_id,state,updated_at) VALUES('legacy','disabled',1); INSERT INTO plugin_accounts(account_uuid,plugin_id,secret_ref,auth_state,generation,display_name,created_at,updated_at) VALUES('retained-account','legacy','opaque-reference','authenticated',9,'Retained',1,1);").unwrap();
+        }
+        let registry = HostRegistry::open(&path).unwrap();
+        let account = registry.plugin_account_secret("legacy").unwrap().unwrap();
+        assert_eq!(account.account_uuid, "retained-account");
+        assert_eq!(account.generation, 9);
+        assert_eq!(account.secret_ref.as_deref(), Some("opaque-reference"));
+        assert_eq!(registry.plugin_lifecycle_epoch("legacy").unwrap(), 1);
+        assert!(
+            !registry
+                .host_plugin("legacy")
+                .unwrap()
+                .unwrap()
+                .enabled_intent
+        );
+        drop(registry);
+        let registry = HostRegistry::open(&path).unwrap();
+        assert_eq!(registry.plugin_lifecycle_epoch("legacy").unwrap(), 1);
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_onedrive_contribution_migration_preserves_configuration_and_primary_credential() {
+        let path = temp_registry_path();
+        {
+            let connection = Connection::open(&path).unwrap();
+            for migration in [
+                HOST_MIGRATION_0001,
+                HOST_MIGRATION_0002,
+                HOST_MIGRATION_0003,
+                HOST_MIGRATION_0004,
+                HOST_MIGRATION_0005,
+                HOST_MIGRATION_0006,
+                HOST_MIGRATION_0007,
+                HOST_MIGRATION_0008,
+                HOST_MIGRATION_0009,
+                HOST_MIGRATION_0010,
+                HOST_MIGRATION_0011,
+                HOST_MIGRATION_0012,
+                HOST_MIGRATION_0013,
+                HOST_MIGRATION_0014,
+                HOST_MIGRATION_0015,
+                HOST_MIGRATION_0016,
+                HOST_MIGRATION_0017,
+                HOST_MIGRATION_0018,
+                HOST_MIGRATION_0019,
+            ] {
+                connection.execute_batch(migration).unwrap();
+            }
+            // This pre-contributions record deliberately keeps the historical identity.
+            // Upgrade coverage must not depend on a currently bundled provider manifest.
+            connection.execute_batch(
+                "INSERT INTO plugin_installations(plugin_id,manifest_version,selected_version,enabled_intent,install_root,trust_policy_id,requested_permissions_json,granted_permissions_json,created_at,updated_at)
+                 VALUES('com.mangoo.onedrive',2,'1.0.0',0,'legacy-bundle','embedded-v1','[{\"kind\":\"secret\",\"namespace\":\"microsoft-onedrive\",\"operations\":[\"read\",\"write\",\"delete\"]}]','[{\"kind\":\"secret\",\"namespace\":\"microsoft-onedrive\",\"operations\":[\"read\",\"write\",\"delete\"]}]',1,1);
+                 INSERT INTO plugin_versions(plugin_id,version,manifest_json,entry_relative_path,entry_sha256,state,installed_at)
+                 VALUES('com.mangoo.onedrive','1.0.0','{\"manifestVersion\":2,\"id\":\"com.mangoo.onedrive\",\"name\":\"Legacy Provider\",\"version\":\"1.0.0\"}','bin/provider',zeroblob(32),'selected',1);
+                 INSERT INTO plugin_runtime_state(plugin_id,state,updated_at) VALUES('com.mangoo.onedrive','disabled',1);
+                 INSERT INTO plugin_accounts(account_uuid,plugin_id,secret_ref,auth_state,generation,display_name,created_at,updated_at)
+                 VALUES('legacy-account','com.mangoo.onedrive','retained-primary','authenticated',9,'Retained Account',1,1);
+                 UPDATE onedrive_configuration SET host_override_client_id='01234567-89ab-4cde-8fab-0123456789ab',revision=7,updated_at=1 WHERE singleton=1;",
+            ).unwrap();
+        }
+        for _ in 0..2 {
+            let registry = HostRegistry::open(&path).unwrap();
+            let account = registry
+                .plugin_account_secret("com.mangoo.onedrive")
+                .unwrap()
+                .unwrap();
+            assert_eq!(account.account_uuid, "legacy-account");
+            assert_eq!(account.generation, 9);
+            assert_eq!(account.secret_ref.as_deref(), Some("retained-primary"));
+            let plugin = registry
+                .host_plugin("com.mangoo.onedrive")
+                .unwrap()
+                .unwrap();
+            assert!(!plugin.enabled_intent);
+            assert_eq!(plugin.auth_state.as_deref(), Some("authenticated"));
+            let configuration = registry
+                .plugin_configuration("com.mangoo.onedrive")
+                .unwrap();
+            assert_eq!(configuration.revision, 7);
+            assert!(configuration.configured);
+            assert_eq!(
+                configuration.values["clientId"],
+                "01234567-89ab-4cde-8fab-0123456789ab"
+            );
+            let (namespace, purpose, role, grants): (String, String, String, String) = registry
+                .connection
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT h.namespace,h.purpose,h.role,i.granted_permissions_json FROM plugin_secret_handles h JOIN plugin_installations i ON i.plugin_id=h.plugin_id WHERE h.secret_ref='retained-primary'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(namespace, "microsoft-onedrive");
+            assert_eq!(purpose, "oauth-v1");
+            assert_eq!(role, "primary");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&grants).unwrap(),
+                serde_json::json!([{"kind":"secret","namespace":"microsoft-onedrive","operations":["read","write","delete"]}])
+            );
+            assert!(registry.due_credential_retirements(10).unwrap().is_empty());
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn signed_out_account_gets_a_new_runtime_generation_for_reauthentication() {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).expect("open host registry");
-        register_test_plugin(&registry, "com.megle.reauth", "account-reauth");
+        register_test_plugin(&registry, "com.mangoo.reauth", "account-reauth");
         let original = registry.plugin_runtime_launches().unwrap()[0].fingerprint();
 
         registry
-            .set_plugin_account_secret("com.megle.reauth", None, "signed-out", 2)
+            .set_plugin_account_secret("com.mangoo.reauth", None, "signed-out", 2)
             .unwrap();
         let launches = registry.plugin_runtime_launches().unwrap();
         assert_eq!(launches.len(), 1);
         let reauthentication = launches[0].fingerprint();
         assert_ne!(original, reauthentication);
         assert!(!registry
-            .plugin_runtime_launch_is_current("com.megle.reauth", &original)
+            .plugin_runtime_launch_is_current("com.mangoo.reauth", &original)
             .unwrap());
         assert!(registry
-            .plugin_runtime_launch_is_current("com.megle.reauth", &reauthentication)
+            .plugin_runtime_launch_is_current("com.mangoo.reauth", &reauthentication)
             .unwrap());
 
         drop(registry);
@@ -10721,17 +11869,17 @@ mod tests {
     fn pausing_provider_bindings_returns_rpc_fences_after_generation_advance() {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).expect("open host registry");
-        register_test_plugin(&registry, "com.megle.fenced", "account-fenced");
+        register_test_plugin(&registry, "com.mangoo.fenced", "account-fenced");
         let now = unix_timestamp_millis();
         registry.connection.lock().unwrap().execute(
             "INSERT INTO libraries(library_uuid,root_uuid,name,local_data_dir,managed_root,lifecycle_state,binding_state,availability,marker_version,marker_identity,created_at,updated_at) VALUES ('library-fenced','root-fenced','Library','local','root','ready','local-only','available',1,'marker',?1,?1)",
             [now],
         ).unwrap();
         let (binding_epoch, _) = registry
-            .begin_sync_binding("library-fenced", "com.megle.fenced", "account-fenced")
+            .begin_sync_binding("library-fenced", "com.mangoo.fenced", "account-fenced")
             .unwrap();
 
-        let fences = registry.pause_plugin_bindings("com.megle.fenced").unwrap();
+        let fences = registry.pause_plugin_bindings("com.mangoo.fenced").unwrap();
         assert_eq!(fences.len(), 1);
         assert_eq!(fences[0].account_uuid, "account-fenced");
         assert_eq!(fences[0].binding_epoch, binding_epoch);
@@ -10753,7 +11901,7 @@ mod tests {
         let permissions = r#"[{"kind":"secret","namespace":"fake-sync","operations":["read"]}]"#;
         registry
             .register_bundled_plugin(RegisterBundledPlugin {
-                plugin_id: "com.megle.permissions",
+                plugin_id: "com.mangoo.permissions",
                 version: "1.0.0",
                 manifest_json: r#"{"manifestVersion":2}"#,
                 entry_relative_path: "bin/provider",
@@ -10764,21 +11912,32 @@ mod tests {
             })
             .unwrap();
         registry
-            .set_plugin_intent("com.megle.permissions", true, true)
+            .set_plugin_intent("com.mangoo.permissions", true, true)
             .unwrap();
         assert_eq!(
             registry
-                .host_plugin("com.megle.permissions")
+                .host_plugin("com.mangoo.permissions")
                 .unwrap()
                 .unwrap()
                 .runtime_state,
             "permission-required"
         );
         registry
-            .set_plugin_grants("com.megle.permissions", permissions, false)
+            .set_plugin_grants("com.mangoo.permissions", permissions, false)
+            .unwrap();
+        assert_eq!(
+            registry
+                .host_plugin("com.mangoo.permissions")
+                .unwrap()
+                .unwrap()
+                .runtime_state,
+            "stopping"
+        );
+        registry
+            .finish_plugin_runtime_restart("com.mangoo.permissions")
             .unwrap();
         let plugin = registry
-            .host_plugin("com.megle.permissions")
+            .host_plugin("com.mangoo.permissions")
             .unwrap()
             .unwrap();
         assert!(plugin.enabled_intent);
@@ -10788,7 +11947,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             registry
-                .host_plugin("com.megle.permissions")
+                .host_plugin("com.mangoo.permissions")
                 .unwrap()
                 .unwrap()
                 .runtime_state,
@@ -10804,7 +11963,7 @@ mod tests {
         let registry = HostRegistry::open(&path).unwrap();
         registry
             .register_bundled_plugin(RegisterBundledPlugin {
-                plugin_id: "com.megle.named",
+                plugin_id: "com.mangoo.named",
                 version: "1.0.0",
                 manifest_json: r#"{"manifestVersion":2,"name":"Named Provider v1"}"#,
                 entry_relative_path: "bin/provider-v1",
@@ -10816,7 +11975,7 @@ mod tests {
             .unwrap();
         registry
             .register_bundled_plugin(RegisterBundledPlugin {
-                plugin_id: "com.megle.named",
+                plugin_id: "com.mangoo.named",
                 version: "2.0.0",
                 manifest_json: r#"{"manifestVersion":2,"name":"Named Provider v2"}"#,
                 entry_relative_path: "bin/provider-v2",
@@ -10831,7 +11990,7 @@ mod tests {
             .lock()
             .unwrap()
             .execute(
-                "UPDATE plugin_installations SET selected_version='2.0.0' WHERE plugin_id='com.megle.named'",
+                "UPDATE plugin_installations SET selected_version='2.0.0' WHERE plugin_id='com.mangoo.named'",
                 [],
             )
             .unwrap();
@@ -10841,7 +12000,7 @@ mod tests {
         assert_eq!(listed[0].name, "Named Provider v2");
         assert_eq!(
             registry
-                .host_plugin("com.megle.named")
+                .host_plugin("com.mangoo.named")
                 .unwrap()
                 .unwrap()
                 .name,
@@ -10858,7 +12017,7 @@ mod tests {
         let registry = HostRegistry::open(&path).unwrap();
         registry
             .register_bundled_plugin(RegisterBundledPlugin {
-                plugin_id: "com.megle.historical",
+                plugin_id: "com.mangoo.historical",
                 version: "1.0.0",
                 manifest_json: r#"{"manifestVersion":2,"name":"   "}"#,
                 entry_relative_path: "bin/provider",
@@ -10870,20 +12029,20 @@ mod tests {
             .unwrap();
 
         let plugin = registry
-            .host_plugin("com.megle.historical")
+            .host_plugin("com.mangoo.historical")
             .unwrap()
             .unwrap();
-        assert_eq!(plugin.name, "com.megle.historical");
+        assert_eq!(plugin.name, "com.mangoo.historical");
         assert_eq!(
             selected_plugin_name(&"p".repeat(255), Some(r#"{"name":""}"#)).len(),
             128
         );
         assert_eq!(
             selected_plugin_name(
-                "com.megle.historical",
+                "com.mangoo.historical",
                 Some(&format!(r#"{{"name":"{}"}}"#, "n".repeat(129)))
             ),
-            "com.megle.historical"
+            "com.mangoo.historical"
         );
 
         drop(registry);
@@ -10894,10 +12053,10 @@ mod tests {
     fn rediscovery_does_not_activate_a_candidate_version() {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).unwrap();
-        register_test_plugin(&registry, "com.megle.versioned-discovery", "account");
+        register_test_plugin(&registry, "com.mangoo.versioned-discovery", "account");
         registry
             .register_bundled_plugin(RegisterBundledPlugin {
-                plugin_id: "com.megle.versioned-discovery",
+                plugin_id: "com.mangoo.versioned-discovery",
                 version: "2.0.0",
                 manifest_json: r#"{"manifestVersion":2}"#,
                 entry_relative_path: "bin/provider-v2",
@@ -10908,7 +12067,7 @@ mod tests {
             })
             .unwrap();
         let plugin = registry
-            .host_plugin("com.megle.versioned-discovery")
+            .host_plugin("com.mangoo.versioned-discovery")
             .unwrap()
             .unwrap();
         assert_eq!(plugin.selected_version, "1.0.0");
@@ -10917,7 +12076,7 @@ mod tests {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT state FROM plugin_versions WHERE plugin_id='com.megle.versioned-discovery' AND version='2.0.0'",
+                "SELECT state FROM plugin_versions WHERE plugin_id='com.mangoo.versioned-discovery' AND version='2.0.0'",
                 [],
                 |row| row.get(0),
             )
@@ -10931,11 +12090,13 @@ mod tests {
     fn rediscovery_of_selected_embedded_plugin_updates_install_root() {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).unwrap();
-        let release_root = Path::new(r"D:\Megle\target\release\bundled-plugins\com.megle.onedrive");
-        let debug_root = Path::new(r"D:\Megle\target\debug\bundled-plugins\com.megle.onedrive");
+        let release_root =
+            Path::new(r"D:\Mangoo\target\release\bundled-plugins\com.mangoo.configurable-sync");
+        let debug_root =
+            Path::new(r"D:\Mangoo\target\debug\bundled-plugins\com.mangoo.configurable-sync");
         registry
             .register_bundled_plugin(RegisterBundledPlugin {
-                plugin_id: "com.megle.onedrive",
+                plugin_id: "com.mangoo.configurable-sync",
                 version: "1.0.0",
                 manifest_json: r#"{"manifestVersion":2}"#,
                 entry_relative_path: "bin/provider",
@@ -10948,7 +12109,7 @@ mod tests {
 
         registry
             .register_bundled_plugin(RegisterBundledPlugin {
-                plugin_id: "com.megle.onedrive",
+                plugin_id: "com.mangoo.configurable-sync",
                 version: "1.0.0",
                 manifest_json: r#"{"manifestVersion":2}"#,
                 entry_relative_path: "bin/provider",
@@ -10964,7 +12125,7 @@ mod tests {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT install_root FROM plugin_installations WHERE plugin_id='com.megle.onedrive'",
+                "SELECT install_root FROM plugin_installations WHERE plugin_id='com.mangoo.configurable-sync'",
                 [],
                 |row| row.get(0),
             )
@@ -10980,7 +12141,7 @@ mod tests {
         let registry = HostRegistry::open(&path).unwrap();
         registry
             .register_bundled_plugin(RegisterBundledPlugin {
-                plugin_id: "com.megle.test",
+                plugin_id: "com.mangoo.test",
                 version: "1.0.0",
                 manifest_json: r#"{"manifestVersion":2}"#,
                 entry_relative_path: "bin/provider",
@@ -10993,7 +12154,7 @@ mod tests {
 
         let error = registry
             .register_bundled_plugin(RegisterBundledPlugin {
-                plugin_id: "com.megle.test",
+                plugin_id: "com.mangoo.test",
                 version: "1.0.0",
                 manifest_json: r#"{"manifestVersion":2}"#,
                 entry_relative_path: "bin/provider",
@@ -11012,13 +12173,13 @@ mod tests {
     fn rediscovery_of_selected_version_requires_new_permissions() {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).unwrap();
-        register_test_plugin(&registry, "com.megle.permission-update", "account");
+        register_test_plugin(&registry, "com.mangoo.permission-update", "account");
         registry
-            .set_plugin_intent("com.megle.permission-update", true, true)
+            .set_plugin_intent("com.mangoo.permission-update", true, true)
             .unwrap();
         registry
             .register_bundled_plugin(RegisterBundledPlugin {
-                plugin_id: "com.megle.permission-update",
+                plugin_id: "com.mangoo.permission-update",
                 version: "1.0.0",
                 manifest_json: r#"{"manifestVersion":2}"#,
                 entry_relative_path: "bin/provider",
@@ -11030,7 +12191,7 @@ mod tests {
             })
             .unwrap();
         let plugin = registry
-            .host_plugin("com.megle.permission-update")
+            .host_plugin("com.mangoo.permission-update")
             .unwrap()
             .unwrap();
         assert_eq!(plugin.runtime_state, "permission-required");
@@ -11217,6 +12378,7 @@ mod tests {
 
     #[test]
     fn restore_claim_records_all_plans_atomically_and_replays_exact_request() {
+        let placements = tempfile::tempdir().unwrap();
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).unwrap();
         let now = unix_timestamp_millis();
@@ -11236,7 +12398,7 @@ mod tests {
         let plans = ["remote-a", "remote-b"].map(|library_uuid| RestorePlanInput {
             account_uuid: "account".into(),
             library_uuid: library_uuid.into(),
-            managed_root: PathBuf::from(format!("D:/{library_uuid}")),
+            managed_root: placements.path().join(library_uuid),
             restore_mode: "legacy-library".into(),
             inventory_fence: None,
             roots: Vec::new(),
@@ -11493,6 +12655,11 @@ mod tests {
         let registry = HostRegistry::open(&path).unwrap();
         let now = unix_timestamp_millis();
         register_test_plugin(&registry, "fake", "account");
+        assert!(registry
+            .update_plugin_account_identity_for_session("fake", "test-session", Some("drive-a"))
+            .unwrap()
+            .unwrap()
+            .is_empty());
         registry.connection.lock().unwrap().execute(
             "INSERT INTO libraries(library_uuid,root_uuid,name,local_data_dir,managed_root,lifecycle_state,binding_state,availability,marker_version,marker_identity,created_at,updated_at) VALUES ('library','root','Library','local','root','ready','local-only','available',1,'marker',?1,?1)",
             [now],
@@ -11512,11 +12679,6 @@ mod tests {
             "INSERT INTO provider_remote_libraries(account_uuid,library_uuid,descriptor_size,descriptor_sha256,account_generation,updated_at) VALUES ('account','018f0000-0000-7000-8000-000000000001',1,zeroblob(32),1,?1)",
             [now],
         ).unwrap();
-        assert!(registry
-            .update_plugin_account_identity_for_session("fake", "test-session", Some("drive-a"))
-            .unwrap()
-            .unwrap()
-            .is_empty());
         let fences = registry
             .update_plugin_account_identity_for_session("fake", "test-session", Some("drive-b"))
             .unwrap()
@@ -12105,6 +13267,689 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    fn seed_remote_scope_evidence(
+        registry: &HostRegistry,
+        plugin: &str,
+        account: &str,
+    ) -> uuid::Uuid {
+        registry
+            .update_plugin_account_identity_for_session(plugin, "test-session", Some("drive-a"))
+            .unwrap();
+        register_test_library(registry, "library");
+        let (binding, _) = registry
+            .begin_sync_binding("library", plugin, account)
+            .unwrap();
+        registry.set_binding_state("library", "active").unwrap();
+        registry
+            .record_provider_receipt(
+                "library",
+                binding,
+                1,
+                "segments/receipt.json",
+                None,
+                &[3; 32],
+                "created",
+            )
+            .unwrap();
+        registry
+            .advance_published_frontier("library", binding, 1, 95, "segments/receipt.json")
+            .unwrap();
+        registry
+            .commit_binding_cursor("library", binding, 1, "library", "library", Some("cursor"))
+            .unwrap();
+        {
+            let connection = registry.connection.lock().unwrap();
+            connection.execute("INSERT INTO provider_account_root_cursors(account_uuid,scope,cursor,generation,updated_at) VALUES (?1,'root','cursor',1,1)",[account]).unwrap();
+            connection.execute("INSERT INTO provider_remote_libraries(account_uuid,library_uuid,descriptor_size,descriptor_sha256,account_generation,updated_at) VALUES (?1,'library',1,zeroblob(32),1,1)",[account]).unwrap();
+            for table in [
+                "provider_remote_descriptor_heads",
+                "provider_verified_descriptors",
+            ] {
+                connection.execute(&format!("INSERT INTO {table}(account_uuid,library_uuid,descriptor_key,account_generation,candidate_json) VALUES (?1,'library','descriptor',1,'{{}}')"),[account]).unwrap();
+            }
+        }
+        for historical in [false, true] {
+            let unbind = registry.create_unbind_plan("library").unwrap();
+            let reconnect = registry
+                .create_reconnect_plan(
+                    "library",
+                    account,
+                    "library",
+                    0,
+                    ReconnectPreviewFacts {
+                        remote_exists: true,
+                        remote_compatible: true,
+                        remote_object_count: 1,
+                        remote_descriptor_sha256: Some([3; 32]),
+                        remote_binding_epoch: Some(binding.to_string()),
+                    },
+                )
+                .unwrap();
+            if historical {
+                let connection = registry.connection.lock().unwrap();
+                connection
+                    .execute(
+                        "UPDATE sync_unbind_plans SET state='complete' WHERE plan_uuid=?1",
+                        [unbind.plan_uuid],
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "UPDATE sync_reconnect_plans SET state='committed' WHERE plan_uuid=?1",
+                        [reconnect.plan_uuid],
+                    )
+                    .unwrap();
+            }
+        }
+        binding
+    }
+
+    fn remote_scope_evidence_counts(registry: &HostRegistry) -> Vec<i64> {
+        let connection = registry.connection.lock().unwrap();
+        let mut counts = Vec::new();
+        for table in [
+            "provider_object_receipts",
+            "provider_binding_cursors",
+            "provider_account_root_cursors",
+            "provider_remote_libraries",
+            "provider_remote_descriptor_heads",
+            "provider_verified_descriptors",
+        ] {
+            counts.push(
+                connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap(),
+            );
+        }
+        counts.push(connection.query_row("SELECT published_through_seq FROM library_sync_bindings WHERE library_uuid='library'",[],|row|row.get(0)).unwrap());
+        for (table, state) in [
+            ("sync_unbind_plans", "planned"),
+            ("sync_reconnect_plans", "planned"),
+            ("sync_unbind_plans", "complete"),
+            ("sync_reconnect_plans", "committed"),
+        ] {
+            counts.push(
+                connection
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE state=?1"),
+                        [state],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+            );
+        }
+        counts
+    }
+
+    #[test]
+    fn remote_scope_auth_completion_invalidates_only_changed_or_unknown_identity_atomically() {
+        for case in [
+            "changed",
+            "unknown",
+            "session",
+            "same",
+            "cancelled",
+            "pending",
+            "rollback",
+        ] {
+            let path = temp_registry_path();
+            let registry = HostRegistry::open(&path).unwrap();
+            register_test_plugin(&registry, "fake", "account");
+            let binding = seed_remote_scope_evidence(&registry, "fake", "account");
+            if case == "unknown" {
+                registry
+                    .connection
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE plugin_accounts SET stable_account_identity=NULL",
+                        [],
+                    )
+                    .unwrap();
+            }
+            if case == "rollback" {
+                registry.connection.lock().unwrap().execute_batch("CREATE TRIGGER reject_scope_plan_invalidation BEFORE UPDATE ON sync_reconnect_plans WHEN NEW.state='failed' BEGIN SELECT RAISE(ABORT,'fixture scope failure'); END;").unwrap();
+            }
+            let before = remote_scope_evidence_counts(&registry);
+            assert_eq!(before, vec![1, 1, 1, 1, 1, 1, 95, 1, 1, 1, 1]);
+            let result = if case == "session" {
+                registry.update_plugin_account_identity_for_session(
+                    "fake",
+                    "test-session",
+                    Some("drive-b"),
+                )
+            } else {
+                assert!(registry
+                    .begin_plugin_auth_flow("fake", "flow", "test-session")
+                    .unwrap());
+                if case == "cancelled" {
+                    assert!(registry
+                        .claim_plugin_auth_cancellation("fake", "flow", "test-session")
+                        .unwrap());
+                } else if case != "pending" {
+                    assert!(registry
+                        .claim_plugin_auth_completion("fake", "flow", "test-session")
+                        .unwrap());
+                }
+                registry.apply_plugin_auth_result_for_flow(
+                    "fake",
+                    "flow",
+                    "test-session",
+                    "authenticated",
+                    None,
+                    None,
+                    Some(if case == "same" { "drive-a" } else { "drive-b" }),
+                )
+            };
+            if ["same", "cancelled", "pending", "rollback"].contains(&case) {
+                assert_eq!(result.is_err(), case == "rollback", "{case}");
+                assert_eq!(remote_scope_evidence_counts(&registry), before, "{case}");
+                let transport = registry
+                    .binding_transport("library", "library")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(transport.transport_generation, 1);
+                assert_eq!(transport.state, "active");
+                let identity: String = registry.connection.lock().unwrap().query_row("SELECT stable_account_identity FROM plugin_accounts WHERE plugin_id='fake'",[],|row|row.get(0)).unwrap();
+                assert_eq!(identity, "drive-a");
+            } else {
+                assert_eq!(result.unwrap().unwrap().len(), 1, "{case}");
+                assert_eq!(
+                    remote_scope_evidence_counts(&registry),
+                    vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1],
+                    "{case}"
+                );
+                let current = registry
+                    .binding_transport("library", "library")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(current.binding_epoch, binding);
+                assert_eq!(current.transport_generation, 2);
+                registry.resume_binding("library", &current).unwrap();
+                assert!(!registry
+                    .has_published_receipt("library", &current, "segments/receipt.json", &[3; 32])
+                    .unwrap());
+                assert!(registry
+                    .advance_published_frontier("library", binding, 2, 95, "segments/receipt.json")
+                    .is_err());
+                assert_eq!(registry.sync_published_frontier("library").unwrap(), 0);
+                let plans: Vec<(String, String)> = registry
+                    .connection
+                    .lock()
+                    .unwrap()
+                    .prepare("SELECT plan_uuid,state FROM sync_unbind_plans WHERE state='failed'")
+                    .unwrap()
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                assert_eq!(plans.len(), 1);
+                assert!(registry
+                    .validate_unbind_plan("library", &plans[0].0)
+                    .is_err());
+                let reconnect: String = registry
+                    .connection
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT plan_uuid FROM sync_reconnect_plans WHERE state='failed'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert!(registry
+                    .commit_reconnect_plan(&reconnect, "publish-new-remote")
+                    .is_err());
+            }
+            drop(registry);
+            let reopened = HostRegistry::open(&path).unwrap();
+            assert_eq!(
+                remote_scope_evidence_counts(&reopened),
+                if ["changed", "unknown", "session"].contains(&case) {
+                    vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1]
+                } else {
+                    before
+                }
+            );
+            drop(reopened);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn remote_scope_configuration_change_invalidates_proofs_and_noop_retains_them() {
+        for rollback in [false, true] {
+            let path = temp_registry_path();
+            let registry = HostRegistry::open(&path).unwrap();
+            register_test_plugin(&registry, "com.mangoo.configurable-sync", "account");
+            let binding =
+                seed_remote_scope_evidence(&registry, "com.mangoo.configurable-sync", "account");
+            let config = registry
+                .plugin_configuration("com.mangoo.configurable-sync")
+                .unwrap();
+            let noop = registry
+                .plan_plugin_configuration(
+                    "com.mangoo.configurable-sync",
+                    &std::collections::BTreeMap::new(),
+                    config.revision,
+                )
+                .unwrap();
+            assert!(!noop.effective_changed);
+            let before = remote_scope_evidence_counts(&registry);
+            registry
+                .commit_plugin_configuration(
+                    "com.mangoo.configurable-sync",
+                    &noop.plan_uuid,
+                    config.revision,
+                    false,
+                )
+                .unwrap();
+            assert_eq!(remote_scope_evidence_counts(&registry), before);
+            let plan = registry
+                .plan_plugin_configuration(
+                    "com.mangoo.configurable-sync",
+                    &std::collections::BTreeMap::from([(
+                        "clientId".into(),
+                        Some("01234567-89ab-4cde-8fab-0123456789ab".into()),
+                    )]),
+                    config.revision,
+                )
+                .unwrap();
+            assert!(registry
+                .commit_plugin_configuration(
+                    "com.mangoo.configurable-sync",
+                    &plan.plan_uuid,
+                    config.revision,
+                    false
+                )
+                .is_err());
+            assert_eq!(remote_scope_evidence_counts(&registry), before);
+            if rollback {
+                registry.connection.lock().unwrap().execute_batch("CREATE TRIGGER reject_scope_plan_invalidation BEFORE UPDATE ON sync_reconnect_plans WHEN NEW.state='failed' BEGIN SELECT RAISE(ABORT,'fixture scope failure'); END;").unwrap();
+            }
+            let result = registry.commit_plugin_configuration(
+                "com.mangoo.configurable-sync",
+                &plan.plan_uuid,
+                config.revision,
+                true,
+            );
+            if rollback {
+                assert!(result.is_err());
+                assert_eq!(remote_scope_evidence_counts(&registry), before);
+                assert_eq!(
+                    registry
+                        .plugin_configuration("com.mangoo.configurable-sync")
+                        .unwrap()
+                        .revision,
+                    config.revision
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    remote_scope_evidence_counts(&registry),
+                    vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1]
+                );
+                registry
+                    .finish_plugin_configuration_stop("com.mangoo.configurable-sync")
+                    .unwrap();
+                registry
+                    .record_plugin_runtime_ready(
+                        "com.mangoo.configurable-sync",
+                        "new-session",
+                        &["sync-provider.v1".into()],
+                    )
+                    .unwrap();
+                registry
+                    .begin_plugin_auth_flow("com.mangoo.configurable-sync", "flow", "new-session")
+                    .unwrap();
+                registry
+                    .claim_plugin_auth_completion(
+                        "com.mangoo.configurable-sync",
+                        "flow",
+                        "new-session",
+                    )
+                    .unwrap();
+                registry
+                    .apply_plugin_auth_result_for_flow(
+                        "com.mangoo.configurable-sync",
+                        "flow",
+                        "new-session",
+                        "authenticated",
+                        None,
+                        None,
+                        Some("drive-b"),
+                    )
+                    .unwrap()
+                    .unwrap();
+                let current = registry
+                    .binding_transport("library", "library")
+                    .unwrap()
+                    .unwrap();
+                registry.resume_binding("library", &current).unwrap();
+                assert!(!registry
+                    .has_published_receipt("library", &current, "segments/receipt.json", &[3; 32])
+                    .unwrap());
+                assert!(registry
+                    .advance_published_frontier(
+                        "library",
+                        binding,
+                        current.transport_generation,
+                        95,
+                        "segments/receipt.json"
+                    )
+                    .is_err());
+            }
+            drop(registry);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn remote_scope_invalidation_preserves_other_provider_evidence() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        register_test_plugin(&registry, "fake", "account");
+        seed_remote_scope_evidence(&registry, "fake", "account");
+        register_test_plugin(&registry, "other", "other-account");
+        registry
+            .update_plugin_account_identity_for_session(
+                "other",
+                "test-session",
+                Some("other-drive"),
+            )
+            .unwrap();
+        register_test_library(&registry, "other-library");
+        let (binding, _) = registry
+            .begin_sync_binding("other-library", "other", "other-account")
+            .unwrap();
+        registry
+            .set_binding_state("other-library", "active")
+            .unwrap();
+        registry
+            .record_provider_receipt(
+                "other-library",
+                binding,
+                1,
+                "segments/receipt.json",
+                None,
+                &[8; 32],
+                "created",
+            )
+            .unwrap();
+        registry
+            .advance_published_frontier("other-library", binding, 1, 88, "segments/receipt.json")
+            .unwrap();
+        registry
+            .commit_binding_cursor(
+                "other-library",
+                binding,
+                1,
+                "other-library",
+                "library",
+                Some("other-cursor"),
+            )
+            .unwrap();
+        {
+            let connection = registry.connection.lock().unwrap();
+            connection.execute("INSERT INTO provider_account_root_cursors(account_uuid,scope,cursor,generation,updated_at) VALUES ('other-account','root','other-cursor',1,1)",[]).unwrap();
+            connection.execute("INSERT INTO provider_remote_libraries(account_uuid,library_uuid,descriptor_size,descriptor_sha256,account_generation,updated_at) VALUES ('other-account','other-library',1,zeroblob(32),1,1)",[]).unwrap();
+            for table in [
+                "provider_remote_descriptor_heads",
+                "provider_verified_descriptors",
+            ] {
+                connection.execute(&format!("INSERT INTO {table}(account_uuid,library_uuid,descriptor_key,account_generation,candidate_json) VALUES ('other-account','other-library','descriptor',1,'{{}}')"),[]).unwrap();
+            }
+        }
+        registry.create_unbind_plan("other-library").unwrap();
+        registry
+            .create_reconnect_plan(
+                "other-library",
+                "other-account",
+                "other-library",
+                0,
+                ReconnectPreviewFacts {
+                    remote_exists: true,
+                    remote_compatible: true,
+                    remote_object_count: 1,
+                    remote_descriptor_sha256: Some([8; 32]),
+                    remote_binding_epoch: Some(binding.to_string()),
+                },
+            )
+            .unwrap();
+        let snapshot = || {
+            let connection = registry.connection.lock().unwrap();
+            [
+                ("plugin_accounts", "account_uuid='other-account'"),
+                ("library_sync_bindings", "library_uuid='other-library'"),
+                ("provider_object_receipts", "library_uuid='other-library'"),
+                ("provider_binding_cursors", "library_uuid='other-library'"),
+                (
+                    "provider_account_root_cursors",
+                    "account_uuid='other-account'",
+                ),
+                ("provider_remote_libraries", "account_uuid='other-account'"),
+                (
+                    "provider_remote_descriptor_heads",
+                    "account_uuid='other-account'",
+                ),
+                (
+                    "provider_verified_descriptors",
+                    "account_uuid='other-account'",
+                ),
+                ("sync_unbind_plans", "library_uuid='other-library'"),
+                ("sync_reconnect_plans", "account_uuid='other-account'"),
+            ]
+            .into_iter()
+            .map(|(table, filter)| {
+                let mut statement = connection
+                    .prepare(&format!("SELECT * FROM {table} WHERE {filter}"))
+                    .unwrap();
+                let columns = statement.column_count();
+                statement
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+        };
+        let before = snapshot();
+        assert!(before.iter().all(|rows| rows.len() == 1));
+        registry
+            .begin_plugin_auth_flow("fake", "flow", "test-session")
+            .unwrap();
+        registry
+            .claim_plugin_auth_completion("fake", "flow", "test-session")
+            .unwrap();
+        registry
+            .apply_plugin_auth_result_for_flow(
+                "fake",
+                "flow",
+                "test-session",
+                "authenticated",
+                None,
+                None,
+                Some("drive-b"),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot(), before);
+        assert_eq!(registry.sync_published_frontier("library").unwrap(), 0);
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn published_frontier_reuses_unchanged_receipts_after_plugin_restart() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        register_test_plugin(&registry, "fake", "account");
+        register_test_library(&registry, "library");
+        let (binding, _) = registry
+            .begin_sync_binding("library", "fake", "account")
+            .unwrap();
+        registry.set_binding_state("library", "active").unwrap();
+        for (key, hash, state) in [
+            ("segments/created.json", [3; 32], "created"),
+            ("segments/existing.json", [4; 32], "already-exists-matching"),
+        ] {
+            registry
+                .record_provider_receipt("library", binding, 1, key, None, &hash, state)
+                .unwrap();
+        }
+        let receipts = |registry: &HostRegistry| {
+            let connection = registry.connection.lock().unwrap();
+            let mut statement = connection.prepare("SELECT object_key,sha256,state,generation,created_at,updated_at FROM provider_object_receipts WHERE library_uuid='library' ORDER BY object_key").unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let original_receipts = receipts(&registry);
+        registry
+            .advance_published_frontier("library", binding, 1, 95, "segments/created.json")
+            .unwrap();
+        registry.set_plugin_intent("fake", false, true).unwrap();
+        drop(registry);
+        let registry = HostRegistry::open(&path).unwrap();
+        registry.set_plugin_intent("fake", true, true).unwrap();
+        registry
+            .record_plugin_runtime_ready("fake", "restarted", &["sync-provider.v1".into()])
+            .unwrap();
+        registry.resume_plugin_suspended_bindings("fake").unwrap();
+        let current = registry
+            .binding_transport("library", "library")
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.binding_epoch, binding);
+        assert_eq!(current.transport_generation, 2);
+        assert_eq!(current.state, "active");
+        for (key, hash, sequence) in [
+            ("segments/created.json", [3; 32], 95),
+            ("segments/existing.json", [4; 32], 96),
+        ] {
+            assert!(registry
+                .has_published_receipt("library", &current, key, &hash)
+                .unwrap());
+            assert!(!registry
+                .has_published_receipt("library", &current, key, &[9; 32])
+                .unwrap());
+            registry
+                .advance_published_frontier("library", binding, 2, sequence, key)
+                .expect("a reused immutable receipt must also satisfy the frontier fence");
+        }
+        registry
+            .advance_published_frontier("library", binding, 2, 95, "segments/created.json")
+            .unwrap();
+        assert_eq!(registry.sync_published_frontier("library").unwrap(), 96);
+        assert_eq!(receipts(&registry), original_receipts);
+        drop(registry);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn published_frontier_rejects_invalid_receipts_without_mutation() {
+        for invalid in [
+            "stale-call",
+            "future-receipt",
+            "other-library",
+            "other-binding",
+            "wrong-key",
+            "durable-only",
+            "missing",
+        ] {
+            let path = temp_registry_path();
+            let registry = HostRegistry::open(&path).unwrap();
+            register_test_plugin(&registry, "fake", "account");
+            register_test_library(&registry, "library");
+            register_test_library(&registry, "other-library");
+            registry
+                .begin_sync_binding("other-library", "fake", "account")
+                .unwrap();
+            let (binding, _) = registry
+                .begin_sync_binding("library", "fake", "account")
+                .unwrap();
+            registry.set_binding_state("library", "active").unwrap();
+            registry
+                .record_provider_receipt(
+                    "library",
+                    binding,
+                    1,
+                    "segments/receipt.json",
+                    None,
+                    &[3; 32],
+                    "created",
+                )
+                .unwrap();
+            registry
+                .advance_published_frontier("library", binding, 1, 7, "segments/receipt.json")
+                .unwrap();
+            registry.set_plugin_intent("fake", false, true).unwrap();
+            // Inject one invalid receipt dimension only in this isolated Host fixture.
+            let mutation = match invalid {
+                "future-receipt" => "UPDATE provider_object_receipts SET generation=3",
+                "other-library" => "UPDATE provider_object_receipts SET library_uuid='other-library',binding_epoch=(SELECT binding_epoch FROM library_sync_bindings WHERE library_uuid='other-library')",
+                "other-binding" => "UPDATE provider_object_receipts SET generation=1",
+                "wrong-key" => "UPDATE provider_object_receipts SET object_key='segments/other.json'",
+                "durable-only" => "UPDATE provider_object_receipts SET state='durable'",
+                "missing" => "DELETE FROM provider_object_receipts",
+                "stale-call" => "UPDATE provider_object_receipts SET generation=2",
+                _ => unreachable!(),
+            };
+            registry
+                .connection
+                .lock()
+                .unwrap()
+                .execute(mutation, [])
+                .unwrap();
+            let before = registry.connection.lock().unwrap().query_row(
+                "SELECT published_through_seq,updated_at,(SELECT COALESCE(json_group_array(json_array(library_uuid,hex(binding_epoch),object_key,hex(sha256),state,generation,created_at,updated_at)),'[]') FROM provider_object_receipts) FROM library_sync_bindings WHERE library_uuid='library'",
+                [], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?)),
+            ).unwrap();
+            let generation = if invalid == "stale-call" { 1 } else { 2 };
+            let call_binding = if invalid == "other-binding" {
+                uuid::Uuid::nil()
+            } else {
+                binding
+            };
+            assert!(
+                registry
+                    .advance_published_frontier(
+                        "library",
+                        call_binding,
+                        generation,
+                        99,
+                        "segments/receipt.json",
+                    )
+                    .is_err(),
+                "{invalid}"
+            );
+            let after = registry.connection.lock().unwrap().query_row(
+                "SELECT published_through_seq,updated_at,(SELECT COALESCE(json_group_array(json_array(library_uuid,hex(binding_epoch),object_key,hex(sha256),state,generation,created_at,updated_at)),'[]') FROM provider_object_receipts) FROM library_sync_bindings WHERE library_uuid='library'",
+                [], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?)),
+            ).unwrap();
+            assert_eq!(after, before, "failed frontier mutation for {invalid}");
+            drop(registry);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     #[test]
     fn host_incoming_gap_state_survives_rejected_segment() {
         let path = temp_registry_path();
@@ -12161,45 +14006,45 @@ mod tests {
     fn candidate_probation_commits_or_rolls_back_and_recovers_after_restart() {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).unwrap();
-        register_test_plugin(&registry, "com.megle.versioned", "account-versioned");
+        register_test_plugin(&registry, "com.mangoo.versioned", "account-versioned");
         let now = unix_timestamp_millis();
         let manifest_json = format!(
-            r#"{{"manifestVersion":2,"id":"com.megle.versioned","name":"Versioned","version":"2.0.0","engine":"process","entry":{{"windowsX64":"provider-v2.exe","linuxX64":"provider-v2"}},"rpc":{{"wireVersions":[1],"capabilities":["sync-provider.v1"],"methodVersions":{{"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.poll":1,"auth.cancel":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.get_range":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1}}}},"activationEvents":["sync-enabled"],"requestedPermissions":[],"integrity":{{"sha256":"{}"}}}}"#,
+            r#"{{"manifestVersion":2,"id":"com.mangoo.versioned","name":"Versioned","version":"2.0.0","engine":"process","entry":{{"windowsX64":"provider-v2.exe","linuxX64":"provider-v2"}},"rpc":{{"wireVersions":[1],"capabilities":["sync-provider.v1"],"methodVersions":{{"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.poll":1,"auth.cancel":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.get_range":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1}}}},"activationEvents":["sync-enabled"],"requestedPermissions":[],"integrity":{{"sha256":"{}"}}}}"#,
             "0".repeat(64)
         );
         registry.connection.lock().unwrap().execute(
-            "INSERT INTO plugin_versions(plugin_id,version,manifest_json,entry_relative_path,entry_sha256,state,installed_at) VALUES ('com.megle.versioned','2.0.0',?1,'provider-v2',?2,'candidate',?3)",
+            "INSERT INTO plugin_versions(plugin_id,version,manifest_json,entry_relative_path,entry_sha256,state,installed_at) VALUES ('com.mangoo.versioned','2.0.0',?1,'provider-v2',?2,'candidate',?3)",
             params![manifest_json,[2u8;32].as_slice(),now],
         ).unwrap();
         let manifest_v3_json = manifest_json.replace("2.0.0", "3.0.0");
         registry.connection.lock().unwrap().execute(
-            "INSERT INTO plugin_versions(plugin_id,version,manifest_json,entry_relative_path,entry_sha256,state,installed_at) VALUES ('com.megle.versioned','3.0.0',?1,'provider-v3',?2,'candidate',?3)",
+            "INSERT INTO plugin_versions(plugin_id,version,manifest_json,entry_relative_path,entry_sha256,state,installed_at) VALUES ('com.mangoo.versioned','3.0.0',?1,'provider-v3',?2,'candidate',?3)",
             params![manifest_v3_json,[3u8;32].as_slice(),now],
         ).unwrap();
         registry
-            .select_plugin_version("com.megle.versioned", "2.0.0", true)
+            .select_plugin_version("com.mangoo.versioned", "2.0.0", true)
             .unwrap();
         assert_eq!(
             registry
-                .select_plugin_version("com.megle.versioned", "3.0.0", true)
+                .select_plugin_version("com.mangoo.versioned", "3.0.0", true)
                 .unwrap_err()
                 .to_string(),
             "plugin-version-switch-in-progress"
         );
         assert_eq!(
             registry
-                .host_plugin("com.megle.versioned")
+                .host_plugin("com.mangoo.versioned")
                 .unwrap()
                 .unwrap()
                 .selected_version,
             "2.0.0"
         );
         registry
-            .rollback_plugin_probation("com.megle.versioned", "health-failed")
+            .rollback_plugin_probation("com.mangoo.versioned", "health-failed")
             .unwrap();
         assert_eq!(
             registry
-                .host_plugin("com.megle.versioned")
+                .host_plugin("com.mangoo.versioned")
                 .unwrap()
                 .unwrap()
                 .selected_version,
@@ -12207,14 +14052,14 @@ mod tests {
         );
 
         registry
-            .select_plugin_version("com.megle.versioned", "2.0.0", true)
+            .select_plugin_version("com.mangoo.versioned", "2.0.0", true)
             .unwrap();
         drop(registry);
         let registry = HostRegistry::open(&path).unwrap();
         assert_eq!(registry.recover_plugin_version_journal().unwrap(), 1);
         assert_eq!(
             registry
-                .host_plugin("com.megle.versioned")
+                .host_plugin("com.mangoo.versioned")
                 .unwrap()
                 .unwrap()
                 .selected_version,
@@ -12222,13 +14067,13 @@ mod tests {
         );
 
         registry
-            .select_plugin_version("com.megle.versioned", "2.0.0", true)
+            .select_plugin_version("com.mangoo.versioned", "2.0.0", true)
             .unwrap();
         registry
-            .commit_plugin_probation("com.megle.versioned")
+            .commit_plugin_probation("com.mangoo.versioned")
             .unwrap();
         let projection = registry
-            .host_plugin("com.megle.versioned")
+            .host_plugin("com.mangoo.versioned")
             .unwrap()
             .unwrap();
         assert_eq!(projection.selected_version, "2.0.0");
@@ -12241,102 +14086,159 @@ mod tests {
     fn stale_runtime_launch_cannot_finish_candidate_probation_after_disable() {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).unwrap();
-        register_test_plugin(&registry, "com.megle.stale-probation", "account-stale");
+        register_test_plugin(&registry, "com.mangoo.stale-probation", "account-stale");
         let now = unix_timestamp_millis();
         let manifest_json = format!(
-            r#"{{"manifestVersion":2,"id":"com.megle.stale-probation","name":"Versioned","version":"2.0.0","engine":"process","entry":{{"windowsX64":"provider-v2.exe","linuxX64":"provider-v2"}},"rpc":{{"wireVersions":[1],"capabilities":["sync-provider.v1"],"methodVersions":{{"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.poll":1,"auth.cancel":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.get_range":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1}}}},"activationEvents":["sync-enabled"],"requestedPermissions":[],"integrity":{{"sha256":"{}"}}}}"#,
+            r#"{{"manifestVersion":2,"id":"com.mangoo.stale-probation","name":"Versioned","version":"2.0.0","engine":"process","entry":{{"windowsX64":"provider-v2.exe","linuxX64":"provider-v2"}},"rpc":{{"wireVersions":[1],"capabilities":["sync-provider.v1"],"methodVersions":{{"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.poll":1,"auth.cancel":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.get_range":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1}}}},"activationEvents":["sync-enabled"],"requestedPermissions":[],"integrity":{{"sha256":"{}"}}}}"#,
             "0".repeat(64)
         );
         registry.connection.lock().unwrap().execute(
-            "INSERT INTO plugin_versions(plugin_id,version,manifest_json,entry_relative_path,entry_sha256,state,installed_at) VALUES ('com.megle.stale-probation','2.0.0',?1,'provider-v2',?2,'candidate',?3)",
+            "INSERT INTO plugin_versions(plugin_id,version,manifest_json,entry_relative_path,entry_sha256,state,installed_at) VALUES ('com.mangoo.stale-probation','2.0.0',?1,'provider-v2',?2,'candidate',?3)",
             params![manifest_json,[2u8;32].as_slice(),now],
         ).unwrap();
         registry
-            .select_plugin_version("com.megle.stale-probation", "2.0.0", true)
+            .select_plugin_version("com.mangoo.stale-probation", "2.0.0", true)
+            .unwrap();
+        registry
+            .finish_plugin_runtime_restart("com.mangoo.stale-probation")
             .unwrap();
         let fingerprint = registry.plugin_runtime_launches().unwrap()[0].fingerprint();
         registry
-            .set_plugin_intent("com.megle.stale-probation", false, true)
+            .set_plugin_intent("com.mangoo.stale-probation", false, true)
             .unwrap();
 
         assert!(!registry
-            .commit_plugin_probation_for_launch("com.megle.stale-probation", &fingerprint)
+            .commit_plugin_probation_for_launch("com.mangoo.stale-probation", &fingerprint)
             .unwrap());
         assert!(registry
             .rollback_plugin_probation_for_launch(
-                "com.megle.stale-probation",
+                "com.mangoo.stale-probation",
                 &fingerprint,
                 "stale-health-failure",
             )
             .unwrap()
             .is_none());
         let plugin = registry
-            .host_plugin("com.megle.stale-probation")
+            .host_plugin("com.mangoo.stale-probation")
             .unwrap()
             .unwrap();
         assert_eq!(plugin.selected_version, "2.0.0");
         assert_eq!(plugin.known_good_version.as_deref(), Some("1.0.0"));
-        assert_eq!(plugin.runtime_state, "disabled");
+        assert_eq!(plugin.runtime_state, "stopping");
+        registry
+            .finish_plugin_stop("com.mangoo.stale-probation")
+            .unwrap();
+        assert_eq!(
+            registry
+                .host_plugin("com.mangoo.stale-probation")
+                .unwrap()
+                .unwrap()
+                .runtime_state,
+            "disabled"
+        );
 
         drop(registry);
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn onedrive_configuration_plan_commit_is_revisioned_and_noop_safe() {
+    fn configurable_provider_configuration_plan_commit_is_revisioned_and_noop_safe() {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).unwrap();
-        let initial = registry.onedrive_configuration().unwrap();
+        register_test_plugin(&registry, "com.mangoo.configurable-sync", "config-account");
+        registry.connection.lock().unwrap().execute("UPDATE plugin_accounts SET auth_state='signed-out' WHERE plugin_id='com.mangoo.configurable-sync'",[]).unwrap();
+        let initial = registry
+            .plugin_configuration("com.mangoo.configurable-sync")
+            .unwrap();
         assert_eq!(initial.source, "missing");
         assert!(!initial.configured);
         assert!(!initial.read_only);
         assert_eq!(
             initial.error_code.as_deref(),
-            Some("onedrive-client-id-missing")
+            Some("plugin-configuration-required")
         );
-        assert_eq!(registry.effective_onedrive_client_id().unwrap(), None);
+        assert_eq!(
+            registry
+                .plugin_configuration("com.mangoo.configurable-sync")
+                .map(|c| c.values.get("clientId").cloned())
+                .unwrap(),
+            None
+        );
         let plan = registry
-            .plan_onedrive_configuration(
-                Some("01234567-89ab-4cde-8fab-0123456789ab"),
+            .plan_plugin_configuration(
+                "com.mangoo.configurable-sync",
+                &std::collections::BTreeMap::from([(
+                    "clientId".into(),
+                    Some("01234567-89ab-4cde-8fab-0123456789ab".into()),
+                )]),
                 initial.revision,
             )
             .unwrap();
         assert!(plan.effective_changed);
         assert!(!plan.requires_confirmation);
         assert!(registry
-            .commit_onedrive_configuration(&plan.plan_uuid, plan.expected_revision, false)
+            .commit_plugin_configuration(
+                "com.mangoo.configurable-sync",
+                &plan.plan_uuid,
+                plan.expected_revision,
+                false
+            )
             .unwrap()
             .fences
             .is_empty());
-        let configured = registry.onedrive_configuration().unwrap();
+        let configured = registry
+            .plugin_configuration("com.mangoo.configurable-sync")
+            .unwrap();
         assert_eq!(configured.source, "host-override");
         assert!(configured.configured);
         assert_eq!(configured.revision, initial.revision + 1);
         let no_op = registry
-            .plan_onedrive_configuration(
-                Some("01234567-89AB-4CDE-8FAB-0123456789AB"),
+            .plan_plugin_configuration(
+                "com.mangoo.configurable-sync",
+                &std::collections::BTreeMap::from([(
+                    "clientId".into(),
+                    Some("01234567-89AB-4CDE-8FAB-0123456789AB".into()),
+                )]),
                 configured.revision,
             )
             .unwrap();
         assert!(!no_op.effective_changed);
         registry
-            .commit_onedrive_configuration(&no_op.plan_uuid, no_op.expected_revision, false)
+            .commit_plugin_configuration(
+                "com.mangoo.configurable-sync",
+                &no_op.plan_uuid,
+                no_op.expected_revision,
+                false,
+            )
             .unwrap();
         assert_eq!(
-            registry.onedrive_configuration().unwrap().revision,
+            registry
+                .plugin_configuration("com.mangoo.configurable-sync")
+                .unwrap()
+                .revision,
             configured.revision
         );
         assert!(registry
-            .plan_onedrive_configuration(Some("not-a-uuid"), configured.revision)
+            .plan_plugin_configuration(
+                "com.mangoo.configurable-sync",
+                &std::collections::BTreeMap::from([("clientId".into(), Some("not-a-uuid".into()))]),
+                configured.revision
+            )
             .is_err());
         drop(registry);
 
         let reopened = HostRegistry::open(&path).unwrap();
-        let persisted = reopened.onedrive_configuration().unwrap();
+        let persisted = reopened
+            .plugin_configuration("com.mangoo.configurable-sync")
+            .unwrap();
         assert_eq!(persisted.source, "host-override");
         assert!(persisted.configured);
         assert_eq!(
-            reopened.effective_onedrive_client_id().unwrap().as_deref(),
+            reopened
+                .plugin_configuration("com.mangoo.configurable-sync")
+                .map(|c| c.values.get("clientId").cloned())
+                .unwrap()
+                .as_deref(),
             Some("01234567-89ab-4cde-8fab-0123456789ab")
         );
         drop(reopened);
@@ -12344,27 +14246,47 @@ mod tests {
     }
 
     #[test]
-    fn onedrive_configuration_change_journals_old_credential_until_deleted() {
+    fn configurable_provider_configuration_change_journals_old_credential_until_deleted() {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).unwrap();
-        register_test_plugin(&registry, "com.megle.onedrive", "onedrive-account");
+        register_test_plugin(
+            &registry,
+            "com.mangoo.configurable-sync",
+            "configurable-account",
+        );
         registry
-            .set_plugin_account_secret("com.megle.onedrive", Some("old-secret"), "authenticated", 1)
+            .set_plugin_account_secret(
+                "com.mangoo.configurable-sync",
+                Some("old-secret"),
+                "authenticated",
+                1,
+            )
             .unwrap();
-        let initial = registry.onedrive_configuration().unwrap();
+        let initial = registry
+            .plugin_configuration("com.mangoo.configurable-sync")
+            .unwrap();
         let plan = registry
-            .plan_onedrive_configuration(
-                Some("01234567-89ab-4cde-8fab-0123456789ab"),
+            .plan_plugin_configuration(
+                "com.mangoo.configurable-sync",
+                &std::collections::BTreeMap::from([(
+                    "clientId".into(),
+                    Some("01234567-89ab-4cde-8fab-0123456789ab".into()),
+                )]),
                 initial.revision,
             )
             .unwrap();
         let commit = registry
-            .commit_onedrive_configuration(&plan.plan_uuid, plan.expected_revision, true)
+            .commit_plugin_configuration(
+                "com.mangoo.configurable-sync",
+                &plan.plan_uuid,
+                plan.expected_revision,
+                true,
+            )
             .unwrap();
         assert!(commit.effective_changed);
         assert_eq!(
             registry
-                .plugin_account_secret("com.megle.onedrive")
+                .plugin_account_secret("com.mangoo.configurable-sync")
                 .unwrap()
                 .unwrap()
                 .secret_ref,
@@ -12390,10 +14312,14 @@ mod tests {
     fn sign_out_journals_all_registered_scoped_secrets_across_restart() {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).unwrap();
-        register_test_plugin(&registry, "com.megle.onedrive", "onedrive-account");
+        register_test_plugin(
+            &registry,
+            "com.mangoo.configurable-sync",
+            "configurable-account",
+        );
         registry
             .set_plugin_account_secret(
-                "com.megle.onedrive",
+                "com.mangoo.configurable-sync",
                 Some("oauth-secret"),
                 "authenticated",
                 1,
@@ -12403,21 +14329,21 @@ mod tests {
             .plugin_runtime_launches()
             .unwrap()
             .into_iter()
-            .find(|launch| launch.plugin_id == "com.megle.onedrive")
+            .find(|launch| launch.plugin_id == "com.mangoo.configurable-sync")
             .unwrap()
             .fingerprint();
         assert!(registry
             .register_plugin_secret_handle_for_launch(
-                "com.megle.onedrive",
-                "onedrive-account",
+                "com.mangoo.configurable-sync",
+                "configurable-account",
                 &fingerprint,
                 "upload-secret",
-                ONEDRIVE_SECRET_NAMESPACE,
+                CONFIGURABLE_SECRET_NAMESPACE,
                 "upload-session-v1",
             )
             .unwrap());
         registry
-            .sign_out_plugin_account("com.megle.onedrive", 1)
+            .sign_out_plugin_account("com.mangoo.configurable-sync", 1)
             .unwrap();
         let mut refs = registry
             .due_credential_retirements(10)
@@ -12429,7 +14355,10 @@ mod tests {
         assert_eq!(
             refs,
             vec![
-                ("oauth-secret".into(), ONEDRIVE_CREDENTIAL_PURPOSE.into()),
+                (
+                    "oauth-secret".into(),
+                    CONFIGURABLE_CREDENTIAL_PURPOSE.into()
+                ),
                 ("upload-secret".into(), "upload-session-v1".into()),
             ]
         );
@@ -12444,24 +14373,33 @@ mod tests {
     fn configuration_change_and_account_switch_journal_nested_secrets() {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).unwrap();
-        register_test_plugin(&registry, "com.megle.onedrive", "onedrive-account");
+        register_test_plugin(
+            &registry,
+            "com.mangoo.configurable-sync",
+            "configurable-account",
+        );
         registry
-            .set_plugin_account_secret("com.megle.onedrive", Some("old-oauth"), "authenticated", 1)
+            .set_plugin_account_secret(
+                "com.mangoo.configurable-sync",
+                Some("old-oauth"),
+                "authenticated",
+                1,
+            )
             .unwrap();
         let fingerprint = registry.plugin_runtime_launches().unwrap()[0].fingerprint();
         assert!(registry
             .register_plugin_secret_handle_for_launch(
-                "com.megle.onedrive",
-                "onedrive-account",
+                "com.mangoo.configurable-sync",
+                "configurable-account",
                 &fingerprint,
                 "old-upload",
-                ONEDRIVE_SECRET_NAMESPACE,
+                CONFIGURABLE_SECRET_NAMESPACE,
                 "upload-session-v1",
             )
             .unwrap());
         assert!(registry
             .set_plugin_account_secret_for_launch(
-                "com.megle.onedrive",
+                "com.mangoo.configurable-sync",
                 &fingerprint,
                 Some("new-oauth"),
                 "authenticated",
@@ -12481,15 +14419,26 @@ mod tests {
                 .complete_credential_retirement(&retirement.retirement_uuid)
                 .unwrap();
         }
-        let initial = registry.onedrive_configuration().unwrap();
+        let initial = registry
+            .plugin_configuration("com.mangoo.configurable-sync")
+            .unwrap();
         let plan = registry
-            .plan_onedrive_configuration(
-                Some("01234567-89ab-4cde-8fab-0123456789ab"),
+            .plan_plugin_configuration(
+                "com.mangoo.configurable-sync",
+                &std::collections::BTreeMap::from([(
+                    "clientId".into(),
+                    Some("01234567-89ab-4cde-8fab-0123456789ab".into()),
+                )]),
                 initial.revision,
             )
             .unwrap();
         registry
-            .commit_onedrive_configuration(&plan.plan_uuid, plan.expected_revision, true)
+            .commit_plugin_configuration(
+                "com.mangoo.configurable-sync",
+                &plan.plan_uuid,
+                plan.expected_revision,
+                true,
+            )
             .unwrap();
         let configured = registry.due_credential_retirements(10).unwrap();
         assert_eq!(configured.len(), 1);
@@ -12502,31 +14451,35 @@ mod tests {
     fn cancelling_switch_auth_restores_authenticated_projection() {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).unwrap();
-        register_test_plugin(&registry, "com.megle.onedrive", "onedrive-account");
+        register_test_plugin(
+            &registry,
+            "com.mangoo.configurable-sync",
+            "configurable-account",
+        );
         registry
             .connection
             .lock()
             .unwrap()
             .execute(
-                "UPDATE plugin_runtime_state SET session_id='session-a' WHERE plugin_id='com.megle.onedrive'",
+                "UPDATE plugin_runtime_state SET session_id='session-a' WHERE plugin_id='com.mangoo.configurable-sync'",
                 [],
             )
             .unwrap();
         assert!(registry
-            .begin_plugin_auth_flow("com.megle.onedrive", "flow-a", "session-a")
+            .begin_plugin_auth_flow("com.mangoo.configurable-sync", "flow-a", "session-a")
             .unwrap());
         assert!(registry
-            .claim_plugin_auth_cancellation("com.megle.onedrive", "flow-a", "session-a",)
+            .claim_plugin_auth_cancellation("com.mangoo.configurable-sync", "flow-a", "session-a",)
             .unwrap());
         assert!(!registry
-            .plugin_auth_flow_is_current("com.megle.onedrive", "flow-a", "session-a")
+            .plugin_auth_flow_is_current("com.mangoo.configurable-sync", "flow-a", "session-a")
             .unwrap());
         assert!(!registry
-            .plugin_auth_secret_write_is_allowed("com.megle.onedrive")
+            .plugin_auth_secret_write_is_allowed("com.mangoo.configurable-sync")
             .unwrap());
         assert!(registry
             .apply_plugin_auth_result_for_flow(
-                "com.megle.onedrive",
+                "com.mangoo.configurable-sync",
                 "flow-a",
                 "session-a",
                 "authenticated",
@@ -12538,7 +14491,7 @@ mod tests {
             .is_none());
         assert_eq!(
             registry
-                .host_plugin("com.megle.onedrive")
+                .host_plugin("com.mangoo.configurable-sync")
                 .unwrap()
                 .unwrap()
                 .auth_state
@@ -12546,11 +14499,11 @@ mod tests {
             Some("authorizing")
         );
         assert!(registry
-            .cancel_plugin_auth_flow("com.megle.onedrive", "flow-a", "session-a")
+            .cancel_plugin_auth_flow("com.mangoo.configurable-sync", "flow-a", "session-a")
             .unwrap());
         assert_eq!(
             registry
-                .host_plugin("com.megle.onedrive")
+                .host_plugin("com.mangoo.configurable-sync")
                 .unwrap()
                 .unwrap()
                 .auth_state
@@ -12558,7 +14511,7 @@ mod tests {
             Some("authenticated")
         );
         assert!(!registry
-            .cancel_plugin_auth_flow("com.megle.onedrive", "flow-a", "session-a")
+            .cancel_plugin_auth_flow("com.mangoo.configurable-sync", "flow-a", "session-a")
             .unwrap());
         drop(registry);
         let _ = std::fs::remove_file(path);
@@ -12568,39 +14521,60 @@ mod tests {
     fn cancelled_auth_retires_a_credential_created_before_worker_join() {
         let path = temp_registry_path();
         let registry = HostRegistry::open(&path).unwrap();
-        register_test_plugin(&registry, "com.megle.onedrive", "onedrive-account");
+        register_test_plugin(
+            &registry,
+            "com.mangoo.configurable-sync",
+            "configurable-account",
+        );
         registry
-            .set_plugin_account_secret("com.megle.onedrive", Some("old-secret"), "authenticated", 1)
+            .set_plugin_account_secret(
+                "com.mangoo.configurable-sync",
+                Some("old-secret"),
+                "authenticated",
+                1,
+            )
             .unwrap();
         registry
             .connection
             .lock()
             .unwrap()
             .execute(
-                "UPDATE plugin_runtime_state SET session_id='session-race' WHERE plugin_id='com.megle.onedrive'",
+                "UPDATE plugin_runtime_state SET session_id='session-race' WHERE plugin_id='com.mangoo.configurable-sync'",
                 [],
             )
             .unwrap();
         assert!(registry
-            .begin_plugin_auth_flow("com.megle.onedrive", "flow-race", "session-race")
+            .begin_plugin_auth_flow("com.mangoo.configurable-sync", "flow-race", "session-race")
             .unwrap());
         assert!(registry
-            .claim_plugin_auth_cancellation("com.megle.onedrive", "flow-race", "session-race",)
+            .claim_plugin_auth_cancellation(
+                "com.mangoo.configurable-sync",
+                "flow-race",
+                "session-race",
+            )
             .unwrap());
         registry
             .connection
             .lock()
             .unwrap()
             .execute(
-                "UPDATE plugin_accounts SET secret_ref='late-secret',auth_state='authenticated' WHERE plugin_id='com.megle.onedrive'",
+                "INSERT INTO plugin_secret_handles(plugin_id,account_uuid,secret_ref,namespace,purpose,role,created_at) SELECT plugin_id,account_uuid,'late-secret','configurable-sync','session-v1','primary',0 FROM plugin_accounts WHERE plugin_id='com.mangoo.configurable-sync'",
                 [],
             )
             .unwrap();
+        registry
+            .set_plugin_account_secret(
+                "com.mangoo.configurable-sync",
+                Some("late-secret"),
+                "authenticated",
+                1,
+            )
+            .unwrap();
         assert!(registry
-            .cancel_plugin_auth_flow("com.megle.onedrive", "flow-race", "session-race",)
+            .cancel_plugin_auth_flow("com.mangoo.configurable-sync", "flow-race", "session-race",)
             .unwrap());
         let account = registry
-            .plugin_account_secret("com.megle.onedrive")
+            .plugin_account_secret("com.mangoo.configurable-sync")
             .unwrap()
             .unwrap();
         assert_eq!(account.secret_ref.as_deref(), Some("old-secret"));

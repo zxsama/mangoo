@@ -210,13 +210,307 @@ pub trait SyncProvider: Send + Sync {
         Box::pin(async { Ok(()) })
     }
     fn shutdown(&self) -> ProviderFuture<'_, ()>;
+
+    /// Permanently revoke this runtime session, including streams whose control
+    /// response already completed. Implementations must not reopen the session.
+    fn close_admission(&self) {}
+    fn join_closed(&self) -> ProviderFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 #[derive(Clone, Default)]
 pub struct ProviderManager {
     providers: Arc<Mutex<HashMap<(String, String), Arc<dyn SyncProvider>>>>,
+    lifecycle: Arc<Mutex<HashMap<String, Arc<ProviderLifecycle>>>>,
 }
+
+struct ProviderLifecycle {
+    epoch: std::sync::atomic::AtomicI64,
+    cancellation: tokio_util::sync::CancellationToken,
+    work: std::sync::atomic::AtomicUsize,
+    drained: tokio::sync::Notify,
+}
+
+impl ProviderLifecycle {
+    fn new(epoch: i64) -> Self {
+        Self {
+            epoch: std::sync::atomic::AtomicI64::new(epoch),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            work: std::sync::atomic::AtomicUsize::new(0),
+            drained: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+struct ProviderWorkOwner(Arc<ProviderLifecycle>);
+
+impl Drop for ProviderWorkOwner {
+    fn drop(&mut self) {
+        if self
+            .0
+            .work
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.0.drained.notify_waiters();
+        }
+    }
+}
+
+/// An owned turn, including queued writer closures and local filesystem work.
+/// Clones keep the same turn alive until its last completion is joined.
+#[derive(Clone)]
+pub struct ProviderWork(Arc<ProviderWorkOwner>);
+
+impl ProviderWork {
+    pub fn check_current(&self) -> anyhow::Result<()> {
+        if self.0 .0.cancellation.is_cancelled() {
+            anyhow::bail!("provider-lifecycle-fenced");
+        }
+        Ok(())
+    }
+
+    pub fn cancellation(&self) -> tokio_util::sync::CancellationToken {
+        self.0 .0.cancellation.clone()
+    }
+}
+
+struct ManagedProvider {
+    provider: Arc<dyn SyncProvider>,
+    lifecycle: Arc<ProviderLifecycle>,
+}
+
+impl ManagedProvider {
+    fn run<'a, T: Send + 'a>(&'a self, operation: ProviderFuture<'a, T>) -> ProviderFuture<'a, T> {
+        Box::pin(async move {
+            let cancelled = || {
+                error(
+                    ProviderErrorCode::Cancelled,
+                    false,
+                    "provider lifecycle was fenced",
+                )
+            };
+            if self.lifecycle.cancellation.is_cancelled() {
+                return Err(cancelled());
+            }
+            tokio::select! {
+                biased;
+                _ = self.lifecycle.cancellation.cancelled() => Err(cancelled()),
+                result = operation => {
+                    if self.lifecycle.cancellation.is_cancelled() { Err(cancelled()) } else { result }
+                }
+            }
+        })
+    }
+}
+
+impl SyncProvider for ManagedProvider {
+    fn describe(&self) -> ProviderFuture<'_, ProviderDescription> {
+        self.run(self.provider.describe())
+    }
+    fn health(&self) -> ProviderFuture<'_, ProviderHealth> {
+        self.run(self.provider.health())
+    }
+    fn diagnostics(&self) -> ProviderFuture<'_, serde_json::Value> {
+        self.run(self.provider.diagnostics())
+    }
+    fn auth_begin(&self, callback_url: Option<String>) -> ProviderFuture<'_, AuthBegin> {
+        self.run(self.provider.auth_begin(callback_url))
+    }
+    fn auth_complete<'a>(
+        &'a self,
+        flow_id: &'a str,
+        fields: BTreeMap<String, String>,
+    ) -> ProviderFuture<'a, AuthStatus> {
+        self.run(self.provider.auth_complete(flow_id, fields))
+    }
+    fn auth_poll<'a>(&'a self, flow_id: &'a str) -> ProviderFuture<'a, Option<AuthStatus>> {
+        self.run(self.provider.auth_poll(flow_id))
+    }
+    fn auth_cancel<'a>(&'a self, flow_id: &'a str) -> ProviderFuture<'a, ()> {
+        self.run(self.provider.auth_cancel(flow_id))
+    }
+    fn auth_status(&self) -> ProviderFuture<'_, AuthStatus> {
+        self.run(self.provider.auth_status())
+    }
+    fn auth_sign_out(&self) -> ProviderFuture<'_, ()> {
+        self.run(self.provider.auth_sign_out())
+    }
+    fn delta_list<'a>(
+        &'a self,
+        scope: DeltaScope,
+        cursor: Option<&'a str>,
+        page_token: Option<&'a str>,
+        limit: usize,
+    ) -> ProviderFuture<'a, DeltaPage> {
+        self.run(self.provider.delta_list(scope, cursor, page_token, limit))
+    }
+    fn object_head<'a>(
+        &'a self,
+        context: &'a TransportContext,
+        key: &'a str,
+    ) -> ProviderFuture<'a, Option<ObjectMetadata>> {
+        self.run(self.provider.object_head(context, key))
+    }
+    fn object_get<'a>(
+        &'a self,
+        context: &'a TransportContext,
+        key: &'a str,
+        max_bytes: u64,
+    ) -> ProviderFuture<'a, DownloadedObject> {
+        self.run(self.provider.object_get(context, key, max_bytes))
+    }
+    fn object_get_range<'a>(
+        &'a self,
+        context: &'a TransportContext,
+        key: &'a str,
+        start: u64,
+        end: u64,
+        max_bytes: u64,
+    ) -> ProviderFuture<'a, DownloadedRange> {
+        self.run(
+            self.provider
+                .object_get_range(context, key, start, end, max_bytes),
+        )
+    }
+    fn object_put_immutable<'a>(
+        &'a self,
+        context: &'a TransportContext,
+        key: &'a str,
+        bytes: &'a [u8],
+        sha256: [u8; 32],
+    ) -> ProviderFuture<'a, PutImmutableResult> {
+        self.run(
+            self.provider
+                .object_put_immutable(context, key, bytes, sha256),
+        )
+    }
+    fn upload_begin<'a>(
+        &'a self,
+        context: &'a TransportContext,
+        key: &'a str,
+        size: u64,
+        sha256: [u8; 32],
+    ) -> ProviderFuture<'a, UploadSession> {
+        self.run(self.provider.upload_begin(context, key, size, sha256))
+    }
+    fn upload_write<'a>(
+        &'a self,
+        context: &'a TransportContext,
+        upload_id: &'a str,
+        offset: u64,
+        bytes: &'a [u8],
+    ) -> ProviderFuture<'a, u64> {
+        self.run(
+            self.provider
+                .upload_write(context, upload_id, offset, bytes),
+        )
+    }
+    fn upload_commit<'a>(
+        &'a self,
+        context: &'a TransportContext,
+        upload_id: &'a str,
+    ) -> ProviderFuture<'a, PutImmutableResult> {
+        self.run(self.provider.upload_commit(context, upload_id))
+    }
+    fn upload_abort<'a>(
+        &'a self,
+        context: &'a TransportContext,
+        upload_id: &'a str,
+    ) -> ProviderFuture<'a, ()> {
+        self.run(self.provider.upload_abort(context, upload_id))
+    }
+    fn fence_transport<'a>(&'a self, epoch: &'a str, generation: u64) -> ProviderFuture<'a, ()> {
+        self.provider.fence_transport(epoch, generation)
+    }
+    fn close_admission(&self) {
+        self.lifecycle.cancellation.cancel();
+        self.provider.close_admission();
+    }
+    fn shutdown(&self) -> ProviderFuture<'_, ()> {
+        self.provider.shutdown()
+    }
+    fn join_closed(&self) -> ProviderFuture<'_, ()> {
+        self.provider.join_closed()
+    }
+}
+
 impl ProviderManager {
+    pub fn open_plugin(&self, plugin_id: &str, epoch: i64) -> anyhow::Result<()> {
+        let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(previous) = lifecycle.get(plugin_id) {
+            if previous.epoch.load(std::sync::atomic::Ordering::Acquire) == epoch
+                && !previous.cancellation.is_cancelled()
+            {
+                return Ok(());
+            }
+            if previous.epoch.load(std::sync::atomic::Ordering::Acquire) >= epoch
+                || previous.work.load(std::sync::atomic::Ordering::Acquire) != 0
+            {
+                anyhow::bail!("provider-lifecycle-fenced");
+            }
+            previous.cancellation.cancel();
+        }
+        lifecycle.insert(
+            plugin_id.to_owned(),
+            Arc::new(ProviderLifecycle::new(epoch)),
+        );
+        Ok(())
+    }
+
+    pub fn begin_work(&self, plugin_id: &str) -> anyhow::Result<ProviderWork> {
+        let lifecycle = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+        let state = lifecycle
+            .get(plugin_id)
+            .ok_or_else(|| anyhow::anyhow!("provider-not-ready"))?;
+        if state.cancellation.is_cancelled() {
+            anyhow::bail!("provider-lifecycle-fenced");
+        }
+        state.work.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(ProviderWork(Arc::new(ProviderWorkOwner(state.clone()))))
+    }
+
+    pub fn close_plugin(&self, plugin_id: &str, epoch: i64) {
+        let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+        let state = lifecycle
+            .entry(plugin_id.to_owned())
+            .or_insert_with(|| Arc::new(ProviderLifecycle::new(0)));
+        state.cancellation.cancel();
+        // Keep outstanding guards on the revoked state until drain. A stale
+        // scheduler snapshot cannot reopen the newly committed disabled epoch.
+        state
+            .epoch
+            .fetch_max(epoch, std::sync::atomic::Ordering::AcqRel);
+        let mut providers = self.providers.lock().unwrap_or_else(|p| p.into_inner());
+        providers.retain(|(id, _), provider| {
+            if id == plugin_id {
+                provider.close_admission();
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    pub async fn join_plugin_work(&self, plugin_id: &str) {
+        let state = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(plugin_id)
+            .cloned();
+        if let Some(state) = state {
+            loop {
+                let drained = state.drained.notified();
+                if state.work.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                    break;
+                }
+                drained.await;
+            }
+        }
+    }
+
     pub async fn fence_binding(
         &self,
         _plugin_id: &str,
@@ -238,10 +532,24 @@ impl ProviderManager {
         account_uuid: impl Into<String>,
         provider: Arc<dyn SyncProvider>,
     ) -> anyhow::Result<()> {
+        let plugin_id = plugin_id.into();
+        let account_uuid = account_uuid.into();
+        let mut lifecycle = self.lifecycle.lock().unwrap_or_else(|p| p.into_inner());
+        let state = lifecycle
+            .entry(plugin_id.clone())
+            .or_insert_with(|| Arc::new(ProviderLifecycle::new(0)));
+        if state.cancellation.is_cancelled() {
+            provider.close_admission();
+            anyhow::bail!("provider-lifecycle-fenced");
+        }
+        let provider: Arc<dyn SyncProvider> = Arc::new(ManagedProvider {
+            provider,
+            lifecycle: state.clone(),
+        });
         self.providers
             .lock()
             .map_err(|e| anyhow::anyhow!("provider manager poisoned: {e}"))?
-            .insert((plugin_id.into(), account_uuid.into()), provider);
+            .insert((plugin_id, account_uuid), provider);
         Ok(())
     }
     pub fn resolve(
@@ -462,7 +770,7 @@ impl SyncProvider for InMemorySyncProvider {
     fn describe(&self) -> ProviderFuture<'_, ProviderDescription> {
         Box::pin(async {
             Ok(ProviderDescription {
-                plugin_id: "com.megle.fake".into(),
+                plugin_id: "com.mangoo.fake".into(),
                 account_uuid: "fake-account".into(),
                 capabilities: vec!["sync-provider.v1".into()],
                 max_object_bytes: 64 * 1024 * 1024,
@@ -501,7 +809,7 @@ impl SyncProvider for InMemorySyncProvider {
             }
             let range = bytes[start as usize..end as usize].to_vec();
             let path = std::env::temp_dir().join(format!(
-                "megle-memory-provider-{}-{}.range",
+                "mangoo-memory-provider-{}-{}.range",
                 std::process::id(),
                 uuid::Uuid::now_v7().simple()
             ));
@@ -537,13 +845,26 @@ impl SyncProvider for InMemorySyncProvider {
             )
         })
     }
-    fn auth_begin(&self, _: Option<String>) -> ProviderFuture<'_, AuthBegin> {
-        Box::pin(async {
+    fn auth_begin(&self, callback_url: Option<String>) -> ProviderFuture<'_, AuthBegin> {
+        Box::pin(async move {
+            let completion_mode = if callback_url.is_some() {
+                "host-callback"
+            } else {
+                "manual-response-uri"
+            };
+            let redirect_uri =
+                callback_url.unwrap_or_else(|| "https://auth.example.test/return".into());
+            let mut authorization_url =
+                url::Url::parse("https://auth.example.test/authorize").unwrap();
+            authorization_url
+                .query_pairs_mut()
+                .append_pair("redirect_uri", &redirect_uri)
+                .append_pair("state", "test");
             Ok(AuthBegin {
-                authorization_url: "https://example.invalid/authorize".into(),
+                authorization_url: authorization_url.into(),
                 flow_id: uuid::Uuid::now_v7().to_string(),
-                completion_mode: "loopback".into(),
-                redirect_uri: None,
+                completion_mode: completion_mode.into(),
+                redirect_uri: Some(redirect_uri),
             })
         })
     }
@@ -687,7 +1008,7 @@ impl SyncProvider for InMemorySyncProvider {
                 ));
             }
             let path = std::env::temp_dir().join(format!(
-                "megle-memory-provider-{}-{}.object",
+                "mangoo-memory-provider-{}-{}.object",
                 std::process::id(),
                 uuid::Uuid::now_v7().simple()
             ));
@@ -989,13 +1310,13 @@ mod tests {
         let manager = ProviderManager::default();
         let provider: Arc<dyn SyncProvider> = Arc::new(InMemorySyncProvider::default());
         manager
-            .register("com.megle.fake", "account", Arc::clone(&provider))
+            .register("com.mangoo.fake", "account", Arc::clone(&provider))
             .unwrap();
         let started = std::time::Instant::now();
         let mut turns = tokio::task::JoinSet::new();
         for index in 0..8 {
             let provider = manager
-                .resolve("com.megle.fake", "account")
+                .resolve("com.mangoo.fake", "account")
                 .unwrap()
                 .unwrap();
             turns.spawn(async move {
@@ -1055,5 +1376,54 @@ mod tests {
             etag: None,
         };
         assert!(validate_object("../db", &meta, data, 2).is_err());
+    }
+
+    #[tokio::test]
+    async fn plugin_lifecycle_epoch_tombstone_does_not_stop_other_provider() {
+        let manager = ProviderManager::default();
+        manager.open_plugin("first", 1).unwrap();
+        manager.open_plugin("second", 1).unwrap();
+        manager
+            .register(
+                "first",
+                "account",
+                Arc::new(InMemorySyncProvider::default()),
+            )
+            .unwrap();
+        manager
+            .register(
+                "second",
+                "account",
+                Arc::new(InMemorySyncProvider::default()),
+            )
+            .unwrap();
+        let old = manager.resolve("first", "account").unwrap().unwrap();
+        manager.close_plugin("first", 2);
+        assert!(manager.open_plugin("first", 1).is_err());
+        assert!(manager.open_plugin("first", 2).is_err());
+        assert!(old.health().await.is_err());
+        assert!(manager
+            .resolve("second", "account")
+            .unwrap()
+            .unwrap()
+            .health()
+            .await
+            .is_ok());
+        manager.open_plugin("first", 3).unwrap();
+        manager
+            .register(
+                "first",
+                "account",
+                Arc::new(InMemorySyncProvider::default()),
+            )
+            .unwrap();
+        assert!(old.health().await.is_err());
+        assert!(manager
+            .resolve("first", "account")
+            .unwrap()
+            .unwrap()
+            .health()
+            .await
+            .is_ok());
     }
 }

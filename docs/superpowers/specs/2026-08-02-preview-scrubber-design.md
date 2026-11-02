@@ -8,7 +8,7 @@ Status: Design (brainstorming) — pending implementation plan
 Jumping to an arbitrary position in a folder means holding an arrow key or
 scrolling repeatedly. BandiView solves this with a floating control bar at the
 bottom of the image: a track, a draggable thumb, a position tooltip, and a pin
-to stop it auto-hiding. Megle has no equivalent.
+to stop it auto-hiding. Mangoo has no equivalent.
 
 ## 2. Reference: what BandiView actually does
 
@@ -40,7 +40,7 @@ positions hit, and (b) the fact that on a large folder one pixel of track spans
 many images, so a drag visits far fewer images than it appears to. The user
 observed exactly this: "20k 图片拖动时有最小拖动张数，小小的拖动一下就会跳过几十张图".
 
-**Megle already has every equivalent**: the decoded `previewBitmapPool` (75% of
+**Mangoo already has every equivalent**: the decoded `previewBitmapPool` (75% of
 the same 1200 MB default), `preview_blobs` as the persistent cache, and the
 glass/overlay primitives for the UI. This design needs no new mechanism.
 
@@ -50,7 +50,7 @@ page through every descendant. It pays for that upfront: a progress bar while it
 enumerates, after which it owns a complete in-memory list and every index is
 immediately addressable.
 
-Megle has the same capability — `showChildFolderContents` drives the
+Mangoo has the same capability — `showChildFolderContents` drives the
 `includeDescendants` query flag in `useLibraryData`, and `mediaTotalCount` then
 reports the flattened total. The difference is only *when* the cost is paid: we
 load incrementally in the background instead of blocking on a progress bar, so

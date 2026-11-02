@@ -7,7 +7,7 @@ import type {
   ProcessLogMetadata,
   ProcessLogPage,
   ProcessLogSource
-} from "@megle/notification-contract";
+} from "@mangoo/notification-contract";
 
 export type {
   ProcessLogBatch,
@@ -17,7 +17,7 @@ export type {
   ProcessLogMetadata,
   ProcessLogPage,
   ProcessLogSource
-} from "@megle/notification-contract";
+} from "@mangoo/notification-contract";
 
 export const DEFAULT_PROCESS_LOG_MAX_ENTRIES = 5_000;
 export const DEFAULT_PROCESS_LOG_MAX_BYTES = 5 * 1024 * 1024;
@@ -63,10 +63,10 @@ const ACCESSOR = "[accessor]";
 const WINDOWS_PATH_PATTERN = /(?:[A-Za-z]:[\\/]|\\\\)[^\s"'`<>]+/g;
 const UNIX_SENSITIVE_PATH_PATTERN = /(?:\/Users\/|\/home\/|\/private\/var\/|\/tmp\/)[^\s"'`<>]+/gi;
 const SENSITIVE_NORMALIZED_KEYS = new Set([
-  "meglesession",
-  "meglesessiontoken",
-  "xmeglesession",
-  "xmeglesessiontoken",
+  "mangoosession",
+  "mangoosessiontoken",
+  "xmangoosession",
+  "xmangoosessiontoken",
   "xsessiontoken",
   "sessiontoken",
   "accesstoken",
@@ -100,10 +100,10 @@ const SENSITIVE_HEADER_KEYS = new Set([
   "setcookie",
   "xapikey",
   "apikey",
-  "meglesession",
-  "meglesessiontoken",
-  "xmeglesession",
-  "xmeglesessiontoken",
+  "mangoosession",
+  "mangoosessiontoken",
+  "xmangoosession",
+  "xmangoosessiontoken",
   "xsessiontoken"
 ]);
 

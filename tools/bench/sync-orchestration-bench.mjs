@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 // admission, independent apply/media semaphores and real Catalog writers).
 const result = spawnSync(
   "cargo",
-  ["test", "-p", "megle-core", "--release", "sync::coordinator::tests::sync_protocol_acceptance_probe", "--", "--ignored", "--nocapture"],
+  ["test", "-p", "mangoo-core", "--release", "sync::coordinator::tests::sync_protocol_acceptance_probe", "--", "--ignored", "--nocapture"],
   { cwd: process.cwd(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 60 * 60 * 1000 },
 );
 process.stdout.write(result.stdout ?? "");

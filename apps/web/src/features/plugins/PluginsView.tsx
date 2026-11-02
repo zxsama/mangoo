@@ -1,4 +1,4 @@
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle } from "../../design/icons";
 import { MediaLoadingRing } from "../loading/MediaLoadingRing";
 import { LiquidGlassButton, LiquidGlassSurface } from "../../design/liquid-glass";
 import { ModalSurface, OverlayDialogActions, OverlayDialogBody, OverlayDialogHeader } from "../../design/overlays";

@@ -24,6 +24,10 @@ HOST_MIGRATIONS = [
     ROOT / "crates" / "core" / "host_migrations" / "0016_remote_root_inventory.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0017_restore_action_contracts.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0018_descriptor_snapshots.sql",
+    ROOT / "crates" / "core" / "host_migrations" / "0019_plugin_lifecycle.sql",
+    ROOT / "crates" / "core" / "host_migrations" / "0020_plugin_contributions.sql",
+    ROOT / "crates" / "core" / "host_migrations" / "0021_library_registration_visibility.sql",
+    ROOT / "crates" / "core" / "host_migrations" / "0022_separated_library_storage.sql",
 ]
 MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0001_initial.sql",
@@ -58,6 +62,12 @@ MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0031_sync_root_generation_fence.sql",
     ROOT / "crates" / "core" / "migrations" / "0032_sync_root_reconciliation.sql",
     ROOT / "crates" / "core" / "migrations" / "0033_media_materialization_destination.sql",
+    ROOT / "crates" / "core" / "migrations" / "0034_all_file_collection.sql",
+    ROOT / "crates" / "core" / "migrations" / "0035_materialization_staging_ownership.sql",
+    ROOT / "crates" / "core" / "migrations" / "0036_all_file_browsing.sql",
+    ROOT / "crates" / "core" / "migrations" / "0037_decoder_presentations.sql",
+    ROOT / "crates" / "core" / "migrations" / "0038_folder_appearance.sql",
+    ROOT / "crates" / "core" / "migrations" / "0039_directory_preferences.sql",
 ]
 
 TASK_PROGRESS_COLUMNS = {
@@ -65,6 +75,7 @@ TASK_PROGRESS_COLUMNS = {
     "items_total",
     "folders_seen",
     "media_files_seen",
+    "files_seen",
     "skipped_files",
     "thumbnail_source_fingerprint",
     "attempt_generation",
@@ -72,6 +83,7 @@ TASK_PROGRESS_COLUMNS = {
 
 REQUIRED_TABLES = {
     "schema_migrations",
+    "directory_sort_rules",
     "roots",
     "folders",
     "files",
@@ -148,6 +160,15 @@ REQUIRED_HOST_SYNC_ROOT_TABLES = {
 }
 
 REQUIRED_INDEXES = {
+    "idx_sync_file_os_identity",
+    "idx_sync_file_fingerprint",
+    "idx_sync_file_last_path",
+    "idx_files_browse_root_name",
+    "idx_files_browse_root_mtime",
+    "idx_files_browse_folder_name",
+    "idx_files_browse_folder_mtime",
+    "idx_files_browse_name",
+    "idx_files_browse_mtime",
     "idx_folders_root_parent_name",
     "idx_files_folder_name",
     "idx_files_folder_mtime_id",
@@ -158,6 +179,7 @@ REQUIRED_INDEXES = {
     "idx_files_folder_status_mtime_id",
     "idx_files_folder_status_mtime_id_asc",
     "idx_folders_parent_status_id",
+    "idx_folders_parent_status_name_id",
     "idx_files_root_mtime_id",
     "idx_files_root_name_id",
     "idx_files_root_name_id_desc",
@@ -292,6 +314,18 @@ def index_key_columns(conn: sqlite3.Connection, index_name: str):
 
 def apply_migration(conn: sqlite3.Connection, migration: Path) -> None:
     name = migration.name
+    if name == "0036_all_file_browsing.sql":
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE version=36").fetchone() is None:
+            conn.executescript(migration.read_text(encoding="utf-8"))
+        return
+    if name == "0035_materialization_staging_ownership.sql":
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE version=35").fetchone() is None:
+            conn.executescript(migration.read_text(encoding="utf-8"))
+        return
+    if name == "0034_all_file_collection.sql":
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE version=34").fetchone() is None:
+            conn.executescript(migration.read_text(encoding="utf-8"))
+        return
     if name == "0033_media_materialization_destination.sql":
         if conn.execute("SELECT 1 FROM schema_migrations WHERE version=33").fetchone() is None:
             conn.executescript(migration.read_text(encoding="utf-8"))
@@ -1270,9 +1304,11 @@ def verify_host_sync_root_binding_contract() -> None:
             "DELETE FROM remote_sync_roots WHERE library_uuid=? AND root_uuid=?",
             (library_uuid, "00000000-0000-7000-8000-000000000002"),
         )
-        if conn.execute("SELECT schema_version FROM host_meta WHERE singleton=1").fetchone()[0] != 18:
+        if conn.execute("SELECT schema_version FROM host_meta WHERE singleton=1").fetchone()[0] != 22:
             fail("managed-root orchestration migrations did not update schema_version")
         expected_host_tables = {
+            "library_list_visibility",
+            "library_open_journal",
             "library_local_settings",
             "remote_sync_roots",
             "local_root_bindings",
@@ -1493,7 +1529,164 @@ def verify_sync_query_plans(conn: sqlite3.Connection) -> None:
     )
 
 
+def verify_all_file_collection_upgrade() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        path = Path(temporary) / "all-files.sqlite"
+        conn = sqlite3.connect(path)
+        for migration in MIGRATIONS[:32]:
+            apply_migration(conn, migration)
+        conn.execute("INSERT INTO roots(path,display_name,created_at) VALUES ('D:/fixture','Fixture',1)")
+        root_id = conn.execute("SELECT id FROM roots").fetchone()[0]
+        conn.execute("INSERT INTO folders(root_id,name,path_hash) VALUES (?,'','root')", (root_id,))
+        folder_id = conn.execute("SELECT id FROM folders").fetchone()[0]
+        conn.execute("INSERT INTO files(root_id,folder_id,name,ext,size,mtime) VALUES (?,?,'a..b.jpg','jpg',3,7)", (root_id,folder_id))
+        file_id, asset = conn.execute("SELECT id,asset_uuid FROM files").fetchone()
+        conn.execute("INSERT INTO media(file_id,kind,width,metadata_status) VALUES (?,'image',42,'ready')", (file_id,))
+        conn.execute("INSERT INTO sync_local_file_identities(volume_identity,file_identity,asset_uuid,last_path,content_fingerprint,last_seen_at) VALUES (?,?,?,?,?,?)", (b'volume',b'inode',asset,'D:/fixture/a..b.jpg',bytes(32),8))
+        before_file = conn.execute("SELECT * FROM files").fetchone()
+        before_identity = conn.execute("SELECT * FROM sync_local_file_identities").fetchone()
+        before_media = conn.execute("SELECT * FROM media").fetchone()
+        conn.commit()
+        apply_migration(conn,MIGRATIONS[32])
+        if conn.execute("SELECT * FROM files").fetchone() != before_file + (1,):
+            fail("all-file upgrade rewrote existing file identity or observation")
+        if conn.execute("SELECT volume_identity,file_identity,asset_uuid,last_path,content_fingerprint,last_seen_at FROM sync_local_file_identities").fetchone() != before_identity or conn.execute("SELECT * FROM media").fetchone() != before_media:
+            fail("all-file upgrade changed existing fingerprint/media metadata")
+        conn.execute("INSERT INTO sync_local_file_identities(volume_identity,file_identity,asset_uuid,last_path,content_fingerprint,last_seen_at) VALUES (?,?,?,?,?,?)", (b'volume',b'inode',bytes([1])*16,'D:/fixture/hardlink',bytes(32),9))
+        conn.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000) INSERT INTO files(root_id,folder_id,name,ext,size,mtime) SELECT ?,?,'generic-'||x,'bin',0,1 FROM n", (root_id,folder_id))
+        plan = ' '.join(row[3] for row in conn.execute("EXPLAIN QUERY PLAN SELECT id FROM files INDEXED BY idx_files_browse_root_name WHERE root_id=? AND status='active' AND browse_visible=1 ORDER BY name,id LIMIT 100", (root_id,)))
+        if 'idx_files_browse_root_name' not in plan or 'TEMP B-TREE' in plan:
+            fail("sparse-media page lost its selective ordered index")
+        count = conn.execute("SELECT COUNT(*) FROM files WHERE root_id=? AND status='active' AND browse_visible=1", (root_id,)).fetchone()[0]
+        if count != 1:
+            fail("generic entries leaked into sparse-media count")
+        conn.commit()
+        conn.close()
+        conn=sqlite3.connect(path)
+        apply_migration(conn,MIGRATIONS[32])
+        if conn.execute("PRAGMA integrity_check").fetchone() != ('ok',) or conn.execute("PRAGMA foreign_key_check").fetchall():
+            fail("all-file migration failed reopened integrity checks")
+        if conn.execute("SELECT COUNT(*) FROM sync_local_file_identities").fetchone() != (2,):
+            fail("reopen lost hardlink directory-entry identities")
+        conn.close()
+
+
+def verify_all_file_browsing_upgrade() -> None:
+    migration_index = next(i for i, path in enumerate(MIGRATIONS) if path.name == "0036_all_file_browsing.sql")
+    with tempfile.TemporaryDirectory() as temporary:
+        path = Path(temporary) / "browse.sqlite"
+        conn = sqlite3.connect(path)
+        for migration in MIGRATIONS[:migration_index]:
+            apply_migration(conn, migration)
+        conn.execute("INSERT INTO roots(path,display_name,created_at) VALUES ('D:/browse-fixture','Fixture',1)")
+        root = conn.execute("SELECT id FROM roots").fetchone()[0]
+        conn.execute("INSERT INTO folders(root_id,name,path_hash) VALUES (?,'','root')", (root,))
+        folder = conn.execute("SELECT id FROM folders").fetchone()[0]
+        conn.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000) INSERT INTO files(root_id,folder_id,name,ext,size,mtime) SELECT ?,?,'generic-'||x,'bin',0,x FROM n", (root,folder))
+        conn.execute("INSERT INTO media(file_id,kind) VALUES (1,'image')")
+        conn.execute("INSERT INTO media_fts(rowid,name,note,tags) VALUES(1,'generic-1','','')")
+        before = conn.execute("SELECT id,asset_uuid,name FROM files ORDER BY id").fetchall()
+        conn.commit()
+        apply_migration(conn, MIGRATIONS[migration_index])
+        if conn.execute("SELECT file_collection_version,file_collection_scanned_version FROM roots").fetchone() != (1,0):
+            fail("local root browse upgrade must remain pending until successful scan")
+        if conn.execute("SELECT id,asset_uuid,name FROM files ORDER BY id").fetchall() != before:
+            fail("browse upgrade changed file identity")
+        if conn.execute("SELECT after_file_id,through_file_id,completed FROM file_browse_fts_progress").fetchone() != (0,10000,0):
+            fail("browse FTS upgrade did not save its independent keyset boundary")
+        conn.execute("DELETE FROM media WHERE file_id=1")
+        if conn.execute("SELECT COUNT(*) FROM media_fts WHERE rowid=1").fetchone() != (1,):
+            fail("removing optional media erased file search")
+        for scope,value in [("root",root),("folder",folder)]:
+            for key in ["name","mtime"]:
+                index = f"idx_files_{scope}_status_{key}_id"
+                plan = ' '.join(row[3] for row in conn.execute(f"EXPLAIN QUERY PLAN SELECT id FROM files INDEXED BY {index} WHERE {scope}_id=? AND status='active' ORDER BY {key},id LIMIT 100", (value,)))
+                if index not in plan or 'TEMP B-TREE' in plan:
+                    fail("all-file browsing lost its ordered scope index")
+        conn.execute("INSERT INTO roots(path,display_name,created_at) VALUES ('D:/new-browse-fixture','New',1)")
+        if conn.execute("SELECT MIN(file_collection_version) FROM roots").fetchone() != (1,):
+            fail("new local root did not adopt all-file collection")
+        conn.commit()
+        conn.close()
+        conn = sqlite3.connect(path)
+        apply_migration(conn,MIGRATIONS[migration_index])
+        if conn.execute("PRAGMA integrity_check").fetchone() != ('ok',) or conn.execute("PRAGMA foreign_key_check").fetchall():
+            fail("browse migration failed reopened integrity checks")
+        conn.close()
+
+
+def verify_materialization_staging_ownership_upgrade() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        path = Path(temporary) / "staging.sqlite"
+        conn = sqlite3.connect(path)
+        for migration in MIGRATIONS[:33]:
+            apply_migration(conn, migration)
+        revision, asset = bytes([1]) * 16, bytes([2]) * 16
+        conn.execute("INSERT INTO asset_content_revisions(content_revision_uuid,asset_uuid,byte_size,local_mutation_generation,created_at) VALUES (?,?,0,1,1)", (revision, asset))
+        conn.execute("INSERT INTO media_materialization_jobs(content_revision_uuid,asset_uuid,destination_relpath,phase,expected_length,staging_relpath,created_at,updated_at) VALUES (?,?,'file.bin','pending',0,'.mangoo-staging/legacy.partial',1,1)", (revision,asset))
+        before = conn.execute("SELECT * FROM media_materialization_jobs").fetchone()
+        conn.commit()
+        apply_migration(conn, MIGRATIONS[33])
+        if conn.execute("SELECT * FROM media_materialization_jobs").fetchone() != before + (None,None):
+            fail("staging ownership upgrade changed legacy jobs or assumed their ownership")
+        conn.execute("UPDATE media_materialization_jobs SET staging_relpath='.mangoo-work-fixture/payload.partial',staging_directory_identity='fixture-volume:directory',staging_file_identity='fixture-volume:payload'")
+        expected = conn.execute("SELECT * FROM media_materialization_jobs").fetchone()
+        conn.commit()
+        conn.close()
+        conn = sqlite3.connect(path)
+        apply_migration(conn, MIGRATIONS[33])
+        if conn.execute("SELECT * FROM media_materialization_jobs").fetchone() != expected:
+            fail("staging ownership changed on reopen")
+        indexes = {row[1] for row in conn.execute("PRAGMA index_list(media_materialization_jobs)")}
+        if 'idx_materialization_staging_path' not in indexes:
+            fail("staging ownership path lookup index missing")
+        if conn.execute("PRAGMA integrity_check").fetchone() != ('ok',) or conn.execute("PRAGMA foreign_key_check").fetchall():
+            fail("staging ownership upgrade integrity failed")
+        conn.close()
+
+
+def verify_plugin_contributions_upgrade():
+    import json
+    with tempfile.TemporaryDirectory(prefix="mangoo-plugin-contributions-") as temp_dir:
+        path = Path(temp_dir) / "host.sqlite"
+        conn = sqlite3.connect(path)
+        for migration in HOST_MIGRATIONS[:19]:
+            conn.executescript(migration.read_text(encoding="utf-8"))
+        conn.execute("INSERT INTO plugin_installations(plugin_id,manifest_version,selected_version,enabled_intent,install_root,trust_policy_id,requested_permissions_json,granted_permissions_json,created_at,updated_at,lifecycle_epoch) VALUES ('com.mangoo.onedrive',2,'1.0.0',0,'bundled','embedded-v1','[]','[]',3,4,9)")
+        conn.execute("INSERT INTO plugin_versions(plugin_id,version,manifest_json,entry_relative_path,entry_sha256,state,installed_at) VALUES ('com.mangoo.onedrive','1.0.0','{\"manifestVersion\":2}','bin/provider',?,'selected',3)",(bytes(32),))
+        conn.execute("INSERT INTO plugin_runtime_state(plugin_id,state,updated_at) VALUES ('com.mangoo.onedrive','disabled',4)")
+        conn.execute("INSERT INTO plugin_accounts(account_uuid,plugin_id,stable_account_identity,display_name,secret_ref,auth_state,generation,created_at,updated_at,account_kind) VALUES ('retained-account','com.mangoo.onedrive','stable-identity','Retained account','opaque-ref','authenticated',7,3,4,'personal')")
+        conn.execute("INSERT INTO plugin_secret_handles VALUES ('com.mangoo.onedrive','retained-account','upload-ref','microsoft-onedrive','upload-session-v1',3)")
+        conn.execute("INSERT INTO plugin_secret_handles VALUES ('com.mangoo.onedrive','retained-account','opaque-ref','microsoft-onedrive','oauth-v1',3)")
+        conn.execute("UPDATE onedrive_configuration SET host_override_client_id='01234567-89ab-4cde-8fab-0123456789ab',revision=42,updated_at=4")
+        conn.execute("INSERT INTO onedrive_configuration_plans VALUES ('old-plan',42,NULL,1,0,0,1000,3)")
+        before_account = conn.execute("SELECT * FROM plugin_accounts").fetchone()
+        before_install = conn.execute("SELECT * FROM plugin_installations").fetchone()
+        before_runtime = conn.execute("SELECT * FROM plugin_runtime_state").fetchone()
+        conn.commit()
+        conn.executescript(HOST_MIGRATIONS[19].read_text(encoding="utf-8"))
+        if conn.execute("SELECT * FROM plugin_accounts").fetchone() != before_account or conn.execute("SELECT * FROM plugin_installations").fetchone() != before_install or conn.execute("SELECT * FROM plugin_runtime_state").fetchone() != before_runtime:
+            fail("generic configuration migration changed account/grants/intent/runtime")
+        values, revision = conn.execute("SELECT values_json,revision FROM plugin_configuration WHERE plugin_id='com.mangoo.onedrive'").fetchone()
+        if json.loads(values) != {"clientId":"01234567-89ab-4cde-8fab-0123456789ab"} or revision != 42:
+            fail("generic configuration migration changed effective persisted configuration")
+        if conn.execute("SELECT COUNT(*) FROM onedrive_configuration_plans").fetchone()[0] != 0:
+            fail("old serialized configuration plans retained authority")
+        handles=conn.execute("SELECT secret_ref,namespace,purpose,role FROM plugin_secret_handles ORDER BY secret_ref").fetchall()
+        if handles != [('opaque-ref','microsoft-onedrive','oauth-v1','primary'),('upload-ref','microsoft-onedrive','upload-session-v1','scoped')]:
+            fail("generic migration changed scoped refs or failed primary role migration")
+        conn.close()
+        conn=sqlite3.connect(path)
+        if conn.execute("PRAGMA integrity_check").fetchone()!=('ok',) or conn.execute("PRAGMA foreign_key_check").fetchall():
+            fail("generic configuration reopen integrity failed")
+        if conn.execute("SELECT revision FROM plugin_configuration").fetchone()!=(42,):
+            fail("generic configuration revision lost after reopen")
+        conn.close()
+
+
 def main() -> None:
+    verify_all_file_browsing_upgrade()
+    verify_plugin_contributions_upgrade()
     for migration in MIGRATIONS:
         if not migration.exists():
             fail(f"missing migration: {migration}")
@@ -1505,6 +1698,8 @@ def main() -> None:
     verify_sync_root_generation_fence_contract()
     verify_sync_root_generation_fence_upgrade_from_v30()
     verify_materialization_destination_upgrade_from_v32()
+    verify_all_file_collection_upgrade()
+    verify_materialization_staging_ownership_upgrade()
     verify_host_sync_root_binding_contract()
     verify_host_remote_root_inventory_upgrade_and_rollback()
     verify_host_restore_action_contract_upgrade_and_rollback()
@@ -1566,7 +1761,7 @@ def main() -> None:
         meta = host_conn.execute(
             "SELECT schema_version, active_library_uuid, context_revision, sync_scheduler_state FROM host_meta WHERE singleton = 1"
         ).fetchone()
-        if meta != (18, None, 0, "stopped"):
+        if meta != (22, None, 0, "stopped"):
             fail(f"unexpected Host Registry metadata seed: {meta}")
         auth_flow_columns = {
             row[1]
@@ -1637,7 +1832,7 @@ def main() -> None:
                 "PRAGMA table_info(library_creation_journal)"
             )
         }
-        required_creation_columns = {"root_identity", "staging_identity", "marker_identity"}
+        required_creation_columns = {"root_identity", "staging_identity", "marker_identity", "layout_version", "final_storage_path", "content_roots_json", "owned_artifacts_json"}
         missing_creation_columns = required_creation_columns - creation_columns
         if missing_creation_columns:
             fail(
@@ -1698,7 +1893,7 @@ def main() -> None:
     finally:
         host_conn.close()
 
-    with tempfile.TemporaryDirectory(prefix="megle_schema_") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="mangoo_schema_") as temp_dir:
         db_path = Path(temp_dir) / "schema.sqlite"
         conn = sqlite3.connect(db_path)
         try:
@@ -1846,6 +2041,26 @@ def main() -> None:
             ).fetchone()
             if version is None:
                 fail("migration version 30 was not recorded")
+            if conn.execute("SELECT version FROM schema_migrations WHERE version = 38").fetchone() is None:
+                fail("migration version 38 was not recorded")
+            if conn.execute("SELECT version FROM schema_migrations WHERE version = 39").fetchone() is None:
+                fail("migration version 39 was not recorded")
+            root_columns = {row[1]: row for row in conn.execute("PRAGMA table_info(roots)")}
+            for column in ("icon", "color"):
+                if column not in root_columns or root_columns[column][2] != "TEXT" or root_columns[column][3] != 0:
+                    fail(f"roots.{column} must be nullable TEXT")
+            for table in ("roots", "folders"):
+                columns = {row[1]: row for row in conn.execute(f"PRAGMA table_info({table})")}
+                for column in ("directory_sort_revision", "directory_sort_subtree_revision"):
+                    if column not in columns or columns[column][2] != "INTEGER" or columns[column][3] != 1:
+                        fail(f"{table}.{column} must be required INTEGER")
+            sort_index = [row[2] for row in conn.execute("PRAGMA index_info(idx_folders_parent_status_name_id)")]
+            if sort_index != ["parent_id", "status", "name", "id"]:
+                fail("directory pagination index must cover parent, status, name and id")
+            folder_columns = {row[1]: row for row in conn.execute("PRAGMA table_info(folders)")}
+            for column in ("icon", "color"):
+                if column not in folder_columns or folder_columns[column][2] != "TEXT" or folder_columns[column][3] != 0:
+                    fail(f"folders.{column} must be nullable TEXT")
             version = conn.execute(
                 "SELECT version FROM schema_migrations WHERE version = 31"
             ).fetchone()

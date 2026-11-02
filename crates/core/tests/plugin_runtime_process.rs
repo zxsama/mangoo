@@ -4,10 +4,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn helper(mode: &str) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_megle-core"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mangoo-core"));
     command
         .env_clear()
-        .env("MEGLE_PLUGIN_RUNTIME_TEST_HELPER", mode)
+        .env("MANGOO_PLUGIN_RUNTIME_TEST_HELPER", mode)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -73,7 +73,7 @@ fn real_framed_helper_accepts_split_frame_and_returns_correlated_response() {
     let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
     assert_eq!(response["requestId"], request_id.to_string());
     assert_eq!(response["messageType"], "response");
-    assert_eq!(response["payload"]["pluginId"], "com.megle.fake");
+    assert_eq!(response["payload"]["pluginId"], "com.mangoo.fake");
     child.kill().unwrap();
     let _ = child.wait().unwrap();
 }

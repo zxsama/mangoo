@@ -1,12 +1,16 @@
 import type {
   AcceptedRootResponse,
+  PlaybackSession,
   AddFileTagRequest,
   ActiveLibraryResponse,
   CreateLibraryRequest,
+  OpenLibraryRequest,
+  OpenLibraryResponse,
   EnableLibrarySyncRequest,
   CreateLibraryResponse,
   CreateTagRequest,
   HostPluginProjection,
+  HostPluginViewDocument,
   HostPluginListResponse,
   ThumbnailCacheCancelBulkResponse,
   ThumbnailCacheClearResponse,
@@ -21,7 +25,12 @@ import type {
   FileOperationRecord,
   FileOperationsResponse,
   FileTagsResponse,
+  DirectorySortRule,
+  DirectorySortState,
+  DirectorySortMutationResult,
+  FolderChildrenPage,
   FolderRecord,
+  UpdateFolderAppearanceRequest,
   InteractiveFolderScanTaskRequest,
   LibraryListResponse,
   LibraryPreflightRequest,
@@ -41,10 +50,12 @@ import type {
   PluginDiscoveryResponse,
   PluginAuthBeginResponse,
   PluginAuthCancelRequest,
-  OneDriveConfiguration,
-  OneDriveConfigurationPlanRequest,
-  OneDriveConfigurationPlan,
-  OneDriveConfigurationCommitRequest,
+  PluginConfiguration,
+  PluginExternalLinkRequest,
+  PluginExternalLink,
+  PluginConfigurationPlanRequest,
+  PluginConfigurationPlan,
+  PluginConfigurationCommitRequest,
   PluginAuthCompleteRequest,
   PluginCommandResponse,
   PluginDiagnosticsResponse,
@@ -65,13 +76,17 @@ import type {
   ThumbnailResponse,
   UserMetadataRecord,
   UserMetadataUpdate
-} from "./generated-contract";
-import type { RemoteLibraryListResponse, RemoteLibraryRootListResponse, SyncCommandRequest, SyncConflictListResponse, SyncConflictResolutionRequest, SyncEnableRequest, SyncOperation, SyncPreflightRequest, SyncPreflightResponse, SyncReconnectCommitRequest, SyncReconnectPlan, SyncReconnectPreflightRequest, SyncRestoreListResponse, SyncRestorePlan, SyncRestorePreflight, SyncRestorePreflightRequest, SyncRestoreStartRequest, SyncStatusSnapshot, SyncUnbindCommitRequest, SyncUnbindPlan } from "./generated-contract";
-import type { RootCommandRequest, RootComparisonItem, RootComparisonItemListResponse, RootComparisonItemResolutionRequest, RootComparisonPlan, RootConflictListResponse, RootEnrollmentCommitRequest, RootLocationConflictResolutionRequest, RootLogicalRenameCommitRequest, RootLogicalRenamePlan, RootLogicalRenameRequest, RootOperation, RootOperationFenceRequest, RootOperationListResponse, RootOperationPageResponse, RootPathPreflightRequest, RootPathPreflightResult, RootRebindCommitRequest, RootRebindPlan, RootRebindPreflightRequest, RootReenableCommitRequest, RootRelocationCommitRequest, RootRelocationPreflightRequest, RootSelectionCommitRequest, RootSelectionPreflightRequest, RootSelectionPreflightResult, RootStopCommitRequest, RootStopPlan, SyncFolderListResponse, SyncFolderRecord, SyncFolderSettings, UpdateSyncFolderSettingsRequest } from "./generated-contract";
+} from "./generated-contract.ts";
+import type { RemoteLibraryListResponse, RemoteLibraryRootListResponse, SyncCommandRequest, SyncConflictListResponse, SyncConflictResolutionRequest, SyncEnableRequest, SyncOperation, SyncPreflightRequest, SyncPreflightResponse, SyncReconnectCommitRequest, SyncReconnectPlan, SyncReconnectPreflightRequest, SyncRestoreListResponse, SyncRestorePlan, SyncRestorePreflight, SyncRestorePreflightRequest, SyncRestoreStartRequest, SyncStatusSnapshot, SyncUnbindCommitRequest, SyncUnbindPlan } from "./generated-contract.ts";
+import type { RootCommandRequest, RootComparisonItem, RootComparisonItemListResponse, RootComparisonItemResolutionRequest, RootComparisonPlan, RootConflictListResponse, RootEnrollmentCommitRequest, RootLocationConflictResolutionRequest, RootLogicalRenameCommitRequest, RootLogicalRenamePlan, RootLogicalRenameRequest, RootOperation, RootOperationFenceRequest, RootOperationListResponse, RootOperationPageResponse, RootPathPreflightRequest, RootPathPreflightResult, RootRebindCommitRequest, RootRebindPlan, RootRebindPreflightRequest, RootReenableCommitRequest, RootRelocationCommitRequest, RootRelocationPreflightRequest, RootSelectionCommitRequest, RootSelectionPreflightRequest, RootSelectionPreflightResult, RootStopCommitRequest, RootStopPlan, SyncFolderListResponse, SyncFolderRecord, SyncFolderSettings, UpdateSyncFolderSettingsRequest } from "./generated-contract.ts";
 
 export interface CoreClientConfig {
   baseUrl: string;
   sessionToken?: string;
+  /** Cancels every queued or running request made by this client instance. */
+  signal?: AbortSignal;
+  /** Exact installed lifecycle that owns calls delegated by a sandbox UI. */
+  pluginUiSession?: { pluginId: string; lifecycleEpoch: number };
 }
 
 export class CoreApiError extends Error {
@@ -156,7 +171,7 @@ const coreRequestQueue: QueuedCoreRequest[] = [];
 // ── Debug facility ─────────────────────────────────────────────────────────
 // One global switch gates all client-scheduler diagnostics so they can stay in
 // the code (default off, zero overhead) and be flipped on live for debugging:
-//   window.__megleDebug = true   // then read window.__megleCoreScheduler()
+//   window.__mangooDebug = true   // then read window.__mangooCoreScheduler()
 // When on, each in-flight request is tracked with metadata (path, priority,
 // whether it has an abort signal, how long it has been active) so a stuck slot
 // is immediately visible via the scheduler snapshot.
@@ -171,19 +186,19 @@ const coreDebugActive = new Map<number, CoreDebugEntry>();
 function coreDebugEnabled(): boolean {
   return (
     typeof window !== "undefined" &&
-    (window as unknown as { __megleDebug?: boolean }).__megleDebug === true
+    (window as unknown as { __mangooDebug?: boolean }).__mangooDebug === true
   );
 }
 
 if (typeof window !== "undefined") {
-  (window as unknown as { __megleCoreScheduler: () => unknown }).__megleCoreScheduler = () => {
+  (window as unknown as { __mangooCoreScheduler: () => unknown }).__mangooCoreScheduler = () => {
     const now = typeof performance !== "undefined" ? performance.now() : Date.now();
     return {
       active: activeCoreRequests,
       interactive: activeCoreInteractiveRequests,
       queued: coreRequestQueue.length,
       max: MAX_CORE_REQUESTS,
-      // Populated only while window.__megleDebug is on.
+      // Populated only while window.__mangooDebug is on.
       inFlight: Array.from(coreDebugActive.values()).map((entry) => ({
         sequence: entry.sequence,
         priority: entry.priority,
@@ -196,23 +211,39 @@ if (typeof window !== "undefined") {
 }
 
 export function createCoreClient(config: CoreClientConfig) {
+  if (config.pluginUiSession && (!/^[a-z0-9]+(\.[a-z0-9][a-z0-9-]*)+$/.test(config.pluginUiSession.pluginId)
+      || config.pluginUiSession.pluginId.length > 255
+      || !Number.isSafeInteger(config.pluginUiSession.lifecycleEpoch) || config.pluginUiSession.lifecycleEpoch < 1)) {
+    throw new TypeError("Invalid plugin UI session identity");
+  }
+  const pluginUiSession = config.pluginUiSession ? { ...config.pluginUiSession } : undefined;
+  const applyPluginUiHeaders = (headers: Headers) => {
+    if (pluginUiSession) {
+      headers.set("x-mangoo-plugin-ui-id", pluginUiSession.pluginId);
+      headers.set("x-mangoo-plugin-ui-epoch", String(pluginUiSession.lifecycleEpoch));
+    }
+  };
   let observedContextRevision: string | null = null;
+  const requestSignal = (signal?: AbortSignal | null) =>
+    config.signal && signal ? AbortSignal.any([config.signal, signal]) : config.signal ?? signal;
   async function request<T>(path: string, init: ScheduledRequestInit = {}): Promise<T> {
     const {
       requestPriority = "metadata",
-      signal,
+      signal: callerSignal,
       ...fetchInit
     } = init;
+    const signal = requestSignal(callerSignal);
     const headers = new Headers(init.headers);
+    applyPluginUiHeaders(headers);
     if (init.body && !headers.has("content-type")) {
       headers.set("content-type", "application/json");
     }
     if (config.sessionToken) {
-      headers.set("x-megle-session", config.sessionToken);
+      headers.set("x-mangoo-session", config.sessionToken);
     }
     const method = (fetchInit.method ?? "GET").toUpperCase();
-    if (method !== "GET" && method !== "HEAD" && !headers.has("x-megle-context-revision") && observedContextRevision) {
-      headers.set("x-megle-context-revision", observedContextRevision);
+    if (method !== "GET" && method !== "HEAD" && !headers.has("x-mangoo-context-revision") && observedContextRevision) {
+      headers.set("x-mangoo-context-revision", observedContextRevision);
     }
 
     return scheduleCoreRequest(
@@ -224,7 +255,7 @@ export function createCoreClient(config: CoreClientConfig) {
           { ...fetchInit, headers },
           signal,
           async (response) => {
-            observedContextRevision = response.headers.get("x-megle-context-revision") ?? observedContextRevision;
+            observedContextRevision = response.headers.get("x-mangoo-context-revision") ?? observedContextRevision;
             if (!response.ok) {
               const body = await readResponseBody(response);
               throw new CoreApiError(response.status, body);
@@ -241,14 +272,16 @@ export function createCoreClient(config: CoreClientConfig) {
     path: string,
     init: ScheduledRequestInit = {}
   ): Promise<void> {
-    const { requestPriority = "metadata", signal, ...fetchInit } = init;
+    const { requestPriority = "metadata", signal: callerSignal, ...fetchInit } = init;
+    const signal = requestSignal(callerSignal);
     const headers = new Headers(init.headers);
+    applyPluginUiHeaders(headers);
     if (config.sessionToken) {
-      headers.set("x-megle-session", config.sessionToken);
+      headers.set("x-mangoo-session", config.sessionToken);
     }
     const method = (fetchInit.method ?? "GET").toUpperCase();
-    if (method !== "GET" && method !== "HEAD" && !headers.has("x-megle-context-revision") && observedContextRevision) {
-      headers.set("x-megle-context-revision", observedContextRevision);
+    if (method !== "GET" && method !== "HEAD" && !headers.has("x-mangoo-context-revision") && observedContextRevision) {
+      headers.set("x-mangoo-context-revision", observedContextRevision);
     }
     await scheduleCoreRequest(
       requestPriority,
@@ -259,7 +292,7 @@ export function createCoreClient(config: CoreClientConfig) {
           { ...fetchInit, headers },
           signal,
           async (response) => {
-            observedContextRevision = response.headers.get("x-megle-context-revision") ?? observedContextRevision;
+            observedContextRevision = response.headers.get("x-mangoo-context-revision") ?? observedContextRevision;
             if (!response.ok) {
               const body = await readResponseBody(response);
               throw new CoreApiError(response.status, body);
@@ -271,18 +304,20 @@ export function createCoreClient(config: CoreClientConfig) {
   }
 
   async function fetchBlob(path: string, options: BlobRequestOptions = {}): Promise<Blob> {
+    const signal = requestSignal(options.signal);
     const headers = new Headers();
+    applyPluginUiHeaders(headers);
     if (config.sessionToken) {
-      headers.set("x-megle-session", config.sessionToken);
+      headers.set("x-mangoo-session", config.sessionToken);
     }
     return scheduleCoreRequest(
       options.requestPriority ?? "resource",
-      options.signal,
+      signal,
       () =>
         fetchWithTimeout(
           resolveUrl(config.baseUrl, path),
           { headers },
-          options.signal,
+          signal,
           async (response) => {
             if (!response.ok) {
               const body = await readResponseBody(response);
@@ -299,18 +334,20 @@ export function createCoreClient(config: CoreClientConfig) {
     path: string,
     options: BlobRequestOptions = {}
   ): Promise<PreviewResource> {
+    const signal = requestSignal(options.signal);
     const headers = new Headers();
+    applyPluginUiHeaders(headers);
     if (config.sessionToken) {
-      headers.set("x-megle-session", config.sessionToken);
+      headers.set("x-mangoo-session", config.sessionToken);
     }
     return scheduleCoreRequest(
       options.requestPriority ?? "resource",
-      options.signal,
+      signal,
       () =>
         fetchWithTimeout(
           resolveUrl(config.baseUrl, path),
           { headers },
-          options.signal,
+          signal,
           async (response) => {
             if (!response.ok) {
               const body = await readResponseBody(response);
@@ -318,7 +355,7 @@ export function createCoreClient(config: CoreClientConfig) {
             }
             return {
               blob: await response.blob(),
-              tier: response.headers.get("x-megle-preview-tier") ?? "original"
+              tier: response.headers.get("x-mangoo-preview-tier") ?? "original"
             };
           }
         ),
@@ -351,17 +388,32 @@ export function createCoreClient(config: CoreClientConfig) {
         body: JSON.stringify(body),
         signal: options.signal
       }),
+    openLibrary: (body: OpenLibraryRequest, contextRevision: number, options: CoreRequestOptions = {}) =>
+      request<OpenLibraryResponse>("/libraries/open", {
+        method: "POST",
+        headers: { "x-mangoo-context-revision": String(contextRevision) },
+        requestPriority: options.requestPriority ?? "interactive",
+        body: JSON.stringify(body),
+        signal: options.signal
+      }),
+    forgetLibrary: (libraryUuid: string, contextRevision: number, options: CoreRequestOptions = {}) =>
+      request<ActiveLibraryResponse>(`/libraries/${encodeURIComponent(libraryUuid)}/registration`, {
+        method: "DELETE",
+        headers: { "x-mangoo-context-revision": String(contextRevision) },
+        requestPriority: options.requestPriority ?? "interactive",
+        signal: options.signal
+      }),
     activateLibrary: (libraryUuid: string, contextRevision: number, options: CoreRequestOptions = {}) =>
       request<ActiveLibraryResponse>(`/libraries/${encodeURIComponent(libraryUuid)}/activate`, {
         method: "POST",
-        headers: { "x-megle-context-revision": String(contextRevision) },
+        headers: { "x-mangoo-context-revision": String(contextRevision) },
         requestPriority: options.requestPriority ?? "interactive",
         signal: options.signal
       }),
     updateLibrary: (libraryUuid: string, contextRevision: number, body: UpdateLibraryRequest, options: CoreRequestOptions = {}) =>
       request<LibrarySummary>(`/libraries/${encodeURIComponent(libraryUuid)}`, {
         method: "PATCH",
-        headers: { "x-megle-context-revision": String(contextRevision) },
+        headers: { "x-mangoo-context-revision": String(contextRevision) },
         requestPriority: options.requestPriority ?? "interactive",
         body: JSON.stringify(body),
         signal: options.signal
@@ -369,14 +421,14 @@ export function createCoreClient(config: CoreClientConfig) {
     removeLocalLibrary: (libraryUuid: string, contextRevision: number, options: CoreRequestOptions = {}) =>
       requestNoContent(`/libraries/${encodeURIComponent(libraryUuid)}/local-copy`, {
         method: "DELETE",
-        headers: { "x-megle-context-revision": String(contextRevision) },
+        headers: { "x-mangoo-context-revision": String(contextRevision) },
         requestPriority: options.requestPriority ?? "interactive",
         signal: options.signal
       }),
     enableLibrarySync: (libraryUuid: string, contextRevision: number, body: EnableLibrarySyncRequest, options: CoreRequestOptions = {}) =>
       request<LibrarySummary>(`/libraries/${encodeURIComponent(libraryUuid)}/sync-binding`, {
         method: "POST",
-        headers: { "x-megle-context-revision": String(contextRevision) },
+        headers: { "x-mangoo-context-revision": String(contextRevision) },
         requestPriority: options.requestPriority ?? "interactive",
         body: JSON.stringify(body),
         signal: options.signal
@@ -384,7 +436,7 @@ export function createCoreClient(config: CoreClientConfig) {
     unbindLibrarySync: (libraryUuid: string, contextRevision: number, options: CoreRequestOptions = {}) =>
       requestNoContent(`/libraries/${encodeURIComponent(libraryUuid)}/sync-binding`, {
         method: "DELETE",
-        headers: { "x-megle-context-revision": String(contextRevision) },
+        headers: { "x-mangoo-context-revision": String(contextRevision) },
         requestPriority: options.requestPriority ?? "interactive",
         signal: options.signal
       }),
@@ -393,15 +445,15 @@ export function createCoreClient(config: CoreClientConfig) {
     listRemoteLibraries: (options: CoreRequestOptions = {}) => request<RemoteLibraryListResponse>("/sync/remote-libraries", { requestPriority: options.requestPriority ?? "background", signal: options.signal }),
     listRemoteLibraryRoots: (accountUuid: string, libraryUuid: string, params: { cursor?: string; limit?: number } = {}, options: CoreRequestOptions = {}) => request<RemoteLibraryRootListResponse>(`/sync/remote-libraries/${encodeURIComponent(accountUuid)}/${encodeURIComponent(libraryUuid)}/roots${stringPageQuery(params)}`, { requestPriority: options.requestPriority ?? "background", signal: options.signal }),
     preflightLibrarySync: (libraryUuid: string, body: SyncPreflightRequest, options: CoreRequestOptions = {}) => request<SyncPreflightResponse>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/preflight`, { method: "POST", requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
-    startLibrarySyncEnable: (libraryUuid: string, contextRevision: number, body: SyncEnableRequest, options: CoreRequestOptions = {}) => request<SyncOperation>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/enable`, { method: "POST", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
+    startLibrarySyncEnable: (libraryUuid: string, contextRevision: number, body: SyncEnableRequest, options: CoreRequestOptions = {}) => request<SyncOperation>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/enable`, { method: "POST", headers: { "x-mangoo-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
     pauseLibrarySync: (libraryUuid: string, contextRevision: number, body: SyncCommandRequest) => syncCommand(libraryUuid,"pause",contextRevision,body),
     resumeLibrarySync: (libraryUuid: string, contextRevision: number, body: SyncCommandRequest) => syncCommand(libraryUuid,"resume",contextRevision,body),
     syncLibraryNow: (libraryUuid: string, contextRevision: number, body: SyncCommandRequest) => syncCommand(libraryUuid,"sync-now",contextRevision,body),
     retryLibrarySync: (libraryUuid: string, contextRevision: number, body: SyncCommandRequest) => syncCommand(libraryUuid,"retry",contextRevision,body),
     planLibrarySyncUnbind: (libraryUuid: string) => request<SyncUnbindPlan>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/unbind-plan`, { method: "POST", requestPriority: "interactive" }),
-    commitLibrarySyncUnbind: (libraryUuid: string, contextRevision: number, body: SyncUnbindCommitRequest) => request<SyncOperation>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/unbind-commit`, { method: "POST", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: "interactive", body: JSON.stringify(body) }),
+    commitLibrarySyncUnbind: (libraryUuid: string, contextRevision: number, body: SyncUnbindCommitRequest) => request<SyncOperation>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/unbind-commit`, { method: "POST", headers: { "x-mangoo-context-revision": String(contextRevision) }, requestPriority: "interactive", body: JSON.stringify(body) }),
     preflightLibrarySyncReconnect: (libraryUuid: string, body: SyncReconnectPreflightRequest) => request<SyncReconnectPlan>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/reconnect-preflight`, { method: "POST", requestPriority: "interactive", body: JSON.stringify(body) }),
-    commitLibrarySyncReconnect: (libraryUuid: string, contextRevision: number, body: SyncReconnectCommitRequest) => request<SyncOperation>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/reconnect-commit`, { method: "POST", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: "interactive", body: JSON.stringify(body) }),
+    commitLibrarySyncReconnect: (libraryUuid: string, contextRevision: number, body: SyncReconnectCommitRequest) => request<SyncOperation>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/reconnect-commit`, { method: "POST", headers: { "x-mangoo-context-revision": String(contextRevision) }, requestPriority: "interactive", body: JSON.stringify(body) }),
     preflightSyncRestore: (body: SyncRestorePreflightRequest) => request<SyncRestorePreflight>("/sync/restores/preflight", { method: "POST", requestPriority: "interactive", body: JSON.stringify(body) }),
     startSyncRestore: (body: SyncRestoreStartRequest) => request<SyncRestoreListResponse>("/sync/restores", { method: "POST", requestPriority: "interactive", body: JSON.stringify(body) }),
     getSyncRestore: (restoreUuid: string, options: CoreRequestOptions = {}) => request<SyncRestorePlan>(`/sync/restores/${encodeURIComponent(restoreUuid)}`, { requestPriority: options.requestPriority ?? "background", signal: options.signal }),
@@ -415,35 +467,35 @@ export function createCoreClient(config: CoreClientConfig) {
       const suffix = search.size ? `?${search.toString()}` : "";
       return request<SyncConflictListResponse>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/conflicts${suffix}`, { requestPriority: options.requestPriority ?? "background", signal: options.signal });
     },
-    resolveLibrarySyncConflict: (libraryUuid: string, conflictUuid: string, contextRevision: number, body: SyncConflictResolutionRequest) => request<SyncOperation>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/conflicts/${encodeURIComponent(conflictUuid)}/resolve`, { method: "POST", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: "interactive", body: JSON.stringify(body) }),
+    resolveLibrarySyncConflict: (libraryUuid: string, conflictUuid: string, contextRevision: number, body: SyncConflictResolutionRequest) => request<SyncOperation>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/conflicts/${encodeURIComponent(conflictUuid)}/resolve`, { method: "POST", headers: { "x-mangoo-context-revision": String(contextRevision) }, requestPriority: "interactive", body: JSON.stringify(body) }),
     listSyncFolders: (libraryUuid: string, options: CoreRequestOptions = {}) => request<SyncFolderListResponse>(`/libraries/${encodeURIComponent(libraryUuid)}/sync-folders`, { requestPriority: options.requestPriority ?? "background", signal: options.signal }),
     getSyncFolder: (libraryUuid: string, rootUuid: string, options: CoreRequestOptions = {}) => request<SyncFolderRecord>(`/libraries/${encodeURIComponent(libraryUuid)}/sync-folders/${encodeURIComponent(rootUuid)}`, { requestPriority: options.requestPriority ?? "metadata", signal: options.signal }),
     getSyncFolderSettings: (libraryUuid: string, options: CoreRequestOptions = {}) => request<SyncFolderSettings>(`/libraries/${encodeURIComponent(libraryUuid)}/sync-folders/settings`, { requestPriority: options.requestPriority ?? "metadata", signal: options.signal }),
-    updateSyncFolderSettings: (libraryUuid: string, contextRevision: number, body: UpdateSyncFolderSettingsRequest, options: CoreRequestOptions = {}) => request<SyncFolderSettings>(`/libraries/${encodeURIComponent(libraryUuid)}/sync-folders/settings`, { method: "PATCH", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
+    updateSyncFolderSettings: (libraryUuid: string, contextRevision: number, body: UpdateSyncFolderSettingsRequest, options: CoreRequestOptions = {}) => request<SyncFolderSettings>(`/libraries/${encodeURIComponent(libraryUuid)}/sync-folders/settings`, { method: "PATCH", headers: { "x-mangoo-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
     preflightSyncFolderEnrollment: (libraryUuid: string, body: RootPathPreflightRequest, options: CoreRequestOptions = {}) => request<RootPathPreflightResult>(`/libraries/${encodeURIComponent(libraryUuid)}/sync-folders/enrollment/preflight`, { method: "POST", requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
-    commitSyncFolderEnrollment: (libraryUuid: string, contextRevision: number, body: RootEnrollmentCommitRequest, options: CoreRequestOptions = {}) => request<RootOperation>(`/libraries/${encodeURIComponent(libraryUuid)}/sync-folders/enrollment/commit`, { method: "POST", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
+    commitSyncFolderEnrollment: (libraryUuid: string, contextRevision: number, body: RootEnrollmentCommitRequest, options: CoreRequestOptions = {}) => request<RootOperation>(`/libraries/${encodeURIComponent(libraryUuid)}/sync-folders/enrollment/commit`, { method: "POST", headers: { "x-mangoo-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
     preflightSyncFolderSelection: (libraryUuid: string, body: RootSelectionPreflightRequest, options: CoreRequestOptions = {}) => request<RootSelectionPreflightResult>(`/libraries/${encodeURIComponent(libraryUuid)}/sync-folders/selection/preflight`, { method: "POST", requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
-    commitSyncFolderSelection: (libraryUuid: string, contextRevision: number, body: RootSelectionCommitRequest, options: CoreRequestOptions = {}) => request<RootOperationListResponse>(`/libraries/${encodeURIComponent(libraryUuid)}/sync-folders/selection/commit`, { method: "POST", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
+    commitSyncFolderSelection: (libraryUuid: string, contextRevision: number, body: RootSelectionCommitRequest, options: CoreRequestOptions = {}) => request<RootOperationListResponse>(`/libraries/${encodeURIComponent(libraryUuid)}/sync-folders/selection/commit`, { method: "POST", headers: { "x-mangoo-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
     preflightSyncFolderRebind: (libraryUuid: string, rootUuid: string, body: RootRebindPreflightRequest, options: CoreRequestOptions = {}) => request<RootRebindPlan>(rootSyncFolderPath(libraryUuid, rootUuid, "/rebind/preflight"), { method: "POST", requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
-    commitSyncFolderRebind: (libraryUuid: string, rootUuid: string, contextRevision: number, body: RootRebindCommitRequest, options: CoreRequestOptions = {}) => request<RootOperation>(rootSyncFolderPath(libraryUuid, rootUuid, "/rebind/commit"), { method: "POST", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
-    commandSyncFolder: (libraryUuid: string, rootUuid: string, command: "pause" | "resume" | "stop-sync", contextRevision: number, body: RootCommandRequest, options: CoreRequestOptions = {}) => request<RootOperation>(rootSyncFolderPath(libraryUuid, rootUuid, `/commands/${encodeURIComponent(command)}`), { method: "POST", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
+    commitSyncFolderRebind: (libraryUuid: string, rootUuid: string, contextRevision: number, body: RootRebindCommitRequest, options: CoreRequestOptions = {}) => request<RootOperation>(rootSyncFolderPath(libraryUuid, rootUuid, "/rebind/commit"), { method: "POST", headers: { "x-mangoo-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
+    commandSyncFolder: (libraryUuid: string, rootUuid: string, command: "pause" | "resume" | "stop-sync", contextRevision: number, body: RootCommandRequest, options: CoreRequestOptions = {}) => request<RootOperation>(rootSyncFolderPath(libraryUuid, rootUuid, `/commands/${encodeURIComponent(command)}`), { method: "POST", headers: { "x-mangoo-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
     preflightSyncFolderStop: (libraryUuid: string, rootUuid: string, body: RootOperationFenceRequest, options: CoreRequestOptions = {}) => request<RootStopPlan>(rootSyncFolderPath(libraryUuid, rootUuid, "/stop/preflight"), { method: "POST", requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
-    commitSyncFolderStop: (libraryUuid: string, rootUuid: string, contextRevision: number, body: RootStopCommitRequest, options: CoreRequestOptions = {}) => request<RootOperation>(rootSyncFolderPath(libraryUuid, rootUuid, "/stop/commit"), { method: "POST", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
+    commitSyncFolderStop: (libraryUuid: string, rootUuid: string, contextRevision: number, body: RootStopCommitRequest, options: CoreRequestOptions = {}) => request<RootOperation>(rootSyncFolderPath(libraryUuid, rootUuid, "/stop/commit"), { method: "POST", headers: { "x-mangoo-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
     preflightSyncFolderReenable: (libraryUuid: string, rootUuid: string, body: RootOperationFenceRequest, options: CoreRequestOptions = {}) => request<RootComparisonPlan>(rootSyncFolderPath(libraryUuid, rootUuid, "/reenable/preflight"), { method: "POST", requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
-    commitSyncFolderReenable: (libraryUuid: string, rootUuid: string, contextRevision: number, body: RootReenableCommitRequest, options: CoreRequestOptions = {}) => request<RootOperation>(rootSyncFolderPath(libraryUuid, rootUuid, "/reenable/commit"), { method: "POST", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
+    commitSyncFolderReenable: (libraryUuid: string, rootUuid: string, contextRevision: number, body: RootReenableCommitRequest, options: CoreRequestOptions = {}) => request<RootOperation>(rootSyncFolderPath(libraryUuid, rootUuid, "/reenable/commit"), { method: "POST", headers: { "x-mangoo-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
     getSyncFolderComparison: (libraryUuid: string, rootUuid: string, planUuid: string, options: CoreRequestOptions = {}) => request<RootComparisonPlan>(rootSyncFolderPath(libraryUuid, rootUuid, `/reenable/comparisons/${encodeURIComponent(planUuid)}`), { requestPriority: options.requestPriority ?? "metadata", signal: options.signal }),
     listSyncFolderComparisonItems: (libraryUuid: string, rootUuid: string, planUuid: string, params: { cursor?: number; limit?: number } = {}, options: CoreRequestOptions = {}) => request<RootComparisonItemListResponse>(`${rootSyncFolderPath(libraryUuid, rootUuid, `/reenable/comparisons/${encodeURIComponent(planUuid)}/items`)}${numericPageQuery(params)}`, { requestPriority: options.requestPriority ?? "metadata", signal: options.signal }),
-    resolveSyncFolderComparisonItem: (libraryUuid: string, rootUuid: string, planUuid: string, itemOrdinal: number, contextRevision: number, body: RootComparisonItemResolutionRequest, options: CoreRequestOptions = {}) => request<RootComparisonItem>(rootSyncFolderPath(libraryUuid, rootUuid, `/reenable/comparisons/${encodeURIComponent(planUuid)}/items/${itemOrdinal}/resolve`), { method: "POST", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
+    resolveSyncFolderComparisonItem: (libraryUuid: string, rootUuid: string, planUuid: string, itemOrdinal: number, contextRevision: number, body: RootComparisonItemResolutionRequest, options: CoreRequestOptions = {}) => request<RootComparisonItem>(rootSyncFolderPath(libraryUuid, rootUuid, `/reenable/comparisons/${encodeURIComponent(planUuid)}/items/${itemOrdinal}/resolve`), { method: "POST", headers: { "x-mangoo-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
     preflightSyncFolderRename: (libraryUuid: string, rootUuid: string, body: RootLogicalRenameRequest, options: CoreRequestOptions = {}) => request<RootLogicalRenamePlan>(rootSyncFolderPath(libraryUuid, rootUuid, "/rename/preflight"), { method: "POST", requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
-    commitSyncFolderRename: (libraryUuid: string, rootUuid: string, contextRevision: number, body: RootLogicalRenameCommitRequest, options: CoreRequestOptions = {}) => request<RootOperation>(rootSyncFolderPath(libraryUuid, rootUuid, "/rename/commit"), { method: "POST", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
+    commitSyncFolderRename: (libraryUuid: string, rootUuid: string, contextRevision: number, body: RootLogicalRenameCommitRequest, options: CoreRequestOptions = {}) => request<RootOperation>(rootSyncFolderPath(libraryUuid, rootUuid, "/rename/commit"), { method: "POST", headers: { "x-mangoo-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
     preflightSyncFolderRelocation: (libraryUuid: string, rootUuid: string, body: RootRelocationPreflightRequest, options: CoreRequestOptions = {}) => request<RootPathPreflightResult>(rootSyncFolderPath(libraryUuid, rootUuid, "/relocations/preflight"), { method: "POST", requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
-    startSyncFolderRelocation: (libraryUuid: string, rootUuid: string, contextRevision: number, body: RootRelocationCommitRequest, options: CoreRequestOptions = {}) => request<RootOperation>(rootSyncFolderPath(libraryUuid, rootUuid, "/relocations"), { method: "POST", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
+    startSyncFolderRelocation: (libraryUuid: string, rootUuid: string, contextRevision: number, body: RootRelocationCommitRequest, options: CoreRequestOptions = {}) => request<RootOperation>(rootSyncFolderPath(libraryUuid, rootUuid, "/relocations"), { method: "POST", headers: { "x-mangoo-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
     getSyncFolderRelocation: (libraryUuid: string, rootUuid: string, operationUuid: string, options: CoreRequestOptions = {}) => request<RootOperation>(rootSyncFolderPath(libraryUuid, rootUuid, `/relocations/${encodeURIComponent(operationUuid)}`), { requestPriority: options.requestPriority ?? "background", signal: options.signal }),
     listSyncFolderOperations: (libraryUuid: string, rootUuid: string, params: { cursor?: string; limit?: number; state?: "all" | "active" | "terminal" } = {}, options: CoreRequestOptions = {}) => request<RootOperationPageResponse>(`${rootSyncFolderPath(libraryUuid, rootUuid, "/operations")}${query(params)}`, { requestPriority: options.requestPriority ?? "background", signal: options.signal }),
     getSyncFolderOperation: (libraryUuid: string, rootUuid: string, operationUuid: string, options: CoreRequestOptions = {}) => request<RootOperation>(rootSyncFolderPath(libraryUuid, rootUuid, `/operations/${encodeURIComponent(operationUuid)}`), { requestPriority: options.requestPriority ?? "background", signal: options.signal }),
-    commandSyncFolderRelocation: (libraryUuid: string, rootUuid: string, operationUuid: string, action: "cancel" | "retry", contextRevision: number, body: RootOperationFenceRequest, options: CoreRequestOptions = {}) => request<RootOperation>(rootSyncFolderPath(libraryUuid, rootUuid, `/relocations/${encodeURIComponent(operationUuid)}/${encodeURIComponent(action)}`), { method: "POST", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
+    commandSyncFolderRelocation: (libraryUuid: string, rootUuid: string, operationUuid: string, action: "cancel" | "retry", contextRevision: number, body: RootOperationFenceRequest, options: CoreRequestOptions = {}) => request<RootOperation>(rootSyncFolderPath(libraryUuid, rootUuid, `/relocations/${encodeURIComponent(operationUuid)}/${encodeURIComponent(action)}`), { method: "POST", headers: { "x-mangoo-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
     listSyncFolderConflicts: (libraryUuid: string, rootUuid: string, params: { cursor?: string; limit?: number } = {}, options: CoreRequestOptions = {}) => request<RootConflictListResponse>(`${rootSyncFolderPath(libraryUuid, rootUuid, "/conflicts")}${stringPageQuery(params)}`, { requestPriority: options.requestPriority ?? "background", signal: options.signal }),
-    resolveSyncFolderConflict: (libraryUuid: string, rootUuid: string, conflictUuid: string, contextRevision: number, body: RootLocationConflictResolutionRequest, options: CoreRequestOptions = {}) => request<RootOperation>(rootSyncFolderPath(libraryUuid, rootUuid, `/conflicts/${encodeURIComponent(conflictUuid)}/resolve`), { method: "POST", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
+    resolveSyncFolderConflict: (libraryUuid: string, rootUuid: string, conflictUuid: string, contextRevision: number, body: RootLocationConflictResolutionRequest, options: CoreRequestOptions = {}) => request<RootOperation>(rootSyncFolderPath(libraryUuid, rootUuid, `/conflicts/${encodeURIComponent(conflictUuid)}/resolve`), { method: "POST", headers: { "x-mangoo-context-revision": String(contextRevision) }, requestPriority: options.requestPriority ?? "interactive", body: JSON.stringify(body), signal: options.signal }),
     getLibrarySyncDiagnostics: (libraryUuid: string) => request<Record<string, unknown>>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/diagnostics`, { requestPriority: "background" }),
     exportLibrarySyncDiagnostics: (libraryUuid: string) => request<Record<string, unknown>>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/diagnostics/export`, { method: "POST", requestPriority: "interactive" }),
     listRoots: () => request<Page<RootRecord>>("/roots", { requestPriority: "navigation" }),
@@ -534,12 +586,62 @@ export function createCoreClient(config: CoreClientConfig) {
         method: "POST",
         requestPriority: "interactive"
       }),
+    updateRootAppearance: (
+      rootId: number,
+      input: UpdateFolderAppearanceRequest,
+      options: CoreRequestOptions & { contextRevision: number }
+    ) => request<RootRecord>(`/roots/${rootId}/appearance`, {
+      method: "PATCH", body: JSON.stringify(input),
+      headers: { "X-Mangoo-Context-Revision": String(options.contextRevision) },
+      requestPriority: options.requestPriority ?? "interactive", signal: options.signal
+    }),
+    getRootSort: (rootId: number, options: CoreRequestOptions = {}) =>
+      request<DirectorySortState>(`/roots/${rootId}/sort`, {
+        requestPriority: options.requestPriority ?? "navigation", signal: options.signal
+      }),
+    updateRootSort: (rootId: number, input: DirectorySortRule, options: CoreRequestOptions & { contextRevision: number }) =>
+      request<DirectorySortMutationResult>(`/roots/${rootId}/sort`, {
+        method: "PATCH", body: JSON.stringify(input),
+        headers: { "X-Mangoo-Context-Revision": String(options.contextRevision) },
+        requestPriority: options.requestPriority ?? "interactive", signal: options.signal
+      }),
+    resetRootSort: (rootId: number, options: CoreRequestOptions & { contextRevision: number }) =>
+      request<DirectorySortMutationResult>(`/roots/${rootId}/sort`, {
+        method: "DELETE", headers: { "X-Mangoo-Context-Revision": String(options.contextRevision) },
+        requestPriority: options.requestPriority ?? "interactive", signal: options.signal
+      }),
+    getFolderSort: (folderId: number, options: CoreRequestOptions = {}) =>
+      request<DirectorySortState>(`/folders/${folderId}/sort`, {
+        requestPriority: options.requestPriority ?? "navigation", signal: options.signal
+      }),
+    updateFolderSort: (folderId: number, input: DirectorySortRule, options: CoreRequestOptions & { contextRevision: number }) =>
+      request<DirectorySortMutationResult>(`/folders/${folderId}/sort`, {
+        method: "PATCH", body: JSON.stringify(input),
+        headers: { "X-Mangoo-Context-Revision": String(options.contextRevision) },
+        requestPriority: options.requestPriority ?? "interactive", signal: options.signal
+      }),
+    resetFolderSort: (folderId: number, options: CoreRequestOptions & { contextRevision: number }) =>
+      request<DirectorySortMutationResult>(`/folders/${folderId}/sort`, {
+        method: "DELETE", headers: { "X-Mangoo-Context-Revision": String(options.contextRevision) },
+        requestPriority: options.requestPriority ?? "interactive", signal: options.signal
+      }),
+    updateFolderAppearance: (
+      folderId: number,
+      input: UpdateFolderAppearanceRequest,
+      options: CoreRequestOptions & { contextRevision: number }
+    ) => request<FolderRecord>(`/folders/${folderId}/appearance`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+      headers: { "X-Mangoo-Context-Revision": String(options.contextRevision) },
+      requestPriority: options.requestPriority ?? "interactive",
+      signal: options.signal
+    }),
     listFolderChildren: (
       folderId: number,
       params: ListFolderChildrenParams = {},
       options: CoreRequestOptions = {}
     ) =>
-      request<Page<FolderRecord>>(`/folders/${folderId}/children${query(params)}`, {
+      request<FolderChildrenPage>(`/folders/${folderId}/children${query(params)}`, {
         requestPriority: options.requestPriority ?? "navigation",
         signal: options.signal
       }),
@@ -553,8 +655,11 @@ export function createCoreClient(config: CoreClientConfig) {
         requestPriority: options.requestPriority ?? "navigation",
         signal: options.signal
       }),
-    getMedia: (fileId: number) =>
-      request<MediaRecord>(`/media/${fileId}`, { requestPriority: "interactive" }),
+    getMedia: (fileId: number, options: CoreRequestOptions = {}) =>
+      request<MediaRecord>(`/media/${fileId}`, {
+        requestPriority: options.requestPriority ?? "interactive",
+        signal: options.signal
+      }),
     getMediaPosition: (
       fileId: number,
       params: Pick<ListMediaParams, "rootId" | "folderId" | "includeDescendants" | "sort">,
@@ -586,6 +691,18 @@ export function createCoreClient(config: CoreClientConfig) {
         }
       );
     },
+    createPlaybackSession: (fileId: number, options: CoreRequestOptions = {}) =>
+      request<PlaybackSession>(`/media/${fileId}/playback-sessions`, {
+        ...options, method: "POST", requestPriority: options.requestPriority ?? "interactive"
+      }).then(resolvePlaybackSession),
+    renewPlaybackSession: (sessionId: string, options: CoreRequestOptions = {}) =>
+      request<PlaybackSession>(`/playback-sessions/${encodeURIComponent(sessionId)}/renew`, {
+        ...options, method: "POST", requestPriority: options.requestPriority ?? "interactive"
+      }).then(resolvePlaybackSession),
+    revokePlaybackSession: (sessionId: string, options: CoreRequestOptions = {}) =>
+      requestNoContent(`/playback-sessions/${encodeURIComponent(sessionId)}`, {
+        ...options, method: "DELETE", requestPriority: options.requestPriority ?? "interactive"
+      }),
     getPreviewBlob: (fileId: number, options: BlobRequestOptions = {}) =>
       fetchBlob(`/media/${fileId}/preview${query({ v: options.version })}`, {
         ...options,
@@ -683,7 +800,10 @@ export function createCoreClient(config: CoreClientConfig) {
         requestPriority: "metadata",
         body: JSON.stringify(body)
       }),
-    listPlugins: () => request<HostPluginListResponse>("/plugins", { requestPriority: "metadata" }),
+    listPlugins: (options: CoreRequestOptions = {}) => request<HostPluginListResponse>("/plugins", {
+      requestPriority: options.requestPriority ?? "metadata",
+      signal: options.signal
+    }),
     getPlugin: (pluginId: string) =>
       request<HostPluginProjection>(`/plugins/${encodeURIComponent(pluginId)}`, {
         requestPriority: "metadata"
@@ -722,9 +842,11 @@ export function createCoreClient(config: CoreClientConfig) {
       request<PluginCommandResponse>(`/plugins/${encodeURIComponent(pluginId)}/auth/complete`, { method: "POST", requestPriority: "interactive", body: JSON.stringify(input) }),
     cancelPluginAuth: (pluginId: string, input: PluginAuthCancelRequest) =>
       request<PluginCommandResponse>(`/plugins/${encodeURIComponent(pluginId)}/auth/cancel`, { method: "POST", requestPriority: "interactive", body: JSON.stringify(input) }),
-    getOneDriveConfiguration: () => request<OneDriveConfiguration>("/plugins/com.megle.onedrive/configuration", { requestPriority: "metadata" }),
-    planOneDriveConfiguration: (input: OneDriveConfigurationPlanRequest) => request<OneDriveConfigurationPlan>("/plugins/com.megle.onedrive/configuration/plan", { method: "POST", requestPriority: "interactive", body: JSON.stringify(input) }),
-    commitOneDriveConfiguration: (input: OneDriveConfigurationCommitRequest) => request<OneDriveConfiguration>("/plugins/com.megle.onedrive/configuration", { method: "PUT", requestPriority: "interactive", body: JSON.stringify(input) }),
+    resolvePluginExternalLink: (pluginId: string, input: PluginExternalLinkRequest) => request<PluginExternalLink>(`/plugins/${encodeURIComponent(pluginId)}/external-link`, { method: "POST", requestPriority: "interactive", body: JSON.stringify(input) }),
+    getPluginViewDocument: (pluginId: string, viewId: string, options: CoreRequestOptions = {}) => request<HostPluginViewDocument>(`/plugins/${encodeURIComponent(pluginId)}/views/${encodeURIComponent(viewId)}`, { requestPriority: options.requestPriority ?? "interactive", signal: options.signal }),
+    getPluginConfiguration: (pluginId: string) => request<PluginConfiguration>(`/plugins/${encodeURIComponent(pluginId)}/configuration`, { requestPriority: "metadata" }),
+    planPluginConfiguration: (pluginId: string, input: PluginConfigurationPlanRequest) => request<PluginConfigurationPlan>(`/plugins/${encodeURIComponent(pluginId)}/configuration/plan`, { method: "POST", requestPriority: "interactive", body: JSON.stringify(input) }),
+    commitPluginConfiguration: (pluginId: string, input: PluginConfigurationCommitRequest) => request<PluginConfiguration>(`/plugins/${encodeURIComponent(pluginId)}/configuration`, { method: "PUT", requestPriority: "interactive", body: JSON.stringify(input) }),
     signOutPlugin: (pluginId: string) =>
       request<PluginCommandResponse>(`/plugins/${encodeURIComponent(pluginId)}/auth/sign-out`, { method: "POST", requestPriority: "interactive" }),
     getPluginHealth: (pluginId: string) =>
@@ -733,8 +855,18 @@ export function createCoreClient(config: CoreClientConfig) {
       request<PluginDiagnosticsResponse>(`/plugins/${encodeURIComponent(pluginId)}/diagnostics`, { requestPriority: "metadata" })
   };
 
+  function resolvePlaybackSession(session: PlaybackSession): PlaybackSession {
+    if (!session || typeof session.id !== "string" || !session.id ||
+        typeof session.src !== "string" || !/^\/playback\/[a-zA-Z0-9_-]{32,128}$/.test(session.src) ||
+        !Number.isSafeInteger(session.expiresAt) || session.expiresAt <= 0 ||
+        !Number.isSafeInteger(session.renewAfterMs) || session.renewAfterMs < 1 || session.renewAfterMs > 30_000) {
+      throw new TypeError("Invalid playback session response");
+    }
+    return { ...session, src: resolveUrl(config.baseUrl, session.src) };
+  }
+
   function syncCommand(libraryUuid: string, action: string, contextRevision: number, body: SyncCommandRequest): Promise<SyncOperation> {
-    return request<SyncOperation>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/${action}`, { method: "POST", headers: { "x-megle-context-revision": String(contextRevision) }, requestPriority: "interactive", body: JSON.stringify(body) });
+    return request<SyncOperation>(`/libraries/${encodeURIComponent(libraryUuid)}/sync/${action}`, { method: "POST", headers: { "x-mangoo-context-revision": String(contextRevision) }, requestPriority: "interactive", body: JSON.stringify(body) });
   }
 }
 

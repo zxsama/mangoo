@@ -22,11 +22,13 @@ use crate::host_registry::HostRegistry;
 use crate::library_manager::{ActiveSnapshot, LibraryManager, LibraryRuntimeResources};
 use crate::roots::reachability::{refresh_root_reachability, RootReachability};
 
+mod playback;
+mod plugin_ui_admission;
 pub mod routes;
 
 #[allow(dead_code)]
 pub const API_PREFIX: &str = "/api";
-pub const SESSION_HEADER: &str = "X-Megle-Session";
+pub const SESSION_HEADER: &str = "X-Mangoo-Session";
 pub(crate) const NOTIFICATION_OUTBOX_READ_CONCURRENCY: usize = 4;
 /// Concurrent preview decodes. Deliberately small: each one can hold a
 /// full-resolution decoded image, and they share Tokio's blocking pool with
@@ -142,9 +144,13 @@ impl Drop for NotificationOutboxTestActivity {
 
 #[derive(Clone)]
 pub struct AppState {
+    pub(crate) playback_sessions: Arc<playback::PlaybackSessions>,
     // Runtime-owned equivalent: notification_outbox_wake: Arc<tokio::sync::Notify>
     active: Arc<std::sync::RwLock<ActiveSnapshot>>,
     request_gate: Arc<tokio::sync::RwLock<()>>,
+    /// Separate from Provider lifecycle mutexes: requests never upgrade this
+    /// lease, including plugin UI commands that mutate their own lifecycle.
+    plugin_ui_gate: Arc<tokio::sync::RwLock<()>>,
     pub library_manager: Option<Arc<LibraryManager>>,
     pub(crate) plugin_auth_flows: Arc<crate::plugins::auth_flow::AuthFlowRegistry>,
     pub(crate) plugin_auth_workers: Arc<AsyncMutex<HashMap<String, PluginAuthWorker>>>,
@@ -182,6 +188,7 @@ impl AppState {
     ) -> Self {
         let runtime = LibraryRuntimeResources::from_database_with_task_queue(database, task_queue);
         Self {
+            playback_sessions: Arc::new(playback::PlaybackSessions::default()),
             active: Arc::new(std::sync::RwLock::new(ActiveSnapshot {
                 library_uuid: None,
                 context_revision: 0,
@@ -189,6 +196,7 @@ impl AppState {
                 runtime: Some(runtime),
             })),
             request_gate: Arc::new(tokio::sync::RwLock::new(())),
+            plugin_ui_gate: Arc::new(tokio::sync::RwLock::new(())),
             library_manager: None,
             plugin_auth_flows: Arc::new(crate::plugins::auth_flow::AuthFlowRegistry::default()),
             plugin_auth_workers: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -205,6 +213,7 @@ impl AppState {
         let runtime = LibraryRuntimeResources::from_database(None, 1, database, None, None)
             .expect("construct library runtime");
         Self {
+            playback_sessions: Arc::new(playback::PlaybackSessions::default()),
             active: Arc::new(std::sync::RwLock::new(ActiveSnapshot {
                 library_uuid: None,
                 context_revision: 0,
@@ -212,6 +221,7 @@ impl AppState {
                 runtime: Some(runtime),
             })),
             request_gate: Arc::new(tokio::sync::RwLock::new(())),
+            plugin_ui_gate: Arc::new(tokio::sync::RwLock::new(())),
             library_manager: None,
             plugin_auth_flows: Arc::new(crate::plugins::auth_flow::AuthFlowRegistry::default()),
             plugin_auth_workers: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -270,8 +280,10 @@ impl AppState {
             Arc::clone(&request_gate),
         ));
         let state = Self {
+            playback_sessions: Arc::new(playback::PlaybackSessions::default()),
             active,
             request_gate,
+            plugin_ui_gate: Arc::new(tokio::sync::RwLock::new(())),
             library_manager: Some(Arc::clone(&manager)),
             plugin_auth_flows: Arc::new(crate::plugins::auth_flow::AuthFlowRegistry::default()),
             plugin_auth_workers: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -354,10 +366,22 @@ impl AppState {
 
     pub fn open_read_database(&self) -> anyhow::Result<Option<Database>> {
         let resources = self.resources()?;
+        self.open_runtime_read_database(&resources)
+    }
+
+    pub(super) fn open_runtime_read_database(
+        &self,
+        resources: &LibraryRuntimeResources,
+    ) -> anyhow::Result<Option<Database>> {
         let Some(path) = &resources.read_database_path else {
             return Ok(None);
         };
-        Ok(Some(Database::open(path)?))
+        let mut database = Database::open(path)?;
+        if let Some(manager) = &self.library_manager {
+            database
+                .attach_decoder_context(manager.decoder_manager(), resources.cancellation_token());
+        }
+        Ok(Some(database))
     }
 
     /// Whether a dedicated read connection can be opened (the database is
@@ -384,7 +408,7 @@ pub struct ApiConfig {
     pub session_token: Option<String>,
     pub allowed_origin: Option<HeaderValue>,
     /// When set, the directory holding the built web UI (`apps/web/dist`).
-    /// Triggered by `MEGLE_SERVE_WEB=1`. When `None`, no static UI is served
+    /// Triggered by `MANGOO_SERVE_WEB=1`. When `None`, no static UI is served
     /// and desktop dev keeps its current behavior.
     pub web_dir: Option<PathBuf>,
     /// When set, every request except `/api/health` requires HTTP Basic auth
@@ -446,16 +470,23 @@ pub fn router_with_state(state: AppState, config: ApiConfig) -> Router {
     }
     start_runtime_background_tasks(&state);
     let api_router = routes::router(state.clone())
+        .merge(playback::authenticated_router(state.clone()))
         .layer(middleware::from_fn_with_state(
-            state,
+            state.clone(),
             attach_library_context,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            plugin_ui_admission::admit_plugin_ui,
         ))
         .layer(middleware::from_fn_with_state(
             config.clone(),
             require_session_token,
         ));
 
-    let mut app = api_router;
+    // Capabilities authorize only these GET/HEAD media routes; every ordinary
+    // API keeps the existing session/context middleware above.
+    let mut app = api_router.merge(playback::stream_router(state));
 
     // Static UI serving is opt-in. When `web_dir` is set the UI is mounted
     // alongside the API router with a SPA `index.html` fallback for unknown
@@ -529,6 +560,30 @@ fn start_runtime_background_tasks(state: &AppState) {
     if !runtime.begin_background_ownership() {
         return;
     }
+    let writer = runtime.writer.clone();
+    let cancellation = runtime.cancellation_token();
+    runtime.own_background_task(tokio::spawn(async move {
+        loop {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            let delay = match writer
+                .write(|database| database.backfill_file_fts_batch(128))
+                .await
+            {
+                Ok(true) => break,
+                Ok(false) => std::time::Duration::from_millis(25),
+                Err(error) => {
+                    tracing::warn!(%error, "file search upgrade batch will retry");
+                    std::time::Duration::from_secs(5)
+                }
+            };
+            tokio::select! {
+                _ = cancellation.cancelled() => break,
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+    }));
     let token = runtime.cancellation_token();
     let probe_state = state.clone();
     runtime.own_background_task(tokio::spawn(run_root_reachability_probe(
@@ -648,15 +703,17 @@ mod credential_retirement_tests {
     #[test]
     fn retirement_reconciliation_deletes_the_old_secret_and_journal() {
         let path = std::env::temp_dir().join(format!(
-            "megle-credential-retirement-{}.sqlite",
+            "mangoo-credential-retirement-{}.sqlite",
             uuid::Uuid::now_v7()
         ));
         let registry = Arc::new(HostRegistry::open(&path).unwrap());
         registry
             .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
-                plugin_id: "com.megle.onedrive",
+                plugin_id: "com.mangoo.configurable-sync",
                 version: "1.0.0",
-                manifest_json: r#"{"manifestVersion":2}"#,
+                manifest_json: include_str!(
+                    "../../../../contracts/plugins/fixtures/valid-configurable-provider-v2.json"
+                ),
                 entry_relative_path: "bin/provider",
                 entry_sha256: &[7; 32],
                 install_root: std::path::Path::new("bundled"),
@@ -666,32 +723,48 @@ mod credential_retirement_tests {
             .unwrap();
         registry
             .upsert_plugin_account(
-                "onedrive-account",
-                "com.megle.onedrive",
-                Some("OneDrive"),
+                "configurable-account",
+                "com.mangoo.configurable-sync",
+                Some("Test Storage"),
                 "authenticated",
             )
             .unwrap();
         let store: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::default());
         let scope = SecretScope {
-            plugin_id: "com.megle.onedrive".into(),
-            account_uuid: "onedrive-account".into(),
-            namespace: crate::host_registry::ONEDRIVE_SECRET_NAMESPACE.into(),
-            purpose: crate::host_registry::ONEDRIVE_CREDENTIAL_PURPOSE.into(),
+            plugin_id: "com.mangoo.configurable-sync".into(),
+            account_uuid: "configurable-account".into(),
+            namespace: crate::host_registry::CONFIGURABLE_SECRET_NAMESPACE.into(),
+            purpose: crate::host_registry::CONFIGURABLE_CREDENTIAL_PURPOSE.into(),
         };
         let secret_ref = store.create(&scope, b"token").unwrap();
         registry
-            .set_plugin_account_secret("com.megle.onedrive", Some(&secret_ref), "authenticated", 1)
+            .set_plugin_account_secret(
+                "com.mangoo.configurable-sync",
+                Some(&secret_ref),
+                "authenticated",
+                1,
+            )
             .unwrap();
-        let initial = registry.onedrive_configuration().unwrap();
+        let initial = registry
+            .plugin_configuration("com.mangoo.configurable-sync")
+            .unwrap();
         let plan = registry
-            .plan_onedrive_configuration(
-                Some("01234567-89ab-4cde-8fab-0123456789ab"),
+            .plan_plugin_configuration(
+                "com.mangoo.configurable-sync",
+                &std::collections::BTreeMap::from([(
+                    "clientId".into(),
+                    Some("01234567-89ab-4cde-8fab-0123456789ab".into()),
+                )]),
                 initial.revision,
             )
             .unwrap();
         registry
-            .commit_onedrive_configuration(&plan.plan_uuid, plan.expected_revision, true)
+            .commit_plugin_configuration(
+                "com.mangoo.configurable-sync",
+                &plan.plan_uuid,
+                plan.expected_revision,
+                true,
+            )
             .unwrap();
         assert_eq!(
             reconcile_credential_retirements(&registry, &store, None, None).unwrap(),
@@ -709,15 +782,17 @@ mod credential_retirement_tests {
     #[test]
     fn retirement_reconciliation_deletes_nested_scoped_secret_without_provider() {
         let path = std::env::temp_dir().join(format!(
-            "megle-nested-credential-retirement-{}.sqlite",
+            "mangoo-nested-credential-retirement-{}.sqlite",
             uuid::Uuid::now_v7()
         ));
         let registry = Arc::new(HostRegistry::open(&path).unwrap());
         registry
             .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
-                plugin_id: "com.megle.onedrive",
+                plugin_id: "com.mangoo.configurable-sync",
                 version: "1.0.0",
-                manifest_json: r#"{"manifestVersion":2}"#,
+                manifest_json: include_str!(
+                    "../../../../contracts/plugins/fixtures/valid-configurable-provider-v2.json"
+                ),
                 entry_relative_path: "bin/provider",
                 entry_sha256: &[7; 32],
                 install_root: std::path::Path::new("bundled"),
@@ -727,18 +802,18 @@ mod credential_retirement_tests {
             .unwrap();
         registry
             .upsert_plugin_account(
-                "onedrive-account",
-                "com.megle.onedrive",
-                Some("OneDrive"),
+                "configurable-account",
+                "com.mangoo.configurable-sync",
+                Some("Test Storage"),
                 "authenticated",
             )
             .unwrap();
         registry
-            .set_plugin_intent("com.megle.onedrive", true, true)
+            .set_plugin_intent("com.mangoo.configurable-sync", true, true)
             .unwrap();
         registry
             .record_plugin_runtime_ready(
-                "com.megle.onedrive",
+                "com.mangoo.configurable-sync",
                 "session",
                 &["sync-provider.v1".into()],
             )
@@ -746,10 +821,10 @@ mod credential_retirement_tests {
         let fingerprint = registry.plugin_runtime_launches().unwrap()[0].fingerprint();
         let store: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::default());
         let oauth_scope = SecretScope {
-            plugin_id: "com.megle.onedrive".into(),
-            account_uuid: "onedrive-account".into(),
-            namespace: crate::host_registry::ONEDRIVE_SECRET_NAMESPACE.into(),
-            purpose: crate::host_registry::ONEDRIVE_CREDENTIAL_PURPOSE.into(),
+            plugin_id: "com.mangoo.configurable-sync".into(),
+            account_uuid: "configurable-account".into(),
+            namespace: crate::host_registry::CONFIGURABLE_SECRET_NAMESPACE.into(),
+            purpose: crate::host_registry::CONFIGURABLE_CREDENTIAL_PURPOSE.into(),
         };
         let upload_scope = SecretScope {
             purpose: "upload-session-v1".into(),
@@ -758,12 +833,17 @@ mod credential_retirement_tests {
         let oauth_ref = store.create(&oauth_scope, b"credential").unwrap();
         let upload_ref = store.create(&upload_scope, b"capability").unwrap();
         registry
-            .set_plugin_account_secret("com.megle.onedrive", Some(&oauth_ref), "authenticated", 1)
+            .set_plugin_account_secret(
+                "com.mangoo.configurable-sync",
+                Some(&oauth_ref),
+                "authenticated",
+                1,
+            )
             .unwrap();
         assert!(registry
             .register_plugin_secret_handle_for_launch(
-                "com.megle.onedrive",
-                "onedrive-account",
+                "com.mangoo.configurable-sync",
+                "configurable-account",
                 &fingerprint,
                 &upload_ref,
                 &upload_scope.namespace,
@@ -771,7 +851,7 @@ mod credential_retirement_tests {
             )
             .unwrap());
         registry
-            .sign_out_plugin_account("com.megle.onedrive", 1)
+            .sign_out_plugin_account("com.mangoo.configurable-sync", 1)
             .unwrap();
         assert_eq!(
             reconcile_credential_retirements(&registry, &store, None, None).unwrap(),
@@ -792,15 +872,17 @@ mod credential_retirement_tests {
     #[test]
     fn retirement_waits_until_the_old_provider_is_unregistered() {
         let path = std::env::temp_dir().join(format!(
-            "megle-credential-retirement-order-{}.sqlite",
+            "mangoo-credential-retirement-order-{}.sqlite",
             uuid::Uuid::now_v7()
         ));
         let registry = Arc::new(HostRegistry::open(&path).unwrap());
         registry
             .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
-                plugin_id: "com.megle.onedrive",
+                plugin_id: "com.mangoo.configurable-sync",
                 version: "1.0.0",
-                manifest_json: r#"{"manifestVersion":2}"#,
+                manifest_json: include_str!(
+                    "../../../../contracts/plugins/fixtures/valid-configurable-provider-v2.json"
+                ),
                 entry_relative_path: "bin/provider",
                 entry_sha256: &[7; 32],
                 install_root: std::path::Path::new("bundled"),
@@ -810,31 +892,36 @@ mod credential_retirement_tests {
             .unwrap();
         registry
             .upsert_plugin_account(
-                "onedrive-account",
-                "com.megle.onedrive",
-                Some("OneDrive"),
+                "configurable-account",
+                "com.mangoo.configurable-sync",
+                Some("Test Storage"),
                 "authenticated",
             )
             .unwrap();
         let store: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::default());
         let scope = SecretScope {
-            plugin_id: "com.megle.onedrive".into(),
-            account_uuid: "onedrive-account".into(),
-            namespace: crate::host_registry::ONEDRIVE_SECRET_NAMESPACE.into(),
-            purpose: crate::host_registry::ONEDRIVE_CREDENTIAL_PURPOSE.into(),
+            plugin_id: "com.mangoo.configurable-sync".into(),
+            account_uuid: "configurable-account".into(),
+            namespace: crate::host_registry::CONFIGURABLE_SECRET_NAMESPACE.into(),
+            purpose: crate::host_registry::CONFIGURABLE_CREDENTIAL_PURPOSE.into(),
         };
         let secret_ref = store.create(&scope, b"token").unwrap();
         registry
-            .set_plugin_account_secret("com.megle.onedrive", Some(&secret_ref), "authenticated", 1)
+            .set_plugin_account_secret(
+                "com.mangoo.configurable-sync",
+                Some(&secret_ref),
+                "authenticated",
+                1,
+            )
             .unwrap();
         registry
-            .sign_out_plugin_account("com.megle.onedrive", 1)
+            .sign_out_plugin_account("com.mangoo.configurable-sync", 1)
             .unwrap();
         let providers = crate::sync::provider::ProviderManager::default();
         providers
             .register(
-                "com.megle.onedrive",
-                "onedrive-account",
+                "com.mangoo.configurable-sync",
+                "configurable-account",
                 Arc::new(crate::sync::provider::InMemorySyncProvider::default()),
             )
             .unwrap();
@@ -844,7 +931,7 @@ mod credential_retirement_tests {
         );
         assert!(store.read(&scope, &secret_ref).is_ok());
         providers
-            .unregister("com.megle.onedrive", "onedrive-account")
+            .unregister("com.mangoo.configurable-sync", "configurable-account")
             .unwrap();
         assert_eq!(
             reconcile_credential_retirements(&registry, &store, Some(&providers), None).unwrap(),
@@ -861,15 +948,17 @@ mod credential_retirement_tests {
     #[test]
     fn failed_retirement_is_retried_without_an_active_library_runtime() {
         let path = std::env::temp_dir().join(format!(
-            "megle-credential-retirement-retry-{}.sqlite",
+            "mangoo-credential-retirement-retry-{}.sqlite",
             uuid::Uuid::now_v7()
         ));
         let registry = Arc::new(HostRegistry::open(&path).unwrap());
         registry
             .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
-                plugin_id: "com.megle.onedrive",
+                plugin_id: "com.mangoo.configurable-sync",
                 version: "1.0.0",
-                manifest_json: r#"{"manifestVersion":2}"#,
+                manifest_json: include_str!(
+                    "../../../../contracts/plugins/fixtures/valid-configurable-provider-v2.json"
+                ),
                 entry_relative_path: "bin/provider",
                 entry_sha256: &[7; 32],
                 install_root: std::path::Path::new("bundled"),
@@ -879,26 +968,31 @@ mod credential_retirement_tests {
             .unwrap();
         registry
             .upsert_plugin_account(
-                "onedrive-account",
-                "com.megle.onedrive",
-                Some("OneDrive"),
+                "configurable-account",
+                "com.mangoo.configurable-sync",
+                Some("Test Storage"),
                 "authenticated",
             )
             .unwrap();
         let concrete = Arc::new(FailOnceDeleteStore::default());
         let store: Arc<dyn SecretStore> = concrete.clone();
         let scope = SecretScope {
-            plugin_id: "com.megle.onedrive".into(),
-            account_uuid: "onedrive-account".into(),
-            namespace: crate::host_registry::ONEDRIVE_SECRET_NAMESPACE.into(),
-            purpose: crate::host_registry::ONEDRIVE_CREDENTIAL_PURPOSE.into(),
+            plugin_id: "com.mangoo.configurable-sync".into(),
+            account_uuid: "configurable-account".into(),
+            namespace: crate::host_registry::CONFIGURABLE_SECRET_NAMESPACE.into(),
+            purpose: crate::host_registry::CONFIGURABLE_CREDENTIAL_PURPOSE.into(),
         };
         let secret_ref = store.create(&scope, b"token").unwrap();
         registry
-            .set_plugin_account_secret("com.megle.onedrive", Some(&secret_ref), "authenticated", 1)
+            .set_plugin_account_secret(
+                "com.mangoo.configurable-sync",
+                Some(&secret_ref),
+                "authenticated",
+                1,
+            )
             .unwrap();
         registry
-            .sign_out_plugin_account("com.megle.onedrive", 1)
+            .sign_out_plugin_account("com.mangoo.configurable-sync", 1)
             .unwrap();
         assert_eq!(
             reconcile_credential_retirements(&registry, &store, None, None).unwrap(),
@@ -925,9 +1019,11 @@ mod credential_retirement_tests {
             let registry = Arc::new(HostRegistry::open(path).unwrap());
             registry
                 .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
-                    plugin_id: "com.megle.onedrive",
+                    plugin_id: "com.mangoo.configurable-sync",
                     version: "1.0.0",
-                    manifest_json: r#"{"manifestVersion":2}"#,
+                    manifest_json: include_str!(
+                        "../../../../contracts/plugins/fixtures/valid-configurable-provider-v2.json"
+                    ),
                     entry_relative_path: "bin/provider",
                     entry_sha256: &[7; 32],
                     install_root: std::path::Path::new("bundled"),
@@ -937,18 +1033,18 @@ mod credential_retirement_tests {
                 .unwrap();
             registry
                 .upsert_plugin_account(
-                    "onedrive-account",
-                    "com.megle.onedrive",
-                    Some("OneDrive"),
+                    "configurable-account",
+                    "com.mangoo.configurable-sync",
+                    Some("Test Storage"),
                     "authenticated",
                 )
                 .unwrap();
             registry
-                .set_plugin_intent("com.megle.onedrive", true, true)
+                .set_plugin_intent("com.mangoo.configurable-sync", true, true)
                 .unwrap();
             registry
                 .record_plugin_runtime_ready(
-                    "com.megle.onedrive",
+                    "com.mangoo.configurable-sync",
                     "session",
                     &["sync-provider.v1".into()],
                 )
@@ -958,14 +1054,14 @@ mod credential_retirement_tests {
         }
 
         let path = std::env::temp_dir().join(format!(
-            "megle-pending-secret-creations-{}.sqlite",
+            "mangoo-pending-secret-creations-{}.sqlite",
             uuid::Uuid::now_v7()
         ));
         let (registry, fingerprint) = ready_registry(&path);
         let scope = SecretScope {
-            plugin_id: "com.megle.onedrive".into(),
-            account_uuid: "onedrive-account".into(),
-            namespace: crate::host_registry::ONEDRIVE_SECRET_NAMESPACE.into(),
+            plugin_id: "com.mangoo.configurable-sync".into(),
+            account_uuid: "configurable-account".into(),
+            namespace: crate::host_registry::CONFIGURABLE_SECRET_NAMESPACE.into(),
             purpose: "upload-session-v1".into(),
         };
         let before_create_ref = crate::plugins::secret_store::allocate_secret_ref(&scope).unwrap();
@@ -1011,7 +1107,7 @@ mod credential_retirement_tests {
 
         drop(registry);
         let deleted_path = std::env::temp_dir().join(format!(
-            "megle-retirement-after-delete-{}.sqlite",
+            "mangoo-retirement-after-delete-{}.sqlite",
             uuid::Uuid::now_v7()
         ));
         let (registry, fingerprint) = ready_registry(&deleted_path);
@@ -1027,15 +1123,20 @@ mod credential_retirement_tests {
             )
             .unwrap());
         let oauth_scope = SecretScope {
-            purpose: crate::host_registry::ONEDRIVE_CREDENTIAL_PURPOSE.into(),
+            purpose: crate::host_registry::CONFIGURABLE_CREDENTIAL_PURPOSE.into(),
             ..scope.clone()
         };
         let oauth_ref = store.create(&oauth_scope, b"oauth credential").unwrap();
         registry
-            .set_plugin_account_secret("com.megle.onedrive", Some(&oauth_ref), "authenticated", 1)
+            .set_plugin_account_secret(
+                "com.mangoo.configurable-sync",
+                Some(&oauth_ref),
+                "authenticated",
+                1,
+            )
             .unwrap();
         registry
-            .sign_out_plugin_account("com.megle.onedrive", 1)
+            .sign_out_plugin_account("com.mangoo.configurable-sync", 1)
             .unwrap();
         assert_eq!(registry.due_credential_retirements(10).unwrap().len(), 2);
         store.delete(&scope, &deleted_ref).unwrap();
@@ -1285,24 +1386,27 @@ fn cors_layer(origin: HeaderValue) -> CorsLayer {
             Method::GET,
             Method::POST,
             Method::PUT,
+            Method::PATCH,
             Method::DELETE,
             Method::OPTIONS,
         ])
         .allow_headers([
             header::CONTENT_TYPE,
-            HeaderName::from_static("x-megle-session"),
-            HeaderName::from_static("x-megle-context-revision"),
+            HeaderName::from_static("x-mangoo-session"),
+            HeaderName::from_static("x-mangoo-context-revision"),
+            HeaderName::from_static("x-mangoo-plugin-ui-id"),
+            HeaderName::from_static("x-mangoo-plugin-ui-epoch"),
         ])
         // The renderer and Core are on different loopback PORTS, so every
         // browser request is cross-origin and only CORS-safelisted response
         // headers are readable from JS. Without this the preview client always
-        // saw `x-megle-preview-tier` as null and fell back to "original",
+        // saw `x-mangoo-preview-tier` as null and fell back to "original",
         // silently disabling the background sharpening upgrade — a >4096px
         // image would stay at tier resolution no matter how far you zoomed.
         .expose_headers([
-            HeaderName::from_static("x-megle-preview-tier"),
-            HeaderName::from_static("x-megle-library-id"),
-            HeaderName::from_static("x-megle-context-revision"),
+            HeaderName::from_static("x-mangoo-preview-tier"),
+            HeaderName::from_static("x-mangoo-library-id"),
+            HeaderName::from_static("x-mangoo-context-revision"),
         ])
 }
 
@@ -1330,6 +1434,17 @@ async fn attach_library_context(
     // revision. Otherwise a request can validate A, wait behind an A -> B
     // activation, and then mutate B with A's revision.
     let gate = state.request_gate();
+    // Lifecycle owns operation before the request gate. Root admission shares
+    // that order, otherwise activation can deadlock while joining this request.
+    let _path_admission =
+        if request.method() == Method::POST && request.uri().path() == "/api/roots" {
+            match state.library_manager.as_ref() {
+                Some(manager) => Some(manager.path_admission().await),
+                None => None,
+            }
+        } else {
+            None
+        };
     let request_guard = if is_library_control {
         None
     } else {
@@ -1340,7 +1455,7 @@ async fn attach_library_context(
             let snapshot = manager.active_snapshot();
             let expected = request
                 .headers()
-                .get("x-megle-context-revision")
+                .get("x-mangoo-context-revision")
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse::<u64>().ok());
             if expected != Some(snapshot.context_revision) {
@@ -1371,13 +1486,13 @@ async fn attach_library_context(
         let snapshot = manager.active_snapshot();
         if let Some(library_uuid) = snapshot.library_uuid {
             if let Ok(value) = HeaderValue::from_str(&library_uuid) {
-                response.headers_mut().insert("x-megle-library-id", value);
+                response.headers_mut().insert("x-mangoo-library-id", value);
             }
         }
         if let Ok(value) = HeaderValue::from_str(&snapshot.context_revision.to_string()) {
             response
                 .headers_mut()
-                .insert("x-megle-context-revision", value);
+                .insert("x-mangoo-context-revision", value);
         }
     }
     response
@@ -1467,7 +1582,7 @@ async fn require_basic_auth(
         .status(StatusCode::UNAUTHORIZED)
         .header(
             header::WWW_AUTHENTICATE,
-            HeaderValue::from_static("Basic realm=\"Megle\""),
+            HeaderValue::from_static("Basic realm=\"Mangoo\""),
         )
         .body(axum::body::Body::empty())
         .expect("build 401 response")

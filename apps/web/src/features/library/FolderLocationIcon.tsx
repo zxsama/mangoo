@@ -1,4 +1,4 @@
-import { LocateFixed } from "lucide-react";
+import { LocateFixed } from "../../design/icons";
 import type { ComponentProps } from "react";
 
 export function FolderLocationIcon(props: ComponentProps<typeof LocateFixed>) {

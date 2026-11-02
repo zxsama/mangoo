@@ -2,6 +2,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self as std_mpsc, RecvTimeoutError};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,6 +22,7 @@ const EVENT_COALESCE_WINDOW: Duration = Duration::from_millis(100);
 const ROOT_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct WatcherHandle {
+    cancelled: Arc<AtomicBool>,
     command_sender: Option<std_mpsc::Sender<WatcherCommand>>,
     join_handle: Option<thread::JoinHandle<()>>,
 }
@@ -35,15 +40,23 @@ pub fn start_watcher(
 ) -> WatcherHandle {
     let (command_sender, command_receiver) = std_mpsc::channel();
     let (ready_sender, ready_receiver) = std_mpsc::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = cancelled.clone();
     let join_handle = thread::spawn(move || {
-        if let Err(error) =
-            run_watcher(database, task_queue, writer, command_receiver, ready_sender)
-        {
+        if let Err(error) = run_watcher(
+            database,
+            task_queue,
+            writer,
+            command_receiver,
+            ready_sender,
+            worker_cancelled,
+        ) {
             tracing::warn!(%error, "watcher stopped unexpectedly");
         }
     });
     let _ = ready_receiver.recv_timeout(Duration::from_secs(2));
     WatcherHandle {
+        cancelled,
         command_sender: Some(command_sender),
         join_handle: Some(join_handle),
     }
@@ -86,6 +99,7 @@ impl WatcherHandle {
     }
 
     pub fn shutdown(&mut self) -> anyhow::Result<()> {
+        self.cancelled.store(true, Ordering::Release);
         if let Some(sender) = self.command_sender.take() {
             let _ = sender.send(WatcherCommand::Shutdown);
         }
@@ -105,6 +119,7 @@ impl Drop for WatcherHandle {
 }
 
 struct WatcherState {
+    cancelled: Arc<AtomicBool>,
     database: Database,
     task_queue: TaskSender,
     // File upserts route through this single-writer actor so the watcher
@@ -133,12 +148,14 @@ fn run_watcher(
     writer: DbWriter,
     command_receiver: std_mpsc::Receiver<WatcherCommand>,
     ready_sender: std_mpsc::Sender<()>,
+    cancelled: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let (event_tx, event_rx) = std_mpsc::channel();
     let watcher = recommended_watcher(move |result| {
         let _ = event_tx.send(result);
     })?;
     let mut state = WatcherState {
+        cancelled,
         database,
         task_queue,
         writer,
@@ -277,11 +294,47 @@ fn handle_event(state: &mut WatcherState, event: Event) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn retire_internal_storage(
+    state: &WatcherState,
+    root: &ResolvedWatchedRoot,
+    path: &Path,
+) -> anyhow::Result<bool> {
+    let root_path = PathBuf::from(&root.root.path);
+    let Some(directory) = state
+        .database
+        .internal_storage_directory(&root_path, path)?
+    else {
+        return Ok(false);
+    };
+    let root_id = root.root.id;
+    let token = root.token.clone();
+    state.writer.write_blocking(move |database| {
+        if let Some(token) = token {
+            database.mark_folder_subtree_missing_by_path_for_root_token(
+                &token, root_id, &root_path, &directory,
+            )?;
+        } else {
+            database.mark_folder_subtree_missing_by_path(root_id, &root_path, &directory)?;
+        }
+        Ok(())
+    })?;
+    Ok(true)
+}
+
 fn handle_create_path(state: &mut WatcherState, path: &Path) -> anyhow::Result<()> {
     let Some(root) = root_for_path(state, path) else {
         return Ok(());
     };
-    let metadata = match fs::metadata(path) {
+    let root_path = Path::new(&root.root.path);
+    state.database.invalidate_storage_classification();
+    if retire_internal_storage(state, &root, path)? {
+        return Ok(());
+    }
+    if state.database.is_owned_collection_path(root_path, path)? {
+        return Ok(());
+    }
+    crate::sync::file_policy::require_no_links(root_path, path)?;
+    let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(_) => return Ok(()),
     };
@@ -305,7 +358,16 @@ fn handle_modify_path(state: &mut WatcherState, path: &Path) -> anyhow::Result<(
     let Some(root) = root_for_path(state, path) else {
         return Ok(());
     };
-    let metadata = match fs::metadata(path) {
+    let root_path = Path::new(&root.root.path);
+    state.database.invalidate_storage_classification();
+    if retire_internal_storage(state, &root, path)? {
+        return Ok(());
+    }
+    if state.database.is_owned_collection_path(root_path, path)? {
+        return Ok(());
+    }
+    crate::sync::file_policy::require_no_links(root_path, path)?;
+    let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(_) => return Ok(()),
     };
@@ -380,9 +442,10 @@ fn upsert_media_file(
     // One `lowercase_extension` allocation per event, not two: the guard and the
     // stored `files.ext` are the same string.
     let ext = extension(path);
-    let Some(kind) = media_kind_for_extension(ext.as_str()) else {
+    let kind = media_kind_for_extension(ext.as_str());
+    if kind.is_none() && !state.database.captures_all_files(root.root.id)? {
         return Ok(());
-    };
+    }
     let Some(parent) = path.parent() else {
         return Ok(());
     };
@@ -406,14 +469,14 @@ fn upsert_media_file(
     let file_upsert = FileUpsert {
         root_id: root.root.id,
         folder_id,
-        name: file_name(path),
+        name: crate::sync::file_policy::unicode_name(path)?,
         ext,
-        size: metadata.len() as i64,
+        size: i64::try_from(metadata.len())?,
         mtime: metadata_time(Some(metadata)),
         ctime: metadata_created_time(Some(metadata)),
         file_key: crate::library_path::local_file_identity(path).ok(),
     };
-    let kind_owned = kind.to_owned();
+    let kind_owned = kind.map(ToOwned::to_owned);
     let path_owned = path.to_path_buf();
     let volume_identity = crate::library_path::local_file_identity(Path::new(&root.root.path))
         .unwrap_or_else(|_| root.root.path.clone())
@@ -421,29 +484,51 @@ fn upsert_media_file(
     let file_identity = crate::library_path::local_file_identity(path)
         .unwrap_or_default()
         .into_bytes();
-    let fingerprint = crate::sync::identity::stable_content_fingerprint(path).ok();
+    let (fingerprint, source_stamp) = crate::sync::identity::observed_fingerprint(
+        &state.database,
+        path,
+        &volume_identity,
+        &file_identity,
+        || {
+            if state.cancelled.load(Ordering::Acquire) {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "watcher cancelled",
+                ))
+            } else {
+                Ok(())
+            }
+        },
+    )?;
+    let fingerprint = Some(fingerprint);
+    let rename_candidates = state.database.absent_external_identity_candidates(
+        root.root.id,
+        &volume_identity,
+        &file_identity,
+        fingerprint.as_deref(),
+        path,
+    )?;
     let root_token = root.token;
-    state.writer.write_blocking(move |db| {
-        let file_id = match root_token.as_ref() {
-            Some(token) => db.upsert_external_media_file_for_root_token(
-                token,
-                file_upsert,
-                &kind_owned,
-                &volume_identity,
-                &file_identity,
-                fingerprint.as_deref(),
-                &path_owned,
-            )?,
-            None => db.upsert_external_media_file(
-                file_upsert,
-                &kind_owned,
-                &volume_identity,
-                &file_identity,
-                fingerprint.as_deref(),
-                &path_owned,
-            )?,
-        };
-        Ok(file_id)
+    state.writer.write_authoritative_blocking(move |db| {
+        if let Some(token) = root_token.as_ref() {
+            db.require_sync_root_binding_token(token)?;
+        }
+        db.commit_scan_batch(crate::db::ScanWriteBatch {
+            folders: Vec::new(),
+            scan_generation: None,
+            files: vec![crate::db::ScanFileUpsert {
+                file: file_upsert,
+                media_kind: kind_owned,
+                external_identity: Some(crate::db::ExternalFileIdentity {
+                    volume_identity,
+                    file_identity,
+                    content_fingerprint: fingerprint,
+                    path: path_owned,
+                    rename_candidates,
+                    source_stamp: Some(source_stamp),
+                }),
+            }],
+        })
     })?;
     Ok(())
 }
@@ -456,7 +541,7 @@ mod sync_identity_tests {
     #[test]
     fn watcher_fingerprint_rename_reuses_missing_asset_before_new_row_is_inserted() {
         let base =
-            std::env::temp_dir().join(format!("megle-watch-identity-{}", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("mangoo-watch-identity-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&base).unwrap();
         let old_path = base.join("old.jpg");
         std::fs::write(&old_path, b"stable full fingerprint").unwrap();
@@ -490,7 +575,7 @@ mod sync_identity_tests {
                     ctime: None,
                     file_key: None,
                 },
-                "image",
+                Some("image"),
                 b"volume",
                 b"old-file",
                 Some(&fingerprint),
@@ -515,7 +600,7 @@ mod sync_identity_tests {
                     ctime: None,
                     file_key: None,
                 },
-                "image",
+                Some("image"),
                 b"volume",
                 b"new-file",
                 Some(&fingerprint),
@@ -685,13 +770,6 @@ fn queue_root_rescan(
     Ok(true)
 }
 
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_string()
-}
-
 fn metadata_time(metadata: Option<&fs::Metadata>) -> i64 {
     metadata
         .and_then(|metadata| metadata.modified().ok())
@@ -814,7 +892,96 @@ mod tests {
     }
 
     #[test]
-    fn non_media_creates_are_ignored() {
+    fn all_file_watcher_and_overflow_rescan_use_persisted_policy() {
+        let temp_root = unique_temp_dir("generic-root");
+        let db_dir = unique_temp_dir("generic-db");
+        fs::create_dir_all(&temp_root).unwrap();
+        fs::create_dir_all(&db_dir).unwrap();
+        let path = db_dir.join("catalog.sqlite");
+        let mut database = Database::open(&path).unwrap();
+        database.apply_migrations().unwrap();
+        database
+            .ensure_selected_sync_root(
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                &temp_root.to_string_lossy(),
+                "Files",
+                "Files",
+                [1; 32],
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                uuid::Uuid::now_v7(),
+                1,
+                "active",
+                1,
+                false,
+            )
+            .unwrap();
+        let root = database.list_roots().unwrap().remove(0);
+        scan_root(&mut database, &root).unwrap();
+        let writer = DbWriter::spawn(Database::open(&path).unwrap());
+        let (sender, _receiver) = tokio::sync::mpsc::channel(8);
+        let mut state = WatcherState {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            database: Database::open(&path).unwrap(),
+            task_queue: sender,
+            writer: writer.clone(),
+            watcher: recommended_watcher(|_| {}).unwrap(),
+            watched_roots: HashMap::new(),
+            pending_events: Vec::new(),
+        };
+        sync_enabled_roots(&mut state).unwrap();
+        fs::write(temp_root.join("empty"), b"").unwrap();
+        handle_create_path(&mut state, &temp_root.join("empty")).unwrap();
+        let marker =
+            crate::sync::file_policy::test_root_marker(database.connection_for_fsops(), &temp_root);
+        fs::write(
+            temp_root.join(".mangoo-sync-root"),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        handle_create_path(&mut state, &temp_root.join(".mangoo-sync-root")).unwrap();
+        fs::write(temp_root.join("empty"), b"changed").unwrap();
+        handle_modify_path(&mut state, &temp_root.join("empty")).unwrap();
+        queue_all_watched_roots_for_rescan(&mut state).unwrap();
+        scan_root(&mut database, &root).unwrap();
+        let row: (String, i64, i64) = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT name,size,browse_visible FROM files WHERE name='empty'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("empty".into(), 7, 0));
+        for name in [
+            ".mangoo-staging",
+            ".mangoo-recycle-00000000-0000-0000-0000-000000000001",
+            ".mangoo-library",
+        ] {
+            fs::write(temp_root.join(name), b"user").unwrap();
+            handle_create_path(&mut state, &temp_root.join(name)).unwrap();
+        }
+        scan_root(&mut database, &root).unwrap();
+        let count: i64 = database
+            .connection_for_fsops()
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 4);
+        drop(state);
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(writer.shutdown())
+            .unwrap();
+        drop(database);
+        fs::remove_dir_all(temp_root).unwrap();
+        fs::remove_dir_all(db_dir).unwrap();
+    }
+
+    #[test]
+    fn non_media_creates_are_visible_without_decode() {
         let temp_root = unique_temp_dir("root");
         fs::create_dir_all(&temp_root).expect("create root dir");
 
@@ -833,7 +1000,7 @@ mod tests {
         let _watcher = start_watcher(watcher_db, task_sender, DbWriter::spawn(writer_db));
 
         fs::write(temp_root.join("notes.txt"), b"not media").expect("write text file");
-        wait_for_media_count(&db_path, root_id, 0, Duration::from_secs(2));
+        wait_for_media_count(&db_path, root_id, 1, Duration::from_secs(2));
 
         let _ = fs::remove_dir_all(temp_root);
         let _ = fs::remove_dir_all(db_dir);
@@ -995,6 +1162,7 @@ mod tests {
         let (task_sender, mut task_receiver) = tokio::sync::mpsc::channel(8);
         let writer_db = Database::open(&db_path).expect("reopen writer db");
         let mut state = WatcherState {
+            cancelled: Arc::new(AtomicBool::new(false)),
             database,
             task_queue: task_sender,
             writer: DbWriter::spawn(writer_db),
@@ -1210,6 +1378,62 @@ mod tests {
         let _ = fs::remove_dir_all(&db_dir);
     }
 
+    #[test]
+    fn separated_storage_watcher_retires_previously_indexed_storage_without_delete_events() {
+        let base = tempfile::tempdir().unwrap();
+        let content = base.path().join("content");
+        fs::create_dir_all(content.join("private")).unwrap();
+        fs::write(content.join("private/catalog.sqlite"), b"private").unwrap();
+        let mut db = Database::open(base.path().join("catalog.sqlite")).unwrap();
+        db.apply_migrations().unwrap();
+        let root_id = add_root(&db, &content, "Content");
+        let root = test_root(&db, root_id);
+        scan_root(&mut db, &root).unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(8);
+        let mut state = test_watcher_state(db, sender, root_id, content.clone());
+        let marker = crate::library_path::LibraryMarker {
+            format_version: 2,
+            library_uuid: uuid::Uuid::now_v7().to_string(),
+            root_uuid: uuid::Uuid::now_v7().to_string(),
+            creation_txn_uuid: uuid::Uuid::now_v7().to_string(),
+            state: crate::library_path::MarkerState::Committed,
+        };
+        let marker_path = content.join("private/.mangoo-library");
+        fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        handle_create_path(&mut state, &marker_path).unwrap();
+        handle_modify_path(&mut state, &content.join("private/catalog.sqlite")).unwrap();
+        let active: i64 = state
+            .database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT count(*) FROM files WHERE status='active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 0);
+        let active_folders: i64 = state
+            .database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT count(*) FROM folders WHERE name='private' AND status='active'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_folders, 0);
+        let events: i64 = state
+            .database
+            .connection_for_fsops()
+            .query_row("SELECT count(*) FROM sync_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events, 0);
+        assert_eq!(
+            fs::read(content.join("private/catalog.sqlite")).unwrap(),
+            b"private"
+        );
+    }
+
     fn add_root(database: &Database, temp_root: &Path, display_name: &str) -> i64 {
         database
             .add_root(NewRoot {
@@ -1244,6 +1468,7 @@ mod tests {
                 .expect("writer db"),
         );
         WatcherState {
+            cancelled: Arc::new(AtomicBool::new(false)),
             database,
             task_queue,
             writer,
@@ -1355,7 +1580,7 @@ mod tests {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
         std::env::temp_dir().join(format!(
-            "megle_watch_test_{}_{}_{}_{}",
+            "mangoo_watch_test_{}_{}_{}_{}",
             label,
             std::process::id(),
             std::time::SystemTime::now()

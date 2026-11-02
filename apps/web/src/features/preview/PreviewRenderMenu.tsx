@@ -1,4 +1,4 @@
-import { SlidersHorizontal } from "lucide-react";
+import { SlidersHorizontal } from "../../design/icons";
 import { useRef } from "react";
 
 import { LiquidGlassButton } from "../../design/liquid-glass";

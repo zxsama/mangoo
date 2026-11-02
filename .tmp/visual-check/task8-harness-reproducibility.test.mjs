@@ -5,6 +5,7 @@ import process from "node:process";
 import { Writable } from "node:stream";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import ts from "typescript";
 
 import {
   prepareControlledMediaRoot,
@@ -44,6 +45,65 @@ const appearanceFixturePath = path.join(
   "fixtures",
   "overlayAppearanceVisualFixture.tsx"
 );
+
+test("script-opened fixture reveal is visual-only, same-origin and owned by each parent", async () => {
+  const source = await readFile(path.join(repositoryRoot, "apps", "desktop", "src", "main.ts"), "utf8");
+  const start = source.indexOf("function installVisualFixtureLifecycle(");
+  const end = source.indexOf("function isVisualHarnessEnabled(", start);
+  assert.ok(start >= 0 && end > start);
+  assert.equal(source.match(/installVisualFixtureLifecycle\(window\);/g)?.length, 2);
+  const javascript = ts.transpileModule(source.slice(start, end), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 }
+  }).outputText;
+  const makeInstaller = (enabled) => new Function(
+    "isVisualHarnessEnabled", `${javascript}; return installVisualFixtureLifecycle;`
+  )(() => enabled);
+  let createChild;
+  let parentDestroyed = false;
+  const parent = {
+    isDestroyed: () => parentDestroyed,
+    webContents: {
+      getURL: () => "http://127.0.0.1:51001/#/settings",
+      on: (name, callback) => { assert.equal(name, "did-create-window"); createChild = callback; }
+    }
+  };
+  makeInstaller(false)(parent);
+  assert.equal(createChild, undefined, "ordinary product startup must not install any popup handler");
+  makeInstaller(true)(parent);
+  assert.equal(typeof createChild, "function");
+  const accepted = "http://127.0.0.1:51001/tests/fixtures/overlay-appearance.html";
+  for (const [requested, loaded, destroyed, expected] of [
+    [accepted, accepted, false, 1],
+    [accepted, "http://127.0.0.1:51001/ordinary.html", false, 0],
+    [accepted, "http://127.0.0.1:51002/tests/fixtures/other.html", false, 0],
+    ["http://127.0.0.1:51002/tests/fixtures/other.html", accepted, false, 0],
+    ["https://127.0.0.1:51001/tests/fixtures/other.html", accepted, false, 0],
+    ["http://127.0.0.1:51001/tests/fixtures-other/test.html", accepted, false, 0],
+    ["http://127.0.0.1:51001/tests/fixtures/../ordinary.html", accepted, false, 0],
+    ["invalid-url", accepted, false, 0],
+    [accepted, accepted, true, 0]
+  ]) {
+    let showCount = 0;
+    let finishLoad;
+    const child = {
+      isDestroyed: () => destroyed,
+      show: () => { showCount += 1; },
+      webContents: {
+        isDestroyed: () => destroyed,
+        getURL: () => loaded,
+        once: (name, callback) => { assert.equal(name, "did-finish-load"); finishLoad = callback; }
+      }
+    };
+    createChild(child, { url: requested });
+    assert.equal(showCount, 0, "must wait until loading settles before revealing a fixture");
+    finishLoad?.();
+    assert.equal(showCount, expected, `${requested} -> ${loaded}; destroyed=${destroyed}`);
+    parentDestroyed = true;
+    finishLoad?.();
+    assert.equal(showCount, expected, "a retired owner must not reveal its child");
+    parentDestroyed = false;
+  }
+});
 
 test("repository root resolves from the harness URL instead of cwd", async () => {
   const harnessUrl = pathToFileURL(path.join(repositoryRoot, ".tmp", "visual-check", "fixture.mjs")).href;
@@ -95,8 +155,8 @@ test("controlled media validation rejects a missing root clearly", async () => {
 
 test("Cargo diagnostics preserve pre-finish warnings without treating progress as failures", () => {
   const diagnostics = collectStartupDiagnostics([
-    { source: "stdout", text: "Compiling megle-core v0.1.0\nFinished `dev` profile [unoptimized + debuginfo] target(s)\n" },
-    { source: "stdout", text: "Running `target\\debug\\megle-core.exe`\n" },
+    { source: "stdout", text: "Compiling mangoo-core v0.1.0\nFinished `dev` profile [unoptimized + debuginfo] target(s)\n" },
+    { source: "stdout", text: "Running `target\\debug\\mangoo-core.exe`\n" },
     { source: "stderr", text: "error: runtime failure\n" }
   ]);
 
@@ -107,7 +167,7 @@ test("Cargo diagnostics preserve pre-finish warnings without treating progress a
   ]);
 
   const failedBuild = collectStartupDiagnostics([
-    { source: "stderr", text: "Compiling megle-core v0.1.0\nwarning: real build warning\nerror[E0308]: mismatched types\n" }
+    { source: "stderr", text: "Compiling mangoo-core v0.1.0\nwarning: real build warning\nerror[E0308]: mismatched types\n" }
   ]);
   assert.equal(failedBuild.cargoBuildFinished, false);
   assert.deepEqual(failedBuild.cargoDiagnostics.map(({ line, phase }) => ({ line, phase })), [
@@ -274,7 +334,7 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
   ]);
 
   for (const source of [regressionSource, exhaustiveSource]) {
-    assert.doesNotMatch(source, /["'`]\s*[A-Z]:\\\\(?:Megle|AI_Painter)/i);
+    assert.doesNotMatch(source, /["'`]\s*[A-Z]:\\\\(?:Mangoo|AI_Painter)/i);
     assert.match(source, /resolveRepositoryRoot\(import\.meta\.url\)/);
     assert.match(source, /prepareControlledMediaRoot/);
   }
@@ -299,7 +359,8 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
   ]) {
     assert.match(regressionSource, new RegExp(`${field}[:,]`));
   }
-  assert.match(regressionSource, /MEGLE_VISUAL_DEBUG_PORT.*9500/);
+  assert.match(regressionSource, /MANGOO_VISUAL_DEBUG_PORT.*MANGOO_REMOTE_DEBUG_PORT.*await availableLoopbackPort\(0\)/);
+  assert.match(regressionSource, /const webUrl = `http:\/\/127\.0\.0\.1:\$\{await availableLoopbackPort\(0\)\}`/);
   assert.match(regressionSource, /desktop-ui-regression-\$\{visualRunId\}\.stdout\.log/);
   assert.match(regressionSource, /desktop-ui-regression-\$\{visualRunId\}\.stderr\.log/);
   assert.match(regressionSource, /controlledMedia\.files\.length/);
@@ -345,7 +406,7 @@ test("desktop harnesses have no machine-specific roots and gate diagnostics", as
   assert.match(exhaustiveSource, /collectUnexpectedConsoleErrors\(consoleErrors\)/);
   assert.match(exhaustiveSource, /finalHardFailures\.push\("console errors"\)/);
   assert.match(exhaustiveSource, /finalHardFailures\.push\("network failures"\)/);
-  assert.match(exhaustiveSource, /MEGLE_EXHAUSTIVE_DEBUG_PORT.*9501/);
+  assert.match(exhaustiveSource, /MANGOO_EXHAUSTIVE_DEBUG_PORT.*9501/);
   assert.match(exhaustiveSource, /desktop-ui-exhaustive-\$\{visualRunId\}\.stdout\.log/);
   assert.match(exhaustiveSource, /desktop-ui-exhaustive-\$\{visualRunId\}\.stderr\.log/);
   assert.match(exhaustiveSource, /cargoDiagnostics/);
@@ -424,7 +485,6 @@ test("DPI, preference, and appearance checks assert effective production state",
     "notification-nav",
     "notification-content",
     "field-control",
-    "select-control",
     "readable-inner",
     "selected-fill",
     "popover",
@@ -435,6 +495,8 @@ test("DPI, preference, and appearance checks assert effective production state",
   ]) {
     assert.match(appearanceFixture, new RegExp(`data-appearance-surface=["']${surface}["']`));
   }
+  assert.match(appearanceFixture, /<OverlaySelect[^>]*data-appearance-surface="select-element"/);
+  assert.match(source, /selectControl: surface\('\.overlay-select-control:has\(\[data-appearance-surface="select-element"\]\)'\)/);
   assert.match(appearanceFixture, /ModalSurface/);
   assert.match(appearanceFixture, /useSecondaryWindowInterfaceStyle/);
   for (const probe of ["popover", "nested", "context", "modal"]) {
@@ -443,19 +505,20 @@ test("DPI, preference, and appearance checks assert effective production state",
   assert.match(source, /controlledSolidFallbackEvidence/);
   assert.match(source, /controlledSolidFallbackEvidence[\s\S]*Page\.bringToFront[\s\S]*activateFocusedButtonWithEnter\(fixtureClient\)/);
   assert.match(source, /activateFocusedButtonWithEnter[\s\S]*text: "\\r"[\s\S]*unmodifiedText: "\\r"/);
-  assert.match(source, /megle-overlay-fixture-modal[\s\S]*solid fallback non-modal keyboard phase/);
+  assert.match(source, /mangoo-overlay-fixture-modal[\s\S]*solid fallback non-modal keyboard phase/);
   assert.match(source, /solid fallback modal keyboard phase[\s\S]*solid fallback modal keyboard activation/);
   assert.match(appearanceFixture, /open=\{modalOpen\}/);
-  assert.match(appearanceFixture, /megle-overlay-fixture-modal/);
+  assert.match(appearanceFixture, /mangoo-overlay-fixture-modal/);
   assert.match(source, /production-data-overlay-solid-fallback-variable-path/);
   assert.match(source, /solid fallback .* keyboard activation/);
   assert.match(source, /surface\.opaque/);
   assert.match(source, /surface\.readable/);
   assert.match(source, /contrastRatio >= 4\.5/);
-  assert.match(source, /background\.alpha >= 0\.95 \|\| backdropBackground\.alpha >= 0\.95/);
+  assert.match(source, /opaque: background\.alpha >= 0\.95/);
+  assert.match(source, /surface\.backdrop\?\.backgroundAlpha > 0\.01/);
   assert.match(overlayCss, /@supports not[\s\S]*--overlay-solid-fallback-fill/);
   assert.match(overlayCss, /:root\[data-overlay-solid-fallback="forced"\][\s\S]*--overlay-solid-fallback-fill/);
-  assert.match(overlayCss, /background: var\(--overlay-solid-fallback-fill/);
+  assert.match(overlayCss, /background: var\(\s*--overlay-solid-fallback-fill/);
   assert.match(overlayCss, /--overlay-solid-fallback-filter/);
 });
 

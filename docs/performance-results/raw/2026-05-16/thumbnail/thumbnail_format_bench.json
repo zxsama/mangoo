@@ -25,31 +25,31 @@
       },
       "samples": [
         {
-          "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0001.jpg",
+          "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0001.jpg",
           "sourceBytes": 33506,
           "outputBytes": 31510,
           "ms": 6.5855999999999995
         },
         {
-          "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0002.jpg",
+          "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0002.jpg",
           "sourceBytes": 32791,
           "outputBytes": 30861,
           "ms": 6.68719999999999
         },
         {
-          "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0000.jpg",
+          "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0000.jpg",
           "sourceBytes": 31626,
           "outputBytes": 29700,
           "ms": 7.2339000000000055
         },
         {
-          "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0003.jpg",
+          "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0003.jpg",
           "sourceBytes": 33291,
           "outputBytes": 31244,
           "ms": 6.915099999999995
         },
         {
-          "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0005.jpg",
+          "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0005.jpg",
           "sourceBytes": 33806,
           "outputBytes": 31650,
           "ms": 4.550900000000013
@@ -77,31 +77,31 @@
       },
       "samples": [
         {
-          "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0000.jpg",
+          "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0000.jpg",
           "sourceBytes": 31626,
           "outputBytes": 19114,
           "ms": 14.148400000000038
         },
         {
-          "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0002.jpg",
+          "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0002.jpg",
           "sourceBytes": 32791,
           "outputBytes": 19672,
           "ms": 14.383300000000077
         },
         {
-          "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0001.jpg",
+          "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0001.jpg",
           "sourceBytes": 33506,
           "outputBytes": 19636,
           "ms": 14.55869999999993
         },
         {
-          "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0003.jpg",
+          "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0003.jpg",
           "sourceBytes": 33291,
           "outputBytes": 19210,
           "ms": 14.52520000000004
         },
         {
-          "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0004.jpg",
+          "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0004.jpg",
           "sourceBytes": 31864,
           "outputBytes": 19298,
           "ms": 12.705600000000004
@@ -129,31 +129,31 @@
       },
       "samples": [
         {
-          "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0001.jpg",
+          "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0001.jpg",
           "sourceBytes": 33506,
           "outputBytes": 8950,
           "ms": 69.74300000000017
         },
         {
-          "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0003.jpg",
+          "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0003.jpg",
           "sourceBytes": 33291,
           "outputBytes": 8662,
           "ms": 69.87149999999997
         },
         {
-          "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0002.jpg",
+          "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0002.jpg",
           "sourceBytes": 32791,
           "outputBytes": 8345,
           "ms": 69.9674
         },
         {
-          "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0000.jpg",
+          "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0000.jpg",
           "sourceBytes": 31626,
           "outputBytes": 7908,
           "ms": 72.11830000000009
         },
         {
-          "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0006.jpg",
+          "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0006.jpg",
           "sourceBytes": 33836,
           "outputBytes": 9005,
           "ms": 59.67360000000008
@@ -181,31 +181,31 @@
       },
       "samples": [
         {
-          "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0001.jpg",
+          "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0001.jpg",
           "sourceBytes": 33506,
           "outputBytes": 411832,
           "ms": 9.193500000000313
         },
         {
-          "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0000.jpg",
+          "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0000.jpg",
           "sourceBytes": 31626,
           "outputBytes": 408203,
           "ms": 9.678300000000036
         },
         {
-          "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0003.jpg",
+          "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0003.jpg",
           "sourceBytes": 33291,
           "outputBytes": 414317,
           "ms": 9.334399999999732
         },
         {
-          "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0002.jpg",
+          "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0002.jpg",
           "sourceBytes": 32791,
           "outputBytes": 412110,
           "ms": 9.911499999999705
         },
         {
-          "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0004.jpg",
+          "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\images\\exactish_0004.jpg",
           "sourceBytes": 31864,
           "outputBytes": 413835,
           "ms": 8.872100000000046

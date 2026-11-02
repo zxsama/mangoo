@@ -1,7 +1,9 @@
 import path from "node:path";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import type { CoreSession } from "./core-session.js";
 
-export const MEGLE_APP_USER_MODEL_ID = "com.megle.desktop";
+export const MANGOO_APP_USER_MODEL_ID = "com.mangoo.desktop";
 
 interface PackagedRuntimeOptions {
   readonly isPackaged: boolean;
@@ -9,42 +11,46 @@ interface PackagedRuntimeOptions {
   readonly parentPid: number;
 }
 
-export interface PackagedApplicationIdentity {
-  readonly name: "Megle";
-  readonly appUserModelId?: typeof MEGLE_APP_USER_MODEL_ID;
+export interface ApplicationIdentity {
+  readonly name: "Mangoo";
+  readonly appUserModelId?: typeof MANGOO_APP_USER_MODEL_ID;
 }
 
 export function configurePackagedRuntime(
   options: PackagedRuntimeOptions,
   env: NodeJS.ProcessEnv = process.env
 ): void {
-  if (!options.isPackaged || env.MEGLE_CORE_EXTERNAL === "1") return;
+  if (!options.isPackaged || env.MANGOO_CORE_EXTERNAL === "1") return;
 
-  env.MEGLE_CORE_BINARY = path.join(options.resourcesPath, "core", "megle-core.exe");
-  env.MEGLE_PLUGINS_DIR = path.join(options.resourcesPath, "core", "bundled-plugins");
-  env.MEGLE_SERVE_WEB = "1";
-  env.MEGLE_WEB_DIR = path.join(options.resourcesPath, "web");
-  env.MEGLE_PARENT_PID = String(options.parentPid);
-  delete env.MEGLE_CORE_ADDR;
-  delete env.MEGLE_CORE_PROFILE;
-  delete env.MEGLE_CORE_URL;
-  delete env.MEGLE_ALLOWED_ORIGIN;
-  delete env.MEGLE_WEB_URL;
+  env.MANGOO_CORE_BINARY = path.join(options.resourcesPath, "core", "mangoo-core.exe");
+  env.MANGOO_PLUGINS_DIR = path.join(options.resourcesPath, "core", "bundled-plugins");
+  env.MANGOO_SERVE_WEB = "1";
+  env.MANGOO_WEB_DIR = path.join(options.resourcesPath, "web");
+  env.MANGOO_PARENT_PID = String(options.parentPid);
+  delete env.MANGOO_CORE_ADDR;
+  delete env.MANGOO_CORE_PROFILE;
+  delete env.MANGOO_CORE_URL;
+  delete env.MANGOO_ALLOWED_ORIGIN;
+  delete env.MANGOO_WEB_URL;
 }
 
-export function packagedApplicationIdentity(
-  isPackaged: boolean,
+export function applicationIdentity(
   platform: NodeJS.Platform = process.platform
-): PackagedApplicationIdentity | undefined {
-  if (!isPackaged) return undefined;
+): ApplicationIdentity {
   return {
-    name: "Megle",
-    ...(platform === "win32" ? { appUserModelId: MEGLE_APP_USER_MODEL_ID } : {})
+    name: "Mangoo",
+    ...(platform === "win32" ? { appUserModelId: MANGOO_APP_USER_MODEL_ID } : {})
   };
 }
 
-export function packagedWindowIconPath(isPackaged: boolean, resourcesPath: string): string | undefined {
-  return isPackaged ? path.join(resourcesPath, "icon.png") : undefined;
+export function windowIconPath(
+  isPackaged: boolean,
+  resourcesPath: string,
+  desktopPath = fileURLToPath(new URL("../", import.meta.url))
+): string | undefined {
+  if (isPackaged) return path.join(resourcesPath, "icon.png");
+  const developmentIcon = path.resolve(desktopPath, "build", "icon.png");
+  return existsSync(developmentIcon) ? developmentIcon : undefined;
 }
 
 export function mainWindowSkipsTaskbarDuringBootstrap(isPackaged: boolean): boolean {

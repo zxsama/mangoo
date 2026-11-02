@@ -371,7 +371,7 @@ pub(crate) fn schedule_pending_repair(database: Arc<Mutex<Database>>, writer: cr
     }
 
     let spawn_result = thread::Builder::new()
-        .name("megle-fsops-repair".to_owned())
+        .name("mangoo-fsops-repair".to_owned())
         .spawn(move || {
             const RETRY_DELAYS: [Duration; 5] = [
                 Duration::from_millis(50),
@@ -2069,7 +2069,12 @@ fn apply_success_to_index(
                 "UPDATE files SET name = ?1, ext = ?2, status = 'active' WHERE id = ?3",
                 params![name, extension_from_name(&name), entity_id],
             )?;
-            crate::db::sync_media_fts_for_file_in_transaction_pub(transaction, entity_id)?;
+            crate::db::set_media_presentation_in_transaction(
+                transaction,
+                entity_id,
+                crate::decode::formats::media_kind_for_extension(&extension_from_name(&name)),
+                false,
+            )?;
         }
         (FileOperationKind::Rename, EntityKind::Folder) => {
             let name = target_name(intent)?;
@@ -3142,7 +3147,7 @@ fn apply_target_parent_identity_preflight(intent: &mut PreparedIntent) {
 
 fn recycle_staging_path(source_path: &Path) -> PathBuf {
     let parent = source_path.parent().unwrap_or_else(|| Path::new(""));
-    parent.join(format!(".megle-recycle-{}", Uuid::now_v7()))
+    parent.join(format!(".mangoo-recycle-{}", Uuid::now_v7()))
 }
 
 fn missing_intent(

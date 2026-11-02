@@ -6,13 +6,13 @@ Updated: 2026-05-16
 
 This review only covers component-level open source libraries. It does not evaluate existing photo management applications.
 
-Megle needs:
+Mangoo needs:
 
 - Windows-first desktop app.
 - Existing-folder indexing only.
 - Millions of images/videos.
 - Fast thumbnail browsing and no-stutter preview switching.
-- Tags/ratings stored in Megle database.
+- Tags/ratings stored in Mangoo database.
 - Real file rename/move/delete.
 - Future Web/Docker deployment.
 - Plugin-ready architecture.
@@ -61,7 +61,7 @@ Risk:
 Decision:
 
 - Electron is the shell only.
-- All heavy work goes through `megle-core.exe`.
+- All heavy work goes through `mangoo-core.exe`.
 - Tauri remains a future shell replacement option, not the first implementation.
 
 ### React + TypeScript + Vite

@@ -1,16 +1,20 @@
-import { Activity, History, ScrollText } from "lucide-react";
+import { Activity, History, Puzzle, ScrollText } from "../../design/icons";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import type {
   DesktopProcessLogFilter,
   NotificationWindowIntent,
   ThumbnailFailureSnapshot
-} from "@megle/notification-contract";
+} from "@mangoo/notification-contract";
 import { SecondaryWindowFrame } from "../../app-shell/SecondaryWindowFrame";
 import { useOverlayScrollbars } from "../../app-shell/useOverlayScrollbars";
 import { useSecondaryWindowInterfaceStyle } from "../../app-shell/useSecondaryWindowInterfaceStyle";
 import { getDesktopBridge } from "../../core/desktop";
+import { LiquidGlassButton } from "../../design/liquid-glass";
+import { usePluginContributionViews, usePluginViewLauncher } from "../plugins/PluginContributionsSlot";
+import { usePluginQuerySync } from "../plugins/pluginQuerySync";
 import { NotificationHistoryView } from "./NotificationHistoryView";
-import { NotificationStatusView } from "./NotificationStatusView";
+import { NotificationStatusView, StatusSection } from "./NotificationStatusView";
 import { ProcessLogView } from "./ProcessLogView";
 import { useNotifications } from "./useNotifications";
 
@@ -172,7 +176,12 @@ export function NotificationWindow() {
               onOpenFailureLogs={applyIntent}
               refreshCompact={notifications.refreshCompact}
               reviewManagedRoot={notifications.reviewManagedRoot}
-            />
+            >
+              <NotificationPluginSection
+                key={notifications.compact.activeLibraryId}
+                libraryUuid={notifications.compact.activeLibraryId}
+              />
+            </NotificationStatusView>
           </section>
         ) : null}
         {page === "history" ? (
@@ -217,5 +226,74 @@ export function NotificationWindow() {
         ) : null}
       </main>
     </SecondaryWindowFrame>
+  );
+}
+
+function NotificationPluginSection({ libraryUuid }: { libraryUuid: string | null }) {
+  return getDesktopBridge()?.windowRole === "notifications"
+    ? <DesktopNotificationPluginSection libraryUuid={libraryUuid} />
+    : <ClientNotificationPluginSection libraryUuid={libraryUuid} />;
+}
+
+function DesktopNotificationPluginSection({ libraryUuid }: { libraryUuid: string | null }) {
+  const bridge = getDesktopBridge();
+  const queryClient = useQueryClient();
+  usePluginQuerySync(queryClient);
+  const entries = useQuery({
+    queryKey: ["notification-plugin-entries"],
+    queryFn: () => bridge?.listNotificationPluginEntries?.() ?? Promise.resolve([]),
+    refetchInterval: 30000
+  });
+  const [error, setError] = useState<string | null>(null);
+  const [opening, setOpening] = useState(false);
+  if (!entries.data?.length) return null;
+  return (
+    <StatusSection className="notification-status-plugins" count={entries.data.length} headingId="notification-status-plugins-title" icon={Puzzle} title="插件">
+      {entries.data.map((entry) => (
+        <LiquidGlassButton key={`${entry.pluginId}:${entry.viewId}`} disabled={opening} type="button" onClick={async () => {
+          setOpening(true);
+          setError(null);
+          try {
+            if (!await bridge?.openNotificationPluginView?.({ pluginId: entry.pluginId, viewId: entry.viewId, libraryUuid })) throw new Error("插件入口暂时不可用，请重试。");
+          } catch (cause) {
+            setError(cause instanceof Error ? cause.message : String(cause));
+            void entries.refetch();
+          } finally { setOpening(false); }
+        }}>{entry.title}</LiquidGlassButton>
+      ))}
+      {error ? <p role="alert">{error}</p> : null}
+    </StatusSection>
+  );
+}
+
+function ClientNotificationPluginSection({ libraryUuid }: { libraryUuid: string | null }) {
+  const views = usePluginContributionViews("notification-center");
+  const launcher = usePluginViewLauncher();
+  return (
+    <>
+      {views.length > 0 ? (
+        <StatusSection
+          className="notification-status-plugins"
+          count={views.length}
+          headingId="notification-status-plugins-title"
+          icon={Puzzle}
+          title="插件"
+        >
+          {views.map(({ plugin, view }) => (
+            <LiquidGlassButton
+              key={`${plugin.pluginId}:${view.id}`}
+              onClick={(event) => {
+                event.stopPropagation();
+                launcher.open({ plugin, viewId: view.id, libraryUuid, rootId: null, rootUuid: null }, event.currentTarget);
+              }}
+              type="button"
+            >
+              {view.title}
+            </LiquidGlassButton>
+          ))}
+        </StatusSection>
+      ) : null}
+      {launcher.view}
+    </>
   );
 }

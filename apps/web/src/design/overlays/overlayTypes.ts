@@ -7,13 +7,15 @@ export const NESTED_OVERLAY_OFFSET_PX = 4;
 export type OverlayRootId =
   | "library"
   | "managed-library"
+  | "plugin-view"
   | "filter"
   | "sort"
   | "layout"
   | "preview-render"
   | "notifications"
   | "context-menu"
-  | "file-operation";
+  | "file-operation"
+  | "select";
 
 export type OverlayLayerKind = "root" | "nested" | "modal";
 export type OverlaySurfaceRole = "popover" | "nested" | "modal" | "secondary-content";
@@ -69,6 +71,8 @@ export interface OverlayLayerRegistration {
   dismissOnFocusOutside: boolean;
   dismissOnOutsidePointer: boolean;
   dismissOnWindowBlur: boolean;
+  /** Consulted before removal, including the synchronous start of an async save. */
+  isDismissLocked?: () => boolean;
   restoreFocus: boolean;
   onDismiss: () => void;
 }
@@ -80,9 +84,11 @@ export interface OverlayStackApi {
   isRootOpen(rootId: OverlayRootId): boolean;
   registerLayer(layer: OverlayLayerRegistration): () => void;
   dismissTop(): boolean;
+  getContainingLayer(trigger: HTMLElement): Pick<OverlayLayerRegistration, "id" | "rootId"> | null;
 }
 
 export interface AnchoredOverlayStyle extends CSSProperties {
+  "--overlay-anchor-height"?: string;
   left: number;
   top: number;
   maxWidth: number;

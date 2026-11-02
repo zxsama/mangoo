@@ -1,0 +1,8 @@
+/** Deliberate public surface; never proxy arbitrary properties or URLs. */
+export const CORE_METHODS = [
+  "getActiveLibrary", "listLibraries", "listRoots", "preflightLibrary", "removeLocalLibrary",
+  "getPlugin", "getPluginConfiguration", "beginPluginAuth", "completePluginAuth", "cancelPluginAuth", "signOutPlugin", "planPluginConfiguration", "commitPluginConfiguration", "resolvePluginExternalLink",
+  "listRemoteLibraries", "listRemoteLibraryRoots", "preflightSyncRestore", "startSyncRestore", "getSyncRestore", "pauseSyncRestore", "resumeSyncRestore", "cancelSyncRestore",
+  "getSyncStatus", "preflightLibrarySync", "startLibrarySyncEnable", "pauseLibrarySync", "resumeLibrarySync", "retryLibrarySync", "syncLibraryNow", "planLibrarySyncUnbind", "commitLibrarySyncUnbind", "preflightLibrarySyncReconnect", "commitLibrarySyncReconnect", "listLibrarySyncConflicts", "getLibrarySyncDiagnostics", "resolveLibrarySyncConflict", "exportLibrarySyncDiagnostics",
+  "preflightSyncFolderEnrollment", "commitSyncFolderEnrollment", "listSyncFolders", "getSyncFolder", "commandSyncFolder", "preflightSyncFolderSelection", "commitSyncFolderSelection", "preflightSyncFolderStop", "commitSyncFolderStop", "preflightSyncFolderRelocation", "startSyncFolderRelocation", "getSyncFolderRelocation", "commandSyncFolderRelocation", "preflightSyncFolderRename", "commitSyncFolderRename", "preflightSyncFolderRebind", "commitSyncFolderRebind", "preflightSyncFolderReenable", "commitSyncFolderReenable", "getSyncFolderComparison", "listSyncFolderComparisonItems", "resolveSyncFolderComparisonItem", "listSyncFolderConflicts", "resolveSyncFolderConflict",
+] as const;

@@ -816,7 +816,7 @@ mod tests {
     fn unique_temp_dir(label: &str) -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "megle_fsops_{}_{}_{}_{}",
+            "mangoo_fsops_{}_{}_{}_{}",
             label,
             std::process::id(),
             std::time::SystemTime::now()
@@ -831,6 +831,23 @@ mod tests {
     fn rename_file_updates_disk_db_and_log() {
         let env = TestEnv::new("rename_ok");
         let file_id = env.add_file(env.root_folder_id, "old.jpg");
+        let before = {
+            let database = env.database.lock().expect("db lock");
+            database
+                .upsert_media_kind(file_id, "image")
+                .expect("classify media fixture");
+            database
+                .connection_for_fsops()
+                .execute(
+                    "UPDATE media SET width=640,height=480 WHERE file_id=?1",
+                    [file_id],
+                )
+                .expect("seed media dimensions");
+            database
+                .get_media(file_id)
+                .expect("get media before rename")
+                .expect("media fixture exists")
+        };
         let record = rename(
             &env.database,
             RenameRequest {
@@ -852,6 +869,106 @@ mod tests {
             .expect("get media")
             .unwrap();
         assert_eq!(media.name, "new.jpg");
+        assert_eq!(media.id, before.id);
+        assert_eq!(media.kind, before.kind);
+        assert_eq!((media.width, media.height), (before.width, before.height));
+    }
+
+    #[test]
+    fn all_file_generic_mutations_preserve_metadata_and_restore_identity() {
+        let env = TestEnv::new("generic_mutations");
+        let file = env.add_file(env.root_folder_id, "README");
+        let folder = env.add_folder(env.root_folder_id, "target");
+        let asset: Vec<u8> = {
+            let database = env.database.lock().unwrap();
+            database.connection_for_fsops().execute("INSERT INTO user_metadata(file_id,rating,favorite,note,updated_at) VALUES (?1,3,1,'retained',1)",[file]).unwrap();
+            database
+                .connection_for_fsops()
+                .execute("INSERT INTO tags(id,name) VALUES (1,'generic')", [])
+                .unwrap();
+            database
+                .connection_for_fsops()
+                .execute(
+                    "INSERT INTO file_tags(file_id,tag_id) VALUES (?1,1)",
+                    [file],
+                )
+                .unwrap();
+            database
+                .connection_for_fsops()
+                .query_row("SELECT asset_uuid FROM files WHERE id=?1", [file], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        rename(
+            &env.database,
+            RenameRequest {
+                file_id: Some(file),
+                folder_id: None,
+                new_name: ".hidden".into(),
+            },
+        )
+        .unwrap();
+        move_items(
+            &env.database,
+            MoveRequest {
+                file_ids: vec![file],
+                folder_ids: vec![],
+                target_folder_id: folder,
+            },
+        )
+        .unwrap();
+        {
+            let database = env.database.lock().unwrap();
+            let media = database.get_media(file).unwrap().unwrap();
+            assert_eq!(media.folder_id, folder);
+            assert!(media.kind.is_none());
+            assert_eq!(media.rating, Some(3));
+            assert!(media.favorite);
+            assert_eq!(media.tag_ids, vec![1]);
+            assert_eq!(
+                database
+                    .connection_for_fsops()
+                    .query_row(
+                        "SELECT COUNT(*) FROM media_fts WHERE media_fts MATCH 'hidden'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                1
+            );
+        }
+        delete(
+            &env.database,
+            DeleteRequest {
+                file_ids: vec![file],
+                folder_ids: vec![],
+                permanent: true,
+            },
+        )
+        .unwrap();
+        assert!(env
+            .database
+            .lock()
+            .unwrap()
+            .get_media(file)
+            .unwrap()
+            .is_none());
+        stdfs::write(env.root_path.join("target/.hidden"), b"restored").unwrap();
+        let mut database = env.database.lock().unwrap();
+        let root = database.get_root(env.root_id).unwrap().unwrap();
+        crate::scan::scan_root(&mut database, &root).unwrap();
+        let restored = database.get_media(file).unwrap().unwrap();
+        assert_eq!(restored.note.as_deref(), Some("retained"));
+        assert_eq!(restored.tag_ids, vec![1]);
+        assert_eq!(
+            database
+                .connection_for_fsops()
+                .query_row("SELECT asset_uuid FROM files WHERE id=?1", [file], |r| r
+                    .get::<_, Vec<u8>>(0))
+                .unwrap(),
+            asset
+        );
     }
 
     #[test]
@@ -916,6 +1033,23 @@ mod tests {
         let env = TestEnv::new("move_ok");
         let target_folder = env.add_folder(env.root_folder_id, "dst");
         let file_id = env.add_file(env.root_folder_id, "m.jpg");
+        let before = {
+            let database = env.database.lock().expect("db lock");
+            database
+                .upsert_media_kind(file_id, "image")
+                .expect("classify media fixture");
+            database
+                .connection_for_fsops()
+                .execute(
+                    "UPDATE media SET width=640,height=480 WHERE file_id=?1",
+                    [file_id],
+                )
+                .expect("seed media dimensions");
+            database
+                .get_media(file_id)
+                .expect("get media before move")
+                .expect("media fixture exists")
+        };
         let records = move_items(
             &env.database,
             MoveRequest {
@@ -937,6 +1071,9 @@ mod tests {
             .expect("get")
             .unwrap();
         assert_eq!(media.folder_id, target_folder);
+        assert_eq!(media.id, before.id);
+        assert_eq!(media.kind, before.kind);
+        assert_eq!((media.width, media.height), (before.width, before.height));
     }
 
     #[test]
@@ -1210,6 +1347,18 @@ mod tests {
             let child_id = env.add_folder(parent_id, "child");
             let file_id = env.add_file(child_id, "nested.jpg");
             let target_id = env.add_folder(env.root_folder_id, "target");
+            env.database
+                .lock()
+                .unwrap()
+                .update_folder_appearance(parent_id, "camera", "#abc")
+                .unwrap()
+                .unwrap();
+            env.database
+                .lock()
+                .unwrap()
+                .update_folder_appearance(child_id, "star", "#123456")
+                .unwrap()
+                .unwrap();
             let folder_ids = if reverse {
                 vec![child_id, parent_id, child_id]
             } else {
@@ -1232,6 +1381,19 @@ mod tests {
                 .root_path
                 .join("target/parent/child/nested.jpg")
                 .exists());
+            let ancestors = env
+                .database
+                .lock()
+                .unwrap()
+                .list_folder_ancestors(child_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                ancestors[ancestors.len() - 2].icon.as_deref(),
+                Some("camera")
+            );
+            assert_eq!(ancestors.last().unwrap().id, child_id);
+            assert_eq!(ancestors.last().unwrap().color.as_deref(), Some("#123456"));
         }
     }
 
@@ -2401,7 +2563,7 @@ mod tests {
         let source = env.root_path.join("recycle.jpg");
         let staging = env
             .root_path
-            .join(format!(".megle-recycle-{}", uuid::Uuid::now_v7()));
+            .join(format!(".mangoo-recycle-{}", uuid::Uuid::now_v7()));
         let identity = super::platform::VerifiedSource::open(&source)
             .expect("open source identity")
             .identity()
@@ -2468,7 +2630,7 @@ mod tests {
         let env = TestEnv::new_file_backed("journal_recycle_replaced_staging");
         let file_id = env.add_file(env.root_folder_id, "recycle.jpg");
         let source = env.root_path.join("recycle.jpg");
-        let staging = env.root_path.join(".megle-recycle-staging");
+        let staging = env.root_path.join(".mangoo-recycle-staging");
         let displaced = env.root_path.join("displaced-original.jpg");
         let source_handle =
             super::platform::VerifiedSource::open(&source).expect("open protected source");
@@ -2535,7 +2697,7 @@ mod tests {
         let env = TestEnv::new_file_backed("journal_recycle_moved_staging");
         let file_id = env.add_file(env.root_folder_id, "recycle.jpg");
         let source = env.root_path.join("recycle.jpg");
-        let staging = env.root_path.join(".megle-recycle-staging");
+        let staging = env.root_path.join(".mangoo-recycle-staging");
         let displaced = env.root_path.join("externally-moved-original.jpg");
         let source_handle =
             super::platform::VerifiedSource::open(&source).expect("open protected source");
@@ -3148,6 +3310,12 @@ mod tests {
     fn rename_folder_updates_disk_and_db() {
         let env = TestEnv::new("rename_folder");
         let child = env.add_folder(env.root_folder_id, "old_dir");
+        env.database
+            .lock()
+            .unwrap()
+            .update_folder_appearance(child, "camera", "#a1b2c3")
+            .unwrap()
+            .unwrap();
         let _file_id = env.add_file(child, "inner.jpg");
         let record = rename(
             &env.database,
@@ -3161,6 +3329,18 @@ mod tests {
         assert_eq!(record.operation, "rename");
         assert!(env.root_path.join("new_dir").join("inner.jpg").exists());
         assert!(!env.root_path.join("old_dir").exists());
+        let folder = env
+            .database
+            .lock()
+            .unwrap()
+            .list_folder_ancestors(child)
+            .unwrap()
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(folder.id, child);
+        assert_eq!(folder.icon.as_deref(), Some("camera"));
+        assert_eq!(folder.color.as_deref(), Some("#a1b2c3"));
     }
 
     #[test]
@@ -3211,6 +3391,35 @@ mod tests {
             )
             .expect("read ext");
         assert_eq!(ext, ".mp4");
+        assert_eq!(
+            env.database
+                .lock()
+                .unwrap()
+                .get_media(file_id)
+                .unwrap()
+                .unwrap()
+                .kind
+                .as_deref(),
+            Some("video")
+        );
+        rename(
+            &env.database,
+            RenameRequest {
+                file_id: Some(file_id),
+                folder_id: None,
+                new_name: "renamed".into(),
+            },
+        )
+        .unwrap();
+        let media = env
+            .database
+            .lock()
+            .unwrap()
+            .get_media(file_id)
+            .unwrap()
+            .unwrap();
+        assert!(media.kind.is_none());
+        assert_eq!(media.presentation.preview_kind, "static-thumbnail");
     }
 
     #[test]

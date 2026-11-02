@@ -65,11 +65,21 @@ function cachedBoundingRect(target: HTMLElement): DOMRect {
   const cached = affordanceRectCache.get(target);
   if (cached) return cached;
   const rect = target.getBoundingClientRect();
+  // Pseudo-elements use the padding box; align both pointer layers with the
+  // native border so proximity and keyboard focus never draw parallel edges.
+  // Read only on geometry-cache misses, never on each pointer frame.
+  const style = getComputedStyle(target);
+  const sides = ["top", "right", "bottom", "left"] as const;
+  const widths = sides.map((side) => Number.parseFloat(style.getPropertyValue(`border-${side}-width`) || "0"));
+  for (const [index, side] of sides.entries()) {
+    target.style.setProperty(`--interactive-pointer-${side}`, `${-widths[index]}px`);
+  }
   affordanceRectCache.set(target, rect);
   return rect;
 }
 const INTERACTIVE_POINTER_TARGET_SELECTOR_ATTRIBUTE = "data-interactive-pointer-target-selector";
 const INTERACTIVE_AFFORDANCE_OWNER_SELECTOR = [
+  '[data-interactive-pointer-owner="true"]',
   ".tree-item",
   ".tile-thumb",
   ".settings-style-slider-control",
@@ -361,7 +371,7 @@ function LiquidGlassRefractionDefs() {
     >
       <defs>
         <filter
-          id="megle-liquid-glass-refraction"
+          id="mangoo-liquid-glass-refraction"
           colorInterpolationFilters="sRGB"
           x="-20%"
           y="-20%"
@@ -393,7 +403,7 @@ function LiquidGlassRefractionDefs() {
           <feComposite in="chromaticLift" in2="SourceGraphic" operator="over" />
         </filter>
         <filter
-          id="megle-liquid-glass-edge"
+          id="mangoo-liquid-glass-edge"
           colorInterpolationFilters="sRGB"
           x="-30%"
           y="-30%"

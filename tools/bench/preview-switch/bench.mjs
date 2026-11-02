@@ -65,7 +65,7 @@ try {
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   await page.goto(url);
-  await page.waitForFunction(() => window.__meglePreviewReady === true);
+  await page.waitForFunction(() => window.__mangooPreviewReady === true);
 
   const cached = await page.evaluate(
     (runs) => window.runPreviewSwitchBenchmark?.({ mode: "cached", iterations: runs, step: 17, preloadRadius: 12 }),

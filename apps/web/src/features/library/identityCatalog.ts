@@ -1,0 +1,835 @@
+import { IDENTITY_TYPOGRAPHIC_ICONS } from "./identityTypographicCatalog";
+
+/** Stable presentation keys only; unknown persisted keys are never rewritten. */
+export const IDENTITY_CATEGORIES = [
+  { key: "collections", label: "收纳与阅读" },
+  { key: "media", label: "影像与音乐" },
+  { key: "creative", label: "设计与创作" },
+  { key: "work", label: "文档与办公" },
+  { key: "learning", label: "学习与科学" },
+  { key: "people", label: "人物与社交" },
+  { key: "home", label: "居家与生活" },
+  { key: "food", label: "美食与饮品" },
+  { key: "sports", label: "运动与游戏" },
+  { key: "animals", label: "动物与植物" },
+  { key: "nature", label: "自然与天气" },
+  { key: "places", label: "建筑与地点" },
+  { key: "travel", label: "交通与旅行" },
+  { key: "technology", label: "设备与技术" },
+  { key: "numbers", label: "数字与编号" },
+  { key: "letters-uppercase", label: "大写字母" },
+  { key: "letters-lowercase", label: "小写字母" },
+  { key: "roman-uppercase", label: "大写罗马数字" },
+  { key: "roman-lowercase", label: "小写罗马数字" },
+  { key: "chinese-numerals", label: "中文数字" },
+] as const;
+
+export type IdentityCategory = typeof IDENTITY_CATEGORIES[number]["key"];
+export interface IdentityIconDescriptor {
+  readonly key: string;
+  readonly label: string;
+  readonly category: IdentityCategory;
+  readonly keywords: string;
+  /** Omitted for legacy Fluent pictograms; typography has separate provenance. */
+  readonly sourceKind?: "typographic";
+  /** Official asset directory or pinned font and Unicode codepoint. */
+  readonly source: string;
+}
+
+// The first sixteen persisted keys predate the Fluent artwork. Keep their order
+// and meaning; package export names must never become persisted identities.
+export const IDENTITY_ICONS = [
+  {
+    "key": "library",
+    "label": "资源库",
+    "category": "collections",
+    "source": "Library",
+    "keywords": "books shelf collection"
+  },
+  {
+    "key": "image",
+    "label": "图片",
+    "category": "media",
+    "source": "Image",
+    "keywords": "picture photo"
+  },
+  {
+    "key": "camera",
+    "label": "相机",
+    "category": "media",
+    "source": "Camera",
+    "keywords": "photography photo"
+  },
+  {
+    "key": "film",
+    "label": "胶片",
+    "category": "media",
+    "source": "Filmstrip",
+    "keywords": "film movie cinema"
+  },
+  {
+    "key": "video",
+    "label": "视频",
+    "category": "media",
+    "source": "Video",
+    "keywords": "video recording"
+  },
+  {
+    "key": "music",
+    "label": "音乐",
+    "category": "media",
+    "source": "Music Note 2",
+    "keywords": "music audio sound"
+  },
+  {
+    "key": "palette",
+    "label": "调色板",
+    "category": "creative",
+    "source": "Color",
+    "keywords": "palette color painting"
+  },
+  {
+    "key": "aperture",
+    "label": "光圈",
+    "category": "media",
+    "source": "Record",
+    "keywords": "aperture lens"
+  },
+  {
+    "key": "layers",
+    "label": "图层",
+    "category": "creative",
+    "source": "Layer",
+    "keywords": "layers stack"
+  },
+  {
+    "key": "archive",
+    "label": "归档",
+    "category": "collections",
+    "source": "Archive",
+    "keywords": "archive storage"
+  },
+  {
+    "key": "box",
+    "label": "盒子",
+    "category": "collections",
+    "source": "Box",
+    "keywords": "box package"
+  },
+  {
+    "key": "bookmark",
+    "label": "书签",
+    "category": "collections",
+    "source": "Bookmark",
+    "keywords": "bookmark reading"
+  },
+  {
+    "key": "star",
+    "label": "星星",
+    "category": "people",
+    "source": "Star",
+    "keywords": "star favorite"
+  },
+  {
+    "key": "heart",
+    "label": "爱心",
+    "category": "people",
+    "source": "Heart",
+    "keywords": "heart love"
+  },
+  {
+    "key": "folder-heart",
+    "label": "收藏夹",
+    "category": "collections",
+    "source": "Folder",
+    "keywords": "folder heart favorites"
+  },
+  {
+    "key": "sparkles",
+    "label": "灵感",
+    "category": "creative",
+    "source": "Sparkle",
+    "keywords": "sparkle inspiration"
+  },
+  {
+    "key": "folder",
+    "label": "文件夹",
+    "category": "collections",
+    "source": "Folder",
+    "keywords": "folder directory"
+  },
+  {
+    "key": "book",
+    "label": "书籍",
+    "category": "collections",
+    "source": "Book",
+    "keywords": "book reading"
+  },
+  {
+    "key": "book-open",
+    "label": "阅读",
+    "category": "collections",
+    "source": "Book Open",
+    "keywords": "book open reading"
+  },
+  {
+    "key": "notebook",
+    "label": "笔记本",
+    "category": "collections",
+    "source": "Notebook",
+    "keywords": "notebook notes"
+  },
+  {
+    "key": "paint-brush",
+    "label": "画笔",
+    "category": "creative",
+    "source": "Paint Brush",
+    "keywords": "brush design painting"
+  },
+  {
+    "key": "document",
+    "label": "文档",
+    "category": "work",
+    "source": "Document",
+    "keywords": "document file paper"
+  },
+  {
+    "key": "document-text",
+    "label": "文字",
+    "category": "work",
+    "source": "Document Text",
+    "keywords": "text writing document"
+  },
+  {
+    "key": "document-pdf",
+    "label": "PDF 文档",
+    "category": "work",
+    "source": "Document PDF",
+    "keywords": "pdf document"
+  },
+  {
+    "key": "clipboard",
+    "label": "剪贴板",
+    "category": "work",
+    "source": "Clipboard",
+    "keywords": "clipboard board"
+  },
+  {
+    "key": "briefcase",
+    "label": "公文包",
+    "category": "work",
+    "source": "Briefcase",
+    "keywords": "briefcase work business"
+  },
+  {
+    "key": "calendar",
+    "label": "日历",
+    "category": "work",
+    "source": "Calendar",
+    "keywords": "calendar date schedule"
+  },
+  {
+    "key": "clock",
+    "label": "时钟",
+    "category": "work",
+    "source": "Clock",
+    "keywords": "clock time"
+  },
+  {
+    "key": "home",
+    "label": "家",
+    "category": "home",
+    "source": "Home",
+    "keywords": "home house"
+  },
+  {
+    "key": "building",
+    "label": "建筑",
+    "category": "places",
+    "source": "Building",
+    "keywords": "building architecture"
+  },
+  {
+    "key": "people",
+    "label": "团队",
+    "category": "people",
+    "source": "People",
+    "keywords": "people group team"
+  },
+  {
+    "key": "person",
+    "label": "人物",
+    "category": "people",
+    "source": "Person",
+    "keywords": "person profile portrait"
+  },
+  {
+    "key": "cat",
+    "label": "猫咪",
+    "category": "animals",
+    "source": "Animal Cat",
+    "keywords": "cat animal pet"
+  },
+  {
+    "key": "dog",
+    "label": "狗狗",
+    "category": "animals",
+    "source": "Animal Dog",
+    "keywords": "dog animal pet"
+  },
+  {
+    "key": "leaf",
+    "label": "叶子",
+    "category": "animals",
+    "source": "Leaf One",
+    "keywords": "leaf plant nature"
+  },
+  {
+    "key": "tree",
+    "label": "树木",
+    "category": "animals",
+    "source": "Tree Deciduous",
+    "keywords": "tree forest nature"
+  },
+  {
+    "key": "plant",
+    "label": "植物",
+    "category": "animals",
+    "source": "Leaf Three",
+    "keywords": "plant garden leaves"
+  },
+  {
+    "key": "food",
+    "label": "美食",
+    "category": "food",
+    "source": "Food",
+    "keywords": "food meal dining"
+  },
+  {
+    "key": "coffee",
+    "label": "咖啡",
+    "category": "food",
+    "source": "Drink Coffee",
+    "keywords": "coffee drink cafe"
+  },
+  {
+    "key": "airplane",
+    "label": "飞机",
+    "category": "travel",
+    "source": "Airplane",
+    "keywords": "airplane travel flight"
+  },
+  {
+    "key": "car",
+    "label": "汽车",
+    "category": "travel",
+    "source": "Vehicle Car",
+    "keywords": "car vehicle transport"
+  },
+  {
+    "key": "bicycle",
+    "label": "自行车",
+    "category": "travel",
+    "source": "Vehicle Bicycle",
+    "keywords": "bicycle cycling bike"
+  },
+  {
+    "key": "beach",
+    "label": "海滩",
+    "category": "nature",
+    "source": "Beach",
+    "keywords": "beach sea vacation"
+  },
+  {
+    "key": "globe",
+    "label": "地球",
+    "category": "travel",
+    "source": "Globe",
+    "keywords": "globe world earth"
+  },
+  {
+    "key": "map",
+    "label": "地图",
+    "category": "travel",
+    "source": "Map",
+    "keywords": "map travel navigation"
+  },
+  {
+    "key": "location",
+    "label": "地点",
+    "category": "travel",
+    "source": "Location",
+    "keywords": "location place pin"
+  },
+  {
+    "key": "sun",
+    "label": "太阳",
+    "category": "nature",
+    "source": "Weather Sunny",
+    "keywords": "sun sunny weather"
+  },
+  {
+    "key": "moon",
+    "label": "月亮",
+    "category": "nature",
+    "source": "Weather Moon",
+    "keywords": "moon night weather"
+  },
+  {
+    "key": "snowflake",
+    "label": "雪花",
+    "category": "nature",
+    "source": "Weather Snowflake",
+    "keywords": "snow winter weather"
+  },
+  {
+    "key": "cloud",
+    "label": "云朵",
+    "category": "nature",
+    "source": "Cloud",
+    "keywords": "cloud sky weather"
+  },
+  {
+    "key": "desktop",
+    "label": "电脑",
+    "category": "technology",
+    "source": "Desktop",
+    "keywords": "computer desktop screen"
+  },
+  {
+    "key": "laptop",
+    "label": "笔记本电脑",
+    "category": "technology",
+    "source": "Laptop",
+    "keywords": "laptop computer"
+  },
+  {
+    "key": "code",
+    "label": "代码",
+    "category": "technology",
+    "source": "Code",
+    "keywords": "code programming development"
+  },
+  {
+    "key": "database",
+    "label": "数据库",
+    "category": "technology",
+    "source": "Database",
+    "keywords": "database data storage"
+  },
+  {
+    "key": "hard-drive",
+    "label": "硬盘",
+    "category": "technology",
+    "source": "Hard Drive",
+    "keywords": "hard drive disk storage"
+  },
+  {
+    "key": "games",
+    "label": "游戏",
+    "category": "sports",
+    "source": "Games",
+    "keywords": "game controller gaming"
+  },
+  {
+    "key": "football",
+    "label": "足球",
+    "category": "sports",
+    "source": "Sport Soccer",
+    "keywords": "football soccer sport"
+  },
+  {
+    "key": "trophy",
+    "label": "奖杯",
+    "category": "sports",
+    "source": "Trophy",
+    "keywords": "trophy award achievement"
+  },
+  {
+    "key": "graduation",
+    "label": "学业",
+    "category": "learning",
+    "source": "Hat Graduation",
+    "keywords": "graduation education school"
+  },
+  {
+    "key": "beaker",
+    "label": "科学",
+    "category": "learning",
+    "source": "Beaker",
+    "keywords": "beaker science lab"
+  },
+  {
+    "key": "lightbulb",
+    "label": "创意",
+    "category": "creative",
+    "source": "Lightbulb",
+    "keywords": "lightbulb idea creativity"
+  },
+  {
+    "key": "puzzle",
+    "label": "拼图",
+    "category": "sports",
+    "source": "Puzzle Piece",
+    "keywords": "puzzle piece hobby"
+  },
+  {
+    "key": "shopping-bag",
+    "label": "购物",
+    "category": "home",
+    "source": "Shopping Bag",
+    "keywords": "shopping bag purchase"
+  },
+  {
+    "key": "gift",
+    "label": "礼物",
+    "category": "people",
+    "source": "Gift",
+    "keywords": "gift present celebration"
+  },
+  {
+    "key": "ribbon",
+    "label": "奖章",
+    "category": "sports",
+    "source": "Ribbon",
+    "keywords": "ribbon medal award"
+  },
+  {
+    "key": "shield",
+    "label": "盾牌",
+    "category": "technology",
+    "source": "Shield",
+    "keywords": "shield protection security"
+  },
+  {"key": "headphones", "label": "耳机", "category": "media", "source": "Headphones", "keywords": "headphones audio listening 耳麦"},
+  {"key": "microphone", "label": "麦克风", "category": "media", "source": "Mic", "keywords": "microphone recording podcast 录音 播客"},
+  {"key": "speaker", "label": "扬声器", "category": "media", "source": "Speaker 2", "keywords": "speaker audio sound 音响"},
+  {"key": "projection-screen", "label": "幕布", "category": "media", "source": "Projection Screen", "keywords": "projection screen cinema 投影"},
+  {"key": "video-clip", "label": "短片", "category": "media", "source": "Video Clip", "keywords": "video clip footage 片段"},
+  {"key": "image-stack", "label": "图集", "category": "media", "source": "Image Multiple", "keywords": "images photos gallery 图像"},
+  {"key": "subtitles", "label": "字幕", "category": "media", "source": "Closed Caption", "keywords": "subtitles caption translation 翻译"},
+  {"key": "music-album", "label": "专辑", "category": "media", "source": "Album", "keywords": "album music collection 唱片集"},
+  {"key": "music-notes", "label": "乐谱", "category": "media", "source": "Music Note 1", "keywords": "music score notes 旋律"},
+  {"key": "megaphone", "label": "扩音器", "category": "people", "source": "Megaphone", "keywords": "megaphone announcement broadcast 广播"},
+  {"key": "pen", "label": "钢笔", "category": "creative", "source": "Pen", "keywords": "pen writing ink 书写"},
+  {"key": "pencil", "label": "铅笔", "category": "creative", "source": "Edit", "keywords": "pencil sketch drawing 素描"},
+  {"key": "paint-bucket", "label": "油漆桶", "category": "creative", "source": "Paint Bucket", "keywords": "paint bucket fill 填色"},
+  {"key": "ruler", "label": "直尺", "category": "creative", "source": "Ruler", "keywords": "ruler measure length 测量"},
+  {"key": "scissors", "label": "剪刀", "category": "creative", "source": "Cut", "keywords": "scissors cut craft 手工"},
+  {"key": "shapes", "label": "形状", "category": "creative", "source": "Shapes", "keywords": "shapes geometry vector 几何 矢量"},
+  {"key": "cube", "label": "立方体", "category": "creative", "source": "Cube", "keywords": "cube model 3d 模型"},
+  {"key": "design", "label": "设计方案", "category": "creative", "source": "Design Ideas", "keywords": "design layout composition 构图"},
+  {"key": "wand", "label": "魔法棒", "category": "creative", "source": "Wand", "keywords": "wand magic effects 特效"},
+  {"key": "draw", "label": "绘画", "category": "creative", "source": "Draw Shape", "keywords": "draw art illustration 插画"},
+  {"key": "receipt", "label": "收据", "category": "work", "source": "Receipt", "keywords": "receipt invoice bill 账单 发票"},
+  {"key": "calculator", "label": "计算器", "category": "work", "source": "Calculator", "keywords": "calculator math finance 数学 财务"},
+  {"key": "chart", "label": "图表", "category": "work", "source": "Chart Multiple", "keywords": "chart graph analytics 数据分析"},
+  {"key": "clipboard-task", "label": "待办清单", "category": "work", "source": "Clipboard Task", "keywords": "tasks checklist todo 任务"},
+  {"key": "mail", "label": "信件", "category": "people", "source": "Mail", "keywords": "mail email letter 邮件"},
+  {"key": "certificate", "label": "证书", "category": "learning", "source": "Certificate", "keywords": "certificate diploma qualification 资质"},
+  {"key": "presentation", "label": "演示", "category": "work", "source": "Presenter", "keywords": "presentation slides lecture 幻灯片"},
+  {"key": "brain", "label": "思考", "category": "learning", "source": "Brain", "keywords": "brain mind thinking 思维"},
+  {"key": "glasses", "label": "眼镜", "category": "learning", "source": "Glasses", "keywords": "glasses reading study 学习"},
+  {"key": "timer", "label": "计时器", "category": "work", "source": "Timer", "keywords": "timer stopwatch countdown 倒计时"},
+  {"key": "backpack", "label": "背包", "category": "travel", "source": "Backpack", "keywords": "backpack bag school 书包"},
+  {"key": "tag", "label": "标签", "category": "collections", "source": "Tag", "keywords": "tag label organize 分类"},
+  {"key": "news", "label": "报纸", "category": "collections", "source": "News", "keywords": "news newspaper magazine 杂志"},
+  {"key": "reading-list", "label": "阅读清单", "category": "collections", "source": "Reading List", "keywords": "reading list collection 书单"},
+  {"key": "storage", "label": "收纳箱", "category": "collections", "source": "Box Multiple", "keywords": "boxes storage containers 整理"},
+  {"key": "book-letter", "label": "字典", "category": "collections", "source": "Book Letter", "keywords": "dictionary language letters 语言"},
+  {"key": "book-number", "label": "数字笔记", "category": "learning", "source": "Book Number", "keywords": "numbers arithmetic notebook 算术"},
+  {"key": "book-contacts", "label": "通讯录", "category": "people", "source": "Book Contacts", "keywords": "contacts address directory 联系人"},
+  {"key": "balloon", "label": "气球", "category": "people", "source": "Balloon", "keywords": "balloon party celebration 派对"},
+  {"key": "cake", "label": "蛋糕", "category": "food", "source": "Food Cake", "keywords": "cake birthday dessert 生日 甜点"},
+  {"key": "pizza", "label": "披萨", "category": "food", "source": "Food Pizza", "keywords": "pizza food meal 餐饮"},
+  {"key": "cookie", "label": "饼干", "category": "food", "source": "Cookies", "keywords": "cookie biscuit snack 零食"},
+  {"key": "wine", "label": "酒杯", "category": "food", "source": "Drink Wine", "keywords": "wine glass drink 饮品"},
+  {"key": "fitness", "label": "健身", "category": "sports", "source": "Dumbbell", "keywords": "fitness gym dumbbell 运动 哑铃"},
+  {"key": "basketball", "label": "篮球", "category": "sports", "source": "Sport Basketball", "keywords": "basketball sport match 比赛"},
+  {"key": "baseball", "label": "棒球", "category": "sports", "source": "Sport Baseball", "keywords": "baseball bat sport 球类"},
+  {"key": "umbrella", "label": "雨伞", "category": "home", "source": "Umbrella", "keywords": "umbrella rain shelter 遮雨"},
+  {"key": "bed", "label": "床铺", "category": "home", "source": "Bed", "keywords": "bed sleep rest 睡眠"},
+  {"key": "fog", "label": "雾气", "category": "nature", "source": "Weather Fog", "keywords": "fog mist weather 薄雾"},
+  {"key": "turtle", "label": "乌龟", "category": "animals", "source": "Animal Turtle", "keywords": "turtle animal reptile 爬宠"},
+  {"key": "rabbit", "label": "兔子", "category": "animals", "source": "Animal Rabbit", "keywords": "rabbit bunny pet 宠物"},
+  {"key": "wind", "label": "风雪", "category": "nature", "source": "Weather Blowing Snow", "keywords": "wind snow weather 暴风雪"},
+  {"key": "temperature", "label": "温度", "category": "nature", "source": "Temperature", "keywords": "temperature thermometer climate 气温"},
+  {"key": "paw", "label": "爪印", "category": "animals", "source": "Animal Paw Print", "keywords": "paw animal pet 足迹"},
+  {"key": "rain", "label": "雨天", "category": "nature", "source": "Weather Rain", "keywords": "rain weather shower 下雨"},
+  {"key": "partly-cloudy", "label": "晴间多云", "category": "nature", "source": "Weather Partly Cloudy Day", "keywords": "cloudy daylight weather 白天"},
+  {"key": "lightning", "label": "闪电", "category": "nature", "source": "Weather Thunderstorm", "keywords": "lightning thunder storm 雷雨"},
+  {"key": "water", "label": "水滴", "category": "nature", "source": "Drop", "keywords": "drop water liquid 水流"},
+  {"key": "mountain", "label": "山峰", "category": "nature", "source": "Mountain Location Bottom", "keywords": "mountain hiking outdoors 徒步"},
+  {"key": "tent", "label": "帐篷", "category": "travel", "source": "Tent", "keywords": "tent camping outdoors 露营"},
+  {"key": "boat", "label": "帆船", "category": "travel", "source": "Vehicle Ship", "keywords": "boat ship sailing 航海"},
+  {"key": "train", "label": "火车", "category": "travel", "source": "Vehicle Subway", "keywords": "train rail subway 地铁"},
+  {"key": "bus", "label": "巴士", "category": "travel", "source": "Vehicle Bus", "keywords": "bus transport transit 公交"},
+  {"key": "rocket", "label": "火箭", "category": "travel", "source": "Rocket", "keywords": "rocket space launch 太空"},
+  {"key": "compass", "label": "指南针", "category": "travel", "source": "Compass Northwest", "keywords": "compass navigation direction 导航"},
+  {"key": "city", "label": "城市", "category": "places", "source": "Building Multiple", "keywords": "city buildings skyline 都市"},
+  {"key": "store", "label": "商店", "category": "places", "source": "Building Shop", "keywords": "store shop retail 店铺"},
+  {"key": "luggage", "label": "行李箱", "category": "travel", "source": "Luggage", "keywords": "luggage suitcase travel 旅行"},
+  {"key": "phone", "label": "手机", "category": "technology", "source": "Phone", "keywords": "phone mobile smartphone 移动设备"},
+  {"key": "tablet", "label": "平板", "category": "technology", "source": "Tablet", "keywords": "tablet device screen 触屏"},
+  {"key": "keyboard", "label": "键盘", "category": "technology", "source": "Keyboard", "keywords": "keyboard typing input 输入"},
+  {"key": "cursor", "label": "指针", "category": "technology", "source": "Cursor", "keywords": "mouse cursor pointer 光标"},
+  {"key": "printer", "label": "打印机", "category": "technology", "source": "Print", "keywords": "printer print office 办公"},
+  {"key": "chip", "label": "芯片", "category": "technology", "source": "Developer Board", "keywords": "chip processor circuit 电路"},
+  {"key": "server", "label": "服务器", "category": "technology", "source": "Server", "keywords": "server hosting network 网络"},
+  {"key": "usb", "label": "存储棒", "category": "technology", "source": "Usb Stick", "keywords": "usb stick storage 移动存储"},
+  {"key": "plug", "label": "插头", "category": "technology", "source": "Plug Connected", "keywords": "plug power connection 连接"},
+  {"key": "robot", "label": "机器人", "category": "technology", "source": "Bot", "keywords": "robot bot automation 自动化"},
+  {"key": "drawer", "label": "抽屉", "category": "collections", "source": "Drawer", "keywords": "drawer storage cabinet 收纳 柜子"},
+  {"key": "vault", "label": "保险柜", "category": "collections", "source": "Vault", "keywords": "vault safe valuables 贵重物品"},
+  {"key": "note", "label": "便签", "category": "collections", "source": "Note", "keywords": "note memo reminder 备忘"},
+  {"key": "binder", "label": "活页夹", "category": "collections", "source": "Binder Triangle", "keywords": "binder stationery files 文具"},
+  {"key": "notepad", "label": "记事本", "category": "collections", "source": "Notepad", "keywords": "notepad writing notes 记录"},
+  {"key": "guitar", "label": "吉他", "category": "media", "source": "Guitar", "keywords": "guitar instrument music 乐器"},
+  {"key": "tv", "label": "电视", "category": "media", "source": "TV", "keywords": "television tv shows 节目"},
+  {"key": "radio", "label": "对讲机", "category": "media", "source": "Walkie Talkie", "keywords": "walkie talkie radio communication 通信"},
+  {"key": "sound-wave", "label": "声音波形", "category": "media", "source": "Sound Source", "keywords": "sound source audio wave 声源"},
+  {"key": "panorama-video", "label": "全景视频", "category": "media", "source": "Video 360", "keywords": "panorama video 360 全景"},
+  {"key": "headset", "label": "通话耳麦", "category": "media", "source": "Headset", "keywords": "headset call audio 通话"},
+  {"key": "calligraphy", "label": "书法", "category": "creative", "source": "Calligraphy Pen", "keywords": "calligraphy pen ink 毛笔 书写"},
+  {"key": "eyedropper", "label": "滴管", "category": "creative", "source": "Eyedropper", "keywords": "eyedropper color sample 取色"},
+  {"key": "eraser", "label": "橡皮", "category": "creative", "source": "Eraser", "keywords": "eraser rubber drawing 擦除"},
+  {"key": "frame", "label": "画框", "category": "creative", "source": "Frame", "keywords": "frame artwork canvas 装裱"},
+  {"key": "ink-stroke", "label": "笔触", "category": "creative", "source": "Ink Stroke", "keywords": "ink stroke brush 手绘"},
+  {"key": "whiteboard", "label": "白板", "category": "creative", "source": "Whiteboard", "keywords": "whiteboard sketch ideas 草图"},
+  {"key": "spreadsheet", "label": "表格", "category": "work", "source": "Table", "keywords": "table spreadsheet cells 工作表"},
+  {"key": "pie-chart", "label": "饼图", "category": "work", "source": "Data Pie", "keywords": "pie chart data statistics 统计"},
+  {"key": "form", "label": "表单", "category": "work", "source": "Form", "keywords": "form survey questionnaire 问卷"},
+  {"key": "signature", "label": "签名", "category": "work", "source": "Signature", "keywords": "signature autograph contract 合同"},
+  {"key": "scales", "label": "天平", "category": "work", "source": "Scales", "keywords": "scales balance law 法律"},
+  {"key": "wallet", "label": "钱包", "category": "work", "source": "Wallet", "keywords": "wallet money finance 财务"},
+  {"key": "microscope", "label": "显微镜", "category": "learning", "source": "Microscope", "keywords": "microscope science research 研究"},
+  {"key": "molecule", "label": "分子", "category": "learning", "source": "Molecule", "keywords": "molecule chemistry structure 化学"},
+  {"key": "math-formula", "label": "数学公式", "category": "learning", "source": "Math Formula", "keywords": "math formula equation 方程"},
+  {"key": "pi", "label": "圆周率", "category": "learning", "source": "Pi", "keywords": "pi mathematics constant 数学"},
+  {"key": "planet", "label": "行星", "category": "learning", "source": "Planet", "keywords": "planet astronomy space 天文"},
+  {"key": "teaching", "label": "教学", "category": "learning", "source": "Teaching", "keywords": "teaching education class 课堂"},
+  {"key": "quiz", "label": "测验", "category": "learning", "source": "Quiz", "keywords": "quiz test questions 考试"},
+  {"key": "translate", "label": "翻译", "category": "learning", "source": "Translate", "keywords": "translate language linguistics 语言"},
+  {"key": "stethoscope", "label": "听诊器", "category": "learning", "source": "Stethoscope", "keywords": "stethoscope medicine doctor 医学"},
+  {"key": "pulse", "label": "脉搏", "category": "learning", "source": "Pulse", "keywords": "pulse health biology 生物"},
+  {"key": "book-globe", "label": "地理", "category": "learning", "source": "Book Globe", "keywords": "geography earth study 地理课"},
+  {"key": "book-lightbulb", "label": "知识", "category": "learning", "source": "Book Open Lightbulb", "keywords": "knowledge learning discovery 学习"},
+  {"key": "chat", "label": "聊天", "category": "people", "source": "Chat", "keywords": "chat conversation message 消息"},
+  {"key": "comment", "label": "评论", "category": "people", "source": "Comment", "keywords": "comment discussion feedback 讨论"},
+  {"key": "handshake", "label": "握手", "category": "people", "source": "Handshake", "keywords": "handshake cooperation agreement 合作"},
+  {"key": "community", "label": "社群", "category": "people", "source": "People Community", "keywords": "community group neighbors 社区"},
+  {"key": "contact-card", "label": "名片", "category": "people", "source": "Contact Card", "keywords": "contact card business identity 联系"},
+  {"key": "smile", "label": "笑脸", "category": "people", "source": "Emoji", "keywords": "emoji smile happy 快乐"},
+  {"key": "hand-wave", "label": "挥手", "category": "people", "source": "Hand Wave", "keywords": "hand wave hello greeting 问候"},
+  {"key": "accessibility", "label": "无障碍", "category": "people", "source": "Accessibility", "keywords": "accessibility inclusive support 辅助"},
+  {"key": "organization", "label": "组织", "category": "people", "source": "Organization", "keywords": "organization hierarchy team 机构"},
+  {"key": "person-heart", "label": "关怀", "category": "people", "source": "Person Heart", "keywords": "care kindness person heart 关爱"},
+  {"key": "couch", "label": "沙发", "category": "home", "source": "Couch", "keywords": "couch sofa lounge 客厅"},
+  {"key": "desk", "label": "书桌", "category": "home", "source": "Desk", "keywords": "desk furniture workspace 家具"},
+  {"key": "seat", "label": "座椅", "category": "home", "source": "Seat", "keywords": "seat chair furniture 椅子"},
+  {"key": "lamp", "label": "灯泡", "category": "home", "source": "Lightbulb Filament", "keywords": "lamp lighting filament 照明"},
+  {"key": "door", "label": "门", "category": "home", "source": "Door", "keywords": "door entrance room 房间"},
+  {"key": "key", "label": "钥匙", "category": "home", "source": "Key", "keywords": "key home access 门锁"},
+  {"key": "clothes-hanger", "label": "衣架", "category": "home", "source": "Clothes Hanger", "keywords": "clothes hanger wardrobe 衣柜"},
+  {"key": "washer", "label": "洗衣机", "category": "home", "source": "Washer", "keywords": "washer laundry clothes 洗衣"},
+  {"key": "dishwasher", "label": "洗碗机", "category": "home", "source": "Dishwasher", "keywords": "dishwasher kitchen dishes 餐具"},
+  {"key": "shower", "label": "花洒", "category": "home", "source": "Showerhead", "keywords": "shower bath bathroom 浴室"},
+  {"key": "fireplace", "label": "壁炉", "category": "home", "source": "Fireplace", "keywords": "fireplace warmth hearth 取暖"},
+  {"key": "broom", "label": "扫帚", "category": "home", "source": "Broom", "keywords": "broom clean housework 清洁"},
+  {"key": "toolbox", "label": "工具箱", "category": "home", "source": "Toolbox", "keywords": "toolbox tools repair 维修"},
+  {"key": "teddy", "label": "玩具熊", "category": "home", "source": "Teddy", "keywords": "teddy bear toy 玩具"},
+  {"key": "apple", "label": "苹果", "category": "food", "source": "Food Apple", "keywords": "apple fruit food 水果"},
+  {"key": "carrot", "label": "胡萝卜", "category": "food", "source": "Food Carrot", "keywords": "carrot vegetable food 蔬菜"},
+  {"key": "egg", "label": "鸡蛋", "category": "food", "source": "Food Egg", "keywords": "egg breakfast food 早餐"},
+  {"key": "toast", "label": "吐司", "category": "food", "source": "Food Toast", "keywords": "toast bread breakfast 面包"},
+  {"key": "salad", "label": "沙拉", "category": "food", "source": "Bowl Salad", "keywords": "salad vegetables bowl 轻食"},
+  {"key": "noodles", "label": "面碗", "category": "food", "source": "Bowl Chopsticks", "keywords": "noodles bowl chopsticks 面食"},
+  {"key": "beer", "label": "啤酒", "category": "food", "source": "Drink Beer", "keywords": "beer drink mug 饮料"},
+  {"key": "cocktail", "label": "鸡尾酒", "category": "food", "source": "Drink Margarita", "keywords": "cocktail margarita drink 调酒"},
+  {"key": "chicken", "label": "鸡腿", "category": "food", "source": "Food Chicken Leg", "keywords": "chicken leg poultry 烹饪"},
+  {"key": "chess", "label": "国际象棋", "category": "sports", "source": "Chess", "keywords": "chess strategy board game 棋类"},
+  {"key": "hockey", "label": "曲棍球", "category": "sports", "source": "Sport Hockey", "keywords": "hockey stick sport 球杆"},
+  {"key": "american-football", "label": "美式足球", "category": "sports", "source": "Sport American Football", "keywords": "american football sport 橄榄球"},
+  {"key": "cricket", "label": "板球", "category": "sports", "source": "Sport Cricket Bat", "keywords": "cricket bat sport 球拍"},
+  {"key": "running", "label": "跑步", "category": "sports", "source": "Run", "keywords": "running jogging exercise 慢跑"},
+  {"key": "target", "label": "靶心", "category": "sports", "source": "Target", "keywords": "target archery aim 射箭"},
+  {"key": "puzzle-cube", "label": "魔方", "category": "sports", "source": "Puzzle Cube", "keywords": "puzzle cube rubik game 益智"},
+  {"key": "clover", "label": "四叶草", "category": "animals", "source": "Clover", "keywords": "clover plant luck 幸运草"},
+  {"key": "grass", "label": "青草", "category": "animals", "source": "Plant Grass", "keywords": "grass lawn meadow 草坪"},
+  {"key": "cattail", "label": "香蒲", "category": "animals", "source": "Plant Cattail", "keywords": "cattail wetland plant 湿地"},
+  {"key": "ragweed", "label": "豚草", "category": "animals", "source": "Plant Ragweed", "keywords": "ragweed herb plant 草本"},
+  {"key": "fire", "label": "火焰", "category": "nature", "source": "Fire", "keywords": "fire flame heat 火光"},
+  {"key": "humidity", "label": "湿度", "category": "nature", "source": "Weather Humidity", "keywords": "humidity moisture weather 潮湿"},
+  {"key": "water-waves", "label": "水面", "category": "nature", "source": "Water", "keywords": "water waves river 河流"},
+  {"key": "haze", "label": "霾", "category": "nature", "source": "Weather Haze", "keywords": "haze weather atmosphere 天气"},
+  {"key": "bank", "label": "银行", "category": "places", "source": "Building Bank", "keywords": "bank building finance 金融"},
+  {"key": "government", "label": "政务建筑", "category": "places", "source": "Building Government", "keywords": "government civic building 政务"},
+  {"key": "factory", "label": "工厂", "category": "places", "source": "Building Factory", "keywords": "factory industry manufacturing 工业"},
+  {"key": "skyscraper", "label": "摩天楼", "category": "places", "source": "Building Skyscraper", "keywords": "skyscraper tower skyline 高楼"},
+  {"key": "lighthouse", "label": "灯塔", "category": "places", "source": "Building Lighthouse", "keywords": "lighthouse coast beacon 海岸"},
+  {"key": "townhouse", "label": "联排住宅", "category": "places", "source": "Building Townhouse", "keywords": "townhouse neighborhood residential 住宅"},
+  {"key": "mosque", "label": "清真寺", "category": "places", "source": "Building Mosque", "keywords": "mosque architecture religion 宗教"},
+  {"key": "swimming-pool", "label": "泳池", "category": "places", "source": "Swimming Pool", "keywords": "swimming pool leisure 游泳"},
+  {"key": "bench", "label": "长椅", "category": "places", "source": "Bench", "keywords": "bench park garden 公园"},
+  {"key": "motorcycle", "label": "摩托车", "category": "travel", "source": "Vehicle Motorcycle", "keywords": "motorcycle motorbike transport 机车"},
+  {"key": "truck", "label": "卡车", "category": "travel", "source": "Vehicle Truck", "keywords": "truck delivery freight 货运"},
+  {"key": "tractor", "label": "拖拉机", "category": "travel", "source": "Vehicle Tractor", "keywords": "tractor farming agriculture 农业"},
+  {"key": "cable-car", "label": "缆车", "category": "travel", "source": "Vehicle Cable Car", "keywords": "cable car mountain tourism 观光"},
+  {"key": "taxi", "label": "出租车", "category": "travel", "source": "Vehicle Cab", "keywords": "taxi cab transport 出租"},
+  {"key": "gas-pump", "label": "加油站", "category": "travel", "source": "Gas Pump", "keywords": "gas pump fuel station 燃油"},
+  {"key": "road", "label": "道路", "category": "travel", "source": "Road", "keywords": "road route journey 路线"},
+  {"key": "street-sign", "label": "路标", "category": "travel", "source": "Street Sign", "keywords": "street sign navigation 方向"},
+  {"key": "ticket", "label": "票券", "category": "travel", "source": "Ticket Diagonal", "keywords": "ticket travel admission 门票"},
+  {"key": "router", "label": "路由器", "category": "technology", "source": "Router", "keywords": "router network internet 联网"},
+  {"key": "vr-headset", "label": "虚拟现实", "category": "technology", "source": "Headset VR", "keywords": "virtual reality vr headset 头显"},
+  {"key": "smartwatch", "label": "智能手表", "category": "technology", "source": "Smartwatch", "keywords": "smartwatch wearable watch 穿戴"},
+  {"key": "battery", "label": "电池", "category": "technology", "source": "Battery Charge", "keywords": "battery charging power 电量"},
+  {"key": "fingerprint", "label": "指纹", "category": "technology", "source": "Fingerprint", "keywords": "fingerprint biometrics identity 生物识别"},
+  {"key": "qr-code", "label": "二维码", "category": "technology", "source": "QR Code", "keywords": "qr code scan matrix 扫码"},
+  {"key": "bug", "label": "程序调试", "category": "technology", "source": "Bug", "keywords": "bug debugging software 程序"},
+  {"key": "terminal", "label": "命令终端", "category": "technology", "source": "Window Dev Tools", "keywords": "terminal console developer tools 开发"},
+  {"key": "branch", "label": "代码分支", "category": "technology", "source": "Branch", "keywords": "branch version code development 版本"},
+  {"key": "network", "label": "虚拟网络", "category": "technology", "source": "Virtual Network", "keywords": "virtual network topology 网络拓扑"},
+  {"key": "usb-port", "label": "USB 接口", "category": "technology", "source": "Port USB C", "keywords": "usb port connector type c 接口"},
+  {"key": "folder-stack", "label": "文件夹组", "category": "collections", "source": "Folder Multiple", "keywords": "folders multiple collection 分组 收纳"},
+  {"key": "folder-documents", "label": "文档文件夹", "category": "collections", "source": "Folder Document", "keywords": "folder document files 文件 归档"},
+  {"key": "zip-folder", "label": "压缩文件夹", "category": "collections", "source": "Folder Zip", "keywords": "zip compressed archive 压缩包"},
+  {"key": "bookmark-stack", "label": "书签组", "category": "collections", "source": "Bookmark Multiple", "keywords": "bookmarks multiple reading 阅读 标记"},
+  {"key": "reading-quote", "label": "引文", "category": "collections", "source": "Text Quote", "keywords": "quote citation reading 引用 阅读"},
+  {"key": "reading-aloud", "label": "朗读", "category": "collections", "source": "Read Aloud", "keywords": "read aloud voice 阅读 语音"},
+  {"key": "book-search", "label": "检索书籍", "category": "collections", "source": "Book Search", "keywords": "book search reference 查阅 参考"},
+  {"key": "archive-history", "label": "历史档案", "category": "collections", "source": "Archive Clock", "keywords": "archive history records 历史 记录"},
+  {"key": "video-short", "label": "短视频", "category": "media", "source": "Video Short", "keywords": "short video clip 短片 影像"},
+  {"key": "film-images", "label": "影像胶片", "category": "media", "source": "Filmstrip Image", "keywords": "filmstrip image cinema 胶片 摄影"},
+  {"key": "captions", "label": "文本字幕", "category": "media", "source": "Subtitles", "keywords": "subtitles captions language 字幕 翻译"},
+  {"key": "audio-midi", "label": "音序器", "category": "media", "source": "Midi", "keywords": "midi instrument music 音乐 编曲"},
+  {"key": "audio-stream", "label": "直播流", "category": "media", "source": "Stream", "keywords": "stream broadcasting live 直播 媒体"},
+  {"key": "audio-voicemail", "label": "语音留言", "category": "media", "source": "Voicemail", "keywords": "voicemail audio message 语音 留言"},
+  {"key": "audio-speaker-box", "label": "音箱", "category": "media", "source": "Speaker Box", "keywords": "speaker sound audio 音响 播放"},
+  {"key": "video-projection", "label": "投影幕", "category": "media", "source": "Projection Screen Text", "keywords": "projection screen presentation 投影 放映"},
+  {"key": "design-diamond", "label": "菱形宝石", "category": "creative", "source": "Diamond", "keywords": "diamond gem shape 宝石 形状"},
+  {"key": "design-hexagon", "label": "六边形", "category": "creative", "source": "Hexagon", "keywords": "hexagon geometry polygon 几何 多边形"},
+  {"key": "design-triangle", "label": "三角形", "category": "creative", "source": "Triangle", "keywords": "triangle geometry shape 几何 形状"},
+  {"key": "design-organic", "label": "有机形状", "category": "creative", "source": "Shape Organic", "keywords": "organic shape abstract 抽象 曲线"},
+  {"key": "design-bezier", "label": "套索", "category": "creative", "source": "Lasso", "keywords": "lasso selection drawing 绘图 选区"},
+  {"key": "design-pen-tool", "label": "墨水笔", "category": "creative", "source": "Inking Tool", "keywords": "inking pen drawing 绘图 墨水"},
+  {"key": "design-ruler-grid", "label": "辅助网格", "category": "creative", "source": "Grid", "keywords": "grid layout alignment 网格 排版"},
+  {"key": "design-paint-bucket", "label": "油漆桶与画笔", "category": "creative", "source": "Paint Bucket Brush", "keywords": "paint bucket brush painting 绘画 涂色"},
+  {"key": "design-sticker", "label": "贴纸", "category": "creative", "source": "Sticker", "keywords": "sticker label decoration 装饰 贴画"},
+  {"key": "design-sketch", "label": "手绘线条", "category": "creative", "source": "Line Style Sketch", "keywords": "sketch line drawing 手绘 草稿"},
+  {"key": "work-gavel", "label": "法槌", "category": "work", "source": "Gavel", "keywords": "gavel law justice 法律 裁决"},
+  {"key": "work-coins", "label": "硬币堆", "category": "work", "source": "Coin Stack", "keywords": "coin stack finance money 金融 理财"},
+  {"key": "work-payment", "label": "银行卡", "category": "work", "source": "Payment", "keywords": "payment card bank 支付 银行"},
+  {"key": "work-poll", "label": "投票统计", "category": "work", "source": "Poll", "keywords": "poll voting survey 投票 调查"},
+  {"key": "work-gantt", "label": "甘特图", "category": "work", "source": "Gantt Chart", "keywords": "gantt planning schedule 项目 计划"},
+  {"key": "work-diagram", "label": "关系图", "category": "work", "source": "Diagram", "keywords": "diagram structure relations 结构 关系"},
+  {"key": "work-flowchart", "label": "流程图", "category": "work", "source": "Flowchart", "keywords": "flowchart workflow process 流程 业务"},
+  {"key": "work-line-chart", "label": "折线图", "category": "work", "source": "Data Line", "keywords": "line chart data statistics 数据 趋势"},
+  {"key": "work-funnel", "label": "漏斗图", "category": "work", "source": "Data Funnel", "keywords": "funnel chart analytics 分析 转化"},
+  {"key": "work-task-list", "label": "任务清单", "category": "work", "source": "Task List LTR", "keywords": "task list checklist 任务 待办"},
+  {"key": "science-brain", "label": "脑部电路", "category": "learning", "source": "Brain Circuit", "keywords": "brain circuit neuroscience 大脑 神经"},
+  {"key": "science-omega", "label": "欧米伽", "category": "learning", "source": "Omega", "keywords": "omega greek physics 物理 希腊字母"},
+  {"key": "science-math", "label": "运算符号", "category": "learning", "source": "Math Symbols", "keywords": "math symbols arithmetic 数学 运算"},
+  {"key": "science-heart", "label": "心率", "category": "learning", "source": "Heart Pulse", "keywords": "heart pulse health 心脏 健康"},
+  {"key": "science-pill", "label": "药片", "category": "learning", "source": "Pill", "keywords": "pill medicine pharmacy 药品 医学"},
+  {"key": "science-xray", "label": "影像检查", "category": "learning", "source": "Xray", "keywords": "xray radiology medical 医学 检查"},
+  {"key": "science-dentist", "label": "牙齿", "category": "learning", "source": "Dentist", "keywords": "dentist tooth dental 牙科 口腔"},
+  {"key": "science-brain-ideas", "label": "脑力灵感", "category": "learning", "source": "Brain Sparkle", "keywords": "brain ideas thinking 思考 灵感"},
+  {"key": "people-audience", "label": "观众", "category": "people", "source": "People Audience", "keywords": "people audience public 观众 群体"},
+  {"key": "people-team", "label": "协作团队", "category": "people", "source": "People Team", "keywords": "people team collaboration 团队 协作"},
+  {"key": "people-queue", "label": "排队", "category": "people", "source": "People Queue", "keywords": "people queue line 排队 等候"},
+  {"key": "people-communication", "label": "交流", "category": "people", "source": "People Communication", "keywords": "people communication conversation 交流 对话"},
+  {"key": "people-laugh", "label": "大笑", "category": "people", "source": "Emoji Laugh", "keywords": "emoji laugh happy 表情 开心"},
+  {"key": "people-surprise", "label": "惊讶", "category": "people", "source": "Emoji Surprise", "keywords": "emoji surprise expression 表情 惊喜"},
+  {"key": "people-thumbs-up", "label": "点赞", "category": "people", "source": "Thumb Like", "keywords": "thumb like approval 赞同 鼓励"},
+  {"key": "people-crown", "label": "王冠", "category": "people", "source": "Crown", "keywords": "crown royalty honor 荣誉 冠冕"},
+  {"key": "home-alarm", "label": "闹钟", "category": "home", "source": "Clock Alarm", "keywords": "clock alarm morning 闹钟 起床"},
+  {"key": "home-oven", "label": "烤箱", "category": "home", "source": "Oven", "keywords": "oven baking kitchen 厨房 烘焙"},
+  {"key": "home-flashlight", "label": "手电筒", "category": "home", "source": "Flashlight", "keywords": "flashlight torch lighting 照明 手电"},
+  {"key": "home-bell", "label": "服务铃", "category": "home", "source": "Service Bell", "keywords": "service bell reception 服务 接待"},
+  {"key": "home-tools", "label": "扳手与螺丝刀", "category": "home", "source": "Wrench Screwdriver", "keywords": "wrench screwdriver tools 工具 修理"},
+  {"key": "home-recycle", "label": "回收桶", "category": "home", "source": "Bin Recycle", "keywords": "recycle bin recycling 回收 分类"},
+  {"key": "home-garage", "label": "车库", "category": "home", "source": "Home Garage", "keywords": "home garage parking 住宅 停车"},
+  {"key": "home-bow-tie", "label": "领结", "category": "home", "source": "Bow Tie", "keywords": "bow tie clothing attire 服饰 正装"},
+  {"key": "food-grains", "label": "谷物", "category": "food", "source": "Food Grains", "keywords": "grain wheat cereal 谷物 小麦"},
+  {"key": "food-fish", "label": "鱼料理", "category": "food", "source": "Food Fish", "keywords": "fish seafood meal 海鲜 食物"},
+  {"key": "food-takeaway", "label": "外带饮品", "category": "food", "source": "Drink To Go", "keywords": "takeaway drink cup 饮品 外带"},
+  {"key": "food-utensils", "label": "锅铲与勺", "category": "food", "source": "Spatula Spoon", "keywords": "spatula spoon cooking 餐厨 烹饪"},
+  {"key": "sport-cricket-ball", "label": "板球球体", "category": "sports", "source": "Sport Cricket Ball", "keywords": "cricket ball sport 运动 球类"},
+  {"key": "sport-medal", "label": "奖牌", "category": "sports", "source": "Medal", "keywords": "medal award winner 奖项 荣誉"},
+  {"key": "sport-walking", "label": "步行", "category": "sports", "source": "Person Walking", "keywords": "walking hiking exercise 步行 锻炼"},
+  {"key": "sport-cube-piece", "label": "魔方块", "category": "sports", "source": "Puzzle Cube Piece", "keywords": "puzzle cube piece 益智 拼块"},
+  {"key": "sport-archery", "label": "箭中靶心", "category": "sports", "source": "Target Arrow", "keywords": "target arrow archery 射箭 命中"},
+  {"key": "sport-hourglass", "label": "沙漏", "category": "sports", "source": "Hourglass", "keywords": "hourglass sand timer 计时 沙漏"},
+  {"key": "plant-leaves", "label": "双叶", "category": "animals", "source": "Leaf Two", "keywords": "leaves plant foliage 植物 叶片"},
+  {"key": "plant-earth", "label": "生态地球", "category": "animals", "source": "Earth Leaf", "keywords": "earth leaf ecology 植物 生态"},
+  {"key": "nature-drizzle", "label": "毛毛雨", "category": "nature", "source": "Weather Drizzle", "keywords": "drizzle rain weather 细雨 天气"},
+  {"key": "nature-hail", "label": "白昼冰雹", "category": "nature", "source": "Weather Hail Day", "keywords": "hail day weather 冰雹 白天"},
+  {"key": "nature-sleet", "label": "雨夹雪", "category": "nature", "source": "Weather Rain Snow", "keywords": "rain snow sleet 雨雪 天气"},
+  {"key": "nature-duststorm", "label": "沙尘暴", "category": "nature", "source": "Weather Duststorm", "keywords": "duststorm dust weather 沙尘 天气"},
+  {"key": "nature-night-cloud", "label": "夜间多云", "category": "nature", "source": "Weather Partly Cloudy Night", "keywords": "cloudy night moon 月夜 天气"},
+  {"key": "nature-celsius", "label": "摄氏温度", "category": "nature", "source": "Temperature Degree Celsius", "keywords": "celsius temperature degree 温度 摄氏"},
+  {"key": "nature-fahrenheit", "label": "华氏温度", "category": "nature", "source": "Temperature Degree Fahrenheit", "keywords": "fahrenheit temperature degree 温度 华氏"},
+  {"key": "place-conference", "label": "会议室", "category": "places", "source": "Conference Room", "keywords": "conference room meeting 会议 场所"},
+  {"key": "place-elevator", "label": "电梯", "category": "places", "source": "Elevator", "keywords": "elevator lift building 建筑 升降"},
+  {"key": "place-kiosk", "label": "服务亭", "category": "places", "source": "Kiosk", "keywords": "kiosk booth information 服务 站点"},
+  {"key": "place-residence", "label": "住宅楼", "category": "places", "source": "Building Home", "keywords": "building home residence 住宅 居住"},
+  {"key": "place-retail", "label": "零售门店", "category": "places", "source": "Building Retail", "keywords": "retail store shop 零售 商业"},
+  {"key": "place-city", "label": "城市地标", "category": "places", "source": "City", "keywords": "city skyline landmark 城市 地标"},
+  {"key": "place-office", "label": "办公楼", "category": "places", "source": "Building Desktop", "keywords": "office building workspace 办公 场所"},
+  {"key": "travel-takeoff", "label": "飞机起飞", "category": "travel", "source": "Airplane Take Off", "keywords": "airplane takeoff departure 航班 出发"},
+  {"key": "travel-landing", "label": "飞机降落", "category": "travel", "source": "Airplane Landing", "keywords": "airplane landing arrival 航班 到达"},
+  {"key": "travel-parking", "label": "停车位", "category": "travel", "source": "Vehicle Car Parking", "keywords": "car parking vehicle 停车 汽车"},
+  {"key": "travel-highway", "label": "高速公路", "category": "travel", "source": "Highway", "keywords": "highway motorway road 公路 出行"},
+  {"key": "travel-mountain-trail", "label": "山间小径", "category": "travel", "source": "Mountain Trail", "keywords": "mountain trail hiking 徒步 山路"},
+  {"key": "travel-north", "label": "正北指南针", "category": "travel", "source": "Compass True North", "keywords": "compass north navigation 北方 导航"},
+  {"key": "travel-engine", "label": "发动机", "category": "travel", "source": "Engine", "keywords": "engine motor vehicle 发动机 动力"},
+  {"key": "travel-directions", "label": "方向路牌", "category": "travel", "source": "Directions", "keywords": "directions route navigation 路线 导航"},
+  {"key": "tech-bluetooth", "label": "蓝牙", "category": "technology", "source": "Bluetooth", "keywords": "bluetooth wireless connection 蓝牙 无线"},
+  {"key": "tech-barcode", "label": "条码扫描", "category": "technology", "source": "Barcode Scanner", "keywords": "barcode scanner reader 条码 扫描"},
+  {"key": "tech-iot", "label": "物联网", "category": "technology", "source": "IoT", "keywords": "iot internet things 物联网 设备"},
+  {"key": "tech-tower", "label": "电脑主机", "category": "technology", "source": "Desktop Tower", "keywords": "desktop tower computer 主机 电脑"},
+  {"key": "tech-code-block", "label": "代码块", "category": "technology", "source": "Code Block", "keywords": "code block programming 编程 代码"},
+  {"key": "tech-braces", "label": "花括号", "category": "technology", "source": "Braces", "keywords": "braces code syntax 代码 语法"},
+  {"key": "tech-serial-port", "label": "串行端口", "category": "technology", "source": "Serial Port", "keywords": "serial port connector 串口 接口"},
+  {"key": "tech-sim", "label": "通信卡", "category": "technology", "source": "SIM", "keywords": "sim cellular card 通信 手机卡"},
+  {"key": "tech-cast", "label": "无线投屏", "category": "technology", "source": "Cast", "keywords": "cast wireless display 投屏 显示"},
+  {"key": "tech-usb-hub", "label": "USB 连接", "category": "technology", "source": "USB", "keywords": "usb connector universal 连接 数据"},
+  {"key": "number-circle-0", "label": "圈号 0", "category": "numbers", "source": "Number Circle 0", "keywords": "number circle digit 0 zero 零 〇 数字 编号 圈号 圆圈 序号"},
+  {"key": "number-circle-1", "label": "圈号 1", "category": "numbers", "source": "Number Circle 1", "keywords": "number circle digit 1 one 一 壹 数字 编号 圈号 圆圈 序号"},
+  {"key": "number-circle-2", "label": "圈号 2", "category": "numbers", "source": "Number Circle 2", "keywords": "number circle digit 2 two 二 贰 两 数字 编号 圈号 圆圈 序号"},
+  {"key": "number-circle-3", "label": "圈号 3", "category": "numbers", "source": "Number Circle 3", "keywords": "number circle digit 3 three 三 叁 数字 编号 圈号 圆圈 序号"},
+  {"key": "number-circle-4", "label": "圈号 4", "category": "numbers", "source": "Number Circle 4", "keywords": "number circle digit 4 four 四 肆 数字 编号 圈号 圆圈 序号"},
+  {"key": "number-circle-5", "label": "圈号 5", "category": "numbers", "source": "Number Circle 5", "keywords": "number circle digit 5 five 五 伍 数字 编号 圈号 圆圈 序号"},
+  {"key": "number-circle-6", "label": "圈号 6", "category": "numbers", "source": "Number Circle 6", "keywords": "number circle digit 6 six 六 陆 数字 编号 圈号 圆圈 序号"},
+  {"key": "number-circle-7", "label": "圈号 7", "category": "numbers", "source": "Number Circle 7", "keywords": "number circle digit 7 seven 七 柒 数字 编号 圈号 圆圈 序号"},
+  {"key": "number-circle-8", "label": "圈号 8", "category": "numbers", "source": "Number Circle 8", "keywords": "number circle digit 8 eight 八 捌 数字 编号 圈号 圆圈 序号"},
+  {"key": "number-circle-9", "label": "圈号 9", "category": "numbers", "source": "Number Circle 9", "keywords": "number circle digit 9 nine 九 玖 数字 编号 圈号 圆圈 序号"},
+  {"key": "number-row", "label": "数字行", "category": "numbers", "source": "Number Row", "keywords": "number digits row 123 数字 编号 序列"},
+  {"key": "number-symbol", "label": "编号符号", "category": "numbers", "source": "Number Symbol", "keywords": "number hash symbol 编号 井号 数字"},
+  {"key": "number-symbol-square", "label": "方框编号", "category": "numbers", "source": "Number Symbol Square", "keywords": "number hash square 编号 井号 方框"},
+  {"key": "number-list", "label": "数字列表", "category": "numbers", "source": "Text Number List LTR", "keywords": "numbered list sequence 123 数字 编号 序号 列表"},
+  {"key": "page-number", "label": "页码", "category": "numbers", "source": "Document Page Number", "keywords": "page number document 数字 编号 页数"},
+  {"key": "clipboard-123", "label": "数字记录", "category": "numbers", "source": "Clipboard Number 123", "keywords": "clipboard number 123 数字 编号 记录"},
+  {"key": "roman-uppercase", "label": "大写罗马编号", "category": "numbers", "source": "Text List Roman Numeral Uppercase", "keywords": "roman numeral uppercase I II III 数字 编号 罗马 大写"},
+  {"key": "roman-lowercase", "label": "小写罗马编号", "category": "numbers", "source": "Text List Roman Numeral Lowercase", "keywords": "roman numeral lowercase i ii iii 数字 编号 罗马 小写"},
+  {"key": "alphabet-uppercase", "label": "大写字母编号", "category": "numbers", "source": "Text List Abc Uppercase LTR", "keywords": "alphabet uppercase ABC sequence 字母 编号 大写"},
+  {"key": "alphabet-lowercase", "label": "小写字母编号", "category": "numbers", "source": "Text List Abc Lowercase LTR", "keywords": "alphabet lowercase abc sequence 字母 编号 小写"},
+  {"key": "number-counter", "label": "计数器", "category": "numbers", "source": "Counter", "keywords": "counter count tally 数字 编号 计数"},
+  {"key": "sequence-steps", "label": "步骤序列", "category": "numbers", "source": "Steps", "keywords": "steps sequence order 步骤 编号 顺序"},
+  {"key": "week-numbers", "label": "周次编号", "category": "numbers", "source": "Calendar Week Numbers", "keywords": "calendar week number 周次 数字 编号"},
+  {"key": "number-format", "label": "数字格式", "category": "numbers", "source": "Text Number Format", "keywords": "number format decimal 数字 编号 小数"},
+  ...IDENTITY_TYPOGRAPHIC_ICONS,
+] as const satisfies readonly IdentityIconDescriptor[];
+
+const iconsByKey = new Map<string, IdentityIconDescriptor>(IDENTITY_ICONS.map((icon) => [icon.key, icon]));
+
+/** Rendering fallback only; callers keep the original stored key in their draft. */
+export function resolveIdentityIcon(key?: string): IdentityIconDescriptor {
+  return (key ? iconsByKey.get(key) : undefined) ?? IDENTITY_ICONS[0];
+}
+
+export function matchesIdentityIcon(icon: IdentityIconDescriptor, query: string): boolean {
+  const haystack = `${icon.label} ${icon.key} ${icon.keywords}`.toLocaleLowerCase();
+  return query.trim().toLocaleLowerCase().split(/\s+/).every((term) => haystack.includes(term));
+}

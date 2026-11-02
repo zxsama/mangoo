@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-File operation consistency benchmark for Megle Phase 0.
+File operation consistency benchmark for Mangoo Phase 0.
 
 Creates a small sandbox root, indexes it in SQLite, then performs rename, move,
 and soft-delete operations while logging every operation. This validates the

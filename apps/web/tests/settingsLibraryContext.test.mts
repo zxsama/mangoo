@@ -11,7 +11,7 @@ function library(id: string, active = true): LibrarySummary {
     name: `Library ${id.toUpperCase()}`,
     icon: null,
     color: null,
-    managedRoot: `C:/Megle/${id}`,
+    databasePath: `C:/Mangoo/${id}`,
     active,
     availability: "available",
     lifecycleState: "ready",

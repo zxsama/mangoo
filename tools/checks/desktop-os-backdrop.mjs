@@ -23,11 +23,11 @@ const expectedRoot = path.join(exactTreeRoot, "tools", "checks", "desktop-os-bac
 if (path.resolve(import.meta.filename) !== expectedRoot) {
   throw new Error(`OS-backdrop harness must execute from its own exact tree: ${exactTreeRoot}`);
 }
-const exactTree = process.env.MEGLE_EVIDENCE_EXACT_TREE === "1";
-const commit = process.env.MEGLE_EVIDENCE_COMMIT
+const exactTree = process.env.MANGOO_EVIDENCE_EXACT_TREE === "1";
+const commit = process.env.MANGOO_EVIDENCE_COMMIT
   ?? spawnSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8", windowsHide: true }).stdout.trim();
-if (exactTree && !process.env.MEGLE_EVIDENCE_COMMIT) {
-  throw new Error("exact-tree OS-backdrop collection requires MEGLE_EVIDENCE_COMMIT");
+if (exactTree && !process.env.MANGOO_EVIDENCE_COMMIT) {
+  throw new Error("exact-tree OS-backdrop collection requires MANGOO_EVIDENCE_COMMIT");
 }
 const runDirectory = await createRunDirectory("os-backdrop", options.output);
 const runId = path.basename(runDirectory);
@@ -43,15 +43,15 @@ try {
   await delay(5_000);
   const runtime = await desktop.cdp.evalJson(`(() => ({
     title: document.title,
-    role: window.megleDesktop.windowRole,
-    visualHarness: typeof window.megleDesktop.visual?.capturePage === "function",
+    role: window.mangooDesktop.windowRole,
+    visualHarness: typeof window.mangooDesktop.visual?.capturePage === "function",
     htmlBackground: getComputedStyle(document.documentElement).backgroundColor,
     bodyBackground: getComputedStyle(document.body).backgroundColor,
     shellPresent: Boolean(document.querySelector(".app-shell, .app-frame, main")),
     error: document.querySelector(".error-strip")?.textContent ?? null
   }))()`);
   const captureEvaluation = await desktop.cdp.send("Runtime.evaluate", {
-    expression: "window.megleDesktop.visual.capturePage()",
+    expression: "window.mangooDesktop.visual.capturePage()",
     awaitPromise: true,
     returnByValue: true,
   });

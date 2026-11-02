@@ -68,6 +68,7 @@ export function pointOverlayAnchor(x: number, y: number): OverlayVirtualAnchor {
 }
 
 export interface ResolveAnchoredOverlayLayoutInput {
+  integratedAnchor?: boolean;
   trigger: OverlayRect;
   overlay: { measuredWidth: number; height: number };
   viewport: OverlayViewport;
@@ -81,6 +82,7 @@ export interface ResolveAnchoredOverlayLayoutInput {
 
 export interface AnchoredOverlayLayoutResult extends OverlayPositionResult {
   width: number;
+  anchorHeight: number;
 }
 
 export function resolveAnchoredOverlayLayout(
@@ -88,7 +90,7 @@ export function resolveAnchoredOverlayLayout(
 ): AnchoredOverlayLayoutResult {
   const widthInput = {
     measuredWidth: input.overlay.measuredWidth,
-    preferredWidth: input.preferredWidth,
+    preferredWidth: input.integratedAnchor ? input.trigger.width : input.preferredWidth,
     minWidth: input.minWidth,
     maxWidth: input.maxWidth,
     viewportWidth: input.viewport.width,
@@ -100,13 +102,14 @@ export function resolveAnchoredOverlayLayout(
     overlay: { width, height: input.overlay.height },
     viewport: input.viewport,
     preferredPlacement: input.preferredPlacement,
-    offset: input.offset,
+    offset: input.integratedAnchor ? -input.trigger.height : input.offset,
     gutter: input.gutter
   });
   return {
     ...position,
     maxWidth: resolveOverlayMaxWidth(widthInput),
-    width
+    width,
+    anchorHeight: input.trigger.height
   };
 }
 

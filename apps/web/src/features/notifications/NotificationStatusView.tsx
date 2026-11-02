@@ -5,14 +5,14 @@ import {
   Layers3,
   Radio,
   Square,
-  type LucideIcon
-} from "lucide-react";
+  type AppIcon
+} from "../../design/icons";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import type {
   DesktopThumbnailCacheSummary,
   ManagedRootNotificationTarget,
   NotificationWindowIntent
-} from "@megle/notification-contract";
+} from "@mangoo/notification-contract";
 import { LiquidGlassButton } from "../../design/liquid-glass";
 import type {
   CompactNotificationModel,
@@ -41,6 +41,7 @@ type ManagedRootAction = (
 
 export function NotificationStatusView({
   cancel,
+  children,
   dismissManagedRoot,
   model,
   onOpenFailureLogs,
@@ -48,6 +49,7 @@ export function NotificationStatusView({
   refreshCompact
 }: {
   cancel: NotificationAction;
+  children?: ReactNode;
   dismissManagedRoot: ManagedRootAction;
   model: CompactNotificationModel;
   onOpenFailureLogs(intent: NotificationWindowIntent): void;
@@ -95,7 +97,7 @@ export function NotificationStatusView({
           count={1}
           headingId="notification-status-health-title"
           icon={AlertTriangle}
-          title="通知同步受限"
+          title="通知服务受限"
         >
           <p>{model.healthDetail || "通知服务暂时不可用，浏览不会因此中断。"}</p>
         </StatusSection>
@@ -246,6 +248,7 @@ export function NotificationStatusView({
           </div>
         </StatusSection>
       ) : null}
+      {children}
     </div>
   );
 }
@@ -259,7 +262,7 @@ function ViewHeading({ detail, title }: { detail: string; title: string }) {
   );
 }
 
-function StatusSection({
+export function StatusSection({
   children,
   className,
   count,
@@ -270,7 +273,7 @@ function StatusSection({
   children: ReactNode;
   className: string;
   count: number;
-  icon: LucideIcon;
+  icon: AppIcon;
   headingId: string;
   title: string;
 }) {
@@ -349,7 +352,7 @@ function ActiveOperation({
               tone="primary"
               type="button"
             >
-              {reviewing ? "打开中…" : "查看位置"}
+              {reviewing ? "打开中…" : "管理插件"}
             </LiquidGlassButton>
             <LiquidGlassButton
               disabled={reviewing || dismissing}

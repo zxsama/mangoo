@@ -9,7 +9,7 @@ import type {
   ProcessLogSubscriptionId,
   ProcessLogSubscriptionStart,
   RendererLogEntryInput
-} from "@megle/notification-contract";
+} from "@mangoo/notification-contract";
 
 import type {
   NotificationHistoryQuery,

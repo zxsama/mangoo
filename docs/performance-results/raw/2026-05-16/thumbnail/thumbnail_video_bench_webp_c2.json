@@ -18,49 +18,49 @@
   },
   "samples": [
     {
-      "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\videos\\video_1080p_0000.mp4",
+      "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\videos\\video_1080p_0000.mp4",
       "sourceBytes": 1214661,
       "outputBytes": 7610,
       "ms": 132.3959
     },
     {
-      "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\videos\\video_1080p_0001.mp4",
+      "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\videos\\video_1080p_0001.mp4",
       "sourceBytes": 1213024,
       "outputBytes": 7498,
       "ms": 141.4823
     },
     {
-      "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\videos\\video_1080p_0002.mp4",
+      "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\videos\\video_1080p_0002.mp4",
       "sourceBytes": 1207641,
       "outputBytes": 7490,
       "ms": 132.72310000000002
     },
     {
-      "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\videos\\video_1080p_0003.mp4",
+      "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\videos\\video_1080p_0003.mp4",
       "sourceBytes": 1208559,
       "outputBytes": 7492,
       "ms": 132.01059999999998
     },
     {
-      "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\videos\\video_720p_0000.mp4",
+      "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\videos\\video_720p_0000.mp4",
       "sourceBytes": 601205,
       "outputBytes": 7858,
       "ms": 104.15480000000002
     },
     {
-      "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\videos\\video_720p_0001.mp4",
+      "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\videos\\video_720p_0001.mp4",
       "sourceBytes": 605970,
       "outputBytes": 7886,
       "ms": 106.97340000000003
     },
     {
-      "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\videos\\video_720p_0002.mp4",
+      "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\videos\\video_720p_0002.mp4",
       "sourceBytes": 601590,
       "outputBytes": 7924,
       "ms": 101.45479999999998
     },
     {
-      "file": "D:\\Megle\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\videos\\video_720p_0003.mp4",
+      "file": "D:\\Mangoo\\tools\\bench\\thumbnail\\results\\thumbnail-samples\\videos\\video_720p_0003.mp4",
       "sourceBytes": 600437,
       "outputBytes": 7810,
       "ms": 106.9416

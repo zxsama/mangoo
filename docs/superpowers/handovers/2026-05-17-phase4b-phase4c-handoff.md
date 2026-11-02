@@ -1,7 +1,7 @@
-# Megle Phase 4B/4C Handoff
+# Mangoo Phase 4B/4C Handoff
 
 Date: 2026-05-17
-Workspace: `D:/Megle`
+Workspace: `D:/Mangoo`
 Branch: `codex/phase1-foundation`
 
 ## Status (updated 2026-05-17 by Claude Code)
@@ -15,7 +15,7 @@ The backend implementer agent `019e3521-0631-7342-b8ea-4e2f13dcb016` was closed 
 
 ## Operating Rules To Preserve
 
-- Read `D:/Megle/.codex/memory.md` before continuing.
+- Read `D:/Mangoo/.codex/memory.md` before continuing.
 - Main conversation/controller is for direction, decomposition, and review.
 - Code modifications and verification/test command execution should be delegated to subagents.
 - Keep concurrency low because repeated 429 errors occurred. Prefer one writer agent at a time until limits stabilize.
@@ -41,7 +41,7 @@ Last observed `git status --short --branch`:
 ?? CLAUDE.md
 ?? crates/core/migrations/0009_scan_reconciliation.sql
 ?? crates/core/src/watch/
-?? docs/superpowers/plans/2026-05-16-megle-task-center-and-watcher.md
+?? docs/superpowers/plans/2026-05-16-mangoo-task-center-and-watcher.md
 ```
 
 Notes:
@@ -83,10 +83,10 @@ Implemented or partially implemented backend changes:
 
 Before the final interruption, agents reported:
 
-- `cargo test -p megle-core watch:: -- --nocapture`: 10 passed
-- `cargo test -p megle-core scan`: 30 passed
-- `cargo test -p megle-core db`: 43 passed
-- `cargo test -p megle-core tasks`: 19 passed
+- `cargo test -p mangoo-core watch:: -- --nocapture`: 10 passed
+- `cargo test -p mangoo-core scan`: 30 passed
+- `cargo test -p mangoo-core db`: 43 passed
+- `cargo test -p mangoo-core tasks`: 19 passed
 - `npm run check:schema`: PASS
 - `npm run check:core-api`: PASS
 - `npm run check:rust`: 99 passed
@@ -158,7 +158,7 @@ Expected fix direction:
 Dispatch one backend worker, no UI edits:
 
 ```text
-Continue Phase 4B from current dirty workspace in D:/Megle. Code quality review found three blockers after the last reported verification. Backend files only, no UI edits, no commit.
+Continue Phase 4B from current dirty workspace in D:/Mangoo. Code quality review found three blockers after the last reported verification. Backend files only, no UI edits, no commit.
 
 Fix:
 1. Running root_scan must not suppress a pending follow-up scan for directory create/move events. Coalesce duplicate pending scans, but allow one pending scan while a scan is running.
@@ -166,10 +166,10 @@ Fix:
 3. Pending tasks persisted when watcher try_send returns Full/Closed must not be stranded. Add live scheduler draining after worker tasks or equivalent.
 
 Add regression tests for each. Run:
-- cargo test -p megle-core watch:: -- --nocapture
-- cargo test -p megle-core scan
-- cargo test -p megle-core db
-- cargo test -p megle-core tasks
+- cargo test -p mangoo-core watch:: -- --nocapture
+- cargo test -p mangoo-core scan
+- cargo test -p mangoo-core db
+- cargo test -p mangoo-core tasks
 - npm run check:schema
 - npm run check:core-api
 - npm run check:rust
@@ -195,14 +195,14 @@ Known current UI surface:
 - `apps/web/src/app/App.tsx` has a Tasks tab with a simple table.
 - `apps/web/src/features/tasks/TaskPanel.tsx` has compact summary rendering.
 - `apps/web/src/core/useLibraryData.ts` polls tasks and exposes `tasks`/`scanActive`.
-- `@megle/core-client` already exposes `listTasks`, `cancelTask`, and `retryTask`.
+- `@mangoo/core-client` already exposes `listTasks`, `cancelTask`, and `retryTask`.
 
 Do not start Phase 4C until Phase 4B is approved, unless the user explicitly asks to parallelize again.
 
 ## Phase 4C Suggested Agent Prompt
 
 ```text
-Implement Phase 4C Task Center UI in D:/Megle after Phase 4B backend is approved. Own only apps/web/src/app/App.tsx, apps/web/src/features/tasks/**, apps/web/src/core/useLibraryData.ts, apps/web/src/styles.css, and narrow web-only helpers.
+Implement Phase 4C Task Center UI in D:/Mangoo after Phase 4B backend is approved. Own only apps/web/src/app/App.tsx, apps/web/src/features/tasks/**, apps/web/src/core/useLibraryData.ts, apps/web/src/styles.css, and narrow web-only helpers.
 
 Build a real task center and task drawer/panel:
 - render every TaskStatus explicitly: pending, running, succeeded, failed, cancelled
@@ -215,8 +215,8 @@ Build a real task center and task drawer/panel:
 Verify:
 - npm run check:web
 - npm run check:core-client
-- npm --workspace @megle/web run typecheck
-- npm --workspace @megle/web run build
+- npm --workspace @mangoo/web run typecheck
+- npm --workspace @mangoo/web run build
 - npm test if backend is stable
 
 Do not edit crates/core/** or contracts/** unless a true type-contract mismatch forces it.

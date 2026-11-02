@@ -1,3 +1,5 @@
+import type { MediaRecord } from "../../core/types";
+
 export type PreviewRenderLane = "canvas" | "image" | "video";
 
 // Formats that may carry more than one frame. A canvas paints exactly one
@@ -25,7 +27,9 @@ export function selectPreviewRenderLane(input: {
   source: "thumbnail" | "original";
   kind?: string | null;
   ext?: string | null;
+  presentation?: MediaRecord["presentation"];
 }): PreviewRenderLane {
+  if (input.presentation?.previewKind === "static-thumbnail") return "image";
   if (input.kind === "video") {
     return "video";
   }

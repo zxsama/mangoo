@@ -1,6 +1,6 @@
 # Plugin Runtime and Sync Provider v1
 
-Megle owns synchronization policy in Core. A trusted bundled Provider is a
+Mangoo owns synchronization policy in Core. A trusted bundled Provider is a
 supervised native child process that supplies authentication and opaque,
 immutable-object transport. It never receives a Catalog/Host database path,
 media root, SQL statement, or another account's secret namespace.
@@ -59,47 +59,23 @@ after its descriptor receipt is durable.
 Secret references, never tokens, are stored in Host SQLite. Windows uses
 Credential Manager. Docker uses AES-256-GCM authenticated records under
 `/data/secrets` and a separately mounted 32-byte key from
-`MEGLE_SECRET_KEY_FILE`; CAS generations protect refresh-token rotation.
+`MANGOO_SECRET_KEY_FILE`; CAS generations protect refresh-token rotation.
 Missing or unsafe key configuration degrades only the Provider.
 
-Docker executes bundled Providers only from read-only `/opt/megle/plugins`.
+Docker executes bundled Providers only from read-only `/opt/mangoo/plugins`.
 Writable state is `/data/plugin-state`; `/data` is never executable discovery.
 
-## OneDrive public-client authorization
+## Provider configuration and authorization
 
-Each user or deployment operator supplies a self-managed Microsoft Entra
-public-client registration for Personal and/or Business accounts with delegated
-`Files.ReadWrite.AppFolder` and `offline_access`. Release artifacts embed no
-publisher-owned Client ID. `MEGLE_ONEDRIVE_CLIENT_ID` is an optional non-secret,
-read-only deployment value; otherwise the five-step setup wizard stores a
-revisioned Host override. The public projection reports only
-source/configured/read-only/revision state, never the effective ID. Missing
-configuration safely keeps OneDrive `configuration-required`. No mode uses or
-accepts a client secret.
+Configuration, setup text, help links, authentication modes and redirects are
+manifest contributions validated by the Host. Shared UI uses the revisioned
+configuration and pending-flow APIs; Desktop opens exact declared help links or
+pending authorization flows through the authenticated external-link endpoint.
+The Provider owns service-specific endpoints, protocol parameters and exchanges.
+Secret values stay behind the scoped Secret Broker.
 
-Desktop uses Authorization Code + PKCE S256 with a Provider-owned ephemeral
-IPv4 `127.0.0.1` listener while advertising
-`http://localhost:<port>/plugin-auth/callback`. The Entra public-client
-registration uses **Mobile and desktop applications** with
-`http://localhost/plugin-auth/callback`; localhost port matching is ignored but
-the path must match. `auth.poll` observes
-the pending flow without consuming it; only a callback terminal result,
-expiry, explicit `auth.cancel`, or runtime-session fencing ends the flow.
-Electron opens only a narrowly validated Microsoft authorize URL through the
-typed preload bridge.
-
-Docker sets `MEGLE_ONEDRIVE_AUTH_MODE=manual-response-uri`. `auth.begin` uses
-`https://login.microsoftonline.com/common/oauth2/nativeclient`, and the browser
-UI displays the authorization URL plus a transient field for the complete final
-response URI, matching the `abraunegg/onedrive` workflow. Core bounds and
-strictly parses the URI, removes inert `session_state`, and sends only an
-allowlisted field map to the Provider. The URI is cleared after submit/cancel
-and never enters RPC, SQLite, logs, errors, diagnostics, or query cache. Docker
-does not require `MEGLE_PUBLIC_URL`, an inbound callback, or a confidential
-registration.
-
-OAuth tokens and refresh tokens remain behind the Secret Broker: Credential
-Manager on Windows, or authenticated encrypted files under `/data/secrets`
-using the independently mounted `MEGLE_SECRET_KEY_FILE` in Docker. Client IDs
-are configuration; authorization codes, state, response URIs, tokens, and
-preauthenticated Graph URLs are sensitive material.
+OneDrive-specific setup and release requirements moved to its independent
+[authorization guide](../../Mangoo_OneDriveSync/docs/authorization-and-release.md).
+The default Host bundle contains only the fake conformance Provider; optional
+external artifacts require explicit build-time selection and a Core rebuild as
+described in the [extraction note](onedrive-extraction.md).

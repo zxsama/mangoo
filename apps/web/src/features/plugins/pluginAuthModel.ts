@@ -1,6 +1,4 @@
-import type { HostPluginProjection, OneDriveConfiguration } from "@megle/core-client";
-
-export const ONEDRIVE_PLUGIN_ID = "com.megle.onedrive";
+import type { HostPluginProjection, PluginConfiguration } from "@mangoo/core-client";
 
 export type PluginAuthPrimaryAction =
   | "unavailable"
@@ -12,7 +10,7 @@ export type PluginAuthPrimaryAction =
 
 export function pluginAuthPrimaryAction(
   plugin: HostPluginProjection | null,
-  configuration: OneDriveConfiguration | null,
+  configuration: PluginConfiguration | null,
 ): PluginAuthPrimaryAction {
   if (!plugin) return "unavailable";
   if (!plugin.enabledIntent || plugin.permissionRequired || plugin.runtimeState === "permission-required") return "configure";
@@ -24,9 +22,9 @@ export function pluginAuthPrimaryAction(
 }
 
 export function accountKindLabel(kind: HostPluginProjection["accountKind"]): string {
-  if (kind === "personal") return "OneDrive Personal";
-  if (kind === "business") return "OneDrive Business";
-  return "OneDrive";
+  if (kind === "personal") return "个人账户";
+  if (kind === "business") return "组织账户";
+  return "账户";
 }
 
 export function pluginAuthStateLabel(state: HostPluginProjection["authState"]): string {
@@ -41,11 +39,12 @@ export function pluginAuthStateLabel(state: HostPluginProjection["authState"]): 
   }
 }
 
-export function configurationSourceLabel(source: OneDriveConfiguration["source"]): string {
+export function configurationSourceLabel(source: PluginConfiguration["source"]): string {
   switch (source) {
-    case "environment": return "部署环境（只读）";
-    case "host-override": return "此设备高级覆盖";
+    case "environment": return "部署环境";
+    case "host-override": return "此设备配置";
     case "missing": return "尚未配置";
+    case "default": return "插件默认配置";
   }
 }
 

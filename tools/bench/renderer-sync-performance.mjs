@@ -55,8 +55,8 @@ function summarize(sample) {
 
 async function installCollector(cdp) {
   await cdp.run(`(() => {
-    window.__megleRendererPerf = { frameDeltas: [], longTasks: [], syncRequests: 0, syncRequestFailures: 0, inputEvents: 0, startedAt: performance.now(), lastFrame: null };
-    const state = window.__megleRendererPerf;
+    window.__mangooRendererPerf = { frameDeltas: [], longTasks: [], syncRequests: 0, syncRequestFailures: 0, inputEvents: 0, startedAt: performance.now(), lastFrame: null };
+    const state = window.__mangooRendererPerf;
     const tick = (now) => {
       if (state.lastFrame !== null) state.frameDeltas.push(now - state.lastFrame);
       state.lastFrame = now;
@@ -74,7 +74,7 @@ async function installCollector(cdp) {
 
 async function takeSample(cdp) {
   const sample = await cdp.evalJson(`(() => {
-    const state = window.__megleRendererPerf;
+    const state = window.__mangooRendererPerf;
     const value = {
       frameDeltas: state.frameDeltas,
       longTasks: state.longTasks,
@@ -92,11 +92,11 @@ async function takeSample(cdp) {
 
 const options = parseArgs(process.argv.slice(2));
 if (process.platform !== "win32") throw new Error("renderer sync performance collection requires Windows");
-const exactTree = process.env.MEGLE_EVIDENCE_EXACT_TREE === "1";
-const commit = process.env.MEGLE_EVIDENCE_COMMIT ?? git(["rev-parse", "HEAD"]);
+const exactTree = process.env.MANGOO_EVIDENCE_EXACT_TREE === "1";
+const commit = process.env.MANGOO_EVIDENCE_COMMIT ?? git(["rev-parse", "HEAD"]);
 const dirty = exactTree ? false : git(["status", "--porcelain=v1"]).length > 0;
-if (exactTree && !process.env.MEGLE_EVIDENCE_COMMIT) {
-  throw new Error("exact-tree renderer collection requires MEGLE_EVIDENCE_COMMIT");
+if (exactTree && !process.env.MANGOO_EVIDENCE_COMMIT) {
+  throw new Error("exact-tree renderer collection requires MANGOO_EVIDENCE_COMMIT");
 }
 const exactTreeRoot = path.resolve(process.cwd());
 const expectedRoot = path.join(exactTreeRoot, "tools", "bench", "renderer-sync-performance.mjs");
@@ -120,9 +120,9 @@ try {
 
   await installCollector(desktop.cdp);
   await desktop.cdp.run(`(() => {
-    const state = window.__megleRendererPerf;
-    const coreUrl = window.megleDesktop.coreUrl;
-    const token = window.megleDesktop.sessionToken;
+    const state = window.__mangooRendererPerf;
+    const coreUrl = window.mangooDesktop.coreUrl;
+    const token = window.mangooDesktop.sessionToken;
     let direction = 1;
     state.stressTimer = setInterval(() => {
       const grid = document.querySelector(".virtual-grid");
@@ -138,14 +138,14 @@ try {
         state.syncRequests += 1;
         fetch(coreUrl + endpoint, {
           method: endpoint.endsWith("wake") ? "POST" : "GET",
-          headers: { "x-megle-session": token }
+          headers: { "x-mangoo-session": token }
         }).then((response) => { if (!response.ok) state.syncRequestFailures += 1; })
           .catch(() => { state.syncRequestFailures += 1; });
       }
     }, 250);
   })()`);
   await delay(durationMs);
-  await desktop.cdp.run(`clearInterval(window.__megleRendererPerf.stressTimer)`);
+  await desktop.cdp.run(`clearInterval(window.__mangooRendererPerf.stressTimer)`);
   const stress = await takeSample(desktop.cdp);
   const longFrameIncrease = stress.longFramePercent - baseline.longFramePercent;
   const droppedFrameIncrease = stress.droppedFramePercent - baseline.droppedFramePercent;

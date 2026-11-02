@@ -352,10 +352,10 @@ Expected: every command exits `0` with no new warning or failure attributed to t
 Run:
 
 ```powershell
-$env:MEGLE_VISUAL_OS_BACKDROP='1'
+$env:MANGOO_VISUAL_OS_BACKDROP='1'
 node .tmp\visual-check\desktop-ui-regression.mjs
 $taskHarnessCode = $LASTEXITCODE
-Remove-Item Env:\MEGLE_VISUAL_OS_BACKDROP
+Remove-Item Env:\MANGOO_VISUAL_OS_BACKDROP
 exit $taskHarnessCode
 ```
 

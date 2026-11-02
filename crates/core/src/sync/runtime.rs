@@ -140,7 +140,8 @@ impl DormantSyncRuntime {
         F: FnOnce(&mut Database) -> anyhow::Result<T> + Send + 'static,
     {
         let _lease = self.leases.acquire(&self.library_uuid).await?;
-        let database = Database::open(&self.catalog_path).context("open dormant catalog")?;
+        let database =
+            Database::open_existing(&self.catalog_path).context("open dormant catalog")?;
         database
             .apply_migrations()
             .context("migrate dormant catalog")?;
@@ -222,9 +223,10 @@ mod tests {
     #[tokio::test]
     async fn dormant_turn_opens_bounded_writer_then_releases_for_promotion() {
         let directory =
-            std::env::temp_dir().join(format!("megle-dormant-{}", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("mangoo-dormant-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("catalog.sqlite");
+        drop(Database::open(&path).unwrap());
         let leases = RuntimeLeases::default();
         let runtime = DormantSyncRuntime::new("library", &path, leases.clone());
         let (synchronous, cache_kib, mmap_bytes) = runtime
@@ -256,8 +258,9 @@ mod tests {
     #[tokio::test]
     async fn dormant_turn_and_unbind_share_the_same_fence() {
         let directory =
-            std::env::temp_dir().join(format!("megle-dormant-{}", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("mangoo-dormant-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&directory).unwrap();
+        drop(Database::open(directory.join("catalog.sqlite")).unwrap());
         let runtime = DormantSyncRuntime::new(
             "library",
             directory.join("catalog.sqlite"),

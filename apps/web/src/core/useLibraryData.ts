@@ -1,7 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type SetStateAction } from "react";
 import type {
+  ActiveLibraryResponse,
   FileOperationRecord,
   FolderRecord,
+  UpdateFolderAppearanceRequest,
+  UpdateRootAppearanceRequest,
+  DirectorySortRule,
+  DirectorySortState,
   MediaRecord,
   RootRecord,
   ScanSummary,
@@ -14,10 +19,11 @@ import type {
   ThumbnailResponse,
   UserMetadataRecord,
   UserMetadataUpdate
-} from "@megle/core-client";
-import type { MediaFocusRequest } from "@megle/notification-contract";
-import { CoreApiError } from "@megle/core-client";
+} from "@mangoo/core-client";
+import type { MediaFocusRequest } from "@mangoo/notification-contract";
+import { CoreApiError } from "@mangoo/core-client";
 import { createCoreClient } from "./client";
+import { reconcileFolderAppearanceRead, replaceFolderAppearance, replaceFolderAppearanceInMap } from "./folderAppearanceState";
 import { readDesktopDiagnostics, subscribeLibraryPhase, type DesktopDiagnostics } from "./desktop";
 import {
   expandFolderPath,
@@ -51,10 +57,12 @@ import {
   type NotificationLibraryContext
 } from "./notificationReporting";
 import type { ThumbnailGenerationMode } from "../features/preview/previewPreferences";
+import { subscribePluginChanges } from "../features/plugins/pluginQuerySync";
 
 const INITIAL_MEDIA_WINDOW_LIMIT = 96;
 const MEDIA_WINDOW_MAX_LIMIT = 256;
 const FOLDER_PAGE_LIMIT = 500;
+export type DirectorySortTarget = { kind: "root" | "folder"; id: number };
 const SEARCH_DEBOUNCE_MS = 250;
 const INTERACTIVE_FOLDER_SCAN_DEBOUNCE_MS = 300;
 const SCAN_REFRESH_INTERVAL_MS = 800;
@@ -73,7 +81,7 @@ const THUMBNAIL_SCOPE_SYNC_DEBOUNCE_MS = 120;
 // or bulk-demote it (allPersist). This IS the "delay a few seconds before
 // cancelling" the user asked for.
 const THUMBNAIL_SCOPE_RETENTION_MS = 6000;
-const SHOW_SUBFOLDER_CONTENTS_STORAGE_KEY = "megle.library.subfolder-content-open";
+const SHOW_SUBFOLDER_CONTENTS_STORAGE_KEY = "mangoo.library.subfolder-content-open";
 const SEEN_THUMBNAIL_PERSIST_BATCH_SIZE = 128;
 const SEEN_THUMBNAIL_PERSIST_DEBOUNCE_MS = 500;
 const SEEN_THUMBNAIL_PERSIST_RETRY_MS = 10_000;
@@ -141,6 +149,7 @@ export interface LibraryState {
   folderChildNextCursorByParent: Record<number, string | null>;
   expandedFolderIds: Set<number>;
   loadingFolderIds: Set<number>;
+  failedFolderIds: Set<number>;
   loadingFolderDescendantIds: Set<number>;
   loadingMoreFolderIds: Set<number>;
   loading: boolean;
@@ -192,7 +201,11 @@ export interface LibraryState {
   toggleShowChildFolderContents: () => void;
   setSelectedMediaId: (mediaId: number | null) => void;
   toggleFolderExpanded: (folderId: number) => void;
-  requestFolderChildren: (folderId: number) => Promise<FolderRecord[]>;
+  updateFolderAppearance: (folderId: number, input: UpdateFolderAppearanceRequest) => Promise<void>;
+  updateRootAppearance: (rootId: number, input: UpdateRootAppearanceRequest) => Promise<void>;
+  getDirectorySort: (target: DirectorySortTarget, signal?: AbortSignal) => Promise<DirectorySortState>;
+  updateDirectorySort: (target: DirectorySortTarget, rule: DirectorySortRule | null) => Promise<DirectorySortState>;
+  requestFolderChildren: (folderId: number, options?: { force?: boolean; signal?: AbortSignal }) => Promise<FolderRecord[]>;
   revealFolderPath: (folderId: number) => Promise<FolderRecord[]>;
   locateMedia: (request: MediaFocusRequest, options?: { signal?: AbortSignal }) => Promise<boolean>;
   requestThumbnailStates: (mediaIds: number[], priority: ThumbnailRequestPriority) => void;
@@ -269,7 +282,14 @@ export function useLibraryData(
   options: UseLibraryDataOptions = { persistentThumbnailCacheAutoRefresh: false }
 ): LibraryState {
   const client = useMemo(() => createCoreClient(), []);
+  // Host discovery is valid before the first Library exists. Catalog requests
+  // must wait for this authoritative snapshot, not the sidebar name/ready loop.
+  const [libraryAdmission, setLibraryAdmission] = useState<ActiveLibraryResponse | null>(null);
+  const libraryAdmissionRef = useRef(libraryAdmission);
+  libraryAdmissionRef.current = libraryAdmission;
+  const refreshLibraryAdmissionRef = useRef<(() => Promise<void>) | null>(null);
   const mediaPageGeneration = useRef(0);
+  const [presentationRevision, setPresentationRevision] = useState(0);
   const inFlightMediaPageKeys = useRef<Set<string>>(new Set());
   const loadedMediaPageKeys = useRef<Set<string>>(new Set());
   const inFlightFolderChildPageKeys = useRef<Set<string>>(new Set());
@@ -295,6 +315,36 @@ export function useLibraryData(
   const seenThumbnailPersistActiveRef = useRef(true);
   const loadTasksRequestRef = useRef<Promise<TaskRecord[]> | null>(null);
   const libraryRequestGenerationRef = useRef(0);
+  const folderAppearanceVersionRef = useRef(0);
+  const folderAppearanceSavedRef = useRef(new Map<number, { version: number; folder: FolderRecord }>());
+  const folderAppearanceLifetimeRef = useRef(0);
+  const rootAppearanceVersionRef = useRef(0);
+  const rootAppearanceSavedRef = useRef(new Map<number, { version: number; root: RootRecord }>());
+  const rootReadGenerationRef = useRef(0);
+  const folderSortStatesRef = useRef(new Map<number, DirectorySortState>());
+  const folderSortGenerationRef = useRef(new Map<number, number>());
+  const folderChildrenLoadedRef = useRef(new Set<number>());
+  const pendingSortReloadsRef = useRef(new Map<number, number>());
+  useEffect(() => () => { folderAppearanceLifetimeRef.current += 1; }, []);
+  useEffect(() => {
+    // Folder integer IDs are local to one catalog. Clear only folder-owned
+    // state when admission changes; an appearance save never changes admission.
+    folderAppearanceSavedRef.current.clear();
+    rootAppearanceSavedRef.current.clear();
+    rootReadGenerationRef.current += 1;
+    folderSortStatesRef.current.clear();
+    folderSortGenerationRef.current.clear();
+    folderChildrenLoadedRef.current.clear();
+    pendingSortReloadsRef.current.clear();
+    folderChildrenByParentRef.current = {};
+    folderDescendantsByParentRef.current = {};
+    folderAncestorPathCacheRef.current.clear();
+    setFolderChildrenByParent({});
+    setFolderDescendantsByParent({});
+    setFolderChildNextCursorByParent({});
+    setFailedFolderIds(new Set());
+    setSelectedFolderInfoState(null);
+  }, [libraryAdmission]);
   const prepareNavigationMediaReloadRef = useRef<(() => void) | null>(null);
   const interactiveFolderScanControllerRef = useRef<AbortController | null>(null);
   const thumbnailPriorityScopeSyncControllerRef = useRef<AbortController | null>(null);
@@ -338,11 +388,20 @@ export function useLibraryData(
   >({});
   const folderDescendantsByParentRef = useRef(folderDescendantsByParent);
   folderDescendantsByParentRef.current = folderDescendantsByParent;
-  const [folderChildNextCursorByParent, setFolderChildNextCursorByParent] = useState<
+  const [folderChildNextCursorByParent, setFolderChildNextCursorState] = useState<
     Record<number, string | null>
   >({});
+  const folderChildNextCursorByParentRef = useRef(folderChildNextCursorByParent);
+  const setFolderChildNextCursorByParent = useCallback((update: SetStateAction<Record<number, string | null>>) => {
+    // Child and parent responses may commit in one React batch. Publish the
+    // cursor evidence synchronously alongside folderChildrenByParentRef.
+    const next = typeof update === "function" ? update(folderChildNextCursorByParentRef.current) : update;
+    folderChildNextCursorByParentRef.current = next;
+    setFolderChildNextCursorState(next);
+  }, []);
   const [expandedFolderIds, setExpandedFolderIds] = useState<Set<number>>(() => new Set());
   const [loadingFolderIds, setLoadingFolderIds] = useState<Set<number>>(() => new Set());
+  const [failedFolderIds, setFailedFolderIds] = useState<Set<number>>(() => new Set());
   const [loadingFolderDescendantIds, setLoadingFolderDescendantIds] = useState<Set<number>>(
     () => new Set()
   );
@@ -576,6 +635,7 @@ export function useLibraryData(
   const refreshThumbnailCacheStats = useCallback(async (
     refreshOptions: { requireNotificationPersistence?: boolean } = {}
   ) => {
+    if (!libraryAdmissionRef.current?.library) return null;
     // The thumbnail-status tab shows LIBRARY-WIDE progress, so stats are always
     // computed over the whole library ({} scope) — never the current folder.
     // This is deliberate (issue #2): a folder-scoped stats query recomputes an
@@ -1230,29 +1290,93 @@ export function useLibraryData(
     scheduleThumbnailPriorityScopeSync
   ]);
 
+  const updateFolderAppearance = useCallback(async (folderId: number, input: UpdateFolderAppearanceRequest) => {
+    // This closure is captured when the editor opens, so a reused folder integer
+    // in another Library can never receive an old editor's draft.
+    const context = libraryAdmission;
+    if (!context?.library || libraryAdmissionRef.current !== context) throw new Error("资源库已切换，请重新打开外观编辑器。");
+    const lifetime = folderAppearanceLifetimeRef.current;
+    const generation = libraryRequestGenerationRef.current;
+    const saved = await client.updateFolderAppearance(folderId, input, { contextRevision: context.contextRevision });
+    if (lifetime !== folderAppearanceLifetimeRef.current || generation !== libraryRequestGenerationRef.current || libraryAdmissionRef.current !== context) return;
+    folderAppearanceSavedRef.current.set(saved.id, { version: ++folderAppearanceVersionRef.current, folder: saved });
+    const children = replaceFolderAppearanceInMap(folderChildrenByParentRef.current, saved);
+    folderChildrenByParentRef.current = children;
+    setFolderChildrenByParent(children);
+    const descendants = replaceFolderAppearanceInMap(folderDescendantsByParentRef.current, saved);
+    folderDescendantsByParentRef.current = descendants;
+    setFolderDescendantsByParent(descendants);
+    for (const [id, path] of folderAncestorPathCacheRef.current) {
+      folderAncestorPathCacheRef.current.set(id, replaceFolderAppearance(path, saved));
+    }
+    setSelectedFolderInfoState((current) => current?.id === saved.id ? { ...current, icon: saved.icon, color: saved.color } : current);
+  }, [client, libraryAdmission]);
+
+  const updateRootAppearance = useCallback(async (rootId: number, input: UpdateRootAppearanceRequest) => {
+    const context = libraryAdmission;
+    if (!context?.library || libraryAdmissionRef.current !== context) throw new Error("资源库已切换，请重新打开外观编辑器。");
+    const lifetime = folderAppearanceLifetimeRef.current;
+    const generation = libraryRequestGenerationRef.current;
+    const saved = await client.updateRootAppearance(rootId, input, { contextRevision: context.contextRevision });
+    if (lifetime !== folderAppearanceLifetimeRef.current || generation !== libraryRequestGenerationRef.current || libraryAdmissionRef.current !== context) return;
+    rootAppearanceSavedRef.current.set(saved.id, { version: ++rootAppearanceVersionRef.current, root: saved });
+    // The update response is metadata, never a source of newer reachability/counts.
+    replaceRoots(rootsRef.current.map((root) => root.id === saved.id ? { ...root, icon: saved.icon, color: saved.color } : root));
+  }, [client, libraryAdmission, replaceRoots]);
+
+  const getDirectorySort = useCallback(async (target: DirectorySortTarget, signal?: AbortSignal) => {
+    const context = libraryAdmission;
+    if (!context?.library || libraryAdmissionRef.current !== context) throw new Error("资源库已切换，请重新打开排序菜单。");
+    const state = await (target.kind === "root" ? client.getRootSort(target.id, { signal }) : client.getFolderSort(target.id, { signal }));
+    if (libraryAdmissionRef.current !== context) throw new DOMException("Library changed", "AbortError");
+    return state;
+  }, [client, libraryAdmission]);
+
+  const invalidateContradictedEmptyChildren = useCallback((items: FolderRecord[]) => {
+    const invalidated = items.filter((item) => item.hasChildren === true
+      && folderChildrenLoadedRef.current.has(item.id)
+      && folderChildNextCursorByParentRef.current[item.id] === null
+      && folderChildrenByParentRef.current[item.id]?.length === 0);
+    if (invalidated.length === 0) return;
+    // A refreshed parent can discover a child under a previously empty folder.
+    // Retire only the contradicted completion evidence; expansion loads it on
+    // demand, without an eager read for every visible folder.
+    for (const item of invalidated) folderChildrenLoadedRef.current.delete(item.id);
+    setFolderChildNextCursorByParent((current) => {
+      const next = { ...current };
+      for (const item of invalidated) delete next[item.id];
+      return next;
+    });
+  }, []);
+
   const loadFolderChildren = useCallback(
-    async (folderId: number, options: { force?: boolean; signal?: AbortSignal } = {}) => {
+    async (folderId: number, options: { force?: boolean; signal?: AbortSignal; retainCount?: number } = {}) => {
       if (options.signal?.aborted) return [];
+      const context = libraryAdmissionRef.current;
+      if (!context?.library) return [];
       const force = options.force ?? false;
       const cachedChildren = folderChildrenByParentRef.current[folderId];
-      if (!force && cachedChildren !== undefined) {
-        if (cachedChildren.length === 0) {
-          setExpandedFolderIds((current) =>
-            reconcileFolderExpansionForSelection(current, folderId, false)
-          );
-        }
+      if (!force && cachedChildren !== undefined && folderChildrenLoadedRef.current.has(folderId)) {
+        // Only a successful terminal page below proves a leaf. A cached empty
+        // page can still own a next cursor and must remain expandable.
         return cachedChildren;
       }
       const existingRequest = folderChildInitialRequestsRef.current.get(folderId);
       if (!force && existingRequest) {
         return existingRequest;
       }
-      const requestKey = folderChildPageRequestKey(folderId, "initial");
       if (force) {
+        // A failed refresh must be retryable instead of accepting its old
+        // completed page as a successful cache hit on the next expansion.
+        folderChildrenLoadedRef.current.delete(folderId);
+        folderSortGenerationRef.current.set(folderId, (folderSortGenerationRef.current.get(folderId) ?? 0) + 1);
+        setLoadingMoreFolderIds((current) => { const next = new Set(current); next.delete(folderId); return next; });
         clearFolderChildPageKeys(loadedFolderChildPageKeys.current, folderId);
-        folderChildControllersRef.current.get(requestKey)?.abort();
+        for (const [key, controller] of folderChildControllersRef.current) if (key.startsWith(`${folderId}:`)) controller.abort();
         folderChildInitialRequestsRef.current.delete(folderId);
       }
+      const sortGeneration = folderSortGenerationRef.current.get(folderId) ?? 0;
+      const requestKey = folderChildPageRequestKey(folderId, `initial:${sortGeneration}`);
       const controller = new AbortController();
       const abortForScope = () => controller.abort();
       options.signal?.addEventListener("abort", abortForScope, { once: true });
@@ -1262,19 +1386,42 @@ export function useLibraryData(
 
       const rawRequest = (async () => {
         const cursor = null;
+        const appearanceVersion = folderAppearanceVersionRef.current;
         const page = await client.listFolderChildren(folderId, {
           cursor: cursor ?? undefined,
           limit: FOLDER_PAGE_LIMIT
         }, {
           signal: controller.signal
         });
-        if (options.signal?.aborted) return [];
+        // Replace a previously paged visible window atomically. Publishing only
+        // its first page would shrink the folder strip and shift media scroll.
+        // Fetch at most the old loaded count, never the unvisited subtree.
+        const retainCount = options.retainCount ?? 0;
+        const visitedCursors = new Set<string>();
+        while (page.items.length < retainCount && page.nextCursor) {
+          if (controller.signal.aborted || libraryAdmissionRef.current !== context || sortGeneration !== (folderSortGenerationRef.current.get(folderId) ?? 0)) return [];
+          if (visitedCursors.has(page.nextCursor)) throw new Error("目录分页未前进，请重试。");
+          visitedCursors.add(page.nextCursor);
+          const next = await client.listFolderChildren(folderId, { cursor: page.nextCursor, limit: FOLDER_PAGE_LIMIT }, { signal: controller.signal });
+          if (next.sortState.revision !== page.sortState.revision || next.sortState.effectiveOrder !== page.sortState.effectiveOrder) throw new Error("目录排序已改变，请重试。");
+          page.items.push(...next.items);
+          page.nextCursor = next.nextCursor;
+        }
+        if (controller.signal.aborted || options.signal?.aborted || libraryAdmissionRef.current !== context || sortGeneration !== (folderSortGenerationRef.current.get(folderId) ?? 0)) return [];
+        if (page.sortState) folderSortStatesRef.current.set(folderId, page.sortState);
+        folderChildrenLoadedRef.current.add(folderId);
+        setFailedFolderIds((current) => {
+          if (!current.has(folderId)) return current;
+          const next = new Set(current); next.delete(folderId); return next;
+        });
+        page.items = reconcileFolderAppearanceRead(page.items, appearanceVersion, folderAppearanceSavedRef.current);
+        invalidateContradictedEmptyChildren(page.items);
         let nextChildrenByParent = {
           ...folderChildrenByParentRef.current,
           [folderId]: page.items
         };
         for (const path of folderAncestorPathCacheRef.current.values()) {
-          nextChildrenByParent = mergeFolderAncestorPath(nextChildrenByParent, path);
+          nextChildrenByParent = mergeFolderAncestorPath(nextChildrenByParent, path, folderSortStatesRef.current);
         }
         folderChildrenByParentRef.current = nextChildrenByParent;
         setFolderChildrenByParent(nextChildrenByParent);
@@ -1296,6 +1443,9 @@ export function useLibraryData(
           if (isAbortError(cause)) {
             return [];
           }
+          if (libraryAdmissionRef.current === context && sortGeneration === (folderSortGenerationRef.current.get(folderId) ?? 0)) {
+            setFailedFolderIds((current) => new Set(current).add(folderId));
+          }
           return reportLibraryErrorAndRethrow(
             reportingAttempt,
             {
@@ -1315,7 +1465,7 @@ export function useLibraryData(
           if (folderChildInitialRequestsRef.current.get(folderId) === request) {
             folderChildInitialRequestsRef.current.delete(folderId);
           }
-          setLoadingFolderIds((current) => {
+          if (sortGeneration === (folderSortGenerationRef.current.get(folderId) ?? 0) && libraryAdmissionRef.current === context) setLoadingFolderIds((current) => {
             const next = new Set(current);
             next.delete(folderId);
             return next;
@@ -1325,7 +1475,7 @@ export function useLibraryData(
       folderChildInitialRequestsRef.current.set(folderId, request);
       return request;
     },
-    [client, createReportingAttempt]
+    [client, createReportingAttempt, invalidateContradictedEmptyChildren]
   );
 
   const revealFolderPath = useCallback(
@@ -1340,6 +1490,7 @@ export function useLibraryData(
         const mergedChildren = mergeFolderAncestorPath(
           folderChildrenByParentRef.current,
           cachedPath
+          , folderSortStatesRef.current
         );
         folderChildrenByParentRef.current = mergedChildren;
         setFolderChildrenByParent(mergedChildren);
@@ -1361,12 +1512,13 @@ export function useLibraryData(
       options.signal?.addEventListener("abort", abortForScope, { once: true });
       folderAncestorControllersRef.current.set(folderId, controller);
       const rawRequest = (async () => {
+        const appearanceVersion = folderAppearanceVersionRef.current;
         const response = await client.listFolderAncestors(folderId, {
           requestPriority: "navigation",
           signal: controller.signal
         });
-        if (options.signal?.aborted) return [];
-        const path = response.items;
+        if (controller.signal.aborted || options.signal?.aborted) return [];
+        const path = reconcileFolderAppearanceRead(response.items, appearanceVersion, folderAppearanceSavedRef.current);
         if (path.length === 0 || path[path.length - 1]?.id !== folderId) {
           throw new Error(`Invalid folder ancestor path for ${folderId}`);
         }
@@ -1375,6 +1527,7 @@ export function useLibraryData(
         const mergedChildren = mergeFolderAncestorPath(
           folderChildrenByParentRef.current,
           path
+          , folderSortStatesRef.current
         );
         folderChildrenByParentRef.current = mergedChildren;
         setFolderChildrenByParent(mergedChildren);
@@ -1417,11 +1570,15 @@ export function useLibraryData(
   const loadMoreFolderChildren = useCallback(
     async (folderId: number) => {
       const reportingAttempt = createReportingAttempt();
+      const context = libraryAdmissionRef.current;
+      if (!context?.library) return;
+      const sortGeneration = folderSortGenerationRef.current.get(folderId) ?? 0;
+      const sortState = folderSortStatesRef.current.get(folderId);
       const cursor = folderChildNextCursorByParent[folderId];
       if (!cursor || loadingMoreFolderIds.has(folderId)) {
         return;
       }
-      const requestKey = folderChildPageRequestKey(folderId, cursor);
+      const requestKey = folderChildPageRequestKey(folderId, `${sortGeneration}:${sortState?.revision ?? ""}:${cursor}`);
       if (
         inFlightFolderChildPageKeys.current.has(requestKey) ||
         loadedFolderChildPageKeys.current.has(requestKey)
@@ -1434,14 +1591,22 @@ export function useLibraryData(
       folderChildControllersRef.current.set(requestKey, controller);
       setLoadingMoreFolderIds((current) => new Set(current).add(folderId));
       try {
+        const appearanceVersion = folderAppearanceVersionRef.current;
         const page = await client.listFolderChildren(folderId, {
           cursor: cursor ?? undefined,
           limit: FOLDER_PAGE_LIMIT
         }, {
           signal: controller.signal
         });
+        if (controller.signal.aborted || libraryAdmissionRef.current !== context || sortGeneration !== (folderSortGenerationRef.current.get(folderId) ?? 0)) return;
+        if (sortState && page.sortState && (sortState.revision !== page.sortState.revision || sortState.effectiveOrder !== page.sortState.effectiveOrder)) {
+          await loadFolderChildren(folderId, { force: true, retainCount: folderChildrenByParentRef.current[folderId]?.length });
+          return;
+        }
+        page.items = reconcileFolderAppearanceRead(page.items, appearanceVersion, folderAppearanceSavedRef.current);
+        invalidateContradictedEmptyChildren(page.items);
         setFolderChildrenByParent((current) => {
-          const next = mergeFolderChildrenByParent(current, folderId, page.items);
+          const next = mergeFolderChildrenByParent(current, folderId, page.items, page.sortState?.effectiveOrder);
           folderChildrenByParentRef.current = next;
           return next;
         });
@@ -1452,6 +1617,13 @@ export function useLibraryData(
         }));
       } catch (cause) {
         if (isAbortError(cause)) {
+          return;
+        }
+        if (cause instanceof CoreApiError && cause.status === 400 && libraryErrorCode(cause, "") === "stale_folder_cursor"
+          && libraryAdmissionRef.current === context && sortGeneration === (folderSortGenerationRef.current.get(folderId) ?? 0)) {
+          // Exactly one fresh first-page request; it has no cursor and cannot
+          // recurse through this recovery path. Unrelated 400s remain errors.
+          await loadFolderChildren(folderId, { force: true, retainCount: folderChildrenByParentRef.current[folderId]?.length }).catch(() => undefined);
           return;
         }
         reportLibraryFailure(
@@ -1465,7 +1637,7 @@ export function useLibraryData(
         if (folderChildControllersRef.current.get(requestKey) === controller) {
           folderChildControllersRef.current.delete(requestKey);
         }
-        setLoadingMoreFolderIds((current) => {
+        if (sortGeneration === (folderSortGenerationRef.current.get(folderId) ?? 0) && libraryAdmissionRef.current === context) setLoadingMoreFolderIds((current) => {
           const next = new Set(current);
           next.delete(folderId);
           return next;
@@ -1478,6 +1650,8 @@ export function useLibraryData(
       createReportingAttempt,
       folderChildNextCursorByParent,
       loadingMoreFolderIds,
+      loadFolderChildren,
+      invalidateContradictedEmptyChildren,
       reportLibraryFailure
     ]
   );
@@ -1493,12 +1667,15 @@ export function useLibraryData(
       folderDescendantControllersRef.current.set(folderId, controller);
       setLoadingFolderDescendantIds((current) => new Set(current).add(folderId));
       try {
+        const appearanceVersion = folderAppearanceVersionRef.current;
         const page = await client.listFolderChildren(folderId, {
           includeDescendants: true,
           limit: FOLDER_PAGE_LIMIT
         }, {
           signal: controller.signal
         });
+        if (controller.signal.aborted) return [];
+        page.items = reconcileFolderAppearanceRead(page.items, appearanceVersion, folderAppearanceSavedRef.current);
         setFolderDescendantsByParent((current) => ({
           ...current,
           [folderId]: page.items
@@ -1524,6 +1701,86 @@ export function useLibraryData(
     },
     [client]
   );
+
+  const expandedFolderIdsRef = useRef(expandedFolderIds);
+  expandedFolderIdsRef.current = expandedFolderIds;
+  const updateDirectorySort = useCallback(async (target: DirectorySortTarget, rule: DirectorySortRule | null) => {
+    const context = libraryAdmission;
+    const lifetime = folderAppearanceLifetimeRef.current;
+    if (!context?.library || libraryAdmissionRef.current !== context) throw new Error("资源库已切换，请重新打开排序菜单。");
+    const options = { contextRevision: context.contextRevision };
+    const result = target.kind === "root"
+      ? await (rule ? client.updateRootSort(target.id, rule, options) : client.resetRootSort(target.id, options))
+      : await (rule ? client.updateFolderSort(target.id, rule, options) : client.resetFolderSort(target.id, options));
+    if (libraryAdmissionRef.current !== context || lifetime !== folderAppearanceLifetimeRef.current) throw new DOMException("Library changed", "AbortError");
+    const parentId = target.kind === "root" ? rootsRef.current.find((root) => root.id === target.id)?.rootFolderId : target.id;
+    if (parentId == null) return result.state;
+
+    // Walk only catalog rows already held by the UI; no descendant fetch or
+    // per-node preference reads. A changed recursive rule is one Core write.
+    const childIds = new Map<number, Set<number>>();
+    const addRows = (rows: FolderRecord[]) => {
+      for (const folder of rows) {
+        if (folder.parentId === null) continue;
+        const children = childIds.get(folder.parentId) ?? new Set<number>();
+        children.add(folder.id); childIds.set(folder.parentId, children);
+      }
+    };
+    Object.values(folderChildrenByParentRef.current).forEach(addRows);
+    for (const path of folderAncestorPathCacheRef.current.values()) addRows(path);
+    const affected = new Set<number>([parentId]);
+    if (result.invalidateDescendants) {
+      const queue = [parentId];
+      for (let index = 0; index < queue.length; index += 1) {
+        for (const id of childIds.get(queue[index]) ?? []) if (!affected.has(id)) { affected.add(id); queue.push(id); }
+      }
+    }
+    const nextChildren = { ...folderChildrenByParentRef.current };
+    const nextDescendants = { ...folderDescendantsByParentRef.current };
+    for (const [id, rootId] of pendingSortReloadsRef.current) {
+      if (rootId === result.state.rootId) affected.add(id);
+    }
+    const reload: number[] = [];
+    for (const id of affected) {
+      folderSortGenerationRef.current.set(id, (folderSortGenerationRef.current.get(id) ?? 0) + 1);
+      folderChildrenLoadedRef.current.delete(id);
+      clearFolderChildPageKeys(loadedFolderChildPageKeys.current, id);
+      clearFolderChildPageKeys(inFlightFolderChildPageKeys.current, id);
+      for (const [key, controller] of folderChildControllersRef.current) if (key.startsWith(`${id}:`)) controller.abort();
+      folderChildInitialRequestsRef.current.delete(id);
+      folderDescendantControllersRef.current.get(id)?.abort();
+      const visible = expandedFolderIdsRef.current.has(id) || selectedFolderIdRef.current === id;
+      // Retain visible geometry until its replacement page commits. The loaded
+      // marker/cursor/generation are already retired, so it cannot mix pages.
+      if (!visible) { delete nextChildren[id]; folderSortStatesRef.current.delete(id); }
+      delete nextDescendants[id];
+      if (visible) { reload.push(id); pendingSortReloadsRef.current.set(id, result.state.rootId); }
+    }
+    abortAllControllers(folderAncestorControllersRef.current);
+    folderAncestorRequestsRef.current.clear();
+    folderChildrenByParentRef.current = nextChildren;
+    folderDescendantsByParentRef.current = nextDescendants;
+    setFolderChildrenByParent(nextChildren); setFolderDescendantsByParent(nextDescendants);
+    setFolderChildNextCursorByParent((current) => {
+      const next = { ...current }; for (const id of affected) delete next[id]; return next;
+    });
+    setLoadingMoreFolderIds((current) => new Set([...current].filter((id) => !affected.has(id))));
+    // Bounded concurrency, only currently expanded/selected branches. A failed
+    // reload is reported normally and retrying the menu retries the read too.
+    let index = 0;
+    let reloadFailed = false;
+    await Promise.all(Array.from({ length: Math.min(4, reload.length) }, async () => {
+      while (index < reload.length && libraryAdmissionRef.current === context) {
+        const id = reload[index++];
+        try {
+          await loadFolderChildren(id, { retainCount: nextChildren[id]?.length });
+          if (libraryAdmissionRef.current === context) pendingSortReloadsRef.current.delete(id);
+        } catch { reloadFailed = true; }
+      }
+    }));
+    if (reloadFailed) throw new Error("排序已保存，部分目录加载失败，请重试。");
+    return result.state;
+  }, [client, libraryAdmission, loadFolderChildren]);
 
   const updateFolderNavigationHistory = useCallback(
     (updater: (current: FolderNavigationHistory) => FolderNavigationHistory) => {
@@ -1584,9 +1841,23 @@ export function useLibraryData(
     [updateFolderNavigationHistory]
   );
 
+  const readRootsSnapshot = useCallback(async () => {
+    const context = libraryAdmissionRef.current;
+    if (!context?.library) throw new DOMException("Library unavailable", "AbortError");
+    const generation = ++rootReadGenerationRef.current;
+    const lifetime = folderAppearanceLifetimeRef.current;
+    const appearanceVersion = rootAppearanceVersionRef.current;
+    const response = await client.listRoots();
+    if (context !== libraryAdmissionRef.current || generation !== rootReadGenerationRef.current || lifetime !== folderAppearanceLifetimeRef.current) throw new DOMException("Stale roots", "AbortError");
+    return response.items.map((root) => {
+      const saved = rootAppearanceSavedRef.current.get(root.id);
+      return saved && saved.version > appearanceVersion ? { ...root, icon: saved.root.icon, color: saved.root.color } : root;
+    });
+  }, [client]);
+
   const loadRoots = useCallback(async (scope?: LibrarySelectionScope) => {
     scope?.signal?.throwIfAborted();
-    const response = await client.listRoots();
+    const response = { items: await readRootsSnapshot() };
     scope?.signal?.throwIfAborted();
     replaceRoots(response.items);
     const requestedRootId =
@@ -1605,7 +1876,7 @@ export function useLibraryData(
       nextRootId === null ? null : { rootId: nextRootId, folderId: nextFolderId }
     );
     return { roots: response.items, selectedRoot: nextRoot ?? null, selectedFolderId: nextFolderId };
-  }, [client, initializeFolderNavigationHistory, replaceRoots]);
+  }, [readRootsSnapshot, initializeFolderNavigationHistory, replaceRoots]);
 
   // Refresh only the roots LIST (for status / lastScanAt display), WITHOUT
   // re-driving selection or navigation history. The 800ms scan refresh used the
@@ -1613,12 +1884,32 @@ export function useLibraryData(
   // refresh token — if the user clicked a different folder mid-refresh, the
   // in-flight refresh snapped the selection/expansion back to the old folder.
   const refreshRootsList = useCallback(async () => {
-    const response = await client.listRoots();
-    replaceRoots(response.items);
-    return response.items;
-  }, [client, replaceRoots]);
+    const items = await readRootsSnapshot();
+    replaceRoots(items);
+    return items;
+  }, [readRootsSnapshot, replaceRoots]);
+
+  useEffect(() => {
+    // A watched file can reach a fresh media page after the root scan has
+    // finished. Reconcile its sidebar count once instead of leaving the old
+    // root projection until another scan or a manual navigation refresh.
+    const root = rootsRef.current.find((item) => item.id === selectedRootId);
+    if (!root || loading || searchActive || !showChildFolderContents
+      || (selectedFolderId !== null && selectedFolderId !== root.rootFolderId)
+      || (root.fileCount ?? root.mediaCount) === mediaTotalCount) return;
+    let cancelled = false;
+    const reportingAttempt = createReportingAttempt();
+    void readRootsSnapshot().then((items) => {
+      if (!cancelled) replaceRoots(items);
+    }).catch((cause: unknown) => {
+      if (!cancelled && !isAbortError(cause)) void reportLibraryFailure(cause, "root-load", "library", "count-refresh-failed", reportingAttempt);
+    });
+    return () => { cancelled = true; };
+  }, [readRootsSnapshot, createReportingAttempt, loading, mediaTotalCount, replaceRoots,
+    reportLibraryFailure, searchActive, selectedFolderId, selectedRootId, showChildFolderContents]);
 
   const loadTasks = useCallback(async () => {
+    if (!libraryAdmissionRef.current?.library) return [];
     if (loadTasksRequestRef.current) {
       return loadTasksRequestRef.current;
     }
@@ -1875,8 +2166,52 @@ export function useLibraryData(
         requestGeneration: mediaPageGeneration.current
       });
     },
-    [loadMediaWindow]
+    [loadMediaWindow, presentationRevision]
   );
+
+  useEffect(() => {
+    let selectedController: AbortController | null = null;
+    const unsubscribe = subscribePluginChanges(() => {
+      // Initial/root-switch loading will read current capabilities itself.
+      // Do not invalidate that request before a root scope exists to reload.
+      if (selectedRootIdRef.current === null) return;
+      const requestGeneration = ++mediaPageGeneration.current;
+      retireStaleMediaPageRequests();
+      inFlightMediaPageKeys.current.clear();
+      loadedMediaPageKeys.current.clear();
+      // Keep slots, count, cursors and selection in place. A new callback makes
+      // the grid reload its visible window; other windows refresh on demand.
+      loadedMediaRangesRef.current = [];
+      setLoadedMediaRanges([]);
+      setPresentationRevision((value) => value + 1);
+      const rootId = selectedRootIdRef.current;
+      if (rootId !== null && mediaTotalCountRef.current === 0) {
+        void loadMediaWindow({ rootId, folderId: selectedFolderIdRef.current ?? undefined,
+          includeDescendants: showChildFolderContentsRef.current, offset: 0,
+          limit: INITIAL_MEDIA_WINDOW_LIMIT, requestGeneration, selectFirst: true });
+      }
+      selectedController?.abort();
+      const selectedId = selectedMediaIdRef.current;
+      if (selectedId === null) return;
+      const controller = new AbortController();
+      selectedController = controller;
+      const reportingAttempt = createReportingAttempt();
+      void client.getMedia(selectedId, { signal: controller.signal }).then((record) => {
+        if (controller.signal.aborted || requestGeneration !== mediaPageGeneration.current) return;
+        setMedia((current) => appendUniqueMedia(current, [record]));
+        setMediaSlots((current) => new Map([...current].map(([index, item]) =>
+          [index, item.id === record.id ? record : item]
+        )));
+      }).catch((cause: unknown) => {
+        if (controller.signal.aborted || requestGeneration !== mediaPageGeneration.current) return;
+        void reportLibraryFailure(cause, "media-load", `file:${selectedId}`, "presentation-refresh-failed", reportingAttempt);
+      });
+    });
+    return () => {
+      unsubscribe();
+      selectedController?.abort();
+    };
+  }, [client, createReportingAttempt, loadMediaWindow, reportLibraryFailure, retireStaleMediaPageRequests]);
 
   const reloadCurrentMedia = useCallback(
     async (scope?: {
@@ -2096,6 +2431,10 @@ export function useLibraryData(
 
   const loadLibrary = useCallback(async (scope?: LibrarySelectionScope) => {
     if (scope?.signal?.aborted) return;
+    if (!libraryAdmissionRef.current?.library) {
+      if (libraryAdmissionRef.current) setLoading(false);
+      return;
+    }
     const reportingAttempt = createReportingAttempt();
     const requestGeneration = ++mediaPageGeneration.current;
     retireStaleMediaPageRequests();
@@ -2173,6 +2512,7 @@ export function useLibraryData(
       if (requestGeneration === mediaPageGeneration.current) setLoading(false);
     }
   }, [
+    libraryAdmission,
     loadMediaWindow,
     abortStaleFolderRequests,
     createReportingAttempt,
@@ -2259,14 +2599,60 @@ export function useLibraryData(
   }, [client, loadLibrary, loadMediaWindow, options.activeLibraryId, revealFolderPath]);
 
   useEffect(() => {
+    let generation = 0;
+    let controller: AbortController | null = null;
+    const refresh = () => {
+      const requestGeneration = ++generation;
+      controller?.abort();
+      controller = new AbortController();
+      const reportingAttempt = createReportingAttempt();
+      return client.getActiveLibrary({ signal: controller.signal }).then((snapshot) => {
+        if (requestGeneration !== generation) return;
+        const current = libraryAdmissionRef.current;
+        if (current?.library?.libraryUuid === snapshot.library?.libraryUuid
+            && current?.contextRevision === snapshot.contextRevision
+            && current?.runtimeGeneration === snapshot.runtimeGeneration) return;
+        libraryAdmissionRef.current = snapshot;
+        setLibraryAdmission(snapshot);
+      }).catch((cause: unknown) => {
+        if (requestGeneration !== generation || isAbortError(cause)) return;
+        setLoading(false);
+        void reportLibraryFailure(cause, "library-load", "library", "context-load-failed", reportingAttempt);
+      });
+    };
+    refreshLibraryAdmissionRef.current = refresh;
+    void refresh();
+    const unsubscribe = subscribeLibraryPhase((phase) => {
+      if (phase === "loading-media" || phase === "ready") {
+        if (phase === "loading-media") {
+          libraryAdmissionRef.current = null;
+          setLibraryAdmission(null);
+        }
+        void refresh();
+      } else {
+        generation += 1;
+        controller?.abort();
+        libraryAdmissionRef.current = null;
+        setLibraryAdmission(null);
+      }
+    });
+    return () => {
+      generation += 1;
+      controller?.abort();
+      refreshLibraryAdmissionRef.current = null;
+      unsubscribe();
+    };
+  }, [client, createReportingAttempt, reportLibraryFailure]);
+
+  useEffect(() => {
     void loadLibrary();
   }, [loadLibrary]);
 
   useEffect(() => {
     const unsubscribe = subscribeLibraryPhase((phase) => {
       if (phase === "starting-core") {
-        // A library switch has BEGUN (Core is being restarted). Tear the old
-        // library's view down immediately — before the new Core is even healthy
+        // An active Library context change has BEGUN. Tear the old
+        // library's view down immediately — before the next context is admitted
         // — so no stale content lingers and no old-library thumbnail can bleed
         // into the new library (which reuses the same fileId integers). Bumping
         // the media-cache epoch invalidates every thumbnail/preview cache + any
@@ -2276,6 +2662,13 @@ export function useLibraryData(
         resetMediaCachesForLibrarySwitch();
         abortAllMediaPageRequests();
         prepareNavigationMediaReloadRef.current?.();
+        // A forgotten active Library can settle with no replacement. No media
+        // load then runs, so its totals and virtual slots must retire here too.
+        setMediaTotalCount(0);
+        setMediaSlots(new Map());
+        setLoadedMediaRanges([]);
+        mediaCursorByStartIndexRef.current.clear();
+        loadedMediaPageKeys.current.clear();
         selectedRootIdRef.current = null;
         selectedFolderIdRef.current = null;
         selectRoot(null);
@@ -2383,8 +2776,12 @@ export function useLibraryData(
     searchState.tagIds.join(",")
   ]);
 
-  // Load tag list once and refresh on demand via createTag/deleteTag.
+  // Reload tags for each active context, including reactivation of the same Library.
   useEffect(() => {
+    if (!libraryAdmission?.library) {
+      setTags([]);
+      return;
+    }
     let cancelled = false;
     const reportingAttempt = createReportingAttempt();
     void client
@@ -2408,7 +2805,7 @@ export function useLibraryData(
     return () => {
       cancelled = true;
     };
-  }, [client, createReportingAttempt, reportLibraryFailure]);
+  }, [client, createReportingAttempt, libraryAdmission, reportLibraryFailure]);
 
   // Load user metadata for the currently selected media item.
   useEffect(() => {
@@ -2843,6 +3240,7 @@ export function useLibraryData(
   }, [scanActiveRootTask, selectedRootId]);
 
   const refresh = useCallback(async () => {
+    await refreshLibraryAdmissionRef.current?.();
     await loadLibrary();
   }, [loadLibrary]);
 
@@ -3626,6 +4024,10 @@ export function useLibraryData(
   // tasks are cancelled. (Fixes: "活动任务 30019" persisting in renderedOnly.)
   const cancelledBulkForModeRef = useRef<ThumbnailGenerationMode | null>(null);
   useEffect(() => {
+    cancelledBulkForModeRef.current = null;
+  }, [libraryAdmission]);
+  useEffect(() => {
+    if (!libraryAdmission?.library) return;
     if (generationMode === "allPersist") {
       cancelledBulkForModeRef.current = null;
       return;
@@ -3634,15 +4036,23 @@ export function useLibraryData(
       return;
     }
     cancelledBulkForModeRef.current = generationMode;
+    const controller = new AbortController();
     // A fresh renderer may reach this effect before any ordinary API response
     // has taught core-client the active context revision. Prime that revision
     // explicitly so this background mutation obeys the same stale-write fence
     // as user-driven mutations instead of producing a noisy startup 409.
     void client
-      .getActiveLibrary({ requestPriority: "background" })
-      .then(() => client.cancelBulkThumbnailCache({ requestPriority: "background" }))
-      .then(() => {
-        void refreshThumbnailCacheStats();
+      .getActiveLibrary({ requestPriority: "background", signal: controller.signal })
+      .then((snapshot) => {
+        controller.signal.throwIfAborted();
+        if (!snapshot.library
+          || snapshot.library.libraryUuid !== libraryAdmission.library?.libraryUuid
+          || snapshot.contextRevision !== libraryAdmission.contextRevision
+          || snapshot.runtimeGeneration !== libraryAdmission.runtimeGeneration) return false;
+        return client.cancelBulkThumbnailCache({ requestPriority: "background", signal: controller.signal }).then(() => true);
+      })
+      .then((cancelled) => {
+        if (cancelled && !controller.signal.aborted) void refreshThumbnailCacheStats();
       })
       .catch((cause) => {
         if (!isAbortError(cause)) {
@@ -3650,7 +4060,8 @@ export function useLibraryData(
           cancelledBulkForModeRef.current = null;
         }
       });
-  }, [client, generationMode, refreshThumbnailCacheStats]);
+    return () => controller.abort();
+  }, [client, generationMode, libraryAdmission, refreshThumbnailCacheStats]);
 
   const retryThumbnailCacheFailures = useCallback(async () => {
     await enqueueThumbnailCacheLoop(currentThumbnailCacheScope() ?? {}, "retryFailedAndStale");
@@ -3703,9 +4114,14 @@ export function useLibraryData(
     selectedMetadata,
     folderChildrenByParent,
     folderDescendantsByParent,
+    updateFolderAppearance,
+    updateRootAppearance,
+    getDirectorySort,
+    updateDirectorySort,
     folderChildNextCursorByParent,
     expandedFolderIds,
     loadingFolderIds,
+    failedFolderIds,
     loadingFolderDescendantIds,
     loadingMoreFolderIds,
     loading,

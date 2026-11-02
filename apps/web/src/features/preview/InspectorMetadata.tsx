@@ -1,7 +1,7 @@
-import { Heart, Star } from "lucide-react";
+import { Heart, Star } from "../../design/icons";
 import type { KeyboardEvent } from "react";
 import { useEffect, useId, useMemo, useState } from "react";
-import type { TagRecord, UserMetadataRecord } from "@megle/core-client";
+import type { TagRecord, UserMetadataRecord } from "@mangoo/core-client";
 import { LiquidGlassButton, LiquidGlassSurface } from "../../design/liquid-glass";
 import { TagChip } from "../library/TagChip";
 
@@ -181,7 +181,7 @@ export function InspectorMetadata({
                 role="radio"
                 type="button"
               >
-                <Star size={14} fill={active ? "currentColor" : "none"} />
+                <Star size={14} weight={active ? "fill" : "regular"} />
               </button>
             );
           })}
@@ -205,7 +205,7 @@ export function InspectorMetadata({
           onClick={() => void onUpdate(fileId, { favorite: !favorite })}
           type="button"
         >
-          <Heart size={14} fill={favorite ? "currentColor" : "none"} />
+          <Heart size={14} weight={favorite ? "fill" : "regular"} />
           <span>{favorite ? "Favorited" : "Favorite"}</span>
         </button>
       </div>

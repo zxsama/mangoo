@@ -10,7 +10,7 @@ Run from the repository root on Windows:
 node tools/bench/managed-library-lifecycle-bench.mjs
 ```
 
-The machine-readable result is written to the ignored path `.tmp/bench/managed-library-lifecycle.json`. Override it with `MEGLE_LIBRARY_BENCH_OUTPUT`; set `MEGLE_LIBRARY_BENCH_KEEP=1` to retain the temporary Host and Library files for diagnosis.
+The machine-readable result is written to the ignored path `.tmp/bench/managed-library-lifecycle.json`. Override it with `MANGOO_LIBRARY_BENCH_OUTPUT`; set `MANGOO_LIBRARY_BENCH_KEEP=1` to retain the temporary Host and Library files for diagnosis.
 
 ## Result
 

@@ -4,14 +4,14 @@ import type {
   NotificationOrigin,
   NotificationPresentation,
   RootPathPreflightMode
-} from "@megle/core-client/generated-contract";
+} from "@mangoo/core-client/generated-contract";
 
 export type {
   NotificationOperationSnapshot,
   NotificationOperationStatus,
   NotificationOrigin,
   NotificationPresentation
-} from "@megle/core-client/generated-contract";
+} from "@mangoo/core-client/generated-contract";
 
 export type NotificationOperationInput = NotificationOperationSnapshot;
 export type DesktopNotificationStatus = NotificationOperationStatus;
@@ -64,6 +64,11 @@ export interface ThumbnailFailureDetail {
 
 export type ThumbnailCacheSummary = DesktopThumbnailCacheSummary;
 
+/**
+ * Local Core/Desktop notification transport and store health.
+ * This is not cloud synchronization or plugin business state; the name and wire
+ * fields remain unchanged for compatibility.
+ */
 export interface NotificationSyncHealth {
   state: "healthy" | "syncing" | "degraded";
   libraryId: string | null;
@@ -224,6 +229,16 @@ export interface DesktopFolderPickerRequest {
   readonly dialogTitle: string;
 }
 
+export interface ResolveLibraryCreationPathsRequest {
+  readonly name: string;
+  readonly databasePath?: string;
+}
+
+export interface LibraryCreationPaths {
+  readonly databasePath: string;
+  readonly defaultContentPath: string;
+}
+
 export interface ThumbnailFailureSnapshot {
   readonly totalCount: number;
   readonly visibleCount: number;
@@ -335,3 +350,20 @@ export interface NotificationIpcBridge {
 }
 
 export type DesktopNotificationsBridge = NotificationIpcBridge;
+
+export interface NotificationPluginEntry {
+  pluginId: string;
+  viewId: string;
+  title: string;
+}
+
+export interface NotificationPluginOpenRequest {
+  pluginId: string;
+  viewId: string;
+  libraryUuid: string | null;
+}
+
+export interface PluginViewWindowIntent extends NotificationPluginOpenRequest {
+  lifecycleEpoch: number;
+  contextRevision: number;
+}

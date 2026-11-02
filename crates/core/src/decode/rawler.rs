@@ -64,7 +64,7 @@ mod tests {
     #[test]
     fn malformed_raw_reports_a_decoder_error_instead_of_no_decoder() {
         let path = std::env::temp_dir().join(format!(
-            "megle-rawler-decoder-{}-{}.dng",
+            "mangoo-rawler-decoder-{}-{}.dng",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

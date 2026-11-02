@@ -207,7 +207,7 @@ fn run_and_read(command: &mut Command, scratch: &std::path::Path) -> anyhow::Res
 fn scratch_path() -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     std::env::temp_dir().join(format!(
-        "megle-decode-{}-{}-{}.png",
+        "mangoo-decode-{}-{}-{}.png",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -228,7 +228,7 @@ mod tests {
     fn unique_temp_dir() -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "megle_decode_ffmpeg_{}_{}_{}",
+            "mangoo_decode_ffmpeg_{}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -415,7 +415,7 @@ mod tests {
             );
             return;
         }
-        let missing = std::env::temp_dir().join("megle-decode-does-not-exist-12345.heic");
+        let missing = std::env::temp_dir().join("mangoo-decode-does-not-exist-12345.heic");
         let _ = std::fs::remove_file(&missing);
 
         let error = FfmpegDecoder

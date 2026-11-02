@@ -1,4 +1,4 @@
-import type { MediaRecord } from "@megle/core-client";
+import type { MediaRecord } from "@mangoo/core-client";
 
 // Byte estimate used for a neighbor whose `size` is unknown/zero, so the buffer
 // budget still bounds how many such neighbors we warm.

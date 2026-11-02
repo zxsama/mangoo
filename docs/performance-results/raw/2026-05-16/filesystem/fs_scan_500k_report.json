@@ -1,14 +1,14 @@
 {
   "generation": {
-    "root": "D:\\Megle\\tools\\bench\\fs-scan\\results\\tree_500k",
+    "root": "D:\\Mangoo\\tools\\bench\\fs-scan\\results\\tree_500k",
     "files": 500000,
     "folders": 5000,
     "elapsed_ms": 180740.73
   },
   "runs": [
     {
-      "root": "D:\\Megle\\tools\\bench\\fs-scan\\results\\tree_500k",
-      "db": "D:\\Megle\\tools\\bench\\fs-scan\\results\\fs_scan_500k_run1.sqlite",
+      "root": "D:\\Mangoo\\tools\\bench\\fs-scan\\results\\tree_500k",
+      "db": "D:\\Mangoo\\tools\\bench\\fs-scan\\results\\fs_scan_500k_run1.sqlite",
       "scanned_dirs": 5051,
       "scanned_files": 500001,
       "media_files": 437500,
@@ -22,8 +22,8 @@
       "db_size_mb": 45.45
     },
     {
-      "root": "D:\\Megle\\tools\\bench\\fs-scan\\results\\tree_500k",
-      "db": "D:\\Megle\\tools\\bench\\fs-scan\\results\\fs_scan_500k_run2.sqlite",
+      "root": "D:\\Mangoo\\tools\\bench\\fs-scan\\results\\tree_500k",
+      "db": "D:\\Mangoo\\tools\\bench\\fs-scan\\results\\fs_scan_500k_run2.sqlite",
       "scanned_dirs": 5051,
       "scanned_files": 500001,
       "media_files": 437500,

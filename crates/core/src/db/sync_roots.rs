@@ -521,6 +521,31 @@ impl Database {
         Ok(None)
     }
 
+    pub(crate) fn ensure_file_collection_upgrade_scans(&self) -> anyhow::Result<Vec<i64>> {
+        let mut query=self.connection.prepare("SELECT r.id FROM roots r WHERE r.enabled=1 AND r.file_collection_version>r.file_collection_scanned_version ORDER BY r.id")?;
+        let roots = query
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(query);
+        let mut tasks = Vec::new();
+        for root_id in roots {
+            if let Some(token) = self.sync_root_binding_token_for_root_id(root_id)? {
+                if !self.sync_root_binding_token_is_watchable(&token)? {
+                    continue;
+                }
+                if let Some(task) = self.ensure_root_scan_task_for_token(root_id, &token)? {
+                    tasks.push(task);
+                }
+            } else if !self.has_active_root_scan_task(root_id)? {
+                tasks.push(self.create_root_scan_task_with_origin(
+                    root_id,
+                    super::NotificationOrigin::Recovery,
+                )?);
+            }
+        }
+        Ok(tasks)
+    }
+
     fn ensure_root_scan_task_for_token(
         &self,
         root_id: i64,
@@ -529,7 +554,7 @@ impl Database {
         let generation = i64::try_from(token.binding_generation)
             .context("binding generation exceeds SQLite integer range")?;
         let already_enqueued: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM tasks WHERE kind='root_scan' AND root_id=?1 AND root_uuid=?2 AND local_binding_uuid=?3 AND binding_generation=?4 AND status IN ('pending','running','succeeded'))",
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE kind='root_scan' AND root_id=?1 AND root_uuid=?2 AND local_binding_uuid=?3 AND binding_generation=?4 AND (status IN ('pending','running') OR (status='succeeded' AND EXISTS(SELECT 1 FROM roots WHERE id=?1 AND file_collection_scanned_version=file_collection_version))))",
             params![root_id, token.root_uuid.as_slice(), token.local_binding_uuid.as_slice(), generation],
             |row| row.get(0),
         )?;
@@ -1471,15 +1496,6 @@ impl Database {
                     .context("sync root descriptor disappeared")
             })
             .collect()
-    }
-
-    pub fn sync_root_logical_bytes(&self, root_uuid: &[u8; 16]) -> anyhow::Result<u64> {
-        let bytes: i64 = self.connection.query_row(
-            "SELECT COALESCE(SUM(file.size),0) FROM files file JOIN roots root ON root.id=file.root_id WHERE root.root_uuid=?1 AND file.status='active'",
-            [root_uuid.as_slice()],
-            |row| row.get(0),
-        )?;
-        Ok(bytes.max(0) as u64)
     }
 
     /// Links an already-created Catalog root to its existing empty-name
@@ -2622,7 +2638,7 @@ mod tests {
         let database = Database::open_in_memory().expect("open database");
         database.apply_migrations().expect("apply migrations");
         let directory = std::env::temp_dir().join(format!(
-            "megle-enrollment-canonical-path-{}",
+            "mangoo-enrollment-canonical-path-{}",
             Uuid::now_v7().simple()
         ));
         std::fs::create_dir_all(&directory).expect("create root directory");
@@ -2665,6 +2681,89 @@ mod tests {
 
         drop(database);
         std::fs::remove_dir_all(directory).expect("remove root directory");
+    }
+
+    #[test]
+    fn all_file_policy_upgrade_retries_old_success_and_preserves_local_fork_scope() {
+        let temp =
+            std::env::temp_dir().join(format!("mangoo-file-policy-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let root_path = temp.join("root");
+        std::fs::create_dir_all(&root_path).unwrap();
+        std::fs::write(root_path.join("data.bin"), b"generic").unwrap();
+        let path = temp.join("catalog.sqlite");
+        let db = Database::open(&path).unwrap();
+        db.apply_migrations().unwrap();
+        let library = uuid::Uuid::now_v7();
+        let root_uuid = uuid::Uuid::now_v7();
+        let binding = uuid::Uuid::now_v7();
+        let logical = uuid::Uuid::now_v7();
+        db.ensure_selected_sync_root(
+            library,
+            root_uuid,
+            uuid::Uuid::now_v7(),
+            logical,
+            &root_path.to_string_lossy(),
+            "Files",
+            "Files",
+            [7; 32],
+            binding,
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7(),
+            1,
+            "active",
+            1,
+            true,
+        )
+        .unwrap();
+        db.initialize_sync_identity(library, logical, uuid::Uuid::now_v7())
+            .unwrap();
+        db.begin_sync_capture(uuid::Uuid::now_v7(), uuid::Uuid::now_v7())
+            .unwrap();
+        db.connection
+            .execute(
+                "UPDATE tasks SET status='succeeded' WHERE kind='root_scan'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.ensure_file_collection_upgrade_scans().unwrap().len(), 1);
+        assert!(db
+            .ensure_file_collection_upgrade_scans()
+            .unwrap()
+            .is_empty());
+        db.connection
+            .execute(
+                "UPDATE tasks SET status='cancelled' WHERE status='pending'",
+                [],
+            )
+            .unwrap();
+        drop(db);
+        let mut db = Database::open(&path).unwrap();
+        db.apply_migrations().unwrap();
+        assert_eq!(db.ensure_file_collection_upgrade_scans().unwrap().len(), 1);
+        let root = db.list_roots().unwrap().remove(0);
+        crate::scan::scan_root(&mut db, &root).unwrap();
+        assert!(db
+            .ensure_file_collection_upgrade_scans()
+            .unwrap()
+            .is_empty());
+        db.fence_root_as_local_only(
+            root_uuid,
+            binding,
+            1,
+            2,
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7(),
+            2,
+        )
+        .unwrap();
+        std::fs::write(root_path.join("fork.hlsl"), b"local").unwrap();
+        crate::scan::scan_root(&mut db, &root).unwrap();
+        assert!(db.captures_all_files(root.id).unwrap());
+        let row:(i64,i64)=db.connection.query_row("SELECT (SELECT COUNT(*) FROM files WHERE name='fork.hlsl'),(SELECT COUNT(*) FROM sync_outbox WHERE state='pending')",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(row, (1, 0));
+        drop(db);
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]
@@ -2967,7 +3066,7 @@ mod tests {
     #[test]
     fn local_binding_projection_is_monotonic_and_fences_stale_work_after_restart() {
         let database_path = std::env::temp_dir().join(format!(
-            "megle-sync-root-generation-fence-{}.sqlite",
+            "mangoo-sync-root-generation-fence-{}.sqlite",
             Uuid::now_v7()
         ));
         let root_uuid = [21; 16];

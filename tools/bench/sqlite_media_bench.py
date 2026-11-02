@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SQLite media index benchmark for Megle Phase 0.
+SQLite media index benchmark for Mangoo Phase 0.
 
 This script intentionally uses Python stdlib sqlite3 so it can run before the
 Rust workspace exists. It validates schema shape, SQLite pragmas, bulk insert,

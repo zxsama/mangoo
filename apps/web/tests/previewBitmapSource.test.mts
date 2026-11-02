@@ -4,7 +4,7 @@ import { describe, it } from "node:test";
 
 register("./resolve-source-imports.mjs", import.meta.url);
 (globalThis as typeof globalThis & { window: Record<string, unknown> }).window = {
-  megleDesktop: { coreUrl: "http://127.0.0.1:47321/api" }
+  mangooDesktop: { coreUrl: "http://127.0.0.1:47321/api" }
 };
 
 const {

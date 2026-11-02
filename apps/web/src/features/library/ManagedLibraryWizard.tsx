@@ -1,599 +1,261 @@
-import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
-import { useQueries, useQueryClient } from "@tanstack/react-query";
-import type {
-  RemoteLibraryRoot,
-  RemoteLibrarySummary,
-  SyncRestorePlan,
-  SyncRestorePreflight,
-  SyncRestoreStartItem,
-} from "@megle/core-client";
-import {
-  createLibrary,
-  pickNewLibraryPath,
-  pickSyncFolder,
-  preflightLibrary,
-} from "../../core/desktop";
+import { useEffect, useRef, useState, type RefObject } from "react";
+import { canPickNativeFolder, createLibrary, getDesktopBridge, LibraryCreatedActivationError, pickNativeFolder, preflightLibrary } from "../../core/desktop";
 import { LiquidGlassButton } from "../../design/liquid-glass";
-import {
-  ModalSurface,
-  OverlayDialogActions,
-  OverlayDialogBody,
-  OverlayDialogHeader,
-  OverlayField,
-  OverlayInlineStatus,
-} from "../../design/overlays";
-import {
-  DEFAULT_LIBRARY_COLOR,
-  DEFAULT_LIBRARY_ICON,
-  LibraryIconPicker,
-} from "./libraryGlyph";
-import { createCoreClient } from "../../core/client";
-import { OneDriveAccountSetupContent } from "../plugins/OneDriveAccountSetup";
-import { usePluginAuth } from "../plugins/usePluginAuth";
+import { ArrowRight, ChevronDown, FolderOpen, Loader2, Pencil, FolderPlus, X } from "../../design/icons";
+import { ModalSurface, OverlayDialogActions, OverlayDialogBody, OverlayDialogHeader, OverlayField, OverlayInlineStatus } from "../../design/overlays";
+import { DEFAULT_LIBRARY_COLOR, DEFAULT_LIBRARY_ICON, LibraryGlyph } from "./libraryGlyph";
+
+import { applyLibraryCreationPaths, initialLibraryPathDraft, libraryContentInputs } from "./libraryCreationDraft";
+import { LibraryAppearanceEditor } from "./LibraryAppearanceEditor";
+
+const preflightMessages: Record<string, string> = {
+  "content-roots-required": "请至少添加一个文件夹。",
+  "content-roots-overlap": "文件夹重复或互相包含，请更改或移除这一项。",
+  "database-content-overlap": "数据库不能与文件夹重叠，请选择独立的位置。",
+  "invalid-name": "名称不可用，请避免特殊字符、保留名称或末尾的空格和句点。",
+  "invalid-path": "无法访问此位置，请重新选择一个本机文件夹。",
+  "cloud-sync-root": "请选择云同步目录之外的本机文件夹。",
+  "reparse-point": "请选择实际文件夹，不要使用链接或重定向位置。",
+  "nested-library-root": "此位置与已有资源库重叠，请选择独立的文件夹。",
+  "not-empty": "此文件夹不是空的，请新建或选择一个空文件夹。",
+  "marker-mismatch": "此文件夹包含其他资源库信息，请选择新的空文件夹。",
+  "not-writable": "没有此文件夹的写入权限，请选择其他位置或调整权限。",
+  "insufficient-space": "此位置的可用空间不足，请选择其他磁盘或释放空间。",
+  "path-changed": "文件夹位置已变化，请重新选择后再试。"
+};
+
+type FormError = { field: "name" | "root" | "content" | "form"; rootIndex?: number | null; message: string };
 
 export interface ManagedLibraryWizardProps {
   firstRun?: boolean;
-  initialMode?: "create" | "restore";
   onClose: () => void;
   onCreated: () => void;
   onFailure: (cause: unknown) => void;
+  onOpenExisting?: () => void;
   open: boolean;
   restoreFocusRef?: RefObject<HTMLElement | null>;
 }
 
-interface RestoreRootInventory {
-  inventoryFence: string;
-  roots: Array<RemoteLibraryRoot & { selected: boolean; targetPath: string | null }>;
-}
-
-function proposedRestoreRootPath(placementBase: string, materializedName: string): string {
-  return `${placementBase.replace(/[\\/]+$/u, "")}\\${materializedName}`;
-}
-
-function formatRemoteSize(bytes: number | null) {
-  if (bytes == null) return null;
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`;
-  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
-  return `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
-}
-
-export function ManagedLibraryWizard({
-  firstRun = false,
-  initialMode = "create",
-  onClose,
-  onCreated,
-  onFailure,
-  open,
-  restoreFocusRef,
-}: ManagedLibraryWizardProps) {
-  const [mode, setMode] = useState<"create" | "restore">(initialMode);
-  const [name, setName] = useState("Library");
+export function ManagedLibraryWizard({ firstRun = false, onClose, onCreated, onFailure, onOpenExisting, open, restoreFocusRef }: ManagedLibraryWizardProps) {
+  const [name, setName] = useState("");
+  const [paths, setPaths] = useState(initialLibraryPathDraft);
+  const [resolving, setResolving] = useState(false);
+  const [pathError, setPathError] = useState<string | null>(null);
+  const resolveSequence = useRef(0);
+  const rootId = useRef(1);
+  const contentRef = useRef<HTMLElement>(null);
+  const databaseRef = useRef<HTMLInputElement>(null);
+  const nativePicker = canPickNativeFolder();
+  const resolver = getDesktopBridge()?.resolveLibraryCreationPaths;
+  const [databaseExpanded, setDatabaseExpanded] = useState(!resolver);
+  const databasePath = paths.databasePath;
+  const manualDatabase = paths.databaseSource === "manual" ? paths.databasePath : undefined;
   const [icon, setIcon] = useState(DEFAULT_LIBRARY_ICON);
   const [color, setColor] = useState(DEFAULT_LIBRARY_COLOR);
-  const [managedRoot, setManagedRoot] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [enableSync, setEnableSync] = useState(false);
-  const [remoteLibraries, setRemoteLibraries] = useState<RemoteLibrarySummary[]>([]);
-  const [remoteLoading, setRemoteLoading] = useState(false);
-  const [selectedRemoteIds, setSelectedRemoteIds] = useState<Set<string>>(new Set());
-  const [restoreRoots, setRestoreRoots] = useState<Record<string, string>>({});
-  const [restoreRootInventories, setRestoreRootInventories] = useState<Record<string, RestoreRootInventory>>({});
-  const [restoreItems, setRestoreItems] = useState<SyncRestoreStartItem[] | null>(null);
-  const [restorePreflight, setRestorePreflight] = useState<SyncRestorePreflight | null>(null);
-  const [restorePlans, setRestorePlans] = useState<SyncRestorePlan[]>([]);
+  const [operation, setOperation] = useState<"picking" | "creating" | null>(null);
+  const [error, setError] = useState<FormError | null>(null);
+  const [appearanceAnchor, setAppearanceAnchor] = useState<HTMLButtonElement | null>(null);
   const nameRef = useRef<HTMLInputElement>(null);
-  const restoreModeRef = useRef<HTMLButtonElement>(null);
-  const auth = usePluginAuth();
-  const authResumeRef = useRef<{
-    contextRevision: number;
-    mode: "create" | "restore";
-    selectedRemoteIds: string[];
-  } | null>(null);
-  const [authResumePending, setAuthResumePending] = useState(false);
-  const previousAuthStateRef = useRef(auth.plugin?.authState);
-  const queryClient = useQueryClient();
-
+  const appearanceTriggerRef = useRef<HTMLButtonElement>(null);
+  const rootRef = useRef<HTMLElement>(null);
+  const formErrorRef = useRef<HTMLDivElement>(null);
+  const pending = useRef(false);
+  const generation = useRef(0);
+  const busy = operation !== null;
+  const ready = Boolean(name.trim() && databasePath && !resolving && !pathError && paths.roots.length && paths.roots.every((root) => root.path.trim()));
+  const appearanceOpen = open && !busy && appearanceAnchor !== null;
+  const status = operation === "picking" ? "正在选择存储位置…"
+    : operation === "creating" ? "正在检查位置并创建资源库…"
+      : resolving ? "正在更新目录…" : "";
   useEffect(() => {
-    if (!open) return;
+    generation.current++;
+    pending.current = false;
+    setOperation(null);
     setError(null);
-    setMode(initialMode);
-    setRestorePreflight(null);
-    setRestoreItems(null);
-    setRestorePlans([]);
-    authResumeRef.current = null;
-    setAuthResumePending(false);
-  }, [initialMode, open]);
-
-  async function prepareAuthResume() {
-    const active = await createCoreClient().getActiveLibrary();
-    authResumeRef.current = {
-      contextRevision: active.contextRevision,
-      mode,
-      selectedRemoteIds: [...selectedRemoteIds],
-    };
-    setAuthResumePending(true);
-  }
-
-  async function resumeAfterAuthentication() {
-    const intent = authResumeRef.current;
-    authResumeRef.current = null;
-    setAuthResumePending(false);
-    if (!intent || !open || intent.mode !== mode) return;
-    const active = await createCoreClient().getActiveLibrary();
-    if (active.contextRevision !== intent.contextRevision) {
-      setError("资源库上下文已变化，请重新选择同步或恢复目标。");
+    setAppearanceAnchor(null);
+    setDatabaseExpanded(!resolver);
+    return () => { generation.current++; };
+  }, [open]);
+  useEffect(() => {
+    const sequence = ++resolveSequence.current;
+    const owner = generation.current;
+    if (!open || !resolver || (!name.trim() && manualDatabase === undefined)) {
+      setResolving(false);
       return;
     }
-    setSelectedRemoteIds(new Set(intent.selectedRemoteIds));
-    if (mode === "restore") {
-      setRemoteLoading(true);
-      try {
-        const response = await createCoreClient().listRemoteLibraries();
-        setRemoteLibraries(response.items);
-      } finally {
-        setRemoteLoading(false);
-      }
-    }
-    (mode === "create" ? nameRef.current : restoreModeRef.current)?.focus();
+    setResolving(true);
+    setPathError(null);
+    void resolver({ name: name.trim(), ...(manualDatabase === undefined ? {} : { databasePath: manualDatabase }) }).then((result) => {
+      if (sequence !== resolveSequence.current || owner !== generation.current) return;
+      setPaths((current) => applyLibraryCreationPaths(current, result));
+    }, (cause: unknown) => {
+      if (sequence !== resolveSequence.current || owner !== generation.current) return;
+      setPathError(cause instanceof Error ? cause.message : String(cause));
+    }).finally(() => {
+      if (sequence === resolveSequence.current && owner === generation.current) setResolving(false);
+    });
+    return () => { resolveSequence.current++; };
+  }, [open, name, manualDatabase, resolver]);
+
+  function changeDatabase(value: string) {
+    resolveSequence.current++;
+    setPaths((current) => ({ ...current, databasePath: value, databaseSource: "manual" }));
+    setPathError(null);
+    setError(null);
   }
 
   useEffect(() => {
-    const previous = previousAuthStateRef.current;
-    const current = auth.plugin?.authState;
-    previousAuthStateRef.current = current;
-    if (previous !== "authenticated" && current === "authenticated" && authResumeRef.current) {
-      void resumeAfterAuthentication();
-    }
-  }, [auth.plugin?.authState]);
+    if (open && (error?.field === "root" || pathError)) setDatabaseExpanded(true);
+  }, [error, open, pathError]);
 
   useEffect(() => {
-    if (!authResumePending) return;
-    const state = auth.plugin?.authState;
-    if (!auth.plugin || state === "error" || state === "expired") {
-      authResumeRef.current = null;
-      setAuthResumePending(false);
-    }
-  }, [auth.plugin, auth.plugin?.authState, authResumePending]);
+    if (!open || busy || !databaseExpanded || !pathError) return;
+    databaseRef.current?.focus({ preventScroll: true });
+    rootRef.current?.querySelector('[role="alert"]')?.scrollIntoView({ block: "nearest" });
+  }, [busy, databaseExpanded, open, pathError]);
 
   useEffect(() => {
-    if (!authResumePending || !open) return;
-    let disposed = false;
-    const verifyContext = async () => {
-      const intent = authResumeRef.current;
-      if (!intent) return;
-      try {
-        const active = await createCoreClient().getActiveLibrary({ requestPriority: "background" });
-        if (!disposed && active.contextRevision !== intent.contextRevision) {
-          authResumeRef.current = null;
-          setAuthResumePending(false);
-          setError("资源库上下文已变化，请重新选择同步或恢复目标。");
+    if (!open || busy || !error) return;
+    if (error.field === "root" && !databaseExpanded) return;
+    const field = error.field === "name" ? nameRef.current?.closest(".managed-library-form-section")
+      : error.field === "root" ? rootRef.current : error.field === "content" ? contentRef.current?.querySelector(`[data-root-index="${error.rootIndex ?? 0}"]`) ?? contentRef.current : formErrorRef.current;
+    // Keep the recovery control and its message reachable inside the body scroller.
+    if (error.field === "name") nameRef.current?.focus({ preventScroll: true });
+    if (error.field === "root") databaseRef.current?.focus({ preventScroll: true });
+    if (error.field === "content") (field?.querySelector("input, button") as HTMLElement | null)?.focus({ preventScroll: true });
+    field?.querySelector('[role="alert"]')?.scrollIntoView({ block: "nearest" });
+  }, [busy, databaseExpanded, error, open]);
+
+  async function chooseRoot(target: "database" | number | "add" = "database") {
+    if (!open || pending.current) return;
+    pending.current = true;
+    setAppearanceAnchor(null);
+    setOperation("picking");
+    const owner = generation.current;
+    try {
+      const selected = await pickNativeFolder();
+      if (owner === generation.current && selected) {
+        if (target === "database") changeDatabase(selected);
+        else {
+          const id = rootId.current++;
+          setPaths((current) => ({ ...current, roots: target === "add"
+            ? [...current.roots, { id, path: selected, createIfMissing: false, source: "existing" }]
+            : current.roots.map((root) => root.id === target ? { ...root, path: selected, createIfMissing: false, source: "existing" } : root) }));
+          setError(null);
         }
-      } catch {
-        // A transient context read must not destroy an otherwise recoverable intent.
-      }
-    };
-    const timer = window.setInterval(() => void verifyContext(), 1_000);
-    void verifyContext();
-    return () => { disposed = true; window.clearInterval(timer); };
-  }, [authResumePending, open]);
-
-  useEffect(() => {
-    if (!open || mode !== "restore" || auth.plugin?.authState !== "authenticated") return;
-    const controller = new AbortController();
-    setRemoteLoading(true);
-    void createCoreClient().listRemoteLibraries({ signal: controller.signal })
-      .then((response) => setRemoteLibraries(response.items))
-      .catch((cause) => {
-        if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : String(cause));
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setRemoteLoading(false);
-      });
-    return () => controller.abort();
-  }, [auth.plugin?.authState, mode, open]);
-
-  const selectedRemote = useMemo(
-    () => remoteLibraries.filter((remote) => selectedRemoteIds.has(remote.libraryUuid)),
-    [remoteLibraries, selectedRemoteIds],
-  );
-  const restoreQueries = useQueries({
-    queries: restorePlans.map((plan) => ({
-      enabled: open,
-      initialData: plan,
-      queryFn: ({ signal }: { signal: AbortSignal }) => createCoreClient().getSyncRestore(plan.restoreUuid, { signal }),
-      queryKey: ["sync", "restore", plan.restoreUuid] as const,
-      refetchInterval: (query: { state: { data?: SyncRestorePlan } }) =>
-        query.state.data && ["complete", "cancelled", "failed"].includes(query.state.data.state) ? false : 2_000,
-    })),
-  });
-  const visibleRestorePlans = restorePlans.map((plan, index) => restoreQueries[index]?.data ?? plan);
-
-  async function chooseRoot() {
-    try {
-      const selected = await pickNewLibraryPath(name.trim() || "Library");
-      if (selected) setManagedRoot(selected);
-    } catch (cause) {
-      setError(String(cause));
-      onFailure(cause);
-    }
-  }
-
-  async function chooseRestoreRoot(remote: RemoteLibrarySummary) {
-    try {
-      const selected = await pickSyncFolder({
-        libraryUuid: remote.libraryUuid,
-        rootUuid: null,
-        mode: "materialize-remote",
-        suggestedPath: restoreRoots[remote.libraryUuid] ?? null,
-        dialogTitle: `选择“${remote.name}”的本机位置`
-      });
-      if (selected) {
-        setRestoreRoots((current) => ({ ...current, [remote.libraryUuid]: selected }));
-        setRestoreRootInventories((current) => {
-          const inventory = current[remote.libraryUuid];
-          if (!inventory) return current;
-          return {
-            ...current,
-            [remote.libraryUuid]: {
-              ...inventory,
-              roots: inventory.roots.map((root) => ({
-                ...root,
-                targetPath: root.selected
-                  ? proposedRestoreRootPath(selected, root.materializedName)
-                  : null,
-              })),
-            },
-          };
-        });
-        setRestorePreflight(null);
-        setRestoreItems(null);
       }
     } catch (cause) {
-      setError(String(cause));
+      if (owner !== generation.current) return;
+      setError({ field: target === "database" ? "root" : "content", rootIndex: typeof target === "number" ? paths.roots.findIndex((root) => root.id === target) : null, message: cause instanceof Error ? cause.message : String(cause) });
       onFailure(cause);
-    }
-  }
-
-  async function loadRestoreRootInventory(remote: RemoteLibrarySummary) {
-    const client = createCoreClient();
-    const roots: RemoteLibraryRoot[] = [];
-    let cursor: string | undefined;
-    let inventoryFence: string | null = null;
-    do {
-      const page = await client.listRemoteLibraryRoots(
-        remote.accountUuid,
-        remote.libraryUuid,
-        { cursor, limit: 200 },
-      );
-      if (inventoryFence !== null && inventoryFence !== page.inventoryFence) {
-        throw new Error(`“${remote.name}”的远端文件夹清单已变化，请重试。`);
-      }
-      inventoryFence = page.inventoryFence;
-      roots.push(...page.items);
-      cursor = page.nextCursor ?? undefined;
-    } while (cursor);
-    const placementBase = restoreRoots[remote.libraryUuid] ?? null;
-    const nextInventory: RestoreRootInventory = {
-      inventoryFence: inventoryFence ?? "",
-      roots: roots.map((root) => ({
-        ...root,
-        selected: root.compatible,
-        targetPath: root.compatible && placementBase
-          ? proposedRestoreRootPath(placementBase, root.materializedName)
-          : null,
-      })),
-    };
-    setRestoreRootInventories((current) => ({
-      ...current,
-      [remote.libraryUuid]: nextInventory,
-    }));
-    return nextInventory;
-  }
-
-  async function chooseRestoreSyncRoot(remote: RemoteLibrarySummary, root: RemoteLibraryRoot) {
-    try {
-      const selected = await pickSyncFolder({
-        libraryUuid: remote.libraryUuid,
-        rootUuid: root.rootUuid,
-        mode: "materialize-remote",
-        suggestedPath: restoreRootInventories[remote.libraryUuid]?.roots.find((item) => item.rootUuid === root.rootUuid)?.targetPath ?? null,
-        dialogTitle: `选择“${root.requestedName}”的同步位置`,
-      });
-      if (!selected) return;
-      setRestoreRootInventories((current) => ({
-        ...current,
-        [remote.libraryUuid]: {
-          ...current[remote.libraryUuid]!,
-          roots: current[remote.libraryUuid]!.roots.map((item) => item.rootUuid === root.rootUuid
-            ? { ...item, selected: true, targetPath: selected }
-            : item),
-        },
-      }));
-      setRestorePreflight(null);
-      setRestoreItems(null);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-      onFailure(cause);
+    } finally {
+      if (owner === generation.current) { pending.current = false; setOperation(null); }
     }
   }
 
   async function submit() {
-    if (busy) return;
-    const nextName = name.trim();
-    if (!nextName) {
-      setError("请输入资源库名称");
-      return;
-    }
-    if (!managedRoot) {
-      setError("请选择资源库根目录");
-      return;
-    }
-    setBusy(true);
+    if (!open || pending.current) return;
+    if (!name.trim()) { setError({ field: "name", message: "请输入资源库名称" }); return; }
+    if (!databasePath || pathError) { setError({ field: "root", message: pathError ?? "请输入数据库目录" }); return; }
+    if (resolving) return;
+    if (!paths.roots.length || paths.roots.some((root) => !root.path.trim())) { setError({ field: "content", message: "请至少填写一个有效的文件夹" }); return; }
+    const snapshot = { name: name.trim(), databasePath, contentRoots: libraryContentInputs(paths), icon, color };
+    pending.current = true;
+    setAppearanceAnchor(null);
+    setOperation("creating");
     setError(null);
+    const owner = generation.current;
     try {
-      const checked = await preflightLibrary({ name: nextName, managedRoot });
-      if (!checked.ok) throw new Error(`无法使用该目录：${checked.reason}`);
-      const created = await createLibrary({
-        activate: true,
-        color,
-        icon,
-        initialMode: "local-only",
-        managedRoot: checked.normalizedRoot,
-        name: nextName,
-        preflightToken: checked.preflightToken,
-      });
-      if (enableSync && created.library) {
-        const client = createCoreClient();
-        const snapshot = await client.getSyncStatus();
-        const provider = snapshot.providers.find((item) => item.runtimeState === "ready" && item.authState === "authenticated");
-        if (!provider) throw new Error("本地资源库已创建，但 OneDrive 尚未登录或 Provider 未就绪。可稍后在设置中启用同步。");
-        const checkedSync = await client.preflightLibrarySync(created.library.libraryUuid, {
-          providerId: provider.pluginId,
-          accountUuid: provider.accountUuid,
-          remoteLibraryUuid: null,
-        });
-        if (!checkedSync.ok || !checkedSync.preflightToken) throw new Error(`本地资源库已创建，但同步预检失败：${checkedSync.reason}`);
-        await client.startLibrarySyncEnable(created.library.libraryUuid, created.library.contextRevision, {
-          operationUuid: crypto.randomUUID(),
-          providerId: provider.pluginId,
-          accountUuid: provider.accountUuid,
-          preflightToken: checkedSync.preflightToken,
-        });
+      const checked = await preflightLibrary({ name: snapshot.name, databasePath: snapshot.databasePath, contentRoots: snapshot.contentRoots });
+      if (owner !== generation.current) return;
+      if (!checked.ok) {
+        const message = preflightMessages[checked.reason] ?? "无法使用此位置，请重新选择文件夹后再试。";
+        setError({ field: checked.reason === "invalid-name" ? "name" : checked.pathRole === "content-root" ? "content" : "root", rootIndex: checked.rootIndex, message });
+        onFailure(new Error(message));
+        return;
       }
+      if (!checked.normalizedDatabasePath || !checked.normalizedContentRoots?.length || !checked.preflightToken) throw new Error("位置检查结果不完整，请重试。");
+      await createLibrary({ activate: true, color: snapshot.color, icon: snapshot.icon, initialMode: "local-only", databasePath: checked.normalizedDatabasePath, contentRoots: checked.normalizedContentRoots, name: snapshot.name, preflightToken: checked.preflightToken });
+      if (owner !== generation.current) return;
       onCreated();
       onClose();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-      onFailure(cause);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function submitRestore() {
-    if (busy) return;
-    if (selectedRemote.length === 0) {
-      setError("请至少选择一个远端资源库");
-      return;
-    }
-    const missingRoot = selectedRemote.find((remote) => !restoreRoots[remote.libraryUuid]);
-    if (missingRoot) {
-      setError(`请为“${missingRoot.name}”选择本机根目录`);
-      return;
-    }
-    setBusy(true);
-    setError(null);
-    try {
-      const items: SyncRestoreStartItem[] = [];
-      for (const remote of selectedRemote) {
-        const checked = await preflightLibrary({ name: remote.name, managedRoot: restoreRoots[remote.libraryUuid] });
-        if (!checked.ok) throw new Error(`“${remote.name}”无法使用该目录：${checked.reason}`);
-        const inventory = restoreRootInventories[remote.libraryUuid]
-          ?? await loadRestoreRootInventory(remote);
-        const missingTarget = inventory.roots.find((root) => root.selected && !root.targetPath);
-        if (missingTarget) throw new Error(`请为“${missingTarget.requestedName}”选择同步位置。`);
-        if (inventory.roots.length === 0) {
-          items.push({
-            restoreMode: "legacy-library",
-            accountUuid: remote.accountUuid,
-            libraryUuid: remote.libraryUuid,
-            name: remote.name,
-            managedRoot: checked.normalizedRoot,
-          });
-        } else {
-          items.push({
-            restoreMode: "root-aware",
-            accountUuid: remote.accountUuid,
-            libraryUuid: remote.libraryUuid,
-            placementBase: checked.normalizedRoot,
-            inventoryFence: inventory.inventoryFence,
-            roots: inventory.roots.map((root) => ({
-              rootUuid: root.rootUuid,
-              expectedLogicalRevision: root.logicalRevision,
-              expectedMaterializationFingerprint: root.materializationFingerprint,
-              selected: root.selected,
-              ...(root.selected ? { targetPath: root.targetPath! } : {}),
-            })),
-          });
-        }
+      if (owner !== generation.current) return;
+      if (cause instanceof LibraryCreatedActivationError) {
+        onCreated();
+        onClose();
+        onFailure(cause);
+        return;
       }
-      const preflight = await createCoreClient().preflightSyncRestore({ items });
-      setRestoreItems(items);
-      setRestorePreflight(preflight);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError({ field: "form", message: cause instanceof Error ? cause.message : String(cause) });
       onFailure(cause);
     } finally {
-      setBusy(false);
+      if (owner === generation.current) { pending.current = false; setOperation(null); }
     }
   }
 
-  async function confirmRestore() {
-    if (!restorePreflight?.preflightToken || !restoreItems || busy) return;
-    setBusy(true); setError(null);
-    try {
-      const response = await createCoreClient().startSyncRestore({ operationUuid: crypto.randomUUID(), preflightToken: restorePreflight.preflightToken, items: restoreItems });
-      setRestorePlans(response.items);
-      onCreated();
-    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); onFailure(cause); }
-    finally { setBusy(false); }
-  }
-
-  async function changeRestoreState(plan: SyncRestorePlan, action: "pause" | "resume" | "cancel") {
-    if (busy) return;
-    setBusy(true); setError(null);
-    try {
-      const client = createCoreClient();
-      const next = action === "pause"
-        ? await client.pauseSyncRestore(plan.restoreUuid)
-        : action === "resume"
-          ? await client.resumeSyncRestore(plan.restoreUuid)
-          : await client.cancelSyncRestore(plan.restoreUuid);
-      setRestorePlans((current) => current.map((item) => item.restoreUuid === next.restoreUuid ? next : item));
-      queryClient.setQueryData(["sync", "restore", next.restoreUuid], next);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-      onFailure(cause);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <ModalSurface
-      ariaDescribedBy="managed-library-wizard-description"
-      ariaLabelledBy="managed-library-wizard-title"
-      busy={busy}
-      className="managed-library-wizard"
-      id="managed-library-wizard"
-      initialFocusRef={mode === "create" ? nameRef : restoreModeRef}
-      onDismiss={() => {
-        if (!busy) onClose();
-      }}
-      open={open}
-      restoreFocusRef={restoreFocusRef}
-      role="dialog"
-      rootId="managed-library"
-    >
-      <OverlayDialogHeader
-        description={mode === "restore" ? "选择一个或多个 OneDrive 资源库，并为每个资源库指定本机根目录。" : firstRun ? "选择固定根目录，创建此设备上的第一个资源库。" : "先创建本机资源库；同步可选且不会阻塞本地使用。"}
-        descriptionId="managed-library-wizard-description"
-        title={firstRun ? "开始使用 Megle" : mode === "restore" ? "从 OneDrive 恢复" : "创建资源库"}
-        titleId="managed-library-wizard-title"
-      />
-      <OverlayDialogBody className="managed-library-wizard-body" data-overlay-scroll-container>
-        <div aria-label="资源库来源" className="managed-library-mode" role="tablist">
-          <LiquidGlassButton active={mode === "create"} aria-selected={mode === "create"} onClick={() => { authResumeRef.current = null; setAuthResumePending(false); setMode("create"); setRestorePreflight(null); setRestoreItems(null); }} role="tab" type="button">新建本机资源库</LiquidGlassButton>
-          <LiquidGlassButton active={mode === "restore"} aria-selected={mode === "restore"} onClick={() => { authResumeRef.current = null; setAuthResumePending(false); setMode("restore"); setRestorePreflight(null); setRestoreItems(null); }} ref={restoreModeRef} role="tab" type="button">从 OneDrive 恢复</LiquidGlassButton>
+  return <ModalSurface ariaLabelledBy="managed-library-wizard-title" busy={busy} className="managed-library-wizard" id="managed-library-wizard" initialFocusRef={nameRef} onDismiss={() => { if (!busy) onClose(); }} open={open} restoreFocusRef={restoreFocusRef} role="dialog" rootId="managed-library">
+    <OverlayDialogHeader title={firstRun ? "创建第一个资源库" : "创建资源库"} titleId="managed-library-wizard-title" />
+    <form className="managed-library-wizard-form" onSubmit={(event) => { event.preventDefault(); void submit(); }}>
+    <OverlayDialogBody className="managed-library-wizard-body" data-overlay-scroll-container>
+      <section className="managed-library-form-section">
+        <div className="managed-library-identity" data-interactive-pointer-owner="true" data-pointer-glow={busy ? "off" : undefined}>
+          <button aria-controls="managed-library-appearance" aria-expanded={appearanceOpen} aria-haspopup="dialog" aria-label="选择图标与颜色" className="managed-library-identity-preview" disabled={busy} onClick={(event) => setAppearanceAnchor(appearanceOpen ? null : event.currentTarget)} ref={appearanceTriggerRef} style={{ color }} title="选择图标与颜色" type="button"><LibraryGlyph color={color} icon={icon} size={26} /><Pencil aria-hidden="true" className="managed-library-identity-edit" size={11} /></button>
+          <OverlayField aria-label="资源库名称" aria-invalid={error?.field === "name"} aria-describedby={error?.field === "name" ? "managed-library-name-error" : undefined} autoComplete="off" disabled={busy} inputRef={nameRef} onChange={(event) => { resolveSequence.current++; setName(event.target.value); setError((current) => current?.field === "name" ? null : current); }} placeholder="资源库名称" value={name} />
         </div>
-        {auth.plugin?.authState !== "authenticated" && (mode === "restore" || enableSync) ? (
-          <section className="managed-library-auth-required">
-            <p>连接 OneDrive 后会自动回到此流程，并保留当前模式和选择。</p>
-            <OneDriveAccountSetupContent
-              compact
-              controller={auth}
-              onBeforeBegin={prepareAuthResume}
-              onCancelled={() => { authResumeRef.current = null; setAuthResumePending(false); }}
-              overlayRootId="managed-library"
-            />
-          </section>
-        ) : null}
-        {mode === "create" ? <section className="managed-library-form-section">
-          <OverlayField
-            disabled={busy}
-            inputRef={nameRef}
-            label="名称"
-            onChange={(event) => setName(event.target.value)}
-            value={name}
-          />
-          <div className="managed-library-icon-field">
-            <span>图标与颜色</span>
-            <LibraryIconPicker
-              color={color}
-              icon={icon}
-              onPick={(nextIcon, nextColor) => {
-                setIcon(nextIcon);
-                setColor(nextColor);
-              }}
-              presentation="overlay"
-            />
-          </div>
-          <div className="managed-library-root-field">
-            <span className="managed-library-field-label">本机根目录</span>
-            <div className="managed-library-wizard-root">
-              <span>{managedRoot ?? "尚未选择目录"}</span>
-              <LiquidGlassButton disabled={busy} onClick={() => void chooseRoot()} type="button">
-                选择目录…
-              </LiquidGlassButton>
+        {error?.field === "name" ? <div className="overlay-field-error" id="managed-library-name-error" role="alert">{error.message}</div> : null}
+      </section>
+      <section aria-labelledby="managed-library-content-label" className="managed-library-root-field" ref={contentRef}>
+        <div className="managed-library-content-heading"><span className="managed-library-field-label" id="managed-library-content-label">{resolver ? "文件夹" : "文件夹（Core 主机）"}</span>
+          <button aria-label="添加内容文件夹" className="managed-library-add-folder" disabled={busy} onClick={() => {
+            if (nativePicker) void chooseRoot("add");
+            else { const id = rootId.current++; setPaths((current) => ({ ...current, roots: [...current.roots, { id, path: "", source: "manual", createIfMissing: false }] })); }
+          }} type="button"><FolderPlus aria-hidden="true" size={16} />添加</button>
+        </div>
+        {paths.roots.map((root, index) => <div className="managed-library-content-entry" data-root-index={index} key={root.id}>
+          <div className="managed-library-path-row managed-library-content-row" data-interactive-pointer-owner="true" data-pointer-glow={busy ? "off" : undefined}>
+            <FolderOpen aria-hidden="true" className="managed-library-folder-icon" size={22} />
+            <div className="managed-library-path-content">
+            <span aria-hidden="true" className="managed-library-folder-name">{root.path.split(/[\\/]/).filter(Boolean).at(-1) || "文件夹"}</span>
+            <OverlayField aria-invalid={error?.field === "content" && error.rootIndex === index} aria-describedby={error?.field === "content" && error.rootIndex === index ? `managed-library-content-error-${root.id}` : undefined} aria-label={`内容文件夹 ${index + 1}`} autoComplete="off" disabled={busy} onChange={(event) => {
+              const value = event.target.value;
+              setPaths((current) => ({ ...current, roots: current.roots.map((item) => item.id === root.id ? { ...item, path: value, source: "manual" } : item) })); setError(null);
+            }} placeholder={resolver && root.source === "default" ? "填写名称后自动生成" : "输入完整文件夹路径"} title={root.path} value={root.path} />
             </div>
+            {nativePicker ? <button aria-label={`更改内容文件夹 ${index + 1}`} className="managed-library-path-action" disabled={busy} onClick={() => void chooseRoot(root.id)} title="选择文件夹" type="button"><Pencil aria-hidden="true" size={16} /></button> : null}
+            <button aria-label={`移除内容文件夹 ${index + 1}`} className="managed-library-path-action" disabled={busy} onClick={() => { setPaths((current) => ({ ...current, roots: current.roots.filter((item) => item.id !== root.id) })); setError(null); }} title="移除文件夹" type="button"><X aria-hidden="true" size={16} /></button>
           </div>
-          <label className="managed-library-enable-sync">
-            <input checked={enableSync} onChange={(event) => setEnableSync(event.target.checked)} type="checkbox" />
-            <span>创建后启用 OneDrive 同步（登录或网络失败不会删除本机资源库）</span>
-          </label>
-        </section> : <section aria-busy={remoteLoading} className="managed-library-remote-list" role="group">
-          {remoteLoading ? <p role="status">正在发现远端资源库…</p> : null}
-          {!remoteLoading && remoteLibraries.length === 0 ? <p role="status">{auth.plugin?.authState === "authenticated" ? "当前账户没有可恢复的远端资源库。" : "请先连接 OneDrive 以发现可恢复的资源库。"}</p> : null}
-          {remoteLibraries.map((remote) => {
-            const selected = selectedRemoteIds.has(remote.libraryUuid);
-            const remoteDetails = [
-              remote.mediaCount == null ? null : `${remote.mediaCount.toLocaleString()} 项`,
-              formatRemoteSize(remote.logicalBytes),
-              remote.lastSyncedAt == null ? null : `同步于 ${new Date(remote.lastSyncedAt).toLocaleString()}`,
-            ].filter(Boolean).join(" · ");
-            return <div className="managed-library-remote-card" key={`${remote.accountUuid}:${remote.libraryUuid}`}>
-              <label>
-                <input checked={selected} disabled={!remote.compatible || remote.boundLocally} onChange={(event) => setSelectedRemoteIds((current) => {
-                  const next = new Set(current);
-                  if (event.target.checked) {
-                    next.add(remote.libraryUuid);
-                    if (!restoreRootInventories[remote.libraryUuid]) {
-                      void loadRestoreRootInventory(remote).catch((cause) => {
-                        setError(cause instanceof Error ? cause.message : String(cause));
-                        onFailure(cause);
-                      });
-                    }
-                  } else next.delete(remote.libraryUuid);
-                  setRestorePreflight(null);
-                  setRestoreItems(null);
-                  return next;
-                })} type="checkbox" />
-                <span><strong>{remote.name}</strong><small>{remote.boundLocally ? "已在本机绑定" : remote.compatible ? "可恢复" : remote.errorCode ?? "描述损坏或版本不兼容"}</small>{remoteDetails ? <small>{remoteDetails}</small> : null}</span>
-              </label>
-              {selected ? <><div className="managed-library-wizard-root"><span>{restoreRoots[remote.libraryUuid] ?? "尚未选择资源库放置目录"}</span><LiquidGlassButton disabled={busy} onClick={() => void chooseRestoreRoot(remote)} type="button">选择放置目录…</LiquidGlassButton></div>{restoreRootInventories[remote.libraryUuid]?.roots.map((root) => <div className="managed-library-wizard-root" key={root.rootUuid}><label><input checked={root.selected} disabled={!root.compatible || busy} onChange={(event) => { const checked = event.target.checked; setRestoreRootInventories((current) => ({ ...current, [remote.libraryUuid]: { ...current[remote.libraryUuid]!, roots: current[remote.libraryUuid]!.roots.map((item) => item.rootUuid === root.rootUuid ? { ...item, selected: checked, targetPath: checked ? item.targetPath ?? (restoreRoots[remote.libraryUuid] ? proposedRestoreRootPath(restoreRoots[remote.libraryUuid], item.materializedName) : null) : null } : item) } })); setRestorePreflight(null); setRestoreItems(null); }} type="checkbox" /><span>{root.requestedName}</span></label><span>{root.selected ? root.targetPath ?? "尚未选择同步位置" : "仅保留远端清单"}</span>{root.selected ? <LiquidGlassButton disabled={busy} onClick={() => void chooseRestoreSyncRoot(remote, root)} type="button">选择位置…</LiquidGlassButton> : null}</div>)}</> : null}
-            </div>;
-          })}
-        </section>}
-        {mode === "restore" && restorePreflight ? <div className="managed-library-restore-confirm" role="status">
-          <strong>{restorePreflight.ok ? "恢复预检已通过" : "恢复预检需要调整"}</strong>
-          <span>{restorePreflight.totalItems} 个资源库 · 预计占用 {formatRemoteSize(restorePreflight.totalBytes)}</span>
-          <small>{restorePreflight.ok ? "确认后才会创建本机资源库和启动恢复任务。" : "请按下方逐项检查容量与目录选择。"}</small>
-          <ul className="managed-library-restore-preflight-roots">
-            {restorePreflight.rootResults.map((result) => <li key={`${result.libraryUuid}:${result.rootUuid}`}><span>{result.rootUuid.slice(0, 8)} · {result.selected ? result.normalizedTargetPath ?? "未提供位置" : "此设备不放置"}</span><span>{result.ok ? `需要 ${formatRemoteSize(result.requiredBytes)}` : result.reason ?? "预检失败"}</span></li>)}
-          </ul>
-          {restorePreflight.volumeResults.length ? <ul aria-label="分卷容量检查" className="managed-library-restore-preflight-volumes">
-            {restorePreflight.volumeResults.map((volume) => <li key={volume.volumeKey}><span>{volume.volumeKey}</span><span>需要 {formatRemoteSize(volume.requiredBytes)} · 可用 {volume.availableBytes == null ? "未知" : formatRemoteSize(volume.availableBytes)} · {volume.ok ? "容量足够" : "容量不足"}</span></li>)}
-          </ul> : null}
-        </div> : null}
-        {mode === "restore" && restorePlans.length ? <div aria-live="polite" className="managed-library-restore-progress">
-          {visibleRestorePlans.map((plan) => <div key={plan.restoreUuid}>
-            <div className="managed-library-restore-progress-copy"><strong>{plan.name}</strong><span>{plan.phase} · {plan.mediaItemsDone}/{plan.mediaItemsTotal ?? "?"}</span><progress max={Math.max(plan.mediaItemsTotal ?? 1, 1)} value={plan.mediaItemsDone} /></div>
-            <div className="managed-library-restore-progress-actions">
-              {plan.state === "paused" ? <LiquidGlassButton disabled={busy} onClick={() => void changeRestoreState(plan, "resume")} type="button">继续</LiquidGlassButton> : !["complete", "cancelled", "failed"].includes(plan.state) ? <LiquidGlassButton disabled={busy} onClick={() => void changeRestoreState(plan, "pause")} type="button">暂停</LiquidGlassButton> : null}
-              {!plan.catalogReady && !["complete", "cancelled", "failed"].includes(plan.state) ? <LiquidGlassButton disabled={busy} onClick={() => void changeRestoreState(plan, "cancel")} tone="danger" type="button">取消恢复</LiquidGlassButton> : null}
-            </div>
-          </div>)}
-        </div> : null}
-        {error ? <OverlayInlineStatus tone="error">{error}</OverlayInlineStatus> : null}
-      </OverlayDialogBody>
-      <OverlayDialogActions className="managed-library-wizard-actions">
-        {!firstRun ? <LiquidGlassButton disabled={busy} onClick={onClose} type="button">取消</LiquidGlassButton> : null}
-        {mode === "restore" && restorePlans.length ? <LiquidGlassButton onClick={onClose} type="button">完成</LiquidGlassButton> : <LiquidGlassButton disabled={busy || (mode === "restore" && selectedRemote.length === 0)} onClick={() => void (mode === "create" ? submit() : restorePreflight?.ok ? confirmRestore() : submitRestore())} type="button">
-          {busy ? (mode === "restore" ? "正在处理…" : "正在创建…") : mode === "restore" ? restorePreflight?.ok ? `确认并恢复 ${restorePreflight.totalItems} 个资源库` : `预检 ${selectedRemote.length || ""} 个资源库` : "创建并打开"}
-        </LiquidGlassButton>}
-      </OverlayDialogActions>
-    </ModalSurface>
-  );
+          {error?.field === "content" && error.rootIndex === index ? <div id={`managed-library-content-error-${root.id}`}><OverlayInlineStatus tone="error">{error.message}</OverlayInlineStatus></div> : null}
+        </div>)}
+        {!paths.roots.length ? <OverlayInlineStatus tone="error">请至少添加一个文件夹。</OverlayInlineStatus> : error?.field === "content" && error.rootIndex == null ? <OverlayInlineStatus tone="error">{error.message}</OverlayInlineStatus> : null}
+      </section>
+      <section aria-labelledby="managed-library-location-label" className="managed-library-database-section" ref={rootRef}>
+        <button aria-controls="managed-library-database-editor" aria-expanded={databaseExpanded} className="managed-library-database-toggle" disabled={busy} onClick={() => setDatabaseExpanded((expanded) => !expanded)} title={databasePath || undefined} type="button">
+          <span id="managed-library-location-label">{resolver ? "数据库" : "数据库（Core 主机）"}</span>
+          {!databaseExpanded ? <span className="managed-library-database-summary" title={databasePath}>{databasePath}</span> : null}
+          <ChevronDown aria-hidden="true" className="managed-library-database-chevron" size={14} />
+        </button>
+        <div className="managed-library-database-editor" hidden={!databaseExpanded} id="managed-library-database-editor">
+          <div className="managed-library-path-row managed-library-database-row" data-interactive-pointer-owner="true" data-pointer-glow={busy ? "off" : undefined}>
+            <OverlayField aria-invalid={error?.field === "root" || Boolean(pathError)} aria-describedby={error?.field === "root" || pathError ? "managed-library-database-error" : undefined} aria-labelledby="managed-library-location-label" autoComplete="off" disabled={busy} inputRef={databaseRef} onChange={(event) => changeDatabase(event.target.value)} placeholder={resolver ? "填写名称后自动生成" : "输入 Core 主机上的完整路径"} title={databasePath} value={databasePath} />
+            {nativePicker ? <button aria-label="选择数据库目录" className="managed-library-path-action" disabled={busy} onClick={() => void chooseRoot()} title="选择数据库" type="button"><FolderOpen aria-hidden="true" size={18} /></button> : null}
+          </div>
+          {error?.field === "root" || pathError ? <div id="managed-library-database-error"><OverlayInlineStatus tone="error">{error?.field === "root" ? error.message : pathError}</OverlayInlineStatus></div> : null}
+        </div>
+      </section>
+      {error?.field === "form" ? <div ref={formErrorRef}><OverlayInlineStatus tone="error">{error.message}</OverlayInlineStatus></div> : null}
+    </OverlayDialogBody>
+    <OverlayDialogActions className="managed-library-wizard-actions">
+      <span className="managed-library-submit-status" data-quiet={!status} id="managed-library-submit-status" role="status">{status}</span>
+      <div className="managed-library-action-buttons">
+      {firstRun && onOpenExisting ? <LiquidGlassButton disabled={busy} onClick={onOpenExisting} type="button">打开已有资源库…</LiquidGlassButton> : null}
+      {!firstRun ? <LiquidGlassButton disabled={busy} onClick={onClose} type="button">取消</LiquidGlassButton> : null}
+      <LiquidGlassButton aria-describedby="managed-library-submit-status" className="managed-library-create" disabled={busy || !ready} type="submit">{operation === "creating" ? <Loader2 aria-hidden="true" className="managed-library-spinner" size={16} /> : null}{operation === "creating" ? "正在创建…" : "创建并打开"}{!busy ? <ArrowRight aria-hidden="true" size={16} /> : null}</LiquidGlassButton>
+      </div>
+    </OverlayDialogActions>
+    </form>
+    <LibraryAppearanceEditor anchor={appearanceAnchor} color={color} icon={icon} id="managed-library-appearance" name={name} parentId="managed-library-wizard"
+      onApply={(nextIcon, nextColor) => { setIcon(nextIcon); setColor(nextColor); }} onClose={() => setAppearanceAnchor(null)}
+      open={appearanceOpen} restoreFocusRef={appearanceTriggerRef} rootId="managed-library" />
+  </ModalSurface>;
 }

@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn whole_object_fallback_is_stream_verified_and_sliced() {
         let root = std::env::temp_dir().join(format!(
-            "megle-media-range-response-{}",
+            "mangoo-media-range-response-{}",
             uuid::Uuid::now_v7().simple()
         ));
         std::fs::create_dir_all(&root).unwrap();
@@ -386,7 +386,7 @@ mod tests {
     #[test]
     fn short_range_response_is_rejected_before_verification() {
         let root = std::env::temp_dir().join(format!(
-            "megle-media-short-range-{}",
+            "mangoo-media-short-range-{}",
             uuid::Uuid::now_v7().simple()
         ));
         std::fs::create_dir_all(&root).unwrap();

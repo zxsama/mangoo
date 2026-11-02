@@ -20,7 +20,7 @@ import type {
   NotificationStoreWorkerMessage,
   ThumbnailCacheSummary
 } from "../src/notification-types.ts";
-import { rendererErrorOperationId } from "@megle/notification-contract";
+import { rendererErrorOperationId } from "@mangoo/notification-contract";
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
 const NOW = Date.UTC(2026, 6, 20, 12);
@@ -29,7 +29,7 @@ const LIBRARY_B: NotificationLibraryIdentity = { id: "library-b", name: "Library
 const TEST_WORKER_URL = new URL("../src/notification-store-worker.ts", import.meta.url);
 
 function temporaryDirectory(): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "megle-notifications-"));
+  return fs.mkdtempSync(path.join(os.tmpdir(), "mangoo-notifications-"));
 }
 
 function testDatabasePath(): string {
@@ -1398,6 +1398,32 @@ describe("notification store", () => {
       assert.match(queryPlan, /idx_operations_history/i);
     } finally {
       upgraded.close();
+    }
+  });
+
+  it("rejects malformed non-null managed-root actions without persisting or advancing the cursor", async () => {
+    const store = await createTestStore();
+    const libraryUuid = "00000000-0000-7000-8000-000000000101";
+    const rootUuid = "00000000-0000-7000-8000-000000000102";
+    try {
+      for (const action of [
+        false, 0, "review-placement", [], {},
+        { kind: "unknown", libraryUuid, rootUuid, inventoryRevision: 1 },
+        { kind: "review-placement", libraryUuid, rootUuid, inventoryRevision: "1" },
+        { kind: "review-placement", libraryUuid, rootUuid: "different-root", inventoryRevision: 1 }
+      ]) {
+        const malformed = { ...operation("invalid-action", 1, "running", { libraryUuid, rootUuid }), managedRootAction: action };
+        await assert.rejects(
+          store.applyOutboxBatch(LIBRARY_A, [event(1, malformed as NotificationOperationInput)], 1),
+          /managedRootAction|managed root action identity/
+        );
+        assert.equal(await store.getOperation(LIBRARY_A.id, "invalid-action"), null);
+        assert.deepEqual(await store.syncState(LIBRARY_A.id), { persistedSequence: 0, ackedSequence: 0 });
+      }
+      await store.applyOutboxBatch(LIBRARY_A, [event(1, operation("omitted-action", 1, "running"))], 1);
+      assert.equal((await store.getOperation(LIBRARY_A.id, "omitted-action"))?.managedRootAction, undefined);
+    } finally {
+      await store.close();
     }
   });
 

@@ -6,7 +6,7 @@ Status: Approved design specification
 
 ## 1. Purpose
 
-This specification defines one visual and interaction system for Megle's transient and secondary-window UI surfaces. It replaces the accumulated independent styling of titlebar popovers, context menus, library management overlays, file-operation dialogs, search controls, and notification surfaces with a shared overlay architecture.
+This specification defines one visual and interaction system for Mangoo's transient and secondary-window UI surfaces. It replaces the accumulated independent styling of titlebar popovers, context menus, library management overlays, file-operation dialogs, search controls, and notification surfaces with a shared overlay architecture.
 
 The approved direction is a restrained, high-density desktop product language based on the existing Settings and Plugins window material treatment. Settings and Plugins are visual references only. Their layout, component structure, behavior, and styling are not changed by this work.
 
@@ -57,7 +57,7 @@ The following are not changed:
 - Main media-grid layout, thumbnail presentation, preview canvas, inspector layout, or file-tree layout.
 - Main titlebar button placement or titlebar height, except state attributes needed to connect triggers to the shared overlay system.
 - Core HTTP APIs, SQLite schema, notification contract, notification persistence, or notification grouping rules.
-- Notification read or unread state. Megle continues to have no read-state model.
+- Notification read or unread state. Mangoo continues to have no read-state model.
 - Search semantics, search indexing, query syntax, or result ordering.
 - Native Windows file, folder, open, save, and confirmation dialogs supplied by Electron or the operating system.
 - New user-facing appearance controls.
@@ -279,7 +279,7 @@ Hardcoded component radii and hardcoded near-opaque popup backgrounds must be re
 
 ## 8. Pointer and Selection Contract
 
-Megle continues to have one pointer-proximity highlight system driven by `LiquidGlassSurface.tsx`.
+Mangoo continues to have one pointer-proximity highlight system driven by `LiquidGlassSurface.tsx`.
 
 Rules:
 
@@ -407,7 +407,7 @@ Rules:
 
 ### 11.1 Product invariants
 
-- Notification data remains sourced through `@megle/notification-contract` and the existing preload bridge.
+- Notification data remains sourced through `@mangoo/notification-contract` and the existing preload bridge.
 - The notification data model, operation grouping, status values, persistence, history pagination, process-log model, and thumbnail-failure snapshots do not change.
 - There is no read or unread state.
 - Per-thumbnail notifications remain prohibited.
@@ -511,7 +511,7 @@ Shape mapping:
 
 ## 13. Responsive Behavior
 
-Megle is Windows-first, but all renderer surfaces must remain usable from the minimum supported window size.
+Mangoo is Windows-first, but all renderer surfaces must remain usable from the minimum supported window size.
 
 - Popover width is `min(preferred width, viewport width - 24px)`.
 - Library switcher retains one column and reduces secondary-path width before hiding essential actions.
@@ -674,7 +674,7 @@ Required focused coverage:
 Run the explicit Windows compositor harness:
 
 ```powershell
-$env:MEGLE_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-regression.mjs; Remove-Item Env:\MEGLE_VISUAL_OS_BACKDROP
+$env:MANGOO_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-regression.mjs; Remove-Item Env:\MANGOO_VISUAL_OS_BACKDROP
 ```
 
 The real desktop interaction pass must cover:

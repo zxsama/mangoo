@@ -46,6 +46,39 @@ const rect = (left: number, top: number, width: number, height: number) => ({
 });
 
 describe("resolveOverlayPosition", () => {
+  it("joins the dropdown header to the trigger below and above without a gap", () => {
+    for (const [top, placement, expectedTop] of [
+      [50, "bottom-start", 50], [540, "top-start", 372]
+    ] as const) {
+      const result = overlayPosition.resolveAnchoredOverlayLayout({
+        trigger: rect(100, top, 180, 32),
+        overlay: { measuredWidth: 300, height: 200 },
+        viewport: { width: 800, height: 600 },
+        preferredPlacement: "bottom-start", integratedAnchor: true, offset: 6, gutter: 12
+      });
+      assert.equal(result.width, 180);
+      assert.equal(result.anchorHeight, 32);
+      assert.equal(result.placement, placement);
+      assert.equal(result.top, expectedTop);
+      if (placement === "top-start") assert.equal(result.top + 200, top + 32);
+    }
+  });
+
+  it("budgets the integrated header inside the available height for long lists", () => {
+    const result = overlayPosition.resolveAnchoredOverlayLayout({
+      trigger: rect(280, 170, 90, 42),
+      overlay: { measuredWidth: 300, height: 362 },
+      viewport: { width: 320, height: 240 },
+      preferredPlacement: "bottom-start", integratedAnchor: true, offset: 6, gutter: 12
+    });
+    assert.equal(result.top, 12);
+    assert.equal(result.placement, "top-start");
+    assert.equal(result.maxHeight, 200);
+    assert.equal(result.top + result.maxHeight, 212);
+    assert.equal(result.maxHeight - result.anchorHeight, 158);
+    assert.equal(result.left + result.width, 308);
+  });
+
   it("places a root popover below its trigger", () => {
     assert.deepEqual(resolveOverlayPosition({
       trigger: rect(100, 20, 28, 28),

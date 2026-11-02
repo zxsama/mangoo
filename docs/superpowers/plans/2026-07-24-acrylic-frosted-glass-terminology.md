@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace the outdated Liquid Glass product-positioning prose in Megle's current authoritative documentation with the approved layered acrylic frosted-glass terminology.
+**Goal:** Replace the outdated Liquid Glass product-positioning prose in Mangoo's current authoritative documentation with the approved layered acrylic frosted-glass terminology.
 
 **Architecture:** Make documentation-only edits in the eight approved authority files. Preserve source-code identifiers, paths, filenames, validator/test literals, Apple proper nouns, third-party package names, and historical plans or reports.
 
@@ -20,7 +20,7 @@
 - Modify: `docs/open-questions.md`
 - Modify: `docs/component-library-review.md`
 - Modify: `docs/final-solution.md`
-- Modify: `docs/superpowers/specs/2026-05-16-megle-ui-liquid-glass-design.md`
+- Modify: `docs/superpowers/specs/2026-05-16-mangoo-ui-liquid-glass-design.md`
 
 - [x] **Step 1: Replace current positioning prose**
 
@@ -37,7 +37,7 @@ Run:
 ```powershell
 git diff --name-only
 git diff --check
-rg -n -i "Liquid Glass|LiquidGlass|liquid-glass|liquid glass|液态玻璃" AGENTS.md CLAUDE.md docs/README.md docs/implementation-roadmap.md docs/open-questions.md docs/component-library-review.md docs/final-solution.md docs/superpowers/specs/2026-05-16-megle-ui-liquid-glass-design.md
+rg -n -i "Liquid Glass|LiquidGlass|liquid-glass|liquid glass|液态玻璃" AGENTS.md CLAUDE.md docs/README.md docs/implementation-roadmap.md docs/open-questions.md docs/component-library-review.md docs/final-solution.md docs/superpowers/specs/2026-05-16-mangoo-ui-liquid-glass-design.md
 ```
 
 Expected: only approved Markdown files plus this plan are changed; whitespace check passes; remaining matches are protected literals or proper nouns.
@@ -45,6 +45,6 @@ Expected: only approved Markdown files plus this plan are changed; whitespace ch
 - [x] **Step 4: Commit the documentation update**
 
 ```powershell
-git add AGENTS.md CLAUDE.md docs/README.md docs/implementation-roadmap.md docs/open-questions.md docs/component-library-review.md docs/final-solution.md docs/superpowers/specs/2026-05-16-megle-ui-liquid-glass-design.md docs/superpowers/plans/2026-07-24-acrylic-frosted-glass-terminology.md
+git add AGENTS.md CLAUDE.md docs/README.md docs/implementation-roadmap.md docs/open-questions.md docs/component-library-review.md docs/final-solution.md docs/superpowers/specs/2026-05-16-mangoo-ui-liquid-glass-design.md docs/superpowers/plans/2026-07-24-acrylic-frosted-glass-terminology.md
 git commit -m "docs: update acrylic glass positioning"
 ```

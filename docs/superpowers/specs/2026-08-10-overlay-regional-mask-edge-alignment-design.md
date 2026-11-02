@@ -97,7 +97,7 @@ This design narrows and corrects the frame-alignment evidence in `2026-08-09-ove
 ## Implementation evidence
 
 - The mounted lifecycle suite records each rounded threshold, its own `feComposite operator="in"` source clip, union inputs, and radius-zero hard-flood bypass; all `12/12` tests pass.
-- Fresh OS-backdrop run `megle-visual-msmfm6a1-66048` passed with `hardFailures: []`. At 100%, Library-left and Notifications-right normal outside counts are `[0,0,0,0]` in left/right/top/bottom order, their zero controls are identically zero, and their restored-clipped counts are `[0,0,0,0]`.
+- Fresh OS-backdrop run `mangoo-visual-msmfm6a1-66048` passed with `hardFailures: []`. At 100%, Library-left and Notifications-right normal outside counts are `[0,0,0,0]` in left/right/top/bottom order, their zero controls are identically zero, and their restored-clipped counts are `[0,0,0,0]`.
 - The same mounted-popup mutation oracle detected the legacy graph on every edge: Library-left `[155,155,427,427]`; Notifications-right `[151,151,327,327]`. Restoring the clipped graph returned all four counts to zero without changing geometry or material state.
 - The source floods remained equal to the independently measured outer boxes: Library-left `12.03125,44.328125,460 x 188`; Notifications-right `955.96875,44.671875,360 x 184` (capture metadata rounds the independent expected coordinates to three decimals).
 - The broader popup/modal matrix passed at device scales `1`, `1.25`, and `1.5` with page scale `1`. The retained real-content gate covered six real images and three DOM text rectangles; image boundary energy was `40.3865 -> 0.3793 -> 0.0887`, text edge energy was `19.2672 -> 0.3324 -> 0.1271`, and both outside-reference deltas were `0`.

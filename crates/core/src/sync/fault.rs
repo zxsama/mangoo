@@ -6,10 +6,10 @@
 pub fn hit(name: &str) {
     #[cfg(test)]
     {
-        if std::env::var("MEGLE_SYNC_FAULTPOINT").ok().as_deref() != Some(name) {
+        if std::env::var("MANGOO_SYNC_FAULTPOINT").ok().as_deref() != Some(name) {
             return;
         }
-        let Some(marker) = std::env::var_os("MEGLE_SYNC_FAULT_MARKER") else {
+        let Some(marker) = std::env::var_os("MANGOO_SYNC_FAULT_MARKER") else {
             return;
         };
         use std::io::Write;
@@ -32,10 +32,10 @@ pub fn hit(name: &str) {
 pub fn add_and_hit_after_bytes(name: &str, durable_delta: u64) {
     #[cfg(test)]
     {
-        let threshold = std::env::var("MEGLE_SYNC_FAULT_AFTER_BYTES")
+        let threshold = std::env::var("MANGOO_SYNC_FAULT_AFTER_BYTES")
             .ok()
             .and_then(|value| value.parse::<u64>().ok());
-        let durable_bytes = match std::env::var_os("MEGLE_SYNC_FAULT_COUNTER") {
+        let durable_bytes = match std::env::var_os("MANGOO_SYNC_FAULT_COUNTER") {
             Some(path) => {
                 let path = std::path::PathBuf::from(path);
                 let previous = std::fs::read_to_string(&path)

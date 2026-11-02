@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { FolderRecord, MediaRecord } from "@megle/core-client";
+import type { FolderRecord, MediaRecord } from "@mangoo/core-client";
 import type { LibraryState } from "../../core/useLibraryData";
 import { MediaGrid, MediaGridRefreshIndicator } from "../media-grid/MediaGrid";
 import type { LibraryGridPreferences } from "../media-grid/gridPreferences";
@@ -14,7 +14,7 @@ import type { MediaGridLocateRequest } from "../../app/mediaFocusWorkflow";
 
 const AHEAD_THUMBNAIL_ROW_COUNT = 4;
 const SUBFOLDER_CHILD_PROBE_LIMIT = 12;
-const SUBFOLDER_STRIP_COLLAPSED_STORAGE_KEY = "megle.library.subfolder-strip-collapsed";
+const SUBFOLDER_STRIP_COLLAPSED_STORAGE_KEY = "mangoo.library.subfolder-strip-collapsed";
 
 interface LibraryViewProps {
   gridPreferences: LibraryGridPreferences;
@@ -445,6 +445,7 @@ export function LibraryCenterPane({
             }
           >
             <MediaGrid
+              hoverPlaybackEnabled={!previewOpen}
               aheadRowCount={AHEAD_THUMBNAIL_ROW_COUNT}
               contentHeader={contentHeader}
               emptyContent={undefined}

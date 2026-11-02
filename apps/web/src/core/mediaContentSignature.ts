@@ -1,14 +1,15 @@
-import type { MediaRecord } from "@megle/core-client";
+import type { MediaRecord } from "@mangoo/core-client";
 
 export function normalizeMediaThumbnailState(
   value: string | null | undefined
-): "pending" | "queued" | "ready" | "failed" | "skipped_small" {
+): "pending" | "queued" | "ready" | "failed" | "skipped_small" | "unavailable" {
   if (
     value === "pending" ||
     value === "queued" ||
     value === "ready" ||
     value === "failed" ||
-    value === "skipped_small"
+    value === "skipped_small" ||
+    value === "unavailable"
   ) {
     return value;
   }
@@ -20,6 +21,7 @@ export function mediaContentSignature(mediaRecord: MediaRecord): string {
     mediaRecord.id,
     mediaRecord.mtime,
     mediaRecord.size,
-    normalizeMediaThumbnailState(mediaRecord.thumbnailState)
+    normalizeMediaThumbnailState(mediaRecord.thumbnailState),
+    mediaRecord.presentation?.generation ?? "legacy"
   ].join(":");
 }

@@ -22,7 +22,7 @@ type BenchResult = {
 
 declare global {
   interface Window {
-    __megleReady?: boolean;
+    __mangooReady?: boolean;
     runVirtualGridBenchmark?: () => Promise<BenchResult>;
   }
 }
@@ -73,7 +73,7 @@ function App() {
   const virtualRows = rowVirtualizer.getVirtualItems();
 
   useEffect(() => {
-    window.__megleReady = true;
+    window.__mangooReady = true;
     window.runVirtualGridBenchmark = async () => {
       const scrollEl = parentRef.current;
       if (!scrollEl) throw new Error("missing scroll element");
@@ -128,7 +128,7 @@ function App() {
   return (
     <main className="shell">
       <aside className="sidebar">
-        <div className="brand">Megle Bench</div>
+        <div className="brand">Mangoo Bench</div>
         <div className="metric">
           <span>Items</span>
           <strong>{ITEM_COUNT.toLocaleString()}</strong>

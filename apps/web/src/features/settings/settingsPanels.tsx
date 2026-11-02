@@ -13,7 +13,7 @@ import {
   Settings2,
   Trash2,
   XCircle
-} from "lucide-react";
+} from "../../design/icons";
 import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import {
   deleteLibraryFile,
@@ -21,6 +21,7 @@ import {
   openNotificationsWindow,
   renameLibraryEntry,
   setLibraryIcon,
+  subscribeLibraryRegistry,
   switchLibrary
 } from "../../core/desktop";
 import type { LibrarySummary } from "../../core/libraryTypes";
@@ -28,12 +29,10 @@ import type { LibraryState } from "../../core/useLibraryData";
 import { LiquidGlassButton, type InterfaceStyleController } from "../../design/liquid-glass";
 import { useOverlayStack } from "../../design/overlays";
 import { thumbnailFailureLogIntentForLibrary } from "../notifications/notificationModel";
-import { LibraryGlyph, LibraryIconPicker } from "../library/libraryGlyph";
+import { LibraryGlyph } from "../library/libraryGlyph";
+import { LibraryAppearanceEditor } from "../library/LibraryAppearanceEditor";
 import { ManagedLibraryWizard } from "../library/ManagedLibraryWizard";
-import { SyncManagementPanel } from "../sync/SyncManagementPanel";
-import { SyncFoldersPanel } from "../sync/SyncFoldersPanel";
-import type { ManagedRootSettingsIntent } from "@megle/notification-contract";
-import { useSyncOrchestration } from "../sync/useSyncOrchestration";
+import { PluginContributionsSlot } from "../plugins/PluginContributionsSlot";
 import {
   LIBRARY_GRID_PREFERENCE_LIMITS,
   type LibraryGridPreferences
@@ -64,7 +63,6 @@ const SHORTCUT_ACTION_LABELS: Record<string, string> = {
 };
 
 interface SettingsPanelsProps {
-  managedRootIntent?: ManagedRootSettingsIntent | null;
   gridPreferences: LibraryGridPreferences;
   interfaceStyle: InterfaceStyleController;
   library: LibraryState;
@@ -91,7 +89,6 @@ const TABS: Array<{ id: SettingsTabId; label: string; icon: typeof Settings2 }> 
 ];
 
 export function SettingsPanels({
-  managedRootIntent,
   gridPreferences,
   interfaceStyle,
   library,
@@ -101,7 +98,6 @@ export function SettingsPanels({
 }: SettingsPanelsProps) {
   const [activeTab, setActiveTab] = useState<SettingsTabId>("general");
 
-  useEffect(() => { if (managedRootIntent) setActiveTab("libraries"); }, [managedRootIntent]);
 
   return (
     <div className="settings-dialog-layout">
@@ -137,7 +133,7 @@ export function SettingsPanels({
               previewPreferences={previewPreferences}
             />
           ) : null}
-          {activeTab === "libraries" ? <LibrariesTab library={library} focusRootUuid={managedRootIntent?.rootUuid ?? null} /> : null}
+          {activeTab === "libraries" ? <LibrariesTab /> : null}
           {activeTab === "thumbnails" ? (
             <ThumbnailsTab
               library={library}
@@ -182,7 +178,7 @@ function GeneralTab({
     <>
       <SettingsGroup title="浏览缓存 (内存)">
         <p className="settings-note">
-          控制浏览时 Megle 在内存中保留的原图与缩略图数据量。持久缩略图缓存存储在 SQLite
+          控制浏览时 Mangoo 在内存中保留的原图与缩略图数据量。持久缩略图缓存存储在 SQLite
           中，可在重启后复用（见“缩略图”标签页）。
         </p>
         <StyleSlider
@@ -643,26 +639,25 @@ function ShortcutsTab() {
 
 // ---- Libraries tab: full library management (superset of the switcher) -----
 
-function LibrariesTab({ library, focusRootUuid }: { library: LibraryState; focusRootUuid: string | null }) {
+function LibrariesTab() {
   const overlays = useOverlayStack();
-  const sync = useSyncOrchestration();
   const [libs, setLibs] = useState<LibrarySummary[]>([]);
-  const [iconMenuId, setIconMenuId] = useState<string | null>(null);
+  const [appearanceTarget, setAppearanceTarget] = useState<LibrarySummary | null>(null);
+  const appearanceRestoreFocusRef = useRef<HTMLElement | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [deleteConfirmText, setDeleteConfirmText] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [wizardOpen, setWizardOpen] = useState(false);
-  const [wizardMode, setWizardMode] = useState<"create" | "restore">("create");
   const wizardRestoreFocusRef = useRef<HTMLElement | null>(null);
+  const registryMountedRef = useRef(false);
+  const registryReloadGenerationRef = useRef(0);
 
   const openManagedLibraryWizard = (
-    mode: "create" | "restore",
     source: HTMLButtonElement,
   ) => {
     wizardRestoreFocusRef.current = source;
-    setWizardMode(mode);
     overlays.openRoot("managed-library");
     setWizardOpen(true);
   };
@@ -672,23 +667,38 @@ function LibrariesTab({ library, focusRootUuid }: { library: LibraryState; focus
     overlays.closeRoot("managed-library");
   };
 
-  const reload = () => void listLibraries().then(setLibs);
+  const reload = () => {
+    if (!registryMountedRef.current) return;
+    const generation = ++registryReloadGenerationRef.current;
+    void listLibraries().then((nextLibraries) => {
+      if (!registryMountedRef.current || generation !== registryReloadGenerationRef.current) return;
+      setLibs(nextLibraries);
+      const listed = new Set(nextLibraries.map((entry) => entry.libraryUuid));
+      setAppearanceTarget((current) => current && listed.has(current.libraryUuid) ? current : null);
+      setRenamingId((current) => current && listed.has(current) ? current : null);
+      setConfirmDeleteId((current) => current && listed.has(current) ? current : null);
+    }).catch((cause: unknown) => {
+      if (!registryMountedRef.current || generation !== registryReloadGenerationRef.current) return;
+      setError(cause instanceof Error ? cause.message : "资源库列表加载失败");
+    });
+  };
   useEffect(() => {
+    registryMountedRef.current = true;
     reload();
+    const unsubscribe = subscribeLibraryRegistry(reload);
+    return () => {
+      registryMountedRef.current = false;
+      registryReloadGenerationRef.current += 1;
+      unsubscribe();
+    };
   }, []);
 
   async function onSwitch(l: LibrarySummary) {
     if (l.active || l.availability !== "available") return;
-    setIconMenuId(null);
+    setAppearanceTarget(null);
     setConfirmDeleteId(null);
     const res = await switchLibrary(l.libraryUuid);
     if (!res.ok) setError(res.error ?? "切换失败");
-    reload();
-  }
-
-  async function onIconPick(l: LibrarySummary, icon: string, color: string) {
-    await setLibraryIcon(l.libraryUuid, icon, color);
-    setIconMenuId(null);
     reload();
   }
 
@@ -712,6 +722,11 @@ function LibrariesTab({ library, focusRootUuid }: { library: LibraryState; focus
 
   return (
     <>
+      {appearanceTarget ? <LibraryAppearanceEditor
+        anchor={appearanceRestoreFocusRef.current} color={appearanceTarget.color} icon={appearanceTarget.icon} id="settings-library-appearance" name={appearanceTarget.name}
+        onApply={async (icon, color) => { await setLibraryIcon(appearanceTarget.libraryUuid, icon, color); }}
+        onClose={() => setAppearanceTarget(null)} open restoreFocusRef={appearanceRestoreFocusRef} rootId="library"
+      /> : null}
       {error ? <div className="settings-inline-error">{error}</div> : null}
       <SettingsGroup title="资源库列表">
         <ul className="settings-library-list">
@@ -728,17 +743,12 @@ function LibrariesTab({ library, focusRootUuid }: { library: LibraryState; focus
                     type="button"
                     className="settings-library-icon"
                     aria-label="更改图标"
-                    onClick={() => setIconMenuId((cur) => (cur === l.libraryUuid ? null : l.libraryUuid))}
+                    aria-haspopup="dialog"
+                    onClick={(event) => { appearanceRestoreFocusRef.current = event.currentTarget; setAppearanceTarget(l); }}
                   >
                     <LibraryGlyph icon={l.icon ?? undefined} color={l.color ?? undefined} size={18} />
                   </button>
-                  {iconMenuId === l.libraryUuid ? (
-                    <LibraryIconPicker
-                      icon={l.icon ?? undefined}
-                      color={l.color ?? undefined}
-                      onPick={(icon, color) => void onIconPick(l, icon, color)}
-                    />
-                  ) : null}
+
                 </div>
                 <div className="settings-library-info">
                   {renamingId === l.libraryUuid ? (
@@ -766,8 +776,8 @@ function LibrariesTab({ library, focusRootUuid }: { library: LibraryState; focus
                       ) : null}
                     </div>
                   )}
-                  <div className="settings-library-path" title={l.managedRoot}>
-                    {l.managedRoot}
+                  <div className="settings-library-path" title={l.databasePath}>
+                    {l.databasePath}
                   </div>
                 </div>
                 <div className="settings-library-actions">
@@ -841,33 +851,13 @@ function LibrariesTab({ library, focusRootUuid }: { library: LibraryState; focus
           ))}
         </ul>
         <div className="settings-library-footer">
-          <LiquidGlassButton type="button" onClick={(event) => openManagedLibraryWizard("create", event.currentTarget)}>
+          <LiquidGlassButton type="button" onClick={(event) => openManagedLibraryWizard(event.currentTarget)}>
             创建资源库…
-          </LiquidGlassButton>
-          <LiquidGlassButton type="button" onClick={(event) => openManagedLibraryWizard("restore", event.currentTarget)}>
-            从 OneDrive 恢复…
           </LiquidGlassButton>
         </div>
       </SettingsGroup>
-      <SyncManagementPanel
-        libraries={libs}
-        statuses={sync.snapshot?.libraries ?? []}
-        providers={(sync.snapshot?.providers ?? []).filter((provider) => provider.runtimeState === "ready" && provider.authState === "authenticated")}
-        busyLibraryId={sync.busyLibraryId}
-        error={sync.error}
-        onAction={(status, action) => void sync.runAction(status, action)}
-        onUnbind={(status, choice) => void sync.unbind(status, choice)}
-        onReconnectPreview={sync.previewReconnect}
-        onReconnectCommit={(status, plan, choice) => void sync.commitReconnect(status, plan, choice)}
-        onEnable={(status, provider) => void sync.enable(status, provider)}
-        onRemoveLocalCopy={(target) => {
-          setConfirmDeleteId(target.libraryUuid);
-          setDeleteConfirmText("");
-        }}
-      />
-      <SyncFoldersPanel focusRootUuid={focusRootUuid} libraryUuid={libs.find((item) => item.active)?.libraryUuid ?? null} />
+      <PluginContributionsSlot slot="library-settings" />
       <ManagedLibraryWizard
-        initialMode={wizardMode}
         onClose={closeManagedLibraryWizard}
         onCreated={reload}
         onFailure={(cause) => setError(cause instanceof Error ? cause.message : String(cause))}

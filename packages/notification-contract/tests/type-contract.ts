@@ -1,4 +1,4 @@
-import type { NotificationOperationSnapshot } from "@megle/core-client/generated-contract";
+import type { NotificationOperationSnapshot } from "@mangoo/core-client/generated-contract";
 import type {
   DesktopNotificationOperation,
   NotificationIpcBridge,

@@ -48,11 +48,13 @@ struct Store {
 
 impl Store {
     fn open() -> Result<Self, Box<dyn std::error::Error>> {
-        let configured = std::env::var_os("MEGLE_FAKE_PROVIDER_STATE_DIR").map(PathBuf::from);
+        let configured = std::env::var_os("MANGOO_PLUGIN_STATE_DIR")
+            .or_else(|| std::env::var_os("MANGOO_FAKE_PROVIDER_STATE_DIR"))
+            .map(PathBuf::from);
         let persistent = configured.is_some();
         let root = configured.unwrap_or_else(|| {
             std::env::temp_dir()
-                .join("megle-fake-provider")
+                .join("mangoo-fake-provider")
                 .join(format!("{}-{}", std::process::id(), uuid::Uuid::now_v7()))
         });
         std::fs::create_dir_all(root.join("objects"))?;
@@ -247,7 +249,16 @@ fn hash_file(path: &Path) -> Result<[u8; 32], String> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut store = Store::open()?;
-    let fault_mode = std::env::var("MEGLE_FAKE_PROVIDER_FAULT").unwrap_or_default();
+    let configuration: std::collections::BTreeMap<String, String> =
+        std::env::var("MANGOO_PLUGIN_CONFIGURATION")
+            .ok()
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default();
+    let fault_mode = configuration
+        .get("fault")
+        .cloned()
+        .or_else(|| std::env::var("MANGOO_FAKE_PROVIDER_FAULT").ok())
+        .unwrap_or_default();
     let mut incoming = HashMap::<u64, (u64, [u8; 32])>::new();
     let mut next_stream_id = 2u64;
     let mut authenticated = false;
@@ -265,6 +276,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let method = envelope["method"].as_str().unwrap_or_default().to_owned();
         if envelope["messageType"] == "cancel" {
             continue;
+        }
+        // Deterministic process fixture: an explicitly installed method barrier
+        // emulates a blocking remote call. It is local, bounded, and never used
+        // by the production Provider.
+        if store.persistent
+            && std::fs::read_to_string(store.root.join("lifecycle-barrier-method"))
+                .is_ok_and(|requested| requested.trim() == method)
+        {
+            std::fs::write(
+                store.root.join("lifecycle-barrier-entered"),
+                std::process::id().to_string(),
+            )?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while std::time::Instant::now() < deadline
+                && !store.root.join("lifecycle-barrier-release").exists()
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
         }
         let request = envelope["payload"].clone();
         if method == "stream.open" {
@@ -310,14 +339,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
             }
             "describe" => Ok(
-                json!({"pluginId":"com.megle.fake-sync","accountUuid":account_uuid,"capabilities":["sync-provider.v1"],"maxObjectBytes":67108864u64}),
+                json!({"pluginId":"com.mangoo.fake-sync","accountUuid":account_uuid,"capabilities":["sync-provider.v1"],"maxObjectBytes":67108864u64}),
             ),
             "health" => Ok(json!({"ready":true,"detail":null})),
             "diagnostics" => Ok(
                 json!({"implementation":"bundled-framed-child","objects":store.objects.len(),"persistent":store.is_persistent(),"transferCounters":store.counters}),
             ),
             "auth.begin" => Ok(
-                json!({"authorizationUrl":"http://127.0.0.1/fake-authorize","flowId":uuid::Uuid::now_v7().to_string(),"expiresAt":4102444800000u64,"completionMode":"loopback","redirectUri":"http://127.0.0.1/fake-callback"}),
+                json!({"authorizationUrl":"https://auth.example.test/authorize?workspace=fixture&state=fixture-state&redirect_uri=https%3A%2F%2Fauth.example.test%2Freturn","flowId":uuid::Uuid::now_v7().to_string(),"expiresAt":4102444800000u64,"completionMode":"manual-response-uri","redirectUri":"https://auth.example.test/return"}),
             ),
             "auth.poll" => Ok(json!({"pending":true})),
             "auth.cancel" => Ok(Value::Null),

@@ -11,7 +11,7 @@ import {
 } from "../features/file-ops/useFileOps";
 import { NotificationPopover } from "../features/notifications/NotificationPopover";
 import type { CompactNotificationModel } from "../features/notifications/notificationModel";
-import type { NotificationWindowIntent } from "@megle/notification-contract";
+import type { NotificationWindowIntent } from "@mangoo/notification-contract";
 import type { LibraryState } from "../core/useLibraryData";
 import type { ComponentProps, RefObject } from "react";
 

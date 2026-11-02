@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Filesystem scan benchmark for Megle Phase 0.
+Filesystem scan benchmark for Mangoo Phase 0.
 
 Creates a synthetic Windows directory tree with many media-like files, then
 measures directory traversal, file stat, media extension filtering, and batched
@@ -94,7 +94,7 @@ def batched(items: list[tuple], size: int) -> Iterable[list[tuple]]:
 
 def generate_tree(root: Path, files: int, folders: int, overwrite: bool) -> dict[str, object]:
     root.mkdir(parents=True, exist_ok=True)
-    marker = root / ".megle_fs_scan_manifest.json"
+    marker = root / ".mangoo_fs_scan_manifest.json"
     if marker.exists() and not overwrite:
         return json.loads(marker.read_text(encoding="utf-8"))
 

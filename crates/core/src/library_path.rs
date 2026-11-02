@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -7,7 +7,191 @@ use sha2::{Digest, Sha256};
 
 const MIN_LIBRARY_FREE_BYTES: u64 = 256 * 1024 * 1024;
 
-pub const MARKER_FILE_NAME: &str = ".megle-library";
+pub const MARKER_FILE_NAME: &str = ".mangoo-library";
+pub const STORAGE_FORMAT_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LibraryContentRootInput {
+    pub path: String,
+    pub create_if_missing: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct LibraryPlanPreflight {
+    pub ok: bool,
+    pub reason: PreflightReason,
+    pub path_role: Option<&'static str>,
+    pub root_index: Option<usize>,
+    pub normalized_database_path: Option<PathBuf>,
+    pub normalized_content_roots: Option<Vec<LibraryContentRootInput>>,
+    pub token: Option<String>,
+    pub available_bytes: Option<u64>,
+}
+
+impl LibraryPlanPreflight {
+    pub fn rejected(
+        reason: PreflightReason,
+        role: Option<&'static str>,
+        index: Option<usize>,
+    ) -> Self {
+        Self {
+            ok: false,
+            reason,
+            path_role: role,
+            root_index: index,
+            normalized_database_path: None,
+            normalized_content_roots: None,
+            token: None,
+            available_bytes: None,
+        }
+    }
+}
+
+/// Resolve existing aliases only after checking the original component chain.
+/// Missing descendants retain their exact names under the canonical ancestor.
+pub fn inspect_directory_path(
+    path: &Path,
+    create_if_missing: bool,
+) -> Result<PathBuf, PreflightReason> {
+    let path = normalize_absolute(path)?;
+    if has_existing_reparse_component(&path) {
+        return Err(PreflightReason::ReparsePoint);
+    }
+    let ancestor = nearest_existing_directory(&path).map_err(|_| PreflightReason::InvalidPath)?;
+    if !create_if_missing && ancestor != path {
+        return Err(PreflightReason::InvalidPath);
+    }
+    let guard =
+        MarkerDirectoryGuard::open_readonly(ancestor).map_err(|_| PreflightReason::ReparsePoint)?;
+    let resolved = fs::canonicalize(ancestor).map_err(|_| PreflightReason::InvalidPath)?;
+    guard
+        .verify_unchanged()
+        .map_err(|_| PreflightReason::PathChanged)?;
+    let suffix = path
+        .strip_prefix(ancestor)
+        .map_err(|_| PreflightReason::InvalidPath)?;
+    Ok(if suffix.as_os_str().is_empty() {
+        resolved
+    } else {
+        resolved.join(suffix)
+    })
+}
+
+pub fn nearest_existing_directory(path: &Path) -> io::Result<&Path> {
+    let mut current = path;
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(metadata) if metadata.is_dir() => return Ok(current),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "not a directory",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                current = current.parent().ok_or(error)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+pub fn preflight_plan(
+    name: &str,
+    database: &Path,
+    content: &[LibraryContentRootInput],
+    storage_paths: &[PathBuf],
+    content_paths: &[PathBuf],
+    allow_empty: bool,
+) -> LibraryPlanPreflight {
+    let reject = LibraryPlanPreflight::rejected;
+    let name = match safe_library_name(name) {
+        Ok(name) => name,
+        Err(reason) => return reject(reason, None, None),
+    };
+    if content.is_empty() && !allow_empty {
+        return reject(
+            PreflightReason::ContentRootsRequired,
+            Some("content-root"),
+            None,
+        );
+    }
+    let database = match inspect_directory_path(database, true) {
+        Ok(path) => path,
+        Err(reason) => return reject(reason, Some("database"), None),
+    };
+    let storage = preflight(&name, &database, storage_paths, &known_cloud_roots());
+    if !storage.ok {
+        return reject(storage.reason, Some("database"), None);
+    }
+    if content_paths
+        .iter()
+        .any(|path| paths_overlap(&database, path))
+    {
+        return reject(
+            PreflightReason::DatabaseContentOverlap,
+            Some("database"),
+            None,
+        );
+    }
+    let mut normalized = Vec::<LibraryContentRootInput>::new();
+    for (index, root) in content.iter().enumerate() {
+        let path = match inspect_directory_path(Path::new(&root.path), root.create_if_missing) {
+            Ok(path) => path,
+            Err(reason) => return reject(reason, Some("content-root"), Some(index)),
+        };
+        if paths_overlap(&path, &database)
+            || storage_paths
+                .iter()
+                .any(|storage| paths_overlap(storage, &path))
+        {
+            return reject(
+                PreflightReason::DatabaseContentOverlap,
+                Some("content-root"),
+                Some(index),
+            );
+        }
+        if normalized
+            .iter()
+            .any(|previous| paths_overlap(Path::new(&previous.path), &path))
+        {
+            return reject(
+                PreflightReason::ContentRootsOverlap,
+                Some("content-root"),
+                Some(index),
+            );
+        }
+        normalized.push(LibraryContentRootInput {
+            path: path.to_string_lossy().into_owned(),
+            create_if_missing: root.create_if_missing,
+        });
+    }
+    let mut digest = Sha256::new();
+    digest.update(name.as_bytes());
+    for (path, flag) in std::iter::once((database.as_path(), true)).chain(
+        normalized
+            .iter()
+            .map(|root| (Path::new(&root.path), root.create_if_missing)),
+    ) {
+        digest.update(path.to_string_lossy().as_bytes());
+        digest.update([u8::from(flag)]);
+        match identity_token(path) {
+            Ok(token) => digest.update(token.as_bytes()),
+            Err(_) => return reject(PreflightReason::PathChanged, None, None),
+        }
+    }
+    LibraryPlanPreflight {
+        ok: true,
+        reason: PreflightReason::Ok,
+        path_role: None,
+        root_index: None,
+        normalized_database_path: Some(database),
+        normalized_content_roots: Some(normalized),
+        token: Some(format!("v2:{}", hex(&digest.finalize()))),
+        available_bytes: storage.available_bytes,
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +225,9 @@ pub enum PreflightReason {
     NotWritable,
     InsufficientSpace,
     PathChanged,
+    ContentRootsRequired,
+    ContentRootsOverlap,
+    DatabaseContentOverlap,
 }
 
 impl PreflightReason {
@@ -57,6 +244,9 @@ impl PreflightReason {
             Self::NotWritable => "not-writable",
             Self::InsufficientSpace => "insufficient-space",
             Self::PathChanged => "path-changed",
+            Self::ContentRootsRequired => "content-roots-required",
+            Self::ContentRootsOverlap => "content-roots-overlap",
+            Self::DatabaseContentOverlap => "database-content-overlap",
         }
     }
 }
@@ -66,7 +256,6 @@ pub struct PreflightResult {
     pub ok: bool,
     pub reason: PreflightReason,
     pub normalized_root: PathBuf,
-    pub token: Option<String>,
     pub available_bytes: Option<u64>,
 }
 
@@ -141,13 +330,12 @@ pub fn preflight(
             }
             Err(_) => return rejected(&root, PreflightReason::NotWritable),
         }
-    } else if root.parent().is_none_or(|parent| !parent.exists()) {
-        return rejected(&root, PreflightReason::InvalidPath);
     }
-    if !probe_writable(&root) {
-        return rejected(&root, PreflightReason::NotWritable);
-    }
-    let available_bytes = free_space_bytes(&root).ok();
+    let ancestor = match nearest_existing_directory(&root) {
+        Ok(path) => path,
+        Err(_) => return rejected(&root, PreflightReason::InvalidPath),
+    };
+    let available_bytes = free_space_bytes(ancestor).ok();
     if available_bytes.is_some_and(|bytes| bytes < MIN_LIBRARY_FREE_BYTES) {
         return rejected(&root, PreflightReason::InsufficientSpace);
     }
@@ -160,18 +348,12 @@ pub fn preflight(
             PreflightReason::NotWritable
         },
         normalized_root: root,
-        token,
         available_bytes,
     }
 }
 
 pub fn identity_token(path: &Path) -> io::Result<String> {
-    let existing = if path.exists() {
-        path
-    } else {
-        path.parent()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?
-    };
+    let existing = nearest_existing_directory(path)?;
     let identity = platform_identity(existing)?;
     let mut digest = Sha256::new();
     digest.update(existing.to_string_lossy().to_lowercase().as_bytes());
@@ -185,17 +367,18 @@ pub fn local_file_identity(path: &Path) -> io::Result<String> {
     platform_identity(path)
 }
 
-pub fn verify_preflight_token(path: &Path, token: &str) -> Result<(), PreflightReason> {
-    if identity_token(path).ok().as_deref() == Some(token) {
-        Ok(())
-    } else {
-        Err(PreflightReason::PathChanged)
-    }
-}
-
+#[cfg(test)]
 pub fn atomic_write_marker_guarded(
     guard: &SafeDirectory,
     marker: &LibraryMarker,
+) -> anyhow::Result<String> {
+    atomic_write_marker_with_ownership(guard, marker, |_, _| Ok(()))
+}
+
+pub fn atomic_write_marker_with_ownership(
+    guard: &SafeDirectory,
+    marker: &LibraryMarker,
+    mut own: impl FnMut(&Path, &str) -> anyhow::Result<()>,
 ) -> anyhow::Result<String> {
     let temporary = PathBuf::from(format!(
         "{MARKER_FILE_NAME}.{}.tmp",
@@ -206,9 +389,17 @@ pub fn atomic_write_marker_guarded(
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("marker temporary has no leaf"))?;
     let mut file = guard.create_file(temporary_name)?;
+    let identity = identity_from_handle(&file)?;
+    // Journal the returned handle before publication; both possible locations
+    // carry this same identity across the atomic rename.
+    own(&temporary, &identity)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
-    guard.rename_child(temporary_name, std::ffi::OsStr::new(MARKER_FILE_NAME), true)?;
+    guard.rename_child(
+        temporary_name,
+        std::ffi::OsStr::new(MARKER_FILE_NAME),
+        marker.state == MarkerState::Committed,
+    )?;
     guard
         .verify_unchanged()
         .map_err(|_| anyhow::anyhow!("path-changed"))?;
@@ -250,16 +441,46 @@ impl SafeDirectory {
         create_relative_file(&self.handle, &self.path, leaf)
     }
 
-    pub fn create_directory(&self, leaf: &std::ffi::OsStr) -> io::Result<()> {
-        create_relative_directory(&self.handle, &self.path, leaf)
-    }
-
     pub fn child_identity(&self, leaf: &std::ffi::OsStr, directory: bool) -> io::Result<String> {
         child_identity_relative(&self.handle, &self.path, leaf, directory)
     }
 
     pub fn delete_file_child(&self, leaf: &std::ffi::OsStr) -> io::Result<()> {
         delete_relative_file(&self.handle, &self.path, leaf)
+    }
+
+    #[cfg(test)]
+    pub fn delete_file_child_expected(
+        &self,
+        leaf: &std::ffi::OsStr,
+        expected_identity: &str,
+    ) -> io::Result<()> {
+        validate_marker_leaf(leaf)?;
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Storage::FileSystem::{
+                DELETE, FILE_GENERIC_READ, FILE_SHARE_READ, SYNCHRONIZE,
+            };
+            let child = nt_open_relative_with_access(
+                &self.handle,
+                leaf,
+                false,
+                false,
+                FILE_GENERIC_READ | DELETE | SYNCHRONIZE,
+                FILE_SHARE_READ,
+            )?;
+            if identity_from_handle(&child)? != expected_identity {
+                return Err(io::Error::new(io::ErrorKind::Other, "path-changed"));
+            }
+            delete_handle(&child)
+        }
+        #[cfg(not(windows))]
+        {
+            if self.child_identity(leaf, false)? != expected_identity {
+                return Err(io::Error::new(io::ErrorKind::Other, "path-changed"));
+            }
+            self.delete_file_child(leaf)
+        }
     }
 
     pub fn rename_child(
@@ -322,10 +543,19 @@ pub struct MarkerDirectoryGuard {
 
 impl MarkerDirectoryGuard {
     pub fn open(path: &Path) -> io::Result<Self> {
+        Self::open_with_access(path, true)
+    }
+
+    pub(crate) fn open_readonly(path: &Path) -> io::Result<Self> {
+        Self::open_with_access(path, false)
+    }
+
+    fn open_with_access(path: &Path, writable: bool) -> io::Result<Self> {
         #[cfg(windows)]
-        let (handle, ancestors) = open_marker_directory_chain(path)?;
+        let (handle, ancestors) = open_marker_directory_chain(path, writable)?;
         #[cfg(not(windows))]
         let handle = {
+            let _ = writable;
             reject_reparse_components(path)?;
             open_directory_nofollow(path)?
         };
@@ -341,6 +571,51 @@ impl MarkerDirectoryGuard {
         Ok(guard)
     }
 
+    /// Create without replacement and keep the returned directory handle alive
+    /// through the caller's durable ownership registration.
+    pub fn create_directory_child(&self, leaf: &std::ffi::OsStr) -> io::Result<Self> {
+        validate_marker_leaf(leaf)?;
+        self.verify_unchanged()?;
+        let path = self.path.join(leaf);
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                SYNCHRONIZE,
+            };
+            let handle = nt_open_relative_with_access(
+                &self.handle,
+                leaf,
+                true,
+                true,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+            )?;
+            let identity = identity_from_handle(&handle)?;
+            let mut ancestors = self
+                ._ancestors
+                .iter()
+                .map(fs::File::try_clone)
+                .collect::<io::Result<Vec<_>>>()?;
+            ancestors.push(self.handle.try_clone()?);
+            let guard = Self {
+                path,
+                handle,
+                identity,
+                _ancestors: ancestors,
+            };
+            guard.verify_unchanged()?;
+            Ok(guard)
+        }
+        #[cfg(not(windows))]
+        {
+            fs::create_dir(&path)?;
+            let guard = Self::open(&path)?;
+            self.verify_unchanged()?;
+            Ok(guard)
+        }
+    }
+
     pub fn identity(&self) -> &str {
         &self.identity
     }
@@ -354,6 +629,68 @@ impl MarkerDirectoryGuard {
 
     pub fn file_identity(&self, file: &fs::File) -> io::Result<String> {
         identity_from_handle(file)
+    }
+
+    pub fn publish_to(
+        &self,
+        source: &fs::File,
+        temporary: &std::ffi::OsStr,
+        target_directory: &Self,
+        target: &std::ffi::OsStr,
+    ) -> io::Result<()> {
+        validate_marker_leaf(temporary)?;
+        validate_marker_leaf(target)?;
+        self.verify_unchanged()?;
+        target_directory.verify_unchanged()?;
+        let current = self.open_marker(temporary, true)?;
+        if identity_from_handle(&current)? != identity_from_handle(source)? {
+            return Err(io::Error::other("path-changed"));
+        }
+        drop(current);
+        #[cfg(windows)]
+        nt_rename_information(Some(&target_directory.handle), source, target, false)?;
+        #[cfg(not(windows))]
+        fs::hard_link(
+            self.path.join(temporary),
+            target_directory.path.join(target),
+        )?;
+        target_directory.verify_unchanged()
+    }
+
+    pub fn delete_file_child_expected(
+        &self,
+        leaf: &std::ffi::OsStr,
+        expected_identity: &str,
+    ) -> io::Result<()> {
+        validate_marker_leaf(leaf)?;
+        self.verify_unchanged()?;
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Storage::FileSystem::{
+                DELETE, FILE_GENERIC_READ, FILE_SHARE_READ, SYNCHRONIZE,
+            };
+            let child = nt_open_relative_with_access(
+                &self.handle,
+                leaf,
+                false,
+                false,
+                FILE_GENERIC_READ | DELETE | SYNCHRONIZE,
+                FILE_SHARE_READ,
+            )?;
+            if identity_from_handle(&child)? != expected_identity {
+                return Err(io::Error::other("path-changed"));
+            }
+            delete_handle(&child)
+        }
+        #[cfg(not(windows))]
+        {
+            let path = self.path.join(leaf);
+            reject_reparse_components(&path)?;
+            if platform_identity(&path)? != expected_identity {
+                return Err(io::Error::other("path-changed"));
+            }
+            fs::remove_file(path)
+        }
     }
 
     pub fn open_temporary(&self, leaf: &std::ffi::OsStr, create: bool) -> io::Result<fs::File> {
@@ -416,6 +753,60 @@ impl MarkerDirectoryGuard {
             return Err(io::Error::other("marker is not a regular file"));
         }
         Ok(file)
+    }
+
+    /// Pin a catalog while permitting its existing SQLite writer, but deny
+    /// replacement on Windows. This remains a no-follow, read-only handle.
+    pub fn open_catalog(&self) -> io::Result<fs::File> {
+        self.open_sqlite_file("catalog.sqlite".as_ref())
+    }
+
+    pub fn open_sqlite_file(&self, name: &std::ffi::OsStr) -> io::Result<fs::File> {
+        #[cfg(windows)]
+        let file = {
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                SYNCHRONIZE,
+            };
+            nt_open_relative_with_access(
+                &self.handle,
+                name,
+                false,
+                false,
+                FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+            )?
+        };
+        #[cfg(not(windows))]
+        let file = open_marker_relative(&self.handle, name, false, false)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("catalog is not a regular file"));
+        }
+        Ok(file)
+    }
+
+    /// CREATE_NEW with SQLite-compatible sharing, keeping the exact newly
+    /// created Catalog pinned against replacement until SQLite closes.
+    pub fn create_catalog(&self) -> io::Result<fs::File> {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                FILE_WRITE_DATA, SYNCHRONIZE,
+            };
+            nt_open_relative_with_access(
+                &self.handle,
+                "catalog.sqlite".as_ref(),
+                false,
+                true,
+                FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            open_marker_relative(&self.handle, "catalog.sqlite".as_ref(), true, true)
+        }
     }
 
     pub fn publish(
@@ -549,7 +940,10 @@ fn validate_marker_leaf(leaf: &std::ffi::OsStr) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn open_marker_directory_chain(path: &Path) -> io::Result<(fs::File, Vec<fs::File>)> {
+fn open_marker_directory_chain(
+    path: &Path,
+    writable: bool,
+) -> io::Result<(fs::File, Vec<fs::File>)> {
     use std::os::windows::fs::OpenOptionsExt;
     use std::path::Prefix;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -612,7 +1006,7 @@ fn open_marker_directory_chain(path: &Path) -> io::Result<(fs::File, Vec<fs::Fil
     identity_from_handle(&current)?;
     let mut ancestors = Vec::with_capacity(names.len());
     for (index, name) in names.iter().enumerate() {
-        let child_access = if index + 1 == names.len() {
+        let child_access = if writable && index + 1 == names.len() {
             access | FILE_GENERIC_WRITE
         } else {
             access
@@ -722,16 +1116,6 @@ fn create_relative_file(
     nt_open_relative(parent, leaf, false, true)
 }
 
-#[cfg(windows)]
-fn create_relative_directory(
-    parent: &fs::File,
-    _path: &Path,
-    leaf: &std::ffi::OsStr,
-) -> io::Result<()> {
-    drop(nt_open_relative(parent, leaf, true, true)?);
-    Ok(())
-}
-
 #[cfg(not(windows))]
 fn create_relative_file(
     _parent: &fs::File,
@@ -791,15 +1175,6 @@ fn open_marker_relative(
         io::ErrorKind::Unsupported,
         "directory-relative marker open is unsupported on this platform",
     ))
-}
-
-#[cfg(not(windows))]
-fn create_relative_directory(
-    _parent: &fs::File,
-    path: &Path,
-    leaf: &std::ffi::OsStr,
-) -> io::Result<()> {
-    fs::create_dir(path.join(leaf))
 }
 
 #[cfg(windows)]
@@ -927,10 +1302,6 @@ fn rename_relative_child(
     fs::rename(path.join(source), path.join(target))
 }
 
-pub fn safe_rename_directory(source: &Path, target: &Path) -> io::Result<()> {
-    safe_rename_directory_inner(source, target, None)
-}
-
 pub fn safe_rename_directory_expected(
     source: &Path,
     target: &Path,
@@ -973,6 +1344,30 @@ fn safe_rename_directory_inner(
 
 pub fn safe_delete_tree_expected(path: &Path, expected_identity: &str) -> io::Result<()> {
     safe_delete_tree_inner(path, Some(expected_identity))
+}
+
+/// Remove an owned container only while it is still empty. Unlike tree cleanup,
+/// an entry arriving after an earlier empty check is preserved by the OS.
+pub fn safe_remove_empty_directory_expected(
+    path: &Path,
+    expected_identity: &str,
+) -> io::Result<()> {
+    reject_reparse_components(path)?;
+    let guard = SafeDirectory::open(path)?;
+    if guard.identity() != expected_identity {
+        return Err(io::Error::new(io::ErrorKind::Other, "path-changed"));
+    }
+    guard
+        .verify_unchanged()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "path-changed"))?;
+    #[cfg(windows)]
+    {
+        delete_handle(&guard.handle)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::remove_dir(path)
+    }
 }
 
 fn safe_delete_tree_inner(path: &Path, expected_identity: Option<&str>) -> io::Result<()> {
@@ -1183,9 +1578,108 @@ fn identity_from_handle(handle: &fs::File) -> io::Result<String> {
 }
 
 pub fn read_marker(root: &Path) -> anyhow::Result<LibraryMarker> {
-    Ok(serde_json::from_slice(&fs::read(
-        root.join(MARKER_FILE_NAME),
-    )?)?)
+    let directory = MarkerDirectoryGuard::open_readonly(root)?;
+    let file = directory.open_marker(MARKER_FILE_NAME.as_ref(), false)?;
+    let mut bytes = Vec::new();
+    file.take(16 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 16 * 1024 {
+        anyhow::bail!("invalid-library-marker");
+    }
+    directory.verify_unchanged()?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Read-only admission for opening an existing Library. Keep the directory and
+/// marker handles alive through registration so Windows cannot swap either.
+pub struct ExistingLibraryRoot {
+    pub path: PathBuf,
+    pub marker: LibraryMarker,
+    pub marker_identity: String,
+    directory: MarkerDirectoryGuard,
+    file: fs::File,
+    bytes: Vec<u8>,
+}
+
+impl ExistingLibraryRoot {
+    pub fn open(path: &Path) -> anyhow::Result<Self> {
+        let path = normalize_absolute(path).map_err(|_| anyhow::anyhow!("invalid-path"))?;
+        let directory = MarkerDirectoryGuard::open_readonly(&path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                anyhow::anyhow!("library-path-not-found")
+            } else {
+                anyhow::anyhow!("library-path-unavailable-or-reparse")
+            }
+        })?;
+        let mut file = directory
+            .open_marker(MARKER_FILE_NAME.as_ref(), false)
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    anyhow::anyhow!("library-marker-not-found")
+                } else {
+                    anyhow::anyhow!("invalid-library-marker")
+                }
+            })?;
+        let mut bytes = Vec::new();
+        (&mut file).take(16 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 16 * 1024 {
+            anyhow::bail!("invalid-library-marker");
+        }
+        let marker: LibraryMarker = serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow::anyhow!("invalid-library-marker"))?;
+        if marker.format_version != STORAGE_FORMAT_VERSION {
+            anyhow::bail!("unsupported-library-marker");
+        }
+        if marker.state != MarkerState::Committed {
+            anyhow::bail!("library-marker-not-committed");
+        }
+        for value in [
+            &marker.library_uuid,
+            &marker.root_uuid,
+            &marker.creation_txn_uuid,
+        ] {
+            if uuid::Uuid::parse_str(value)
+                .ok()
+                .filter(|uuid| !uuid.is_nil() && uuid.to_string() == *value)
+                .is_none()
+            {
+                anyhow::bail!("invalid-library-marker");
+            }
+        }
+        let marker_identity = directory.file_identity(&file)?;
+        Ok(Self {
+            path,
+            marker,
+            marker_identity,
+            directory,
+            file,
+            bytes,
+        })
+    }
+
+    pub fn root_identity(&self) -> &str {
+        self.directory.identity()
+    }
+
+    pub fn verify_unchanged(&mut self) -> anyhow::Result<()> {
+        self.directory
+            .verify_unchanged()
+            .map_err(|_| anyhow::anyhow!("path-changed"))?;
+        let current = self
+            .directory
+            .open_marker(MARKER_FILE_NAME.as_ref(), false)?;
+        if self.directory.file_identity(&current)? != self.marker_identity {
+            anyhow::bail!("path-changed");
+        }
+        self.file.rewind()?;
+        let mut bytes = Vec::new();
+        (&mut self.file)
+            .take(16 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes != self.bytes {
+            anyhow::bail!("path-changed");
+        }
+        Ok(())
+    }
 }
 
 pub fn marker_identity(path: &Path) -> anyhow::Result<String> {
@@ -1412,7 +1906,7 @@ pub(crate) fn probe_writable(root: &Path) -> bool {
     } else {
         root.parent().unwrap_or(root)
     };
-    let probe = parent.join(format!(".megle-write-probe-{}", uuid::Uuid::now_v7()));
+    let probe = parent.join(format!(".mangoo-write-probe-{}", uuid::Uuid::now_v7()));
     match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1499,7 +1993,6 @@ fn rejected(path: &Path, reason: PreflightReason) -> PreflightResult {
         ok: false,
         reason,
         normalized_root: path.to_path_buf(),
-        token: None,
         available_bytes: None,
     }
 }
@@ -1610,10 +2103,96 @@ mod tests {
         assert_eq!(safe_library_name("valid library").unwrap(), "valid library");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn owned_staging_child_creation_keeps_exact_directory_pinned() {
+        let base =
+            std::env::temp_dir().join(format!("mangoo-owned-stage-{}", uuid::Uuid::now_v7()));
+        fs::create_dir(&base).unwrap();
+        let parent = MarkerDirectoryGuard::open(&base).unwrap();
+        let leaf = std::ffi::OsStr::new("work");
+        let child = parent.create_directory_child(leaf).unwrap();
+        assert!(parent.create_directory_child(leaf).is_err());
+        let identity = child.identity().to_owned();
+        drop(parent);
+        assert!(fs::rename(base.join(leaf), base.join("moved")).is_err());
+        assert!(fs::remove_dir(base.join(leaf)).is_err());
+        child.verify_unchanged().unwrap();
+        assert_eq!(child.identity(), identity);
+        drop(child);
+        fs::rename(base.join(leaf), base.join("moved")).unwrap();
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owned_staging_publish_pins_payload_and_never_replaces_destination() {
+        use std::io::Write;
+        let root =
+            std::env::temp_dir().join(format!("mangoo-staging-publish-{}", uuid::Uuid::now_v7()));
+        fs::create_dir_all(root.join("source")).unwrap();
+        fs::create_dir_all(root.join("target")).unwrap();
+        let source = MarkerDirectoryGuard::open(&root.join("source")).unwrap();
+        let target = MarkerDirectoryGuard::open(&root.join("target")).unwrap();
+        let partial = std::ffi::OsStr::new("payload.partial");
+        let destination = std::ffi::OsStr::new("data.bin");
+        let mut file = source.open_temporary(partial, true).unwrap();
+        file.write_all(b"verified bytes").unwrap();
+        file.sync_all().unwrap();
+        let identity = source.file_identity(&file).unwrap();
+        assert!(fs::rename(
+            root.join("source/payload.partial"),
+            root.join("source/replaced")
+        )
+        .is_err());
+        assert!(fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("source/payload.partial"))
+            .is_err());
+        fs::write(root.join("target/data.bin"), b"existing target").unwrap();
+        assert!(source
+            .publish_to(&file, partial, &target, destination)
+            .is_err());
+        assert_eq!(
+            fs::read(root.join("target/data.bin")).unwrap(),
+            b"existing target"
+        );
+        fs::remove_file(root.join("target/data.bin")).unwrap();
+        source
+            .publish_to(&file, partial, &target, destination)
+            .unwrap();
+        drop(file);
+        assert_eq!(
+            fs::read(root.join("target/data.bin")).unwrap(),
+            b"verified bytes"
+        );
+        assert!(!root.join("source/payload.partial").exists());
+        fs::write(
+            root.join("source/payload.partial"),
+            b"replacement user content",
+        )
+        .unwrap();
+        assert!(source
+            .delete_file_child_expected(partial, &identity)
+            .is_err());
+        assert_eq!(
+            fs::read(root.join("source/payload.partial")).unwrap(),
+            b"replacement user content"
+        );
+        let replacement =
+            crate::library_path::local_file_identity(&root.join("source/payload.partial")).unwrap();
+        source
+            .delete_file_child_expected(partial, &replacement)
+            .unwrap();
+        drop(source);
+        drop(target);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn marker_identity_is_filesystem_identity_not_marker_contents() {
         let base =
-            std::env::temp_dir().join(format!("megle-marker-identity-{}", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("mangoo-marker-identity-{}", uuid::Uuid::now_v7()));
         fs::create_dir_all(&base).unwrap();
         let marker = base.join(MARKER_FILE_NAME);
         fs::write(&marker, b"first").unwrap();
@@ -1628,7 +2207,7 @@ mod tests {
 
     #[test]
     fn safe_directory_detects_path_replacement_after_handle_capture() {
-        let base = std::env::temp_dir().join(format!("megle-path-race-{}", uuid::Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-path-race-{}", uuid::Uuid::now_v7()));
         let original = base.join("root");
         let moved = base.join("moved");
         fs::create_dir_all(&original).unwrap();
@@ -1641,9 +2220,23 @@ mod tests {
     }
 
     #[test]
+    fn inspected_directory_has_identical_storage_key_before_and_after_creation() {
+        let base = tempfile::tempdir().unwrap();
+        let path = base.path().join("content");
+        let before = inspect_directory_path(&path, true).unwrap();
+        fs::create_dir(&path).unwrap();
+        let after = inspect_directory_path(&path, false).unwrap();
+        assert_eq!(before.as_os_str(), after.as_os_str());
+        assert_eq!(
+            after.as_os_str(),
+            fs::canonicalize(&path).unwrap().as_os_str()
+        );
+    }
+
+    #[test]
     fn writable_probe_is_deleted_after_preflight() {
         let base =
-            std::env::temp_dir().join(format!("megle-preflight-probe-{}", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("mangoo-preflight-probe-{}", uuid::Uuid::now_v7()));
         fs::create_dir_all(&base).unwrap();
         let result = preflight("Library", &base, &[], &[]);
         assert!(result.ok);
@@ -1661,14 +2254,14 @@ mod tests {
                 "accepted {name:?}"
             );
         }
-        assert!(validate_marker_leaf(std::ffi::OsStr::new(".megle-sync-root")).is_ok());
+        assert!(validate_marker_leaf(std::ffi::OsStr::new(".mangoo-sync-root")).is_ok());
     }
 
     #[cfg(windows)]
     #[test]
     fn marker_guard_refuses_traversal_and_reparse_components() {
         let base =
-            std::env::temp_dir().join(format!("megle-marker-reparse-{}", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("mangoo-marker-reparse-{}", uuid::Uuid::now_v7()));
         let ordinary = base.join("ordinary");
         let other = base.join("other");
         let link = base.join("link");
@@ -1709,7 +2302,7 @@ mod tests {
     #[test]
     fn marker_guard_refuses_a_different_source_handle() {
         let root =
-            std::env::temp_dir().join(format!("megle-marker-source-{}", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("mangoo-marker-source-{}", uuid::Uuid::now_v7()));
         fs::create_dir(&root).unwrap();
         let directory = MarkerDirectoryGuard::open(&root).unwrap();
         let temporary = std::ffi::OsStr::new("operation.tmp");
@@ -1719,10 +2312,10 @@ mod tests {
             .open_temporary(std::ffi::OsStr::new("other.tmp"), true)
             .unwrap();
         let error = directory
-            .publish(&other, temporary, std::ffi::OsStr::new(".megle-sync-root"))
+            .publish(&other, temporary, std::ffi::OsStr::new(".mangoo-sync-root"))
             .unwrap_err();
         assert_eq!(error.to_string(), "path-changed");
-        assert!(!root.join(".megle-sync-root").exists());
+        assert!(!root.join(".mangoo-sync-root").exists());
         assert_eq!(fs::read(root.join(temporary)).unwrap(), b"verified");
         drop(correct);
         drop(other);
@@ -1735,7 +2328,8 @@ mod tests {
     fn marker_child_opens_stay_on_the_captured_directory_after_path_replacement() {
         use std::io::Read;
 
-        let base = std::env::temp_dir().join(format!("megle-marker-open-{}", uuid::Uuid::now_v7()));
+        let base =
+            std::env::temp_dir().join(format!("mangoo-marker-open-{}", uuid::Uuid::now_v7()));
         let root = base.join("root");
         let moved = base.join("moved");
         fs::create_dir_all(&root).unwrap();
@@ -1778,7 +2372,7 @@ mod tests {
     #[test]
     fn marker_native_rename_uses_captured_directory_and_never_replaces() {
         let base =
-            std::env::temp_dir().join(format!("megle-marker-native-{}", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("mangoo-marker-native-{}", uuid::Uuid::now_v7()));
         let root = base.join("root");
         let moved = base.join("moved");
         fs::create_dir_all(&root).unwrap();
@@ -1816,7 +2410,7 @@ mod tests {
     #[test]
     fn marker_native_publication_succeeds_without_hard_link_support() {
         let root =
-            std::env::temp_dir().join(format!("megle-marker-no-links-{}", uuid::Uuid::now_v7()));
+            std::env::temp_dir().join(format!("mangoo-marker-no-links-{}", uuid::Uuid::now_v7()));
         fs::create_dir(&root).unwrap();
         let test_root = root.clone();
         // Isolate the filter to this child thread. Returning EOPNOTSUPP for
@@ -1870,7 +2464,7 @@ mod tests {
 
             let directory = MarkerDirectoryGuard::open(&test_root).unwrap();
             let temporary = std::ffi::OsStr::new("operation.tmp");
-            let final_name = std::ffi::OsStr::new(".megle-sync-root");
+            let final_name = std::ffi::OsStr::new(".mangoo-sync-root");
             let mut source = directory.open_temporary(temporary, true).unwrap();
             source.write_all(b"marker").unwrap();
             source.sync_all().unwrap();
@@ -1901,8 +2495,10 @@ mod tests {
     )))]
     #[test]
     fn marker_native_rename_is_explicitly_unsupported_without_an_atomic_primitive() {
-        let root =
-            std::env::temp_dir().join(format!("megle-marker-unsupported-{}", uuid::Uuid::now_v7()));
+        let root = std::env::temp_dir().join(format!(
+            "mangoo-marker-unsupported-{}",
+            uuid::Uuid::now_v7()
+        ));
         fs::create_dir(&root).unwrap();
         fs::write(root.join("source"), b"original").unwrap();
         let parent = fs::File::open(&root).unwrap();

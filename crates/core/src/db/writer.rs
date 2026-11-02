@@ -43,6 +43,7 @@ enum WriterMessage {
 pub struct DbWriter {
     inner: Arc<DbWriterInner>,
     notify_authoritative_commit: bool,
+    write_admission: Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>,
 }
 
 struct DbWriterInner {
@@ -137,7 +138,7 @@ impl DbWriter {
         let notification_flush_signal = database.notification_flush_signal();
         let (sender, receiver) = mpsc::unbounded_channel::<WriterMessage>();
         let join_handle = std::thread::Builder::new()
-            .name("megle-db-writer".to_string())
+            .name("mangoo-db-writer".to_string())
             .spawn(move || run_writer_actor(database, receiver, authoritative_commit_hook))
             .expect("spawn db writer thread");
         let writer = DbWriter {
@@ -150,10 +151,11 @@ impl DbWriter {
                 scheduler_join_handle: Mutex::new(None),
             }),
             notify_authoritative_commit: true,
+            write_admission: None,
         };
         let scheduler_writer = Arc::downgrade(&writer.inner);
         let scheduler_join_handle = std::thread::Builder::new()
-            .name("megle-notification-flush".to_string())
+            .name("mangoo-notification-flush".to_string())
             .spawn(move || {
                 run_notification_flush_scheduler(scheduler_writer, notification_flush_signal)
             })
@@ -179,7 +181,25 @@ impl DbWriter {
         Self {
             inner: Arc::clone(&self.inner),
             notify_authoritative_commit: false,
+            write_admission: self.write_admission.clone(),
         }
+    }
+
+    /// Scope a handle to owned background work. The queue retains admission
+    /// ownership even when its awaiting future is dropped.
+    pub(crate) fn with_write_admission(
+        &self,
+        admission: Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>,
+    ) -> Self {
+        let mut writer = self.clone();
+        let previous = writer.write_admission.take();
+        writer.write_admission = Some(Arc::new(move || {
+            if let Some(previous) = &previous {
+                previous()?;
+            }
+            admission()
+        }));
+        writer
     }
 
     /// Stop accepting writes, drain all writes queued before this call, flush,
@@ -316,7 +336,11 @@ impl DbWriter {
         T: Send + 'static,
         F: FnOnce(&mut Database) -> anyhow::Result<T> + Send + 'static,
     {
+        let admission = self.write_admission.clone();
         let job: WriteJob = Box::new(move |database| {
+            if let Some(admission) = &admission {
+                admission()?;
+            }
             op(database).map(|value| Box::new(value) as Box<dyn Any + Send>)
         });
         if self.inner.closed.load(Ordering::Acquire) {
@@ -414,6 +438,7 @@ fn run_notification_flush_scheduler(
         let handle = DbWriter {
             inner,
             notify_authoritative_commit: false,
+            write_admission: None,
         };
         let next_due =
             handle.write_blocking(|database| database.next_dirty_notification_flush_at());
@@ -448,6 +473,7 @@ fn run_notification_flush_scheduler(
         let handle = DbWriter {
             inner,
             notify_authoritative_commit: false,
+            write_admission: None,
         };
         let flush_at = crate::db::unix_timestamp_millis();
         let flush_result =
@@ -1132,7 +1158,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reopened_notification_producer_cannot_lose_the_scheduler_wake() {
         let dir = std::env::temp_dir().join(format!(
-            "megle-notification-wake-{}-{}",
+            "mangoo-notification-wake-{}-{}",
             std::process::id(),
             crate::db::unix_timestamp_millis()
         ));
@@ -1169,7 +1195,7 @@ mod tests {
         // Reproduces Core's real setup: a FILE-backed db where the writer actor
         // owns one connection while another connection (like the worker) also
         // writes. A write submitted to the actor must complete, not hang.
-        let dir = std::env::temp_dir().join(format!("megle-writer-repro-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mangoo-writer-repro-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let db_path = dir.join("repro.sqlite");
         let _ = std::fs::remove_file(&db_path);
@@ -1271,7 +1297,7 @@ mod tests {
         use crate::db::{FileUpsert, FolderUpsert, NewRoot};
         let root_id = database
             .add_root(NewRoot {
-                path: format!("D:/megle-wal-bound-{}", std::process::id()),
+                path: format!("D:/mangoo-wal-bound-{}", std::process::id()),
                 display_name: "wal-bound-root".to_string(),
             })
             .expect("add root");
@@ -1305,7 +1331,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sustained_blob_writes_through_writer_keep_wal_bounded() {
         use crate::db::Database;
-        let dir = std::env::temp_dir().join(format!("megle-wal-bound-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mangoo-wal-bound-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let db_path = dir.join("bound.sqlite");
         let _ = std::fs::remove_file(&db_path);
@@ -1356,5 +1382,64 @@ mod tests {
             wal
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn plugin_lifecycle_queued_writer_keeps_ownership_and_rejects_late_mutation() {
+        let database = Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        let writer = DbWriter::spawn(database);
+        let providers = crate::sync::provider::ProviderManager::default();
+        providers.open_plugin("provider", 1).unwrap();
+        let work = providers.begin_work("provider").unwrap();
+        let scoped = writer.with_write_admission(Arc::new(move || work.check_current()));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocking_writer = writer.clone();
+        let blocker = tokio::spawn(async move {
+            blocking_writer
+                .write(move |_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.unwrap();
+        let mutated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mutation = mutated.clone();
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        scoped
+            .enqueue(
+                move |_| {
+                    mutation.store(true, Ordering::Release);
+                    Ok(())
+                },
+                WriteDurability::Authoritative,
+                false,
+                reply,
+            )
+            .unwrap();
+        drop(scoped);
+        drop(reply_rx);
+        providers.close_plugin("provider", 2);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            providers.join_plugin_work("provider")
+        )
+        .await
+        .is_err());
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap().unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            providers.join_plugin_work("provider"),
+        )
+        .await
+        .unwrap();
+        assert!(!mutated.load(Ordering::Acquire));
+        // Local edits through the ordinary handle remain available.
+        writer.write(|_| Ok(())).await.unwrap();
+        writer.shutdown().await.unwrap();
     }
 }

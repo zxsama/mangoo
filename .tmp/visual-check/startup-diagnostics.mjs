@@ -48,8 +48,8 @@ export function collectStartupDiagnostics(startupOutput, { ignoreRuntimeLine } =
       }
       continue;
     }
-    if (normalizedLine.includes("Running `target\\debug\\megle-core.exe`")) continue;
-    if (normalizedLine.includes("Running `target/debug/megle-core`")) continue;
+    if (normalizedLine.includes("Running `target\\debug\\mangoo-core.exe`")) continue;
+    if (normalizedLine.includes("Running `target/debug/mangoo-core`")) continue;
     if (ignoreRuntimeLine?.(normalizedLine)) continue;
     if (RUNTIME_DIAGNOSTIC_PATTERN.test(normalizedLine)) {
       runtimeProblems.push({ ...problem, line: normalizedLine, phase: "runtime" });

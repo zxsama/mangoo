@@ -16,13 +16,13 @@ import { collectStartupDiagnostics as parseStartupDiagnostics } from "./startup-
 const root = await resolveRepositoryRoot(import.meta.url);
 const visualRoot = path.join(root, ".tmp", "visual-check");
 const logDir = path.join(visualRoot, "logs");
-const visualRunId = `megle-exhaustive-${Date.now().toString(36)}-${process.pid}`;
+const visualRunId = `mangoo-exhaustive-${Date.now().toString(36)}-${process.pid}`;
 const dataDir = path.join(visualRoot, `data-exhaustive-ui-${visualRunId}`);
 const electronUserDataDir = path.join(dataDir, "electron-user-data");
 const controlledMedia = await prepareControlledMediaRoot(visualRoot, visualRunId);
 const autoRoot = controlledMedia.root;
 const webUrl = "http://127.0.0.1:5178";
-const debugPort = Number(process.env.MEGLE_EXHAUSTIVE_DEBUG_PORT ?? 9501);
+const debugPort = Number(process.env.MANGOO_EXHAUSTIVE_DEBUG_PORT ?? 9501);
 
 const stdoutPath = path.join(logDir, `desktop-ui-exhaustive-${visualRunId}.stdout.log`);
 const stderrPath = path.join(logDir, `desktop-ui-exhaustive-${visualRunId}.stderr.log`);
@@ -68,13 +68,13 @@ function collectStartupProblems() {
 }
 
 async function waitForControlledRootStartup(timeoutMs = 60_000) {
-  const expected = `[megle] auto-added root ${autoRoot}`;
+  const expected = `[mangoo] auto-added root ${autoRoot}`;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (startupOutput.some((entry) => entry.text.includes(expected))) return;
     const startupProblems = collectStartupProblems();
     const rootFailure = startupProblems.find((problem) =>
-      /MEGLE_AUTO_ADD_ROOT|auto-add|auto.?added root/i.test(problem.line)
+      /MANGOO_AUTO_ADD_ROOT|auto-add|auto.?added root/i.test(problem.line)
     );
     if (rootFailure) throw new Error(`Controlled root startup failed: ${rootFailure.line}`);
     await delay(100);
@@ -87,14 +87,14 @@ function startDevApp() {
     cwd: root,
     env: {
       ...process.env,
-      MEGLE_WEB_URL: webUrl,
-      MEGLE_DB_PATH: path.join(dataDir, "megle.sqlite"),
-      MEGLE_ELECTRON_USER_DATA_DIR: electronUserDataDir,
-      MEGLE_AUTO_ADD_ROOT: autoRoot,
-      MEGLE_REMOTE_DEBUG: "1",
-      MEGLE_REMOTE_DEBUG_PORT: String(debugPort),
-      MEGLE_VISUAL_HARNESS: "1",
-      MEGLE_VISUAL_RUN_ID: visualRunId
+      MANGOO_WEB_URL: webUrl,
+      MANGOO_DB_PATH: path.join(dataDir, "mangoo.sqlite"),
+      MANGOO_ELECTRON_USER_DATA_DIR: electronUserDataDir,
+      MANGOO_AUTO_ADD_ROOT: autoRoot,
+      MANGOO_REMOTE_DEBUG: "1",
+      MANGOO_REMOTE_DEBUG_PORT: String(debugPort),
+      MANGOO_VISUAL_HARNESS: "1",
+      MANGOO_VISUAL_RUN_ID: visualRunId
     },
     shell: process.platform === "win32",
     stdio: ["ignore", "pipe", "pipe"],
@@ -600,19 +600,19 @@ async function installShellSpy(client) {
   await evaluate(
     client,
     `(() => {
-      const shell = window.megleDesktop?.shell;
+      const shell = window.mangooDesktop?.shell;
       if (!shell) return false;
-      window.__megleShellSpy = { calls: [] };
+      window.__mangooShellSpy = { calls: [] };
       shell.openPath = async (value) => {
-        window.__megleShellSpy.calls.push({ method: "openPath", value });
+        window.__mangooShellSpy.calls.push({ method: "openPath", value });
         return true;
       };
       shell.revealPath = async (value) => {
-        window.__megleShellSpy.calls.push({ method: "revealPath", value });
+        window.__mangooShellSpy.calls.push({ method: "revealPath", value });
         return true;
       };
       shell.copyText = async (value) => {
-        window.__megleShellSpy.calls.push({ method: "copyText", value });
+        window.__mangooShellSpy.calls.push({ method: "copyText", value });
         return true;
       };
       return true;
@@ -625,7 +625,7 @@ async function consumeShellCalls(client) {
     (await evaluate(
       client,
       `(() => {
-        const spy = window.__megleShellSpy;
+        const spy = window.__mangooShellSpy;
         if (!spy) return [];
         const calls = [...spy.calls];
         spy.calls.length = 0;
@@ -750,7 +750,7 @@ async function runExhaustiveSweep(client) {
   );
   await waitFor(settingsClient, `Boolean(document.querySelector('#library-grid-gap'))`, 10_000, "Settings library grid controls");
   results.push("primary nav -> settings secondary window");
-  await evaluate(settingsClient, `void window.megleDesktop?.closeSettingsWindow?.()`);
+  await evaluate(settingsClient, `void window.mangooDesktop?.closeSettingsWindow?.()`);
   await waitForPageTargetCount("#/settings", 0);
   settingsClient.close();
 
@@ -770,7 +770,7 @@ async function runExhaustiveSweep(client) {
     "Plugins native-window reveal"
   );
   results.push("primary nav -> plugins secondary window");
-  await evaluate(pluginsClient, `void window.megleDesktop?.closePluginsWindow?.()`);
+  await evaluate(pluginsClient, `void window.mangooDesktop?.closePluginsWindow?.()`);
   await waitForPageTargetCount("#/plugins", 0);
   pluginsClient.close();
 
@@ -925,7 +925,7 @@ async function runExhaustiveSweep(client) {
       return true;
     })()`
   );
-  await evaluate(gridSettingsClient, `void window.megleDesktop?.closeSettingsWindow?.()`);
+  await evaluate(gridSettingsClient, `void window.mangooDesktop?.closeSettingsWindow?.()`);
   await waitForPageTargetCount("#/settings", 0);
   gridSettingsClient.close();
   await waitFor(client, `Boolean(document.querySelector('.virtual-grid'))`, 10_000, "return to library");

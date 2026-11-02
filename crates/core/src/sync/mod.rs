@@ -8,6 +8,7 @@ pub mod codec;
 pub mod coordinator;
 pub mod descriptor;
 pub mod fault;
+pub mod file_policy;
 pub mod identity;
 pub mod inbox;
 pub mod media;

@@ -99,7 +99,7 @@ mod tests {
     fn unique_temp_dir() -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "megle_decode_image_{}_{}_{}",
+            "mangoo_decode_image_{}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

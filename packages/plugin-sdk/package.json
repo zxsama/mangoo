@@ -1,0 +1,14 @@
+{
+  "name": "@mangoo/plugin-sdk",
+  "version": "0.1.0",
+  "type": "module",
+  "files": ["dist", "README.md"],
+  "exports": {
+    ".": { "types": "./dist/types/packages/plugin-sdk/src/index.d.ts", "default": "./dist/index.js" },
+    "./design": { "types": "./dist/types/packages/plugin-sdk/src/design.d.ts", "default": "./dist/design.js" },
+    "./design.css": "./dist/design.css"
+  },
+  "scripts": { "build": "node build.mjs", "test": "node --experimental-strip-types --test tests/*.test.mts" },
+  "peerDependencies": { "react": "^18.3.1", "react-dom": "^18.3.1" },
+  "devDependencies": { "esbuild": "0.28.2", "typescript": "5.9.3", "@types/react": "18.3.31", "@types/react-dom": "18.3.7" }
+}

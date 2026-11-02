@@ -1,5 +1,5 @@
-import { X } from "lucide-react";
-import type { TagRecord } from "@megle/core-client";
+import { X } from "../../design/icons";
+import type { TagRecord } from "@mangoo/core-client";
 
 interface TagChipProps {
   tag: TagRecord;

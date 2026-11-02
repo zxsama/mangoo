@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace Megle's independent popup, menu, dialog, library, search, and notification presentation systems with one appearance-aware overlay architecture while preserving existing behavior and data contracts.
+**Goal:** Replace Mangoo's independent popup, menu, dialog, library, search, and notification presentation systems with one appearance-aware overlay architecture while preserving existing behavior and data contracts.
 
 **Architecture:** Add framework-free overlay primitives under `apps/web/src/design/overlays/`: pure positioning and stack state, one runtime provider, shared acrylic surfaces, anchored portals, menu semantics, modal focus management, and shared fields. Migrate feature surfaces in isolated tasks, append each task's styles to `overlay.css`, and remove legacy `styles.css` blocks only after every feature uses the new system.
 
@@ -15,7 +15,7 @@
 - Read `docs/superpowers/specs/2026-07-27-unified-overlay-ui-design.md` before starting each task.
 - Do not modify Settings or Plugins components or their visual output.
 - Do not add appearance preferences. Semantic CSS aliases may derive from existing variables only.
-- Do not change Core APIs, SQLite, `@megle/notification-contract`, notification state ownership, or notification persistence.
+- Do not change Core APIs, SQLite, `@mangoo/notification-contract`, notification state ownership, or notification persistence.
 - Do not add raw `fetch`, Node filesystem imports in Web production code, or third-party UI/positioning libraries.
 - Preserve unrelated working-tree changes, especially:
   - `docs/benchmarks/2026-07-20-notification-center-verification.md`
@@ -1891,7 +1891,7 @@ Expected: no clipped surface, no unexpected divider, no competing hover rectangl
 - [ ] **Step 3: Run the Windows compositor harness**
 
 ```powershell
-$env:MEGLE_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-regression.mjs; $code=$LASTEXITCODE; Remove-Item Env:\MEGLE_VISUAL_OS_BACKDROP; exit $code
+$env:MANGOO_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-regression.mjs; $code=$LASTEXITCODE; Remove-Item Env:\MANGOO_VISUAL_OS_BACKDROP; exit $code
 ```
 
 Expected: `required-os-composited: passed`, `hardFailures=0`, `startupProblems=0`.
@@ -1899,7 +1899,7 @@ Expected: `required-os-composited: passed`, `hardFailures=0`, `startupProblems=0
 - [ ] **Step 4: Run the exhaustive real interaction sweep**
 
 ```powershell
-$env:MEGLE_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-exhaustive-interaction-sweep.mjs; $code=$LASTEXITCODE; Remove-Item Env:\MEGLE_VISUAL_OS_BACKDROP; exit $code
+$env:MANGOO_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-exhaustive-interaction-sweep.mjs; $code=$LASTEXITCODE; Remove-Item Env:\MANGOO_VISUAL_OS_BACKDROP; exit $code
 ```
 
 Expected: zero hard failures covering titlebar root exclusivity, nested surfaces, context-menu edge positions, dialog layering, notification center, preview return, layout switching, and subfolder interaction.
@@ -1918,7 +1918,7 @@ Expected: every surface responds only to its mapped group; Settings and Plugins 
 
 - [ ] **Step 6: Verify real Windows scale factors**
 
-At 100%, 125%, and 150% Windows display scaling, relaunch production Megle and repeat:
+At 100%, 125%, and 150% Windows display scaling, relaunch production Mangoo and repeat:
 
 1. Open every titlebar root overlay.
 2. Open library nested overlays and remove confirmation.
@@ -1956,7 +1956,7 @@ Add links to the approved spec, implementation plan, and verification report in 
 ```powershell
 git diff --check
 npm test
-$env:MEGLE_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-regression.mjs; $code=$LASTEXITCODE; Remove-Item Env:\MEGLE_VISUAL_OS_BACKDROP; exit $code
+$env:MANGOO_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-regression.mjs; $code=$LASTEXITCODE; Remove-Item Env:\MANGOO_VISUAL_OS_BACKDROP; exit $code
 ```
 
 Expected: full gate PASS and compositor harness reports zero hard failures and startup problems.

@@ -1,3 +1,10 @@
+mod directory_preferences;
+pub use directory_preferences::{
+    DirectorySortMutationResult, DirectorySortRule, DirectorySortState, DirectoryTarget,
+    FolderChildrenPage,
+};
+#[cfg(test)]
+mod directory_preferences_tests;
 pub mod migrations;
 pub mod notification_outbox;
 mod sync_roots;
@@ -35,7 +42,7 @@ const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 pub(crate) const WAL_TRUNCATE_THRESHOLD_BYTES: u64 = 256 * 1024 * 1024;
 /// `synchronous=NORMAL` (1) is the recommended setting under WAL: it never
 /// corrupts the database and only risks losing the last few *committed*
-/// transactions on OS crash / power loss. Every Megle table (thumbnail
+/// transactions on OS crash / power loss. Every Mangoo table (thumbnail
 /// blobs, the file index, the task queue) is regenerable by rescanning, so
 /// this trade is safe — and it removes one fsync per commit, the dominant
 /// cost when the worker persists millions of thumbnails one row at a time.
@@ -63,7 +70,14 @@ fn hex_string(bytes: &[u8]) -> String {
 }
 
 pub struct Database {
+    storage_policy: crate::sync::file_policy::StoragePathPolicy,
+    decoder_context: Option<(
+        crate::plugins::decoder::DecoderManager,
+        tokio_util::sync::CancellationToken,
+    )>,
     connection: Connection,
+    // Rust drops fields in declaration order: close SQLite before releasing this pin.
+    catalog_pin: Option<(crate::library_path::MarkerDirectoryGuard, std::fs::File)>,
     path: Option<PathBuf>,
     notification_outbox_wake: Arc<tokio::sync::Notify>,
     notification_flush_signal: Arc<writer::NotificationFlushSignal>,
@@ -78,6 +92,8 @@ pub struct NewRoot {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RootRecord {
+    pub icon: Option<String>,
+    pub color: Option<String>,
     pub id: i64,
     pub path: String,
     pub display_name: String,
@@ -86,6 +102,7 @@ pub struct RootRecord {
     pub last_scan_at: Option<i64>,
     pub root_folder_id: Option<i64>,
     pub media_count: i64,
+    pub file_count: i64,
     /// Live reachability state. The DB layer always reports `true` (a root's
     /// storage is reachable until an API-level probe says otherwise); the API
     /// layer overlays the real-time value from `RootReachability` before the
@@ -139,17 +156,35 @@ pub struct ScanWriteBatch {
 
 pub struct ScanFileUpsert {
     pub file: FileUpsert,
-    pub media_kind: String,
+    pub media_kind: Option<String>,
     pub external_identity: Option<ExternalFileIdentity>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ExternalFileIdentity {
+    /// Absent prior entries, checked outside the writer. The transaction still
+    /// verifies their root and OS/content identity before reusing an asset.
+    pub rename_candidates: ExternalRenameCandidates,
     pub volume_identity: Vec<u8>,
     pub file_identity: Vec<u8>,
     pub content_fingerprint: Option<Vec<u8>>,
+    pub source_stamp: Option<Vec<u8>>,
     pub path: PathBuf,
 }
+
+#[derive(Debug, Clone)]
+pub struct AbsentExternalFile {
+    pub file_id: i64,
+    pub last_path: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExternalRenameCandidates {
+    pub absent: Vec<AbsentExternalFile>,
+    pub incomplete: bool,
+}
+
+const MAX_EXTERNAL_RENAME_CANDIDATES: usize = 32;
 
 #[allow(dead_code)]
 pub struct ThumbnailStateUpsert {
@@ -395,6 +430,8 @@ pub struct FolderRecord {
     pub parent_id: Option<i64>,
     pub name: String,
     pub status: String,
+    pub icon: Option<String>,
+    pub color: Option<String>,
     /// Whether this folder has at least one active child folder. Lets the UI
     /// decide up front whether to render an expand affordance, instead of
     /// showing a chevron that vanishes once an empty child page loads. Computed
@@ -404,9 +441,33 @@ pub struct FolderRecord {
     /// Active media in this folder and every active descendant folder. Folder
     /// pages compute all row counts in one shared recursive scope.
     pub media_count: i64,
+    pub file_count: i64,
 }
 
 const FOLDER_ANCESTOR_DEPTH_CAP: i64 = 4096;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilePresentation {
+    pub preview_kind: &'static str,
+    pub thumbnail: &'static str,
+    pub generation: u64,
+}
+
+impl FilePresentation {
+    pub fn builtin(kind: Option<&str>) -> Self {
+        let (preview_kind, thumbnail) = match kind {
+            Some("image") => ("original-image", "available"),
+            Some("video") => ("original-video", "available"),
+            _ => ("static-thumbnail", "unavailable"),
+        };
+        Self {
+            preview_kind,
+            thumbnail,
+            generation: 0,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -419,6 +480,7 @@ pub struct MediaRecord {
     pub size: i64,
     pub mtime: i64,
     pub kind: Option<String>,
+    pub presentation: FilePresentation,
     pub width: Option<i64>,
     pub height: Option<i64>,
     pub duration_ms: Option<i64>,
@@ -526,6 +588,7 @@ pub struct TaskRecord {
     pub items_total: Option<i64>,
     pub folders_seen: i64,
     pub media_files_seen: i64,
+    pub files_seen: i64,
     pub skipped_files: i64,
     #[serde(skip_serializing)]
     pub thumbnail_source_fingerprint: Option<String>,
@@ -607,6 +670,7 @@ pub struct TaskScanProgress {
     pub items_total: Option<i64>,
     pub folders_seen: i64,
     pub media_files_seen: i64,
+    pub files_seen: i64,
     pub skipped_files: i64,
 }
 
@@ -740,6 +804,89 @@ impl Database {
         Self::from_connection(connection, Some(path))
     }
 
+    /// Existing storage is never opened with SQLite's CREATE flag.
+    pub fn open_existing(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let directory = crate::library_path::MarkerDirectoryGuard::open_readonly(
+            path.parent()
+                .ok_or_else(|| anyhow::anyhow!("invalid-path"))?,
+        )?;
+        let file = directory.open_sqlite_file(
+            path.file_name()
+                .ok_or_else(|| anyhow::anyhow!("invalid-path"))?,
+        )?;
+        let connection =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        let mut database = Self::from_connection(connection, Some(path))?;
+        database.catalog_pin = Some((directory, file));
+        Ok(database)
+    }
+
+    pub fn open_verified(
+        path: &Path,
+        library_uuid: uuid::Uuid,
+        device_uuid: uuid::Uuid,
+    ) -> anyhow::Result<Self> {
+        let directory = crate::library_path::MarkerDirectoryGuard::open_readonly(
+            path.parent()
+                .ok_or_else(|| anyhow::anyhow!("invalid-path"))?,
+        )?;
+        let file = directory
+            .open_catalog()
+            .map_err(|_| anyhow::anyhow!("library-local-data-unavailable"))?;
+        Self::inspect_existing_catalog(path, library_uuid, device_uuid)?;
+        let database = Self::open_existing(path)?;
+        directory.verify_unchanged()?;
+        drop(file);
+        Ok(database)
+    }
+
+    pub fn inspect_existing_catalog(
+        path: &Path,
+        library_uuid: uuid::Uuid,
+        device_uuid: uuid::Uuid,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        let inspect = || -> anyhow::Result<Vec<PathBuf>> {
+            let parent = path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("library-local-data-unavailable"))?;
+            let directory = crate::library_path::MarkerDirectoryGuard::open_readonly(parent)?;
+            let catalog = directory
+                .open_catalog()
+                .map_err(|_| anyhow::anyhow!("library-local-data-unavailable"))?;
+            let identity = directory.file_identity(&catalog)?;
+            let connection =
+                Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            connection.busy_timeout(std::time::Duration::from_secs(5))?;
+            let stored: (Vec<u8>, Vec<u8>) = connection.query_row(
+                "SELECT library_uuid,device_uuid FROM sync_local_state WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if stored.0 != library_uuid.as_bytes() {
+                anyhow::bail!("library-identity-conflict");
+            }
+            if stored.1 != device_uuid.as_bytes() {
+                anyhow::bail!("library-device-identity-mismatch");
+            }
+            let mut statement = connection.prepare("SELECT path FROM roots ORDER BY id")?;
+            let roots = statement
+                .query_map([], |row| Ok(PathBuf::from(row.get::<_, String>(0)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            directory.verify_unchanged()?;
+            if directory.file_identity(&directory.open_catalog()?)? != identity {
+                anyhow::bail!("path-changed");
+            }
+            Ok(roots)
+        };
+        inspect().map_err(|error| match error.to_string().as_str() {
+            "library-identity-conflict" | "library-device-identity-mismatch" | "path-changed" => {
+                error
+            }
+            _ => anyhow::anyhow!("library-local-data-unavailable"),
+        })
+    }
+
     #[cfg(test)]
     pub fn open_in_memory() -> anyhow::Result<Self> {
         let connection = Connection::open_in_memory()?;
@@ -774,7 +921,10 @@ impl Database {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         register_thumbnail_cache_sql_functions(&connection)?;
         Ok(Self {
+            storage_policy: Default::default(),
+            catalog_pin: None,
             connection,
+            decoder_context: None,
             path,
             notification_outbox_wake,
             notification_flush_signal,
@@ -782,19 +932,192 @@ impl Database {
         })
     }
 
+    /// Called only after the runtime request gate and all owned workers are stopped.
+    pub fn retire_file_connection(&mut self) -> anyhow::Result<()> {
+        let closed = std::mem::replace(&mut self.connection, Connection::open_in_memory()?);
+        drop(closed);
+        self.catalog_pin.take();
+        self.path = None;
+        Ok(())
+    }
+
     pub fn reopen(&self) -> anyhow::Result<Option<Self>> {
         let Some(path) = &self.path else {
             return Ok(None);
         };
-        let connection = Connection::open(path)?;
-        Self::from_connection_with_notification_state(
+        let directory = crate::library_path::MarkerDirectoryGuard::open_readonly(
+            path.parent()
+                .ok_or_else(|| anyhow::anyhow!("invalid-path"))?,
+        )?;
+        let file = directory.open_sqlite_file(
+            path.file_name()
+                .ok_or_else(|| anyhow::anyhow!("invalid-path"))?,
+        )?;
+        let connection =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        let mut database = Self::from_connection_with_notification_state(
             connection,
             Some(path.clone()),
             Arc::clone(&self.notification_outbox_wake),
             Arc::clone(&self.notification_flush_signal),
             self.notification_progress_interval_ms,
-        )
-        .map(Some)
+        )?;
+        database.catalog_pin = Some((directory, file));
+        database.decoder_context = self.decoder_context.clone();
+        database.storage_policy.source = self.storage_policy.source.clone();
+        Ok(Some(database))
+    }
+
+    pub fn attach_storage_snapshot(
+        &mut self,
+        source: crate::sync::file_policy::StorageSnapshotSource,
+    ) {
+        self.storage_policy.source = source;
+    }
+    pub fn begin_storage_traversal(&self) {
+        self.storage_policy.reset();
+    }
+    pub fn invalidate_storage_classification(&self) {
+        self.storage_policy.source.invalidate();
+        self.storage_policy.reset();
+    }
+    pub fn is_internal_storage_path(&self, root: &Path, path: &Path) -> anyhow::Result<bool> {
+        self.storage_policy.excludes(root, path)
+    }
+    pub fn is_owned_collection_path(&self, root: &Path, path: &Path) -> anyhow::Result<bool> {
+        Ok(self.is_internal_storage_path(root, path)?
+            || crate::sync::file_policy::is_owned_path(&self.connection, root, path)?)
+    }
+    pub fn internal_storage_directory(
+        &self,
+        root: &Path,
+        path: &Path,
+    ) -> anyhow::Result<Option<PathBuf>> {
+        let ancestors: Vec<_> = path
+            .ancestors()
+            .take_while(|path| path.starts_with(root))
+            .collect();
+        for ancestor in ancestors.into_iter().rev() {
+            if ancestor.is_dir() && self.is_internal_storage_path(root, ancestor)? {
+                return Ok(Some(ancestor.to_path_buf()));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn attach_decoder_context(
+        &mut self,
+        manager: crate::plugins::decoder::DecoderManager,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) {
+        self.decoder_context = Some((manager, cancellation));
+    }
+    pub fn decoder_context(
+        &self,
+    ) -> Option<(
+        crate::plugins::decoder::DecoderManager,
+        tokio_util::sync::CancellationToken,
+    )> {
+        self.decoder_context.clone()
+    }
+    fn decoder_snapshot(&self) -> crate::plugins::decoder::DecoderSnapshot {
+        self.decoder_context
+            .as_ref()
+            .map(|(manager, _)| manager.snapshot())
+            .unwrap_or_default()
+    }
+    #[cfg(test)]
+    pub fn decoder_cache_matches(
+        &self,
+        file_id: i64,
+        profile: &str,
+        source_fingerprint: &str,
+        decoder_key: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let saved: Option<(String,String)> = self.connection.query_row(
+            "SELECT decoder_key,source_fingerprint FROM decoder_presentations WHERE file_id=?1 AND profile=?2",
+            (file_id, profile), |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
+        Ok(saved.is_some_and(|(key, fingerprint)| {
+            fingerprint == source_fingerprint && decoder_key.is_none_or(|expected| key == expected)
+        }))
+    }
+    pub fn decoder_cache_matches_candidates(
+        &self,
+        file_id: i64,
+        profile: &str,
+        source_fingerprint: &str,
+        snapshot: &crate::plugins::decoder::DecoderSnapshot,
+        extension: &str,
+        purpose: crate::plugins::decoder::DecoderPurpose,
+        failed: bool,
+    ) -> anyhow::Result<bool> {
+        let saved: Option<(String,String)> = self.connection.query_row(
+            "SELECT decoder_key,source_fingerprint FROM decoder_presentations WHERE file_id=?1 AND profile=?2",
+            (file_id, profile), |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
+        Ok(saved.is_some_and(|(key, fingerprint)| {
+            fingerprint == source_fingerprint
+                && snapshot.cache_key_matches(&key, extension, purpose, failed)
+        }))
+    }
+
+    fn project_decoder_thumbnail(
+        &self,
+        thumbnail: &mut ThumbnailRecord,
+        source: &ThumbnailSourceRecord,
+    ) -> anyhow::Result<()> {
+        if FilePresentation::builtin(source.media_kind.as_deref()).thumbnail != "unavailable" {
+            return Ok(());
+        }
+        let extension = Path::new(&source.name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("");
+        let snapshot = self.decoder_snapshot();
+        let capability = snapshot.matching(
+            extension,
+            crate::plugins::decoder::DecoderPurpose::Thumbnail,
+        );
+        if matches!(thumbnail.state.as_str(), "ready" | "failed")
+            && !self.decoder_cache_matches_candidates(
+                source.file_id,
+                &thumbnail.profile,
+                &source.source_fingerprint(&thumbnail.profile),
+                &snapshot,
+                extension,
+                crate::plugins::decoder::DecoderPurpose::Thumbnail,
+                thumbnail.state == "failed",
+            )?
+        {
+            reset_thumbnail_record_to_pending(thumbnail);
+        }
+        if capability.is_none() {
+            derive_unavailable_thumbnail(thumbnail, source);
+        }
+        Ok(())
+    }
+    fn project_decoder_media(&self, media: &mut MediaRecord) -> anyhow::Result<()> {
+        if FilePresentation::builtin(media.kind.as_deref()).thumbnail != "unavailable" {
+            return Ok(());
+        }
+        let snapshot = self.decoder_snapshot();
+        media.presentation.generation = snapshot.generation;
+        if snapshot
+            .matching(
+                &media.ext,
+                crate::plugins::decoder::DecoderPurpose::Thumbnail,
+            )
+            .is_some()
+        {
+            media.presentation.thumbnail = "available";
+        }
+        if let Some(thumbnail) = self.get_thumbnail(media.id, GRID_320_PROFILE)? {
+            if thumbnail.state == "ready" {
+                media.presentation.thumbnail = "available";
+            }
+            media.thumbnail_state = Some(thumbnail.state);
+            media.thumbnail_cache_key = thumbnail.cache_key;
+        }
+        Ok(())
     }
 
     /// Shared wake signal for consumers waiting for committed Outbox rows.
@@ -974,23 +1297,8 @@ impl Database {
         device_uuid: uuid::Uuid,
     ) -> anyhow::Result<()> {
         let transaction = self.connection.unchecked_transaction()?;
-        let root_count: i64 =
-            transaction.query_row("SELECT COUNT(*) FROM roots", [], |row| row.get(0))?;
-        let descriptor_count: i64 =
-            transaction.query_row("SELECT COUNT(*) FROM sync_root_descriptors", [], |row| {
-                row.get(0)
-            })?;
-        if root_count == 0 && descriptor_count == 0 {
-            anyhow::bail!("managed Catalog must contain at least one root");
-        }
-        // Preserve legacy single-root identity while allowing already-enrolled
-        // managed-root-v2 Catalogs to retain one stable UUID per selected root.
-        if root_count == 1 {
-            transaction.execute(
-                "UPDATE roots SET root_uuid=?1 WHERE id=(SELECT id FROM roots LIMIT 1) AND root_folder_uuid IS NULL AND root_uuid != ?1",
-                [root_uuid.as_bytes().as_slice()],
-            )?;
-        }
+        // The marker identifies the virtual Library root. Ordinary content
+        // roots retain independent UUIDs regardless of their count.
         let now = unix_timestamp_millis();
         transaction.execute(
             "INSERT OR IGNORE INTO sync_local_state(singleton,library_uuid,device_uuid,catalog_stream_uuid,next_actor_seq,next_local_mutation_generation,hlc_wall_ms,hlc_logical,capture_enabled,compatibility_state,updated_at) VALUES (1,?1,?2,?3,1,1,0,0,0,'compatible',?4)",
@@ -1004,6 +1312,13 @@ impl Database {
         if stored.0 != library_uuid.as_bytes() || stored.1 != device_uuid.as_bytes() {
             anyhow::bail!("Catalog sync identity does not match Host binding");
         }
+        // A selected binding can predate first Catalog actor initialization.
+        // Seed its counter before any scan/capture; otherwise every root event
+        // would fall back to sequence 1 without a counter row to advance.
+        transaction.execute(
+            "INSERT OR IGNORE INTO sync_actor_epochs(actor_epoch,device_uuid,stream_uuid,stream_kind,binding_epoch,state,next_actor_seq,published_through_seq,created_at) SELECT b.root_actor_epoch,s.device_uuid,s.catalog_stream_uuid,'catalog',b.root_capture_epoch,CASE WHEN b.state='local-only-fork' THEN 'forked' ELSE 'active' END,COALESCE((SELECT MAX(e.actor_seq)+1 FROM sync_events e WHERE e.actor_epoch=b.root_actor_epoch),1),0,?1 FROM sync_root_local_bindings b,sync_local_state s WHERE s.singleton=1",
+            [now],
+        )?;
         let roots = {
             let mut statement = transaction.prepare(
                 "SELECT id,root_uuid,display_name,root_folder_uuid FROM roots ORDER BY id",
@@ -1395,7 +1710,7 @@ impl Database {
                 .map(|parent| parent.join("thumbnail-cache"))
                 .unwrap_or_else(|| PathBuf::from("thumbnail-cache"));
         }
-        std::env::temp_dir().join("megle-thumbnail-cache")
+        std::env::temp_dir().join("mangoo-thumbnail-cache")
     }
 
     /// Access to the underlying connection. Sibling modules such as `fsops`
@@ -1561,6 +1876,30 @@ impl Database {
         if !self.migration_applied(33)? {
             self.connection
                 .execute_batch(migrations::MEDIA_MATERIALIZATION_DESTINATION_MIGRATION)?;
+        }
+        if !self.migration_applied(34)? {
+            self.connection
+                .execute_batch(migrations::ALL_FILE_COLLECTION_MIGRATION)?;
+        }
+        if !self.migration_applied(35)? {
+            self.connection
+                .execute_batch(migrations::MATERIALIZATION_STAGING_OWNERSHIP_MIGRATION)?;
+        }
+        if !self.migration_applied(36)? {
+            self.connection
+                .execute_batch(migrations::ALL_FILE_BROWSING_MIGRATION)?;
+        }
+        if !self.migration_applied(37)? {
+            self.connection
+                .execute_batch(migrations::DECODER_PRESENTATIONS_MIGRATION)?;
+        }
+        if !self.migration_applied(38)? {
+            self.connection
+                .execute_batch(migrations::FOLDER_APPEARANCE_MIGRATION)?;
+        }
+        if !self.migration_applied(39)? {
+            self.connection
+                .execute_batch(migrations::DIRECTORY_PREFERENCES_MIGRATION)?;
         }
         self.backfill_media_fts_if_empty()?;
         self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)?;
@@ -1901,8 +2240,9 @@ impl Database {
                    (
                        SELECT COUNT(*)
                        FROM files
-                       WHERE files.root_id = roots.id AND files.status = 'active'
-                   ) AS media_count
+                       WHERE files.root_id = roots.id AND files.status = 'active' AND files.browse_visible=1
+                   ) AS media_count,
+                   (SELECT COUNT(*) FROM files WHERE files.root_id=roots.id AND files.status='active') AS file_count, roots.icon, roots.color
             FROM roots
             LEFT JOIN folders root_folder
               ON root_folder.root_id = roots.id
@@ -1930,8 +2270,9 @@ impl Database {
                    (
                        SELECT COUNT(*)
                        FROM files
-                       WHERE files.root_id = roots.id AND files.status = 'active'
-                   ) AS media_count
+                       WHERE files.root_id = roots.id AND files.status = 'active' AND files.browse_visible=1
+                   ) AS media_count,
+                   (SELECT COUNT(*) FROM files WHERE files.root_id=roots.id AND files.status='active') AS file_count, roots.icon, roots.color
             FROM roots
             LEFT JOIN folders root_folder
               ON root_folder.root_id = roots.id
@@ -1949,7 +2290,11 @@ impl Database {
 
     pub fn add_root(&self, root: NewRoot) -> anyhow::Result<i64> {
         let now = unix_timestamp();
-        let transaction = self.connection.unchecked_transaction()?;
+        // Acquire the write reservation before the existence read. Otherwise
+        // a concurrent startup/fsops commit can invalidate this WAL snapshot
+        // and the later INSERT fails immediately instead of using busy_timeout.
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let existing = {
             let mut statement =
                 transaction.prepare("SELECT id, enabled FROM roots WHERE path = ?1")?;
@@ -2599,7 +2944,7 @@ impl Database {
                     items_seen = 0,
                     items_total = NULL,
                     folders_seen = 0,
-                    media_files_seen = 0,
+                    media_files_seen = 0, files_seen = 0,
                     skipped_files = 0,
                     thumbnail_source_fingerprint = NULL,
                     error = NULL
@@ -2845,7 +3190,7 @@ impl Database {
             r#"
             SELECT tasks.id
             FROM tasks
-            JOIN files ON files.id = tasks.file_id AND files.status = 'active'
+            JOIN files ON files.id = tasks.file_id AND files.status = 'active' AND files.browse_visible=1
             JOIN roots ON roots.id = files.root_id AND roots.enabled = 1
             WHERE tasks.kind = 'thumbnail' AND tasks.status = 'pending'
             ORDER BY
@@ -2869,7 +3214,7 @@ impl Database {
             r#"
             SELECT tasks.id
             FROM tasks
-            JOIN files ON files.id = tasks.file_id AND files.status = 'active'
+            JOIN files ON files.id = tasks.file_id AND files.status = 'active' AND files.browse_visible=1
             JOIN roots ON roots.id = files.root_id AND roots.enabled = 1
             WHERE tasks.kind = 'thumbnail'
               AND tasks.status = 'pending'
@@ -2895,7 +3240,7 @@ impl Database {
             r#"
             SELECT tasks.id
             FROM tasks
-            JOIN files ON files.id = tasks.file_id AND files.status = 'active'
+            JOIN files ON files.id = tasks.file_id AND files.status = 'active' AND files.browse_visible=1
             JOIN roots ON roots.id = files.root_id AND roots.enabled = 1
             WHERE tasks.kind = 'thumbnail'
               AND tasks.status = 'pending'
@@ -2918,7 +3263,7 @@ impl Database {
             SELECT EXISTS(
               SELECT 1
               FROM tasks
-              JOIN files ON files.id = tasks.file_id AND files.status = 'active'
+              JOIN files ON files.id = tasks.file_id AND files.status = 'active' AND files.browse_visible=1
               JOIN roots ON roots.id = files.root_id AND roots.enabled = 1
               WHERE tasks.kind = 'thumbnail'
                 AND tasks.status = 'pending'
@@ -2940,7 +3285,7 @@ impl Database {
             SELECT EXISTS(
               SELECT 1
               FROM tasks
-              JOIN files ON files.id = tasks.file_id AND files.status = 'active'
+              JOIN files ON files.id = tasks.file_id AND files.status = 'active' AND files.browse_visible=1
               JOIN roots ON roots.id = files.root_id AND roots.enabled = 1
               WHERE tasks.kind = 'thumbnail'
                 AND files.root_id = ?1
@@ -2963,7 +3308,7 @@ impl Database {
             SELECT EXISTS(
               SELECT 1
               FROM tasks
-              JOIN files ON files.id = tasks.file_id AND files.status = 'active'
+              JOIN files ON files.id = tasks.file_id AND files.status = 'active' AND files.browse_visible=1
               JOIN roots ON roots.id = files.root_id AND roots.enabled = 1
               WHERE tasks.kind = 'thumbnail'
                 AND tasks.status = 'pending'
@@ -3014,7 +3359,7 @@ impl Database {
         const TASK_COLUMNS: &str = "id, kind, priority, status, root_id, folder_id, file_id, \
              created_at, updated_at, items_seen, items_total, folders_seen, media_files_seen, \
              skipped_files, thumbnail_source_fingerprint, attempt_generation, \
-             root_uuid, local_binding_uuid, binding_generation, error";
+             root_uuid, local_binding_uuid, binding_generation, error, files_seen";
 
         let mut seen: HashSet<i64> = HashSet::new();
         let mut tasks: Vec<TaskRecord> = Vec::new();
@@ -3087,7 +3432,7 @@ impl Database {
             SELECT id, kind, priority, status, root_id, folder_id, file_id, created_at, updated_at,
                    items_seen, items_total, folders_seen, media_files_seen, skipped_files,
                    thumbnail_source_fingerprint, attempt_generation,
-                   root_uuid, local_binding_uuid, binding_generation, error
+                   root_uuid, local_binding_uuid, binding_generation, error, files_seen
             FROM tasks
             WHERE id = ?1
             "#,
@@ -3103,7 +3448,7 @@ impl Database {
             SELECT id, kind, priority, status, root_id, folder_id, file_id, created_at, updated_at,
                    items_seen, items_total, folders_seen, media_files_seen, skipped_files,
                    thumbnail_source_fingerprint, attempt_generation,
-                   root_uuid, local_binding_uuid, binding_generation, error
+                   root_uuid, local_binding_uuid, binding_generation, error, files_seen
             FROM tasks
             WHERE kind = 'thumbnail'
               AND file_id = ?1
@@ -3413,7 +3758,7 @@ impl Database {
                 items_seen = 0,
                 items_total = NULL,
                 folders_seen = 0,
-                media_files_seen = 0,
+                media_files_seen = 0, files_seen = 0,
                 skipped_files = 0,
                 thumbnail_source_fingerprint = NULL,
                 error = NULL
@@ -3461,7 +3806,7 @@ impl Database {
                 items_seen = 0,
                 items_total = NULL,
                 folders_seen = 0,
-                media_files_seen = 0,
+                media_files_seen = 0, files_seen = 0,
                 skipped_files = 0,
                 thumbnail_source_fingerprint = NULL,
                 error = NULL
@@ -3514,7 +3859,7 @@ impl Database {
                 items_seen = 0,
                 items_total = NULL,
                 folders_seen = 0,
-                media_files_seen = 0,
+                media_files_seen = 0, files_seen = 0,
                 skipped_files = 0,
                 thumbnail_source_fingerprint = NULL,
                 error = NULL
@@ -3638,7 +3983,7 @@ impl Database {
                     SET status = 'pending', updated_at = ?1,
                         attempt_generation = attempt_generation + 1,
                         items_seen = 0, items_total = NULL,
-                        folders_seen = 0, media_files_seen = 0,
+                        folders_seen = 0, media_files_seen = 0, files_seen = 0,
                         skipped_files = 0, thumbnail_source_fingerprint = NULL,
                         error = NULL
                     WHERE id = ?2 AND status IN ('failed', 'cancelled')
@@ -3660,7 +4005,7 @@ impl Database {
                     SET status = 'pending', priority = ?1, updated_at = ?2,
                         attempt_generation = attempt_generation + 1,
                         items_seen = 0, items_total = NULL,
-                        folders_seen = 0, media_files_seen = 0,
+                        folders_seen = 0, media_files_seen = 0, files_seen = 0,
                         skipped_files = 0, thumbnail_source_fingerprint = NULL,
                         error = NULL
                     WHERE id = ?3 AND status IN ('failed', 'cancelled')
@@ -3704,7 +4049,7 @@ impl Database {
                     SET status = 'pending', updated_at = ?1,
                         attempt_generation = attempt_generation + 1,
                         items_seen = 0, items_total = NULL,
-                        folders_seen = 0, media_files_seen = 0,
+                        folders_seen = 0, media_files_seen = 0, files_seen = 0,
                         skipped_files = 0, thumbnail_source_fingerprint = NULL,
                         error = NULL
                     WHERE id = ?2 AND status IN ('failed', 'cancelled')
@@ -3847,7 +4192,8 @@ impl Database {
                 items_total = ?3,
                 folders_seen = ?4,
                 media_files_seen = ?5,
-                skipped_files = ?6
+                skipped_files = ?6,
+                files_seen = ?9
             WHERE id = ?7 AND status = 'running' AND attempt_generation = ?8
             "#,
             (
@@ -3859,6 +4205,7 @@ impl Database {
                 progress.skipped_files,
                 task_id,
                 attempt_generation,
+                progress.files_seen,
             ),
         )?;
         let appended = if updated == 1 {
@@ -3925,8 +4272,7 @@ impl Database {
             }
         }
         if let Some(kind) = query.kind.as_deref() {
-            predicates.push("media.kind = ?".to_string());
-            parameters.push(Value::Text(kind.to_string()));
+            append_media_kind_predicate(&mut predicates, &mut parameters, kind);
         }
         // Only the first page pays for COUNT(*); later pages of the same scroll
         // reuse the client's retained total. On million-row folders this count
@@ -3987,21 +4333,25 @@ impl Database {
         // view) picks the mtime index and sorts ~1M rows by name per page.
         let files_index = if folder_scoped {
             match sort {
-                "mtime_asc" => Some("idx_files_folder_status_mtime_id_asc"),
+                "mtime_asc" => Some("idx_files_folder_status_mtime_id"),
                 "name_asc" => Some("idx_files_folder_status_name_id"),
-                "name_desc" => Some("idx_files_folder_status_name_id_desc"),
+                "name_desc" => Some("idx_files_folder_status_name_id"),
                 _ => Some("idx_files_folder_status_mtime_id"),
             }
         } else if query.root_id.is_some() {
             match sort {
-                "mtime_asc" => Some("idx_files_root_status_mtime_id_asc"),
+                "mtime_asc" => Some("idx_files_root_status_mtime_id"),
                 "name_asc" => Some("idx_files_root_status_name_id"),
-                "name_desc" => Some("idx_files_root_status_name_id_desc"),
+                "name_desc" => Some("idx_files_root_status_name_id"),
                 _ => Some("idx_files_root_status_mtime_id"),
             }
         } else {
-            None
+            Some(match sort {
+                "name_asc" | "name_desc" => "idx_files_global_name_id",
+                _ => "idx_files_global_mtime_id",
+            })
         };
+        let files_index = files_index.map(|index| file_browse_index(index, query.kind.as_deref()));
         let files_from = match files_index {
             Some(index) => format!("files INDEXED BY {index}"),
             None => "files".to_string(),
@@ -4038,7 +4388,9 @@ impl Database {
 
         let mut items = Vec::new();
         for row in rows {
-            items.push(row?);
+            let mut item = row?;
+            self.project_decoder_media(&mut item)?;
+            items.push(item);
         }
         let next_cursor = if items.len() > limit as usize {
             items.pop();
@@ -4091,10 +4443,11 @@ impl Database {
                 predicates.push(
                     r#"files.folder_id IN (
                         WITH RECURSIVE descendant_folders(id) AS (
-                            SELECT id FROM folders WHERE id = ?
+                            SELECT id FROM folders WHERE id = ? AND status = 'active'
                             UNION ALL
                             SELECT folders.id FROM folders
                             JOIN descendant_folders ON folders.parent_id = descendant_folders.id
+                            WHERE folders.status = 'active'
                         )
                         SELECT id FROM descendant_folders
                     )"#
@@ -4104,6 +4457,16 @@ impl Database {
                 predicates.push("files.folder_id = ?".to_string());
             }
             parameters.push(Value::Integer(folder_id));
+        }
+        if let Some(kind) = query.kind.as_deref() {
+            let matches = match kind {
+                "other" => !matches!(target.kind.as_deref(), Some("image" | "video")),
+                _ => target.kind.as_deref() == Some(kind),
+            };
+            if !matches {
+                return Ok(None);
+            }
+            append_media_kind_predicate(&mut predicates, &mut parameters, kind);
         }
         match sort {
             "name_asc" => {
@@ -4136,7 +4499,7 @@ impl Database {
             }
         }
         let sql = format!(
-            "SELECT COUNT(*) FROM files CROSS JOIN roots ON roots.id = files.root_id AND roots.enabled = 1 WHERE {}",
+            "SELECT COUNT(*) FROM files LEFT JOIN media ON media.file_id=files.id CROSS JOIN roots ON roots.id = files.root_id AND roots.enabled = 1 WHERE {}",
             predicates.join(" AND ")
         );
         let index = self
@@ -4161,14 +4524,15 @@ impl Database {
             _ => "files.mtime DESC, files.id DESC",
         };
         let folder_index = match sort {
-            "mtime_asc" => "idx_files_folder_status_mtime_id_asc",
+            "mtime_asc" => "idx_files_folder_status_mtime_id",
             "name_asc" => "idx_files_folder_status_name_id",
-            "name_desc" => "idx_files_folder_status_name_id_desc",
+            "name_desc" => "idx_files_folder_status_name_id",
             _ => "idx_files_folder_status_mtime_id",
         };
+        let folder_index = file_browse_index(folder_index, query.kind.as_deref());
         let descendant_cte = r#"
             WITH RECURSIVE descendant_folders(id) AS (
-                SELECT id FROM folders WHERE id = ?
+                SELECT id FROM folders WHERE id = ? AND status = 'active'
                 UNION ALL
                 SELECT folders.id
                 FROM folders
@@ -4186,8 +4550,7 @@ impl Database {
             base_parameters.push(Value::Integer(root_id));
         }
         if let Some(kind) = query.kind.as_deref() {
-            predicates.push("media.kind = ?".to_string());
-            base_parameters.push(Value::Text(kind.to_string()));
+            append_media_kind_predicate(&mut predicates, &mut base_parameters, kind);
         }
 
         // First page only: the recursive-CTE COUNT(*) over the whole subtree is
@@ -4204,7 +4567,7 @@ impl Database {
                 {descendant_cte}
                 SELECT COUNT(*)
                 FROM descendant_folders
-                CROSS JOIN files INDEXED BY idx_files_folder_status_name_id
+                CROSS JOIN files INDEXED BY {folder_index}
                 LEFT JOIN media ON media.file_id = files.id
                 JOIN roots ON roots.id = files.root_id AND roots.enabled = 1
                 WHERE {where_clause}
@@ -4286,7 +4649,9 @@ impl Database {
 
         let mut items = Vec::new();
         for row in rows {
-            items.push(row?);
+            let mut item = row?;
+            self.project_decoder_media(&mut item)?;
+            items.push(item);
         }
         let next_cursor = if items.len() > limit as usize {
             items.pop();
@@ -4338,6 +4703,7 @@ impl Database {
         };
         let mut media = media;
         media.tag_ids = self.list_file_tag_ids(file_id)?;
+        self.project_decoder_media(&mut media)?;
         Ok(Some(media))
     }
 
@@ -4367,6 +4733,7 @@ impl Database {
         };
         if let Some(source) = self.get_thumbnail_source(file_id)? {
             normalize_thumbnail_record_for_source(&mut thumbnail, &source);
+            self.project_decoder_thumbnail(&mut thumbnail, &source)?;
         }
         Ok(Some(thumbnail))
     }
@@ -4434,6 +4801,31 @@ impl Database {
         task_id: i64,
         attempt_generation: i64,
     ) -> anyhow::Result<Option<bool>> {
+        self.try_mark_thumbnail_task_failed_with_decoder_for_attempt(
+            file_id,
+            profile,
+            attempted_source_fingerprint,
+            error,
+            failure_kind,
+            source_changed,
+            task_id,
+            attempt_generation,
+            None,
+        )
+    }
+
+    pub(crate) fn try_mark_thumbnail_task_failed_with_decoder_for_attempt(
+        &self,
+        file_id: i64,
+        profile: &str,
+        attempted_source_fingerprint: Option<&str>,
+        error: &str,
+        failure_kind: &str,
+        source_changed: bool,
+        task_id: i64,
+        attempt_generation: i64,
+        decoder_key: Option<&str>,
+    ) -> anyhow::Result<Option<bool>> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let updated =
@@ -4443,7 +4835,43 @@ impl Database {
             return Ok(None);
         }
 
-        let failure_persisted = if source_changed {
+        let failure_persisted = if let Some(key) = decoder_key {
+            let current_source = thumbnail_source_in_transaction(&transaction, file_id)?;
+            let current_fingerprint = current_source
+                .as_ref()
+                .map(|source| source.source_fingerprint(profile));
+            if !source_changed
+                && current_fingerprint.as_deref() == attempted_source_fingerprint
+                && !self
+                    .decoder_context
+                    .as_ref()
+                    .is_some_and(|(_, cancel)| cancel.is_cancelled())
+            {
+                if let Some(token) = self.root_binding_token_for_task(task_id)? {
+                    Self::require_sync_root_binding_token_in_transaction(&transaction, &token)?;
+                }
+                self.record_decoder_presentation_in_transaction(
+                    &transaction,
+                    file_id,
+                    profile,
+                    Some((
+                        key,
+                        attempted_source_fingerprint
+                            .ok_or_else(|| anyhow::anyhow!("decoder source missing"))?,
+                    )),
+                )?;
+                publish_thumbnail_failure_for_attempted_source_in_transaction(
+                    &transaction,
+                    file_id,
+                    profile,
+                    attempted_source_fingerprint,
+                    error,
+                    failure_kind,
+                )?
+            } else {
+                false
+            }
+        } else if source_changed {
             reset_thumbnail_after_stale_source_in_transaction(
                 &transaction,
                 file_id,
@@ -4681,8 +5109,13 @@ impl Database {
 
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let outcome =
-            Self::request_thumbnail_task_in_transaction(&transaction, file_id, profile, priority)?;
+        let outcome = Self::request_thumbnail_task_in_transaction(
+            &transaction,
+            file_id,
+            profile,
+            priority,
+            &self.decoder_snapshot(),
+        )?;
         transaction.commit()?;
 
         // Reproduce the original return exactly: the terminal no-op path used the
@@ -4710,6 +5143,7 @@ impl Database {
         file_id: i64,
         profile: &str,
         priority: ThumbnailTaskPriority,
+        decoders: &crate::plugins::decoder::DecoderSnapshot,
     ) -> anyhow::Result<ThumbnailTaskRequestOutcome> {
         if profile != GRID_320_PROFILE {
             return Err(anyhow::anyhow!("unsupported thumbnail profile: {profile}"));
@@ -4717,9 +5151,34 @@ impl Database {
         let source = thumbnail_source_in_transaction(transaction, file_id)?
             .ok_or_else(|| anyhow::anyhow!("media item not found: {file_id}"))?;
         let source_fingerprint = source.source_fingerprint(profile);
-
+        let extension = Path::new(&source.name)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        let decoder = decoders.matching(
+            extension,
+            crate::plugins::decoder::DecoderPurpose::Thumbnail,
+        );
         let requested_priority = priority.task_priority();
-        let current = thumbnail_for_update_in_transaction(transaction, file_id, profile)?;
+        let mut current = thumbnail_for_update_in_transaction(transaction, file_id, profile)?;
+        if FilePresentation::builtin(source.media_kind.as_deref()).thumbnail == "unavailable" {
+            let saved: Option<(String,String)> = transaction.query_row(
+                "SELECT decoder_key,source_fingerprint FROM decoder_presentations WHERE file_id=?1 AND profile=?2",
+                (file_id,profile), |row| Ok((row.get(0)?,row.get(1)?))).optional()?;
+            if !saved.is_some_and(|(key, fingerprint)| {
+                fingerprint == source_fingerprint
+                    && decoders.cache_key_matches(
+                        &key,
+                        extension,
+                        crate::plugins::decoder::DecoderPurpose::Thumbnail,
+                        current
+                            .as_ref()
+                            .is_some_and(|thumbnail| thumbnail.state == "failed"),
+                    )
+            }) {
+                current = None;
+            }
+        }
         if let Some(current) = current {
             let ready_has_required_blob = if requested_priority <= THUMBNAIL_BULK_PRIORITY
                 && current.state == "ready"
@@ -4744,6 +5203,33 @@ impl Database {
                     terminal_thumbnail: Some(current),
                 });
             }
+        }
+        if FilePresentation::builtin(source.media_kind.as_deref()).thumbnail == "unavailable"
+            && decoder.is_none()
+        {
+            let mut thumbnail = ThumbnailRecord {
+                file_id,
+                profile: profile.to_string(),
+                state: "unavailable".to_string(),
+                short_side_px: GRID_320_SHORT_SIDE_PX,
+                output_format: GENERATED_FORMAT.to_string(),
+                cache_key: None,
+                width: None,
+                height: None,
+                byte_size: None,
+                error: None,
+                source_fingerprint: None,
+                served_by: None,
+                updated_at: None,
+            };
+            derive_unavailable_thumbnail(&mut thumbnail, &source);
+            return Ok(ThumbnailTaskRequestOutcome {
+                task_id: None,
+                queued: false,
+                accepted: false,
+                should_enqueue: false,
+                terminal_thumbnail: Some(thumbnail),
+            });
         }
         let existing_pending_task = pending_thumbnail_task(transaction, file_id)?;
         let existing_running_task = running_thumbnail_task(transaction, file_id)?;
@@ -4837,6 +5323,13 @@ impl Database {
             transaction.last_insert_rowid()
         };
         if queued {
+            if let Some(decoder) = decoder {
+                let key = decoder.failure_cache_key();
+                transaction.execute(
+                    "INSERT INTO decoder_presentations(file_id,profile,decoder_key,source_fingerprint) VALUES(?1,?2,?3,?4) ON CONFLICT(file_id,profile) DO UPDATE SET decoder_key=excluded.decoder_key,source_fingerprint=excluded.source_fingerprint",
+                    (file_id, profile, &key, &source_fingerprint),
+                )?;
+            }
             upsert_thumbnail_state_in_transaction(
                 transaction,
                 ThumbnailStateUpsert {
@@ -5125,6 +5618,7 @@ impl Database {
                 file_id,
                 GRID_320_PROFILE,
                 ThumbnailTaskPriority::Bulk,
+                &self.decoder_snapshot(),
             )?;
             if outcome.accepted {
                 accepted_count += 1;
@@ -5174,6 +5668,7 @@ impl Database {
                 file_id,
                 GRID_320_PROFILE,
                 ThumbnailTaskPriority::Bulk,
+                &self.decoder_snapshot(),
             )?;
             if outcome.accepted {
                 accepted_count += 1;
@@ -5540,110 +6035,6 @@ impl Database {
         })
     }
 
-    pub fn list_folder_children_page(
-        &self,
-        folder_id: i64,
-        limit: i64,
-        cursor: Option<String>,
-        include_descendants: bool,
-    ) -> anyhow::Result<Page<FolderRecord>> {
-        let limit = limit.clamp(1, 500);
-        let cursor = cursor.as_deref().map(decode_folder_cursor).transpose()?;
-        let cursor_clause = if cursor.is_some() {
-            "AND (folders.name > ?2 OR (folders.name = ?2 AND folders.id > ?3))"
-        } else {
-            ""
-        };
-        let sql = if include_descendants {
-            format!(
-                r#"
-                WITH RECURSIVE descendant_folders(id) AS (
-                    SELECT id
-                    FROM folders
-                    WHERE parent_id = ?1 AND status = 'active'
-                    UNION ALL
-                    SELECT folders.id
-                    FROM folders
-                    JOIN descendant_folders ON folders.parent_id = descendant_folders.id
-                    WHERE folders.status = 'active'
-                )
-                SELECT folders.id, folders.root_id, folders.parent_id, folders.name, folders.status,
-                    EXISTS(
-                        SELECT 1 FROM folders child
-                        WHERE child.parent_id = folders.id AND child.status = 'active'
-                    ) AS has_children
-                FROM folders
-                JOIN descendant_folders ON descendant_folders.id = folders.id
-                JOIN roots ON roots.id = folders.root_id AND roots.enabled = 1
-                WHERE folders.status = 'active'
-                  {cursor_clause}
-                ORDER BY folders.name ASC, folders.id ASC
-                LIMIT ?4
-                "#,
-                cursor_clause = cursor_clause,
-            )
-        } else {
-            format!(
-                r#"
-                SELECT folders.id, folders.root_id, folders.parent_id, folders.name, folders.status,
-                    EXISTS(
-                        SELECT 1 FROM folders child
-                        WHERE child.parent_id = folders.id AND child.status = 'active'
-                    ) AS has_children
-                FROM folders
-                JOIN roots ON roots.id = folders.root_id AND roots.enabled = 1
-                WHERE folders.parent_id = ?1 AND folders.status = 'active'
-                  {cursor_clause}
-                ORDER BY folders.name ASC, folders.id ASC
-                LIMIT ?4
-                "#,
-                cursor_clause = cursor_clause,
-            )
-        };
-        let mut parameters = vec![Value::Integer(folder_id)];
-        if let Some(cursor) = &cursor {
-            parameters.push(Value::Text(cursor.name.clone()));
-            parameters.push(Value::Integer(cursor.id));
-        } else {
-            parameters.push(Value::Null);
-            parameters.push(Value::Null);
-        }
-        parameters.push(Value::Integer(limit + 1));
-        let mut statement = self.connection.prepare(&sql)?;
-        let rows = statement.query_map(params_from_iter(parameters), |row| {
-            Ok(FolderRecord {
-                id: row.get(0)?,
-                root_id: row.get(1)?,
-                parent_id: row.get(2)?,
-                name: row.get(3)?,
-                status: row.get(4)?,
-                has_children: row.get(5)?,
-                media_count: 0,
-            })
-        })?;
-
-        let mut folders = Vec::new();
-        for row in rows {
-            folders.push(row?);
-        }
-        drop(statement);
-        let next_cursor = if folders.len() > limit as usize {
-            folders.pop();
-            folders.last().map(encode_folder_cursor)
-        } else {
-            None
-        };
-        let media_counts = self.folder_subtree_media_counts(folder_id)?;
-        for folder in &mut folders {
-            folder.media_count = media_counts.get(&folder.id).copied().unwrap_or(0);
-        }
-        Ok(Page {
-            items: folders,
-            next_cursor,
-            total_count: None,
-        })
-    }
-
     /// Returns the active folder path in root-to-target order. The recursive
     /// walk is bounded and carries visited ids so a corrupt parent chain
     /// cannot run indefinitely; malformed chains are returned as errors for
@@ -5655,17 +6046,17 @@ impl Database {
         let mut statement = self.connection.prepare(
             r#"
             WITH RECURSIVE ancestors(
-                id, root_id, parent_id, name, status, depth, visited
+                id, root_id, parent_id, name, status, depth, visited, icon, color
             ) AS (
                 SELECT folders.id, folders.root_id, folders.parent_id, folders.name,
-                       folders.status, 0, ',' || folders.id || ','
+                       folders.status, 0, ',' || folders.id || ',', folders.icon, folders.color
                 FROM folders
                 JOIN roots ON roots.id = folders.root_id AND roots.enabled = 1
                 WHERE folders.id = ?1 AND folders.status = 'active'
                 UNION ALL
                 SELECT parent.id, parent.root_id, parent.parent_id, parent.name,
                        parent.status, ancestors.depth + 1,
-                       ancestors.visited || parent.id || ','
+                       ancestors.visited || parent.id || ',', parent.icon, parent.color
                 FROM ancestors
                 JOIN folders parent
                   ON parent.id = ancestors.parent_id
@@ -5680,7 +6071,7 @@ impl Database {
                        SELECT 1 FROM folders child
                        WHERE child.parent_id = ancestors.id
                          AND child.status = 'active'
-                   ) AS has_children
+                   ) AS has_children, ancestors.icon, ancestors.color
             FROM ancestors
             ORDER BY ancestors.depth DESC
             "#,
@@ -5693,7 +6084,10 @@ impl Database {
                 name: row.get(3)?,
                 status: row.get(4)?,
                 has_children: row.get(5)?,
+                icon: row.get(6)?,
+                color: row.get(7)?,
                 media_count: 0,
+                file_count: 0,
             })
         })?;
 
@@ -5712,13 +6106,51 @@ impl Database {
         }
 
         for folder in &mut ancestors {
-            folder.media_count = self
+            (folder.media_count, folder.file_count) = self
                 .folder_subtree_media_counts(folder.id)?
                 .get(&folder.id)
                 .copied()
-                .unwrap_or(0);
+                .unwrap_or((0, 0));
         }
         Ok(Some(ancestors))
+    }
+
+    /// Appearance is local catalog metadata; preserve folder identity and all scan/fsops fields.
+    pub fn update_folder_appearance(
+        &self,
+        folder_id: i64,
+        icon: &str,
+        color: &str,
+    ) -> anyhow::Result<Option<FolderRecord>> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE folders SET icon = ?1, color = ?2
+             WHERE id = ?3 AND parent_id IS NOT NULL AND status = 'active'
+               AND EXISTS (SELECT 1 FROM roots WHERE roots.id = folders.root_id
+                           AND roots.enabled = 1 AND roots.pending_delete_at IS NULL)",
+            (icon, color, folder_id),
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let mut record = transaction.query_row(
+            "SELECT id, root_id, parent_id, name, status, icon, color,
+                    EXISTS(SELECT 1 FROM folders child WHERE child.parent_id = folders.id AND child.status = 'active')
+             FROM folders WHERE id = ?1",
+            [folder_id],
+            |row| Ok(FolderRecord {
+                id: row.get(0)?, root_id: row.get(1)?, parent_id: row.get(2)?,
+                name: row.get(3)?, status: row.get(4)?, icon: row.get(5)?, color: row.get(6)?,
+                has_children: row.get(7)?, media_count: 0, file_count: 0,
+            }),
+        )?;
+        (record.media_count, record.file_count) = self
+            .folder_subtree_media_counts(folder_id)?
+            .get(&folder_id)
+            .copied()
+            .unwrap_or((0, 0));
+        transaction.commit()?;
+        Ok(Some(record))
     }
 
     #[cfg(test)]
@@ -5728,7 +6160,10 @@ impl Database {
             .items)
     }
 
-    fn folder_subtree_media_counts(&self, folder_id: i64) -> anyhow::Result<HashMap<i64, i64>> {
+    fn folder_subtree_media_counts(
+        &self,
+        folder_id: i64,
+    ) -> anyhow::Result<HashMap<i64, (i64, i64)>> {
         let mut statement = self.connection.prepare(
             r#"
             WITH RECURSIVE folder_scope(id, parent_id, depth) AS (
@@ -5744,7 +6179,7 @@ impl Database {
                  AND child.status = 'active'
             )
             SELECT folder_scope.id, folder_scope.parent_id, folder_scope.depth,
-                   COUNT(files.id) AS direct_media_count
+                   COALESCE(SUM(files.browse_visible),0) AS direct_media_count, COUNT(files.id) AS direct_file_count
             FROM folder_scope
             LEFT JOIN files
               ON files.folder_id = folder_scope.id
@@ -5759,17 +6194,21 @@ impl Database {
                 row.get::<_, Option<i64>>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })?;
 
         let mut media_counts = HashMap::new();
         for row in rows {
-            let (id, parent_id, depth, direct_media_count) = row?;
-            let total = direct_media_count + media_counts.get(&id).copied().unwrap_or(0);
+            let (id, parent_id, depth, direct_media_count, direct_file_count) = row?;
+            let (media, files) = media_counts.get(&id).copied().unwrap_or((0, 0));
+            let total = (direct_media_count + media, direct_file_count + files);
             media_counts.insert(id, total);
             if depth > 0 {
                 if let Some(parent_id) = parent_id {
-                    *media_counts.entry(parent_id).or_insert(0) += total;
+                    let entry = media_counts.entry(parent_id).or_insert((0, 0));
+                    entry.0 += total.0;
+                    entry.1 += total.1;
                 }
             }
         }
@@ -5942,35 +6381,6 @@ impl Database {
         cleanup_inactive_thumbnail_artifacts_in_transaction(&transaction)?;
         transaction.commit()?;
         Ok(true)
-    }
-
-    pub(crate) fn upsert_external_media_file_for_root_token(
-        &self,
-        token: &SyncRootBindingToken,
-        file: FileUpsert,
-        media_kind: &str,
-        volume_identity: &[u8],
-        file_identity: &[u8],
-        fingerprint: Option<&[u8]>,
-        path: &Path,
-    ) -> anyhow::Result<i64> {
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        Self::require_sync_root_binding_token_in_transaction(&transaction, token)?;
-        let scan_generation = active_scan_generation_in_transaction(&transaction, file.root_id)?;
-        let id = Self::upsert_external_media_file_in_transaction(
-            &transaction,
-            file,
-            media_kind,
-            volume_identity,
-            file_identity,
-            fingerprint,
-            path,
-            scan_generation,
-            crate::sync::capture::MutationOrigin::ExternalFs,
-        )?;
-        transaction.commit()?;
-        Ok(id)
     }
 
     pub(crate) fn ensure_folder_chain_for_path_for_root_token(
@@ -6200,7 +6610,7 @@ impl Database {
             (root_id, scan_generation),
         )?;
         transaction.execute(
-            "UPDATE roots SET active_scan_generation = NULL WHERE id = ?1 AND active_scan_generation = ?2",
+            "UPDATE roots SET active_scan_generation = NULL, file_collection_scanned_version=file_collection_version WHERE id = ?1 AND active_scan_generation = ?2",
             (root_id, scan_generation),
         )?;
         cleanup_inactive_thumbnail_artifacts_in_transaction(&transaction)?;
@@ -6258,7 +6668,7 @@ impl Database {
             (root_id, scan_generation),
         )?;
         transaction.execute(
-            "UPDATE roots SET active_scan_generation = NULL WHERE id = ?1 AND active_scan_generation = ?2",
+            "UPDATE roots SET active_scan_generation = NULL, file_collection_scanned_version=file_collection_version WHERE id = ?1 AND active_scan_generation = ?2",
             (root_id, scan_generation),
         )?;
         cleanup_inactive_thumbnail_artifacts_in_transaction(&transaction)?;
@@ -6310,15 +6720,111 @@ impl Database {
         Ok(file_id)
     }
 
+    pub(crate) fn seed_pending_file_publications(&self) -> anyhow::Result<usize> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let count = seed_file_publication_batch(&transaction)?;
+        transaction.commit()?;
+        Ok(count)
+    }
+
+    pub(crate) fn captures_all_files(&self, root_id: i64) -> anyhow::Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT file_collection_version>0 FROM roots WHERE id=?1",
+            [root_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Bounded candidate lookup on the read connection, before submitting the
+    /// observation to DbWriter. Live duplicate/hard-linked entries never move.
+    pub(crate) fn absent_external_identity_candidates(
+        &self,
+        root_id: i64,
+        volume: &[u8],
+        file_identity: &[u8],
+        fingerprint: Option<&[u8]>,
+        path: &Path,
+    ) -> anyhow::Result<ExternalRenameCandidates> {
+        let same_path: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_local_file_identities i JOIN files f ON f.asset_uuid=i.asset_uuid WHERE f.root_id=?1 AND i.last_path=?2)",
+            rusqlite::params![root_id, path.to_string_lossy()], |row| row.get(0))?;
+        if same_path {
+            return Ok(ExternalRenameCandidates::default());
+        }
+        let mut candidates = ExternalRenameCandidates::default();
+        for exact in [true, false] {
+            if exact && file_identity.is_empty() || !exact && fingerprint.is_none() {
+                continue;
+            }
+            let sql = if exact {
+                "SELECT f.id,i.last_path FROM sync_local_file_identities i JOIN files f ON f.asset_uuid=i.asset_uuid WHERE f.root_id=?1 AND i.volume_identity=?2 AND i.file_identity=?3 LIMIT ?4"
+            } else {
+                "SELECT f.id,i.last_path FROM sync_local_file_identities i JOIN files f ON f.asset_uuid=i.asset_uuid WHERE f.root_id=?1 AND i.volume_identity=?2 AND i.content_fingerprint=?3 LIMIT ?4"
+            };
+            let key = if exact {
+                file_identity
+            } else {
+                fingerprint.unwrap()
+            };
+            let mut statement = self.connection.prepare(sql)?;
+            let rows = statement
+                .query_map(
+                    rusqlite::params![root_id, volume, key, MAX_EXTERNAL_RENAME_CANDIDATES + 1],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            // A bounded prefix cannot prove uniqueness. Keep the new entry
+            // independent and retain one diagnostic rather than guessing.
+            if rows.len() > MAX_EXTERNAL_RENAME_CANDIDATES {
+                candidates.incomplete = true;
+                return Ok(candidates);
+            }
+            for (id, old_path) in rows {
+                match std::fs::symlink_metadata(&old_path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        candidates.absent.push(AbsentExternalFile {
+                            file_id: id,
+                            last_path: old_path,
+                        });
+                    }
+                    Err(_) => candidates.incomplete = true,
+                    Ok(_) => {}
+                }
+            }
+            if !candidates.absent.is_empty() || candidates.incomplete {
+                break;
+            }
+        }
+        Ok(candidates)
+    }
+
+    pub(crate) fn cached_external_fingerprint(
+        &self,
+        path: &Path,
+        volume: &[u8],
+        identity: &[u8],
+        stamp: &[u8],
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self.connection.query_row("SELECT i.content_fingerprint FROM sync_local_file_identities i JOIN files f ON f.asset_uuid=i.asset_uuid WHERE i.last_path=?1 AND i.volume_identity=?2 AND i.file_identity=?3 AND i.source_stamp=?4 AND f.status='active' LIMIT 1", rusqlite::params![path.to_string_lossy(),volume,identity,stamp], |row| row.get(0)).optional()?.flatten())
+    }
+
+    #[cfg(test)]
     pub(crate) fn upsert_external_media_file(
         &self,
         file: FileUpsert,
-        media_kind: &str,
+        media_kind: Option<&str>,
         volume_identity: &[u8],
         file_identity: &[u8],
         fingerprint: Option<&[u8]>,
         path: &Path,
     ) -> anyhow::Result<i64> {
+        let absent = self.absent_external_identity_candidates(
+            file.root_id,
+            volume_identity,
+            file_identity,
+            fingerprint,
+            path,
+        )?;
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let scan_generation = active_scan_generation_in_transaction(&transaction, file.root_id)?;
@@ -6332,6 +6838,7 @@ impl Database {
             path,
             scan_generation,
             crate::sync::capture::MutationOrigin::ExternalFs,
+            &absent,
         )?;
         transaction.commit()?;
         Ok(id)
@@ -6340,13 +6847,14 @@ impl Database {
     fn upsert_external_media_file_in_transaction(
         transaction: &rusqlite::Transaction<'_>,
         file: FileUpsert,
-        media_kind: &str,
+        media_kind: Option<&str>,
         volume_identity: &[u8],
         file_identity: &[u8],
         fingerprint: Option<&[u8]>,
         path: &Path,
         scan_generation: Option<i64>,
         origin: crate::sync::capture::MutationOrigin,
+        rename_candidates: &ExternalRenameCandidates,
     ) -> anyhow::Result<i64> {
         // Resolve only against pre-existing missing identities. The provisional
         // browse row does not exist yet, so it cannot self-match or overwrite
@@ -6359,31 +6867,36 @@ impl Database {
         let persisted_file_identity = has_stable_file_identity
             .then(|| file_identity.to_vec())
             .unwrap_or_else(|| path.to_string_lossy().as_bytes().to_vec());
-        let exact: Option<i64> = if has_stable_file_identity {
-            transaction.query_row(
-                "SELECT f.id FROM sync_local_file_identities i JOIN files f ON f.asset_uuid=i.asset_uuid WHERE i.volume_identity=?1 AND i.file_identity=?2 AND (f.status='missing' OR (?3 IS NOT NULL AND COALESCE(f.scan_seen_at,-1)<>?3)) LIMIT 1",
-                rusqlite::params![volume_identity,file_identity,scan_generation], |row| row.get(0),
-            ).optional()?
+        let mut exact_candidates = Vec::new();
+        let mut fingerprint_candidates = Vec::new();
+        for candidate in rename_candidates
+            .absent
+            .iter()
+            .take(MAX_EXTERNAL_RENAME_CANDIDATES)
+        {
+            let matched: Option<(bool,bool)> = transaction.query_row(
+                "SELECT i.volume_identity=?2 AND i.file_identity=?3, i.content_fingerprint=?4 FROM sync_local_file_identities i JOIN files f ON f.asset_uuid=i.asset_uuid WHERE f.id=?1 AND f.root_id=?5 AND i.last_path=?6",
+                rusqlite::params![candidate.file_id,volume_identity,file_identity,fingerprint,file.root_id,candidate.last_path],
+                |row| Ok((row.get(0)?, row.get::<_,Option<bool>>(1)?.unwrap_or(false))),
+            ).optional()?;
+            if let Some((exact, fingerprint)) = matched {
+                if exact && has_stable_file_identity {
+                    exact_candidates.push(candidate.file_id);
+                }
+                if fingerprint {
+                    fingerprint_candidates.push(candidate.file_id);
+                }
+            }
+        }
+        let forced_reuse = if rename_candidates.incomplete {
+            None
+        } else if exact_candidates.len() == 1 {
+            Some(exact_candidates[0])
+        } else if exact_candidates.is_empty() && fingerprint_candidates.len() == 1 {
+            Some(fingerprint_candidates[0])
         } else {
             None
         };
-        let fingerprint_candidates = if exact.is_none() {
-            if let Some(fingerprint) = fingerprint {
-                let mut statement = transaction.prepare("SELECT f.id FROM sync_local_file_identities i JOIN files f ON f.asset_uuid=i.asset_uuid WHERE i.content_fingerprint=?1 AND (f.status='missing' OR (?2 IS NOT NULL AND COALESCE(f.scan_seen_at,-1)<>?2)) ORDER BY f.asset_uuid")?;
-                let candidates = statement
-                    .query_map(rusqlite::params![fingerprint, scan_generation], |row| {
-                        row.get::<_, i64>(0)
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                candidates
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-        let forced_reuse = exact
-            .or_else(|| (fingerprint_candidates.len() == 1).then(|| fingerprint_candidates[0]));
         let previous_asset: Option<Vec<u8>> = if let Some(file_id) = forced_reuse {
             transaction
                 .query_row(
@@ -6417,7 +6930,7 @@ impl Database {
         let source_mtime_ms = file.mtime.saturating_mul(1000);
         let result =
             upsert_file_in_transaction(transaction, file, scan_generation, origin, forced_reuse)?;
-        upsert_media_kind_in_transaction(
+        set_media_presentation_in_transaction(
             transaction,
             result.id,
             media_kind,
@@ -6432,6 +6945,14 @@ impl Database {
         let content_changed = fingerprint.map_or(result.identity_changed, |value| {
             previous_fingerprint.as_deref() != Some(value)
         });
+        if media_kind.is_none() && content_changed && !result.identity_changed {
+            // A same-size write can preserve coarse mtime. The full local
+            // content fingerprint still invalidates a decoder presentation.
+            set_media_presentation_in_transaction(transaction, result.id, None, true)?;
+        }
+        if rename_candidates.incomplete {
+            transaction.execute("INSERT INTO sync_identity_conflicts(conflict_uuid,new_asset_uuid,reason,state,created_at) VALUES (?1,?2,'incomplete-rename-candidates','open',?3)",rusqlite::params![uuid::Uuid::now_v7().as_bytes().as_slice(),asset.as_bytes().as_slice(),unix_timestamp_millis()])?;
+        }
         if fingerprint_candidates.len() > 1 {
             for old_id in fingerprint_candidates {
                 let old: Vec<u8> = transaction.query_row(
@@ -6474,26 +6995,9 @@ impl Database {
 
     #[allow(dead_code)]
     pub fn upsert_media_kind(&self, file_id: i64, kind: &str) -> anyhow::Result<()> {
-        self.connection.execute(
-            r#"
-            INSERT INTO media(file_id, kind, metadata_status)
-            VALUES (?1, ?2, 'pending')
-            ON CONFLICT(file_id) DO UPDATE SET
-              kind = excluded.kind,
-              width = NULL,
-              height = NULL,
-              duration_ms = NULL,
-              codec = NULL,
-              orientation = NULL,
-              has_alpha = NULL,
-              dominant_color = NULL,
-              phash = NULL,
-              preview_placeholder = NULL,
-              preview_placeholder_format = 'image/webp',
-              metadata_status = 'pending'
-            "#,
-            (file_id, kind),
-        )?;
+        let transaction = self.connection.unchecked_transaction()?;
+        set_media_presentation_in_transaction(&transaction, file_id, Some(kind), true)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -6731,17 +7235,20 @@ impl Database {
 
         for file in batch.files {
             if let Some(identity) = file.external_identity {
-                file_ids.push(Self::upsert_external_media_file_in_transaction(
+                let file_id = Self::upsert_external_media_file_in_transaction(
                     &transaction,
                     file.file,
-                    &file.media_kind,
+                    file.media_kind.as_deref(),
                     &identity.volume_identity,
                     &identity.file_identity,
                     identity.content_fingerprint.as_deref(),
                     &identity.path,
                     scan_generation,
                     crate::sync::capture::MutationOrigin::ExternalFs,
-                )?);
+                    &identity.rename_candidates,
+                )?;
+                transaction.execute("UPDATE sync_local_file_identities SET source_stamp=?1 WHERE asset_uuid=(SELECT asset_uuid FROM files WHERE id=?2)", rusqlite::params![identity.source_stamp,file_id])?;
+                file_ids.push(file_id);
             } else {
                 let result = upsert_file_in_transaction(
                     &transaction,
@@ -6750,10 +7257,10 @@ impl Database {
                     crate::sync::capture::MutationOrigin::ExternalFs,
                     None,
                 )?;
-                upsert_media_kind_in_transaction(
+                set_media_presentation_in_transaction(
                     &transaction,
                     result.id,
-                    &file.media_kind,
+                    file.media_kind.as_deref(),
                     result.identity_changed,
                 )?;
                 file_ids.push(result.id);
@@ -6803,17 +7310,20 @@ impl Database {
 
         for file in batch.files {
             if let Some(identity) = file.external_identity {
-                file_ids.push(Self::upsert_external_media_file_in_transaction(
+                let file_id = Self::upsert_external_media_file_in_transaction(
                     &transaction,
                     file.file,
-                    &file.media_kind,
+                    file.media_kind.as_deref(),
                     &identity.volume_identity,
                     &identity.file_identity,
                     identity.content_fingerprint.as_deref(),
                     &identity.path,
                     scan_generation,
                     crate::sync::capture::MutationOrigin::ExternalFs,
-                )?);
+                    &identity.rename_candidates,
+                )?;
+                transaction.execute("UPDATE sync_local_file_identities SET source_stamp=?1 WHERE asset_uuid=(SELECT asset_uuid FROM files WHERE id=?2)", rusqlite::params![identity.source_stamp,file_id])?;
+                file_ids.push(file_id);
                 continue;
             }
             let result = upsert_file_in_transaction(
@@ -6823,10 +7333,10 @@ impl Database {
                 crate::sync::capture::MutationOrigin::ExternalFs,
                 None,
             )?;
-            upsert_media_kind_in_transaction(
+            set_media_presentation_in_transaction(
                 &transaction,
                 result.id,
-                &file.media_kind,
+                file.media_kind.as_deref(),
                 result.identity_changed,
             )?;
             file_ids.push(result.id);
@@ -6928,6 +7438,27 @@ impl Database {
         task_id: i64,
         attempt_generation: i64,
     ) -> anyhow::Result<bool> {
+        self.publish_thumbnail_with_decoder(
+            state,
+            blob,
+            source_dimensions,
+            expected_source_fingerprint,
+            task_id,
+            attempt_generation,
+            None,
+        )
+    }
+
+    pub(crate) fn publish_thumbnail_with_decoder(
+        &self,
+        state: ThumbnailStateUpsert,
+        blob: ThumbBlobRecord,
+        source_dimensions: Option<(i64, i64)>,
+        expected_source_fingerprint: &str,
+        task_id: i64,
+        attempt_generation: i64,
+        decoder_key: Option<&str>,
+    ) -> anyhow::Result<bool> {
         if state.file_id != blob.file_id || state.profile != blob.profile {
             anyhow::bail!(
                 "thumbnail blob does not match thumbnail state for file {} profile {}",
@@ -6947,6 +7478,22 @@ impl Database {
         if current_source.source_fingerprint(&state.profile) != expected_source_fingerprint {
             transaction.commit()?;
             return Ok(false);
+        }
+        if let Some(token) = self.root_binding_token_for_task(task_id)? {
+            Self::require_sync_root_binding_token_in_transaction(&transaction, &token)?;
+        }
+        if let Some(key) = decoder_key {
+            if self
+                .decoder_context
+                .as_ref()
+                .is_some_and(|(_, cancellation)| cancellation.is_cancelled())
+            {
+                return Ok(false);
+            }
+            transaction.execute(
+                "INSERT INTO decoder_presentations(file_id,profile,decoder_key,source_fingerprint) VALUES(?1,?2,?3,?4) ON CONFLICT(file_id,profile) DO UPDATE SET decoder_key=excluded.decoder_key,source_fingerprint=excluded.source_fingerprint",
+                (file_id, &state.profile, key, expected_source_fingerprint),
+            )?;
         }
         upsert_thumb_blob_in_transaction(&transaction, &blob)?;
         upsert_thumbnail_state_in_transaction(&transaction, state)?;
@@ -7071,11 +7618,26 @@ impl Database {
         failure: PreviewFailureRecord,
         token: Option<&SyncRootBindingToken>,
     ) -> anyhow::Result<()> {
+        self.publish_decoder_preview_failure(failure, token, None)
+    }
+
+    pub(crate) fn publish_decoder_preview_failure(
+        &self,
+        failure: PreviewFailureRecord,
+        token: Option<&SyncRootBindingToken>,
+        decoder: Option<(&str, &str)>,
+    ) -> anyhow::Result<()> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         if let Some(token) = token {
             Self::require_sync_root_binding_token_in_transaction(&transaction, token)?;
         }
+        self.record_decoder_presentation_in_transaction(
+            &transaction,
+            failure.file_id,
+            &failure.profile,
+            decoder,
+        )?;
         transaction.execute(
             r#"
             INSERT INTO preview_failures(
@@ -7178,11 +7740,26 @@ impl Database {
         blob: PreviewBlobRecord,
         token: Option<&SyncRootBindingToken>,
     ) -> anyhow::Result<()> {
+        self.publish_decoder_preview_blob(blob, token, None)
+    }
+
+    pub(crate) fn publish_decoder_preview_blob(
+        &self,
+        blob: PreviewBlobRecord,
+        token: Option<&SyncRootBindingToken>,
+        decoder: Option<(&str, &str)>,
+    ) -> anyhow::Result<()> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         if let Some(token) = token {
             Self::require_sync_root_binding_token_in_transaction(&transaction, token)?;
         }
+        self.record_decoder_presentation_in_transaction(
+            &transaction,
+            blob.file_id,
+            &blob.profile,
+            decoder,
+        )?;
         transaction.execute(
             r#"
             INSERT INTO preview_blobs(
@@ -7225,6 +7802,35 @@ impl Database {
             (PREVIEW_BLOB_CACHE_LIMIT_BYTES, blob.file_id, &blob.profile),
         )?;
         transaction.commit()?;
+        Ok(())
+    }
+
+    fn record_decoder_presentation_in_transaction(
+        &self,
+        transaction: &Transaction<'_>,
+        file_id: i64,
+        profile: &str,
+        decoder: Option<(&str, &str)>,
+    ) -> anyhow::Result<()> {
+        if let Some((key, fingerprint)) = decoder {
+            anyhow::ensure!(
+                !self
+                    .decoder_context
+                    .as_ref()
+                    .is_some_and(|(_, cancel)| cancel.is_cancelled()),
+                "decoder library stopped"
+            );
+            let source = thumbnail_source_in_transaction(transaction, file_id)?
+                .ok_or_else(|| anyhow::anyhow!("decoder source missing"))?;
+            anyhow::ensure!(
+                source.source_fingerprint(profile) == fingerprint,
+                "decoder source changed"
+            );
+            transaction.execute(
+                "INSERT INTO decoder_presentations(file_id,profile,decoder_key,source_fingerprint) VALUES(?1,?2,?3,?4) ON CONFLICT(file_id,profile) DO UPDATE SET decoder_key=excluded.decoder_key,source_fingerprint=excluded.source_fingerprint",
+                (file_id, profile, key, fingerprint),
+            )?;
+        }
         Ok(())
     }
 
@@ -7900,33 +8506,42 @@ impl Database {
         Ok(())
     }
 
-    /// Ensure `media_fts` has at least one row per `files` entry. Run once at
-    /// startup; cheap when sizes already match.
     pub fn backfill_media_fts_if_empty(&self) -> anyhow::Result<()> {
-        let files_count: i64 =
-            self.connection
-                .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
-        if files_count == 0 {
-            return Ok(());
-        }
-        let fts_count: i64 =
-            self.connection
-                .query_row("SELECT COUNT(*) FROM media_fts", [], |row| row.get(0))?;
-        if fts_count >= files_count {
-            return Ok(());
-        }
+        // Keep startup bounded; the owned runtime continues the durable cursor.
+        self.backfill_file_fts_batch(128)?;
+        Ok(())
+    }
+
+    /// Returns true once the durable upgrade cursor has been exhausted.
+    pub(crate) fn backfill_file_fts_batch(&self, limit: i64) -> anyhow::Result<bool> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let mut statement = transaction.prepare("SELECT id FROM files")?;
-        let ids: Vec<i64> = statement
-            .query_map([], |row| row.get::<_, i64>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(statement);
-        for file_id in ids {
-            sync_media_fts_for_file_in_transaction(&transaction, file_id)?;
+        let (after, through, completed): (i64, i64, bool) = transaction.query_row(
+            "SELECT after_file_id, through_file_id, completed FROM file_browse_fts_progress WHERE singleton=1",
+            [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        )?;
+        if completed {
+            return Ok(true);
         }
+        let ids = {
+            let mut statement = transaction
+                .prepare("SELECT id FROM files WHERE id>?1 AND id<=?2 ORDER BY id LIMIT ?3")?;
+            let rows = statement.query_map((after, through, limit.clamp(1, 512)), |row| {
+                row.get::<_, i64>(0)
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for file_id in &ids {
+            sync_media_fts_for_file_in_transaction(&transaction, *file_id)?;
+        }
+        let cursor = ids.last().copied().unwrap_or(through);
+        let complete = cursor >= through || ids.is_empty();
+        transaction.execute(
+            "UPDATE file_browse_fts_progress SET after_file_id=?1, completed=?2 WHERE singleton=1",
+            (cursor, complete),
+        )?;
         transaction.commit()?;
-        Ok(())
+        Ok(complete)
     }
 
     pub fn search_media_page(&self, query: SearchQuery) -> anyhow::Result<Page<MediaRecord>> {
@@ -7960,11 +8575,12 @@ impl Database {
                 predicates.push(
                     r#"files.folder_id IN (
                         WITH RECURSIVE descendant_folders(id) AS (
-                            SELECT id FROM folders WHERE id = ?
+                            SELECT id FROM folders WHERE id = ? AND status = 'active'
                             UNION ALL
                             SELECT folders.id
                             FROM folders
                             JOIN descendant_folders ON folders.parent_id = descendant_folders.id
+                            WHERE folders.status = 'active'
                         )
                         SELECT id FROM descendant_folders
                     )"#
@@ -7976,8 +8592,7 @@ impl Database {
             parameters.push(Value::Integer(folder_id));
         }
         if let Some(kind) = query.kind.as_deref() {
-            predicates.push("media.kind = ?".to_string());
-            parameters.push(Value::Text(kind.to_string()));
+            append_media_kind_predicate(&mut predicates, &mut parameters, kind);
         }
         if let Some(min_rating) = query.min_rating {
             predicates
@@ -8172,7 +8787,9 @@ impl Database {
 
         let mut items: Vec<MediaRecord> = Vec::new();
         for row in rows {
-            items.push(row?);
+            let mut item = row?;
+            self.project_decoder_media(&mut item)?;
+            items.push(item);
         }
 
         // Populate per-file tag ids in a single batched query so we avoid
@@ -8685,28 +9302,52 @@ fn create_sync_publication_intent_in_transaction(
 fn seed_initial_media_publication_intents(
     transaction: &rusqlite::Transaction<'_>,
 ) -> anyhow::Result<usize> {
-    type Candidate = (i64, String, i64, i64);
-    let candidates = {
-        let mut statement = transaction.prepare(
-            "WITH RECURSIVE folder_paths(id,root_id,relpath) AS (SELECT id,root_id,'' FROM folders WHERE parent_id IS NULL UNION ALL SELECT f.id,f.root_id,CASE WHEN p.relpath='' THEN f.name ELSE p.relpath||'/'||f.name END FROM folders f JOIN folder_paths p ON f.parent_id=p.id) SELECT f.id,CASE WHEN p.relpath='' THEN root.path||'/'||f.name ELSE root.path||'/'||p.relpath||'/'||f.name END,f.size,f.mtime FROM files f JOIN media ON media.file_id=f.id JOIN roots root ON root.id=f.root_id JOIN folder_paths p ON p.id=f.folder_id WHERE f.status='active' AND root.enabled=1 AND NOT EXISTS (SELECT 1 FROM asset_content_revisions r WHERE r.asset_uuid=f.asset_uuid) ORDER BY f.id",
-        )?;
-        let candidates = statement
-            .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })?
-            .collect::<Result<Vec<Candidate>, _>>()?;
-        candidates
-    };
-    for (file_id, source_path, byte_size, source_mtime_seconds) in &candidates {
-        create_sync_publication_intent_in_transaction(
-            transaction,
-            *file_id,
-            source_path,
-            *byte_size,
-            Some(source_mtime_seconds.saturating_mul(1000)),
+    transaction.execute("INSERT INTO sync_file_seed_progress(singleton,after_file_id,through_file_id) SELECT 1,0,COALESCE(MAX(id),0) FROM files WHERE 1 ON CONFLICT(singleton) DO UPDATE SET after_file_id=0,through_file_id=excluded.through_file_id", [])?;
+    seed_file_publication_batch(transaction)
+}
+
+fn seed_file_publication_batch(transaction: &rusqlite::Transaction<'_>) -> anyhow::Result<usize> {
+    // Limit the file keyset before walking ancestors: work is at most 100 paths,
+    // independent of the total number of files or folders in this Library.
+    let mut statement=transaction.prepare(
+        "WITH RECURSIVE candidates AS (SELECT f.id,f.folder_id,f.name,f.size,f.mtime,f.status,f.asset_uuid,f.root_id FROM files f,sync_file_seed_progress p WHERE f.id>p.after_file_id AND f.id<=p.through_file_id ORDER BY f.id LIMIT 100), paths(file_id,folder_id,relpath,depth) AS (SELECT id,folder_id,name,0 FROM candidates UNION ALL SELECT p.file_id,d.parent_id,CASE WHEN d.name='' THEN p.relpath ELSE d.name||'/'||p.relpath END,p.depth+1 FROM paths p JOIN folders d ON d.id=p.folder_id WHERE p.depth<4096) SELECT c.id,r.path||'/'||p.relpath,c.size,c.mtime,c.status='active' AND r.enabled=1 AND NOT EXISTS(SELECT 1 FROM asset_content_revisions a WHERE a.asset_uuid=c.asset_uuid),r.path FROM candidates c JOIN paths p ON p.file_id=c.id AND p.folder_id IS NULL JOIN roots r ON r.id=c.root_id ORDER BY c.id"
+    )?;
+    let candidates = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, bool>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let mut created = 0;
+    for (id, path, size, mtime, eligible, _root) in &candidates {
+        if *eligible {
+            create_sync_publication_intent_in_transaction(
+                transaction,
+                *id,
+                path,
+                *size,
+                Some(mtime.saturating_mul(1000)),
+            )?;
+            created += 1;
+        }
+    }
+    if let Some((id, _, _, _, _, _)) = candidates.last() {
+        transaction.execute(
+            "UPDATE sync_file_seed_progress SET after_file_id=?1 WHERE singleton=1",
+            [id],
         )?;
     }
-    Ok(candidates.len())
+    if candidates.len() < 100 {
+        transaction.execute("DELETE FROM sync_file_seed_progress WHERE singleton=1", [])?;
+    }
+    Ok(created)
 }
 
 fn upsert_file_in_transaction(
@@ -8739,10 +9380,14 @@ fn upsert_file_in_transaction(
         .unwrap_or(true);
 
     let reusable_file_id = if previous_identity.is_none() {
-        forced_reusable_file_id.or(reusable_file_id_for_content_identity_in_transaction(
-            transaction,
-            &file,
-        )?)
+        if origin == crate::sync::capture::MutationOrigin::ExternalFs {
+            forced_reusable_file_id
+        } else {
+            forced_reusable_file_id.or(reusable_file_id_for_content_identity_in_transaction(
+                transaction,
+                &file,
+            )?)
+        }
     } else {
         None
     };
@@ -8867,6 +9512,26 @@ fn upsert_file_in_transaction(
         id,
         identity_changed,
     })
+}
+
+pub(crate) fn set_media_presentation_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    file_id: i64,
+    kind: Option<&str>,
+    reset_metadata: bool,
+) -> anyhow::Result<()> {
+    if let Some(kind) = kind {
+        upsert_media_kind_in_transaction(transaction, file_id, kind, reset_metadata)?;
+    } else {
+        let removed = transaction.execute("DELETE FROM media WHERE file_id=?1", [file_id])?;
+        if reset_metadata || removed > 0 {
+            transaction.execute("DELETE FROM thumbs WHERE file_id=?1", [file_id])?;
+            transaction.execute("DELETE FROM preview_blobs WHERE file_id=?1", [file_id])?;
+            transaction.execute("DELETE FROM preview_failures WHERE file_id=?1", [file_id])?;
+        }
+    }
+    sync_media_fts_for_file_in_transaction(transaction, file_id)?;
+    Ok(())
 }
 
 fn upsert_media_kind_in_transaction(
@@ -9316,7 +9981,10 @@ fn root_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RootRecord> {
         last_scan_at: row.get(5)?,
         root_folder_id: row.get(6)?,
         media_count: row.get(7)?,
+        file_count: row.get(8)?,
         reachable: true,
+        icon: row.get(9)?,
+        color: row.get(10)?,
     })
 }
 
@@ -9358,6 +10026,7 @@ fn media_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaRecord> {
         ext,
         size,
         mtime,
+        presentation: FilePresentation::builtin(kind.as_deref()),
         kind,
         width,
         height,
@@ -9420,6 +10089,15 @@ fn thumbnail_source_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Thumbn
         height: row.get(9)?,
         metadata_status: row.get(10)?,
     })
+}
+
+fn derive_unavailable_thumbnail(thumbnail: &mut ThumbnailRecord, source: &ThumbnailSourceRecord) {
+    if thumbnail.state != "ready"
+        && FilePresentation::builtin(source.media_kind.as_deref()).thumbnail == "unavailable"
+    {
+        reset_thumbnail_record_to_pending(thumbnail);
+        thumbnail.state = "unavailable".to_string();
+    }
 }
 
 fn normalize_thumbnail_record_for_source(
@@ -9803,7 +10481,7 @@ struct ThumbnailCacheScopeQueryParts {
 
 fn register_thumbnail_cache_sql_functions(connection: &Connection) -> anyhow::Result<()> {
     connection.create_scalar_function(
-        "megle_thumb_fingerprint",
+        "mangoo_thumb_fingerprint",
         8,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |ctx| {
@@ -9828,7 +10506,7 @@ fn register_thumbnail_cache_sql_functions(connection: &Connection) -> anyhow::Re
 fn thumbnail_cache_scope_query_parts(scope: ThumbnailCacheScope) -> ThumbnailCacheScopeQueryParts {
     let mut params = Vec::new();
     let mut where_clauses = vec![
-        "files.status = 'active'".to_string(),
+        "files.status = 'active' AND files.browse_visible=1".to_string(),
         "roots.enabled = 1".to_string(),
         "COALESCE(media.kind, '') IN ('image', 'video')".to_string(),
     ];
@@ -9891,7 +10569,7 @@ fn thumbnail_cache_active_task_scope_query_parts(
 ) -> ThumbnailCacheScopeQueryParts {
     let mut params = Vec::new();
     let mut where_clauses = vec![
-        "files.status = 'active'".to_string(),
+        "files.status = 'active' AND files.browse_visible=1".to_string(),
         "roots.enabled = 1".to_string(),
     ];
     let mut descendant_folder_scope = false;
@@ -9930,7 +10608,7 @@ fn thumbnail_cache_active_task_scope_query_parts(
 
 fn thumbnail_cache_current_fingerprint_sql() -> String {
     format!(
-        "megle_thumb_fingerprint(files.id, files.root_id, files.folder_id, files.name, files.size, files.mtime, files.file_key, COALESCE(thumbs.profile, '{GRID_320_PROFILE}'))"
+        "mangoo_thumb_fingerprint(files.id, files.root_id, files.folder_id, files.name, files.size, files.mtime, files.file_key, COALESCE(thumbs.profile, '{GRID_320_PROFILE}'))"
     )
 }
 
@@ -10693,6 +11371,7 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         items_total: row.get(10)?,
         folders_seen: row.get(11)?,
         media_files_seen: row.get(12)?,
+        files_seen: row.get(20)?,
         skipped_files: row.get(13)?,
         thumbnail_source_fingerprint: row.get(14)?,
         attempt_generation: row.get(15)?,
@@ -10713,7 +11392,7 @@ fn task_record_in_transaction(
             SELECT id, kind, priority, status, root_id, folder_id, file_id, created_at, updated_at,
                    items_seen, items_total, folders_seen, media_files_seen, skipped_files,
                    thumbnail_source_fingerprint, attempt_generation,
-                   root_uuid, local_binding_uuid, binding_generation, error
+                   root_uuid, local_binding_uuid, binding_generation, error, files_seen
             FROM tasks
             WHERE id = ?1
             "#,
@@ -10959,6 +11638,37 @@ fn normalize_media_sort(sort: &str) -> &'static str {
     }
 }
 
+fn file_browse_index(index: &'static str, kind: Option<&str>) -> &'static str {
+    if !matches!(kind, Some("image" | "video")) {
+        return index;
+    }
+    match index {
+        "idx_files_folder_status_mtime_id" => "idx_files_browse_folder_mtime",
+        "idx_files_folder_status_name_id" => "idx_files_browse_folder_name",
+        "idx_files_root_status_mtime_id" => "idx_files_browse_root_mtime",
+        "idx_files_root_status_name_id" => "idx_files_browse_root_name",
+        "idx_files_global_mtime_id" => "idx_files_browse_mtime",
+        "idx_files_global_name_id" => "idx_files_browse_name",
+        _ => index,
+    }
+}
+
+fn append_media_kind_predicate(
+    predicates: &mut Vec<String>,
+    parameters: &mut Vec<Value>,
+    kind: &str,
+) {
+    if kind == "other" {
+        predicates.push("(media.kind IS NULL OR media.kind NOT IN ('image', 'video'))".to_string());
+    } else {
+        if matches!(kind, "image" | "video") {
+            predicates.push("files.browse_visible=1".to_string());
+        }
+        predicates.push("media.kind = ?".to_string());
+        parameters.push(Value::Text(kind.to_string()));
+    }
+}
+
 fn media_count_sql(where_clause: &str, include_media_join: bool) -> String {
     let media_join = if include_media_join {
         "LEFT JOIN media ON media.file_id = files.id"
@@ -11016,33 +11726,6 @@ fn decode_media_cursor(cursor: &str, expected_sort: &str) -> anyhow::Result<Medi
         _ => return Err(anyhow::anyhow!("invalid media cursor")),
     };
     Ok(MediaCursor { key, id })
-}
-
-fn encode_folder_cursor(folder: &FolderRecord) -> String {
-    format!(
-        "v1:folder:{}:{}",
-        folder.id,
-        hex_encode(folder.name.as_bytes())
-    )
-}
-
-fn decode_folder_cursor(cursor: &str) -> anyhow::Result<FolderCursor> {
-    let mut parts = cursor.splitn(4, ':');
-    if parts.next() != Some("v1") || parts.next() != Some("folder") {
-        return Err(anyhow::anyhow!("invalid folder cursor"));
-    }
-    let id = parts
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("invalid folder cursor"))?
-        .parse::<i64>()
-        .map_err(|_| anyhow::anyhow!("invalid folder cursor"))?;
-    let name = hex_decode_to_string(
-        parts
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("invalid folder cursor"))?,
-    )
-    .map_err(|_| anyhow::anyhow!("invalid folder cursor"))?;
-    Ok(FolderCursor { name, id })
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -11329,6 +12012,642 @@ mod tests {
     }
 
     #[test]
+    fn folder_appearance_survives_scan_reopen_and_reset() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("catalog.sqlite");
+        let db = Database::open(&path).unwrap();
+        db.apply_migrations().unwrap();
+        let root = db
+            .add_root(NewRoot {
+                path: temp.path().to_string_lossy().into(),
+                display_name: "Appearance".into(),
+            })
+            .unwrap();
+        let sentinel = db
+            .upsert_folder(FolderUpsert {
+                root_id: root,
+                parent_id: None,
+                name: String::new(),
+                path_hash: "root".into(),
+                mtime: None,
+            })
+            .unwrap();
+        let child = || FolderUpsert {
+            root_id: root,
+            parent_id: Some(sentinel),
+            name: "child".into(),
+            path_hash: "child".into(),
+            mtime: Some(2),
+        };
+        let id = db.upsert_folder(child()).unwrap();
+        let original = db.list_folder_children(sentinel).unwrap().pop().unwrap();
+        assert!(original.icon.is_none() && original.color.is_none());
+        assert!(db
+            .update_folder_appearance(sentinel, "camera", "#fff")
+            .unwrap()
+            .is_none());
+        assert!(db
+            .update_folder_appearance(i64::MAX, "camera", "#fff")
+            .unwrap()
+            .is_none());
+        let saved = db
+            .update_folder_appearance(id, "future-icon", "#1a2B3c")
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.icon.as_deref(), Some("future-icon"));
+        assert_eq!(db.upsert_folder(child()).unwrap(), id);
+        drop(db);
+        let db = Database::open(&path).unwrap();
+        db.apply_migrations().unwrap();
+        let page = db
+            .list_folder_children_page(sentinel, 1, None, true)
+            .unwrap();
+        assert_eq!(page.items[0].icon.as_deref(), Some("future-icon"));
+        assert_eq!(page.items[0].color.as_deref(), Some("#1a2B3c"));
+        let ancestors = db.list_folder_ancestors(id).unwrap().unwrap();
+        assert_eq!(
+            ancestors.last().unwrap().icon.as_deref(),
+            Some("future-icon")
+        );
+        let reset = db
+            .update_folder_appearance(id, "folder", "#ffffff")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reset.icon.as_deref(), Some("folder"));
+        assert_eq!(reset.color.as_deref(), Some("#ffffff"));
+    }
+
+    #[test]
+    fn decoder_preview_cache_provenance_source_and_library_fences_are_atomic() {
+        let mut db = migrated_database();
+        let root = db
+            .add_root(NewRoot {
+                path: "D:/decoder-fixture".into(),
+                display_name: "Decoder".into(),
+            })
+            .unwrap();
+        let folder = db
+            .upsert_folder(FolderUpsert {
+                root_id: root,
+                parent_id: None,
+                name: String::new(),
+                path_hash: "decoder-root".into(),
+                mtime: None,
+            })
+            .unwrap();
+        let id = db
+            .upsert_file(FileUpsert {
+                root_id: root,
+                folder_id: folder,
+                name: "file.ppm".into(),
+                ext: "ppm".into(),
+                size: 12,
+                mtime: 1,
+                ctime: None,
+                file_key: None,
+            })
+            .unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        db.attach_decoder_context(
+            crate::plugins::decoder::DecoderManager::new(temporary.path().to_path_buf()),
+            cancel.clone(),
+        );
+        let fingerprint = db
+            .get_thumbnail_source(id)
+            .unwrap()
+            .unwrap()
+            .source_fingerprint("preview_3072");
+        let record = PreviewBlobRecord {
+            file_id: id,
+            profile: "preview_3072".into(),
+            data: vec![1, 2, 3],
+            width: 1,
+            height: 1,
+            byte_size: 3,
+            output_format: GENERATED_FORMAT.into(),
+            source_size: 12,
+            source_mtime: 1,
+            created_at: 1,
+            updated_at: 1,
+        };
+        db.publish_decoder_preview_blob(record.clone(), None, Some(("decoder-v1", &fingerprint)))
+            .unwrap();
+        assert!(db
+            .decoder_cache_matches(id, "preview_3072", &fingerprint, Some("decoder-v1"))
+            .unwrap());
+        assert!(!db
+            .decoder_cache_matches(id, "preview_3072", &fingerprint, Some("decoder-v2"))
+            .unwrap());
+        assert!(db.get_media(id).unwrap().unwrap().width.is_none());
+        db.connection
+            .execute("UPDATE files SET size=13 WHERE id=?1", [id])
+            .unwrap();
+        assert!(db
+            .publish_decoder_preview_blob(record.clone(), None, Some(("decoder-v2", &fingerprint)))
+            .is_err());
+        assert!(db
+            .decoder_cache_matches(id, "preview_3072", &fingerprint, Some("decoder-v1"))
+            .unwrap());
+        assert_eq!(
+            db.get_preview_blob(id, "preview_3072")
+                .unwrap()
+                .unwrap()
+                .data,
+            vec![1, 2, 3]
+        );
+        let changed = db
+            .get_thumbnail_source(id)
+            .unwrap()
+            .unwrap()
+            .source_fingerprint("preview_3072");
+        cancel.cancel();
+        assert!(db
+            .publish_decoder_preview_blob(record, None, Some(("decoder-v2", &changed)))
+            .is_err());
+        assert!(!db
+            .decoder_cache_matches(id, "preview_3072", &changed, Some("decoder-v2"))
+            .unwrap());
+    }
+
+    #[test]
+    fn all_file_browse_list_search_position_counts_and_generic_cache() {
+        let mut database = migrated_database();
+        let root = database
+            .add_root(NewRoot {
+                path: "D:/all-files-fixture".into(),
+                display_name: "Files".into(),
+            })
+            .unwrap();
+        let folder = database
+            .upsert_folder(FolderUpsert {
+                root_id: root,
+                parent_id: None,
+                name: String::new(),
+                path_hash: "all-root".into(),
+                mtime: None,
+            })
+            .unwrap();
+        let child = database
+            .upsert_folder(FolderUpsert {
+                root_id: root,
+                parent_id: Some(folder),
+                name: "child".into(),
+                path_hash: "all-child".into(),
+                mtime: None,
+            })
+            .unwrap();
+        let names = [".hidden", "README", "a.bin", "b.jpg", "c.mp4", "d.dat"];
+        let mut ids = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let folder_id = if index == 5 { child } else { folder };
+            let id = database
+                .upsert_file(FileUpsert {
+                    root_id: root,
+                    folder_id,
+                    name: (*name).into(),
+                    ext: crate::decode::formats::lowercase_extension(Path::new(name)),
+                    size: 0,
+                    mtime: index as i64,
+                    ctime: None,
+                    file_key: None,
+                })
+                .unwrap();
+            if let Some(kind) = crate::decode::formats::media_kind_for_extension(
+                &crate::decode::formats::lowercase_extension(Path::new(name)),
+            ) {
+                database.upsert_media_kind(id, kind).unwrap();
+            }
+            ids.push(id);
+        }
+        assert_eq!(database.get_root(root).unwrap().unwrap().file_count, 6);
+        assert_eq!(database.get_root(root).unwrap().unwrap().media_count, 2);
+        let children = database
+            .list_folder_children_page(folder, 10, None, false)
+            .unwrap();
+        assert_eq!(
+            (children.items[0].file_count, children.items[0].media_count),
+            (1, 0)
+        );
+        for sort in ["name_asc", "name_desc", "mtime_asc", "mtime_desc"] {
+            for (kind, count) in [
+                (None, 6),
+                (Some("image"), 1),
+                (Some("video"), 1),
+                (Some("other"), 4),
+            ] {
+                let query = MediaPageQuery {
+                    root_id: Some(root),
+                    folder_id: Some(folder),
+                    include_descendants: true,
+                    limit: 2,
+                    offset: None,
+                    cursor: None,
+                    sort: sort.into(),
+                    kind: kind.map(str::to_string),
+                };
+                let first = database.list_media_page(query.clone()).unwrap();
+                assert_eq!(first.total_count, Some(count));
+                let mut found = first.items;
+                let mut cursor = first.next_cursor;
+                while let Some(next) = cursor {
+                    let page = database
+                        .list_media_page(MediaPageQuery {
+                            cursor: Some(next),
+                            ..query.clone()
+                        })
+                        .unwrap();
+                    found.extend(page.items);
+                    cursor = page.next_cursor;
+                }
+                assert_eq!(found.len(), count as usize);
+                for (index, item) in found.iter().enumerate() {
+                    assert_eq!(
+                        database.media_position(item.id, &query).unwrap(),
+                        Some(index as i64)
+                    );
+                }
+            }
+        }
+        database.connection.execute("INSERT INTO user_metadata(file_id,rating,favorite,note,updated_at) VALUES (?1,5,1,'fixture searchable',1)", [ids[0]]).unwrap();
+        database
+            .connection
+            .execute("INSERT INTO tags(id,name) VALUES (1,'fixture-tag')", [])
+            .unwrap();
+        database
+            .connection
+            .execute(
+                "INSERT INTO file_tags(file_id,tag_id) VALUES (?1,1)",
+                [ids[0]],
+            )
+            .unwrap();
+        let tx = database.connection.unchecked_transaction().unwrap();
+        sync_media_fts_for_file_in_transaction(&tx, ids[0]).unwrap();
+        tx.commit().unwrap();
+        for q in [Some("fixture".into()), None] {
+            let page = database
+                .search_media_page(SearchQuery {
+                    q,
+                    root_id: Some(root),
+                    folder_id: Some(folder),
+                    include_descendants: true,
+                    kind: Some("other".into()),
+                    min_rating: Some(5),
+                    favorite: Some(true),
+                    tag_ids: vec![1],
+                    sort: "rating_desc".into(),
+                    limit: 10,
+                    offset: None,
+                    cursor: None,
+                })
+                .unwrap();
+            assert_eq!(page.total_count, Some(1));
+            assert_eq!(page.items[0].id, ids[0]);
+            assert_eq!(page.items[0].tag_ids, vec![1]);
+        }
+        let generic = ids[2];
+        assert_eq!(
+            database
+                .get_media(generic)
+                .unwrap()
+                .unwrap()
+                .presentation
+                .thumbnail,
+            "unavailable"
+        );
+        assert!(database
+            .get_thumbnail_source(generic)
+            .unwrap()
+            .unwrap()
+            .media_kind
+            .is_none());
+        let request = database
+            .request_thumbnail_task(generic, GRID_320_PROFILE, ThumbnailTaskPriority::Visible)
+            .unwrap();
+        assert_eq!(request.thumbnail.state, "unavailable");
+        assert!(request.task_id.is_none());
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE kind='thumbnail'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        // Generic plugin output lives under the original file identity. An
+        // unchanged presentation pass must preserve both state and bytes.
+        let fingerprint = database
+            .get_thumbnail_source(generic)
+            .unwrap()
+            .unwrap()
+            .source_fingerprint(GRID_320_PROFILE);
+        database.connection.execute("INSERT INTO thumbs(file_id,profile,state,source_fingerprint,width,height,byte_size,updated_at) VALUES (?1,'grid_320','ready',?2,320,320,4,1)",rusqlite::params![generic,fingerprint]).unwrap();
+        database
+            .upsert_thumb_blob(ThumbBlobRecord {
+                file_id: generic,
+                profile: GRID_320_PROFILE.into(),
+                data: vec![1, 2, 3, 4],
+                width: 320,
+                height: 320,
+                byte_size: 4,
+                output_format: GENERATED_FORMAT.into(),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        database.connection.execute(
+            "INSERT INTO decoder_presentations(file_id,profile,decoder_key,source_fingerprint) VALUES (?1,'grid_320','fixture-decoder',?2)",
+            rusqlite::params![generic, fingerprint],
+        ).unwrap();
+        let tx = database.connection.unchecked_transaction().unwrap();
+        set_media_presentation_in_transaction(&tx, generic, None, false).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            database
+                .get_thumbnail(generic, GRID_320_PROFILE)
+                .unwrap()
+                .unwrap()
+                .state,
+            "ready"
+        );
+        assert_eq!(
+            database
+                .get_thumb_blob(generic, GRID_320_PROFILE)
+                .unwrap()
+                .unwrap()
+                .data,
+            vec![1, 2, 3, 4]
+        );
+        assert!(database
+            .get_media(generic)
+            .unwrap()
+            .unwrap()
+            .width
+            .is_none());
+        let temporary = tempfile::tempdir().unwrap();
+        let manager = crate::plugins::decoder::DecoderManager::new(temporary.path().to_path_buf());
+        manager.close_plugin("com.example.unavailable", 1);
+        database.attach_decoder_context(manager, tokio_util::sync::CancellationToken::new());
+        let detail = database.get_media(generic).unwrap().unwrap();
+        assert_eq!(detail.presentation.generation, 1);
+        assert_eq!(detail.presentation.thumbnail, "available");
+        for q in [Some("a.bin".into()), None] {
+            let page = database
+                .search_media_page(SearchQuery {
+                    q,
+                    root_id: Some(root),
+                    folder_id: Some(folder),
+                    include_descendants: true,
+                    kind: Some("other".into()),
+                    min_rating: None,
+                    favorite: None,
+                    tag_ids: vec![],
+                    sort: "name_asc".into(),
+                    limit: 10,
+                    offset: None,
+                    cursor: None,
+                })
+                .unwrap();
+            let searched = page.items.iter().find(|item| item.id == generic).unwrap();
+            assert_eq!(
+                searched.presentation.generation,
+                detail.presentation.generation
+            );
+            assert_eq!(
+                searched.presentation.thumbnail,
+                detail.presentation.thumbnail
+            );
+            assert_eq!(searched.thumbnail_state, detail.thumbnail_state);
+        }
+    }
+
+    #[test]
+    fn all_file_fts_backfill_commits_bounded_cursor_and_resumes_after_reopen() {
+        let dir = unique_db_temp_dir("all-file-fts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("catalog.sqlite");
+        let database = Database::open(&path).unwrap();
+        database.apply_migrations().unwrap();
+        let root = database
+            .add_root(NewRoot {
+                path: "D:/fts-fixture".into(),
+                display_name: "Files".into(),
+            })
+            .unwrap();
+        let folder = database
+            .upsert_folder(FolderUpsert {
+                root_id: root,
+                parent_id: None,
+                name: String::new(),
+                path_hash: "fts-root".into(),
+                mtime: None,
+            })
+            .unwrap();
+        database.connection.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<350) INSERT INTO files(root_id,folder_id,name,ext,size,mtime) SELECT ?1,?2,'document-'||x,'.bin',0,x FROM n",(root,folder)).unwrap();
+        database.connection.execute("UPDATE file_browse_fts_progress SET after_file_id=0,through_file_id=350,completed=0",[]).unwrap();
+        assert!(!database.backfill_file_fts_batch(37).unwrap());
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT COUNT(*) FROM media_fts", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            37
+        );
+        drop(database);
+        let database = Database::open(&path).unwrap();
+        database.apply_migrations().unwrap();
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT after_file_id FROM file_browse_fts_progress",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            165
+        );
+        while !database.backfill_file_fts_batch(37).unwrap() {}
+        assert_eq!(
+            database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM media_fts WHERE media_fts MATCH 'document'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            350
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT completed FROM file_browse_fts_progress", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        drop(database);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn all_file_local_upgrade_scan_retries_and_preserves_identity_without_sync() {
+        let dir = unique_db_temp_dir("local-upgrade");
+        let root_path = dir.join("root");
+        std::fs::create_dir_all(&root_path).unwrap();
+        std::fs::write(root_path.join("photo.jpg"), b"image fixture").unwrap();
+        std::fs::write(root_path.join(".hidden"), b"generic fixture").unwrap();
+        std::fs::write(root_path.join("README"), b"").unwrap();
+        let path = dir.join("catalog.sqlite");
+        let mut database = Database::open(&path).unwrap();
+        database.apply_migrations().unwrap();
+        let root = database
+            .add_root(NewRoot {
+                path: root_path.to_string_lossy().into(),
+                display_name: "Local".into(),
+            })
+            .unwrap();
+        database.connection.execute("UPDATE roots SET file_collection_version=0,file_collection_scanned_version=0 WHERE id=?1",[root]).unwrap();
+        let legacy_root = database.get_root(root).unwrap().unwrap();
+        crate::scan::scan_root(&mut database, &legacy_root).unwrap();
+        let before: (i64, Vec<u8>) = database
+            .connection
+            .query_row("SELECT id,asset_uuid FROM files", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        database.connection.execute("INSERT INTO user_metadata(file_id,rating,favorite,note,updated_at) VALUES (?1,4,1,'preserved',1)",[before.0]).unwrap();
+        let old_task = database.create_root_scan_task(root).unwrap();
+        database
+            .connection
+            .execute(
+                "UPDATE tasks SET status='succeeded' WHERE id=?1",
+                [old_task],
+            )
+            .unwrap();
+        database
+            .connection
+            .execute(
+                "UPDATE roots SET file_collection_version=1 WHERE id=?1",
+                [root],
+            )
+            .unwrap();
+        assert!(database
+            .sync_root_binding_token_for_root_id(root)
+            .unwrap()
+            .is_none());
+        let upgrade = database.ensure_file_collection_upgrade_scans().unwrap();
+        assert_eq!(upgrade.len(), 1);
+        assert!(database
+            .ensure_file_collection_upgrade_scans()
+            .unwrap()
+            .is_empty());
+        database
+            .connection
+            .execute(
+                "UPDATE tasks SET status='cancelled' WHERE id=?1",
+                [upgrade[0]],
+            )
+            .unwrap();
+        drop(database);
+        let mut database = Database::open(&path).unwrap();
+        database.apply_migrations().unwrap();
+        assert_eq!(
+            database
+                .ensure_file_collection_upgrade_scans()
+                .unwrap()
+                .len(),
+            1
+        );
+        let current = database.get_root(root).unwrap().unwrap();
+        let summary = crate::scan::scan_root(&mut database, &current).unwrap();
+        assert_eq!((summary.files_seen, summary.media_files_seen), (3, 1));
+        assert!(database
+            .ensure_file_collection_upgrade_scans()
+            .unwrap()
+            .is_empty());
+        let after: (i64, Vec<u8>) = database
+            .connection
+            .query_row(
+                "SELECT id,asset_uuid FROM files WHERE name='photo.jpg'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(before, after);
+        let media = database.get_media(before.0).unwrap().unwrap();
+        assert_eq!(media.rating, Some(4));
+        assert!(media.favorite);
+        assert_eq!(media.note.as_deref(), Some("preserved"));
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT COUNT(*) FROM media_fts", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        let generic = database
+            .connection
+            .query_row("SELECT id FROM files WHERE name='README'", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
+        let fingerprint = database
+            .get_thumbnail_source(generic)
+            .unwrap()
+            .unwrap()
+            .source_fingerprint(GRID_320_PROFILE);
+        database.connection.execute("INSERT INTO thumbs(file_id,profile,state,source_fingerprint,width,height,byte_size,updated_at) VALUES (?1,'grid_320','ready',?2,320,320,4,1)",rusqlite::params![generic,fingerprint]).unwrap();
+        database
+            .upsert_thumb_blob(ThumbBlobRecord {
+                file_id: generic,
+                profile: GRID_320_PROFILE.into(),
+                data: vec![1, 2, 3, 4],
+                width: 320,
+                height: 320,
+                byte_size: 4,
+                output_format: GENERATED_FORMAT.into(),
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        database.connection.execute(
+            "INSERT INTO decoder_presentations(file_id,profile,decoder_key,source_fingerprint) VALUES (?1,'grid_320','fixture-decoder',?2)",
+            rusqlite::params![generic, fingerprint],
+        ).unwrap();
+        crate::scan::scan_root(&mut database, &current).unwrap();
+        assert_eq!(
+            database
+                .get_thumbnail(generic, GRID_320_PROFILE)
+                .unwrap()
+                .unwrap()
+                .state,
+            "ready"
+        );
+        assert_eq!(
+            database
+                .get_thumb_blob(generic, GRID_320_PROFILE)
+                .unwrap()
+                .unwrap()
+                .data,
+            vec![1, 2, 3, 4]
+        );
+        assert!(database
+            .get_media(generic)
+            .unwrap()
+            .unwrap()
+            .width
+            .is_none());
+        drop(database);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn external_scan_captures_initial_and_same_metadata_content_changes() {
         let mut database = migrated_database();
         let root_id = database
@@ -11371,11 +12690,13 @@ mod tests {
                     ctime: None,
                     file_key: Some("stable-file-id".to_string()),
                 },
-                media_kind: "image".to_string(),
+                media_kind: Some("image".to_string()),
                 external_identity: Some(ExternalFileIdentity {
+                    rename_candidates: Default::default(),
                     volume_identity: b"stable-volume".to_vec(),
                     file_identity: b"stable-file-id".to_vec(),
                     content_fingerprint: Some(fingerprint.to_vec()),
+                    source_stamp: None,
                     path: PathBuf::from("D:/Pictures/same-size.jpg"),
                 }),
             }],
@@ -11430,11 +12751,13 @@ mod tests {
                         ctime: None,
                         file_key: Some("relocated-file-id".to_string()),
                     },
-                    media_kind: "image".to_string(),
+                    media_kind: Some("image".to_string()),
                     external_identity: Some(ExternalFileIdentity {
+                        rename_candidates: Default::default(),
                         volume_identity: b"relocated-volume".to_vec(),
                         file_identity: b"relocated-file-id".to_vec(),
                         content_fingerprint: Some(vec![0xa1; 32]),
+                        source_stamp: None,
                         path: PathBuf::from("E:/Relocated/same-size.jpg"),
                     }),
                 }],
@@ -11564,7 +12887,7 @@ mod tests {
     fn file_database_configures_bounded_wal_settings() {
         let db_dir = unique_db_temp_dir("bounded-wal-settings");
         std::fs::create_dir_all(&db_dir).expect("create db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
         let database = Database::open(&db_path).expect("open database");
         database.apply_migrations().expect("apply migrations");
 
@@ -11626,7 +12949,7 @@ mod tests {
     fn file_database_can_truncate_oversized_wal_on_startup_maintenance() {
         let db_dir = unique_db_temp_dir("truncate-oversized-wal");
         std::fs::create_dir_all(&db_dir).expect("create db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
         let database = Database::open(&db_path).expect("open database");
         database.apply_migrations().expect("apply migrations");
         database
@@ -11819,7 +13142,7 @@ mod tests {
     fn legacy_thumbnail_cache_import_persists_blob_and_removes_file() {
         let db_dir = unique_db_temp_dir("legacy-cache-import");
         std::fs::create_dir_all(&db_dir).expect("create db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
         let database = Database::open(&db_path).expect("open database");
         database.apply_migrations().expect("apply migrations");
         let (root_id, folder_id) = seed_media_page_fixture(&database);
@@ -11902,7 +13225,7 @@ mod tests {
     fn legacy_thumbnail_cache_import_invalidates_ready_row_when_referenced_webp_is_undecodable() {
         let db_dir = unique_db_temp_dir("legacy-cache-corrupt");
         std::fs::create_dir_all(&db_dir).expect("create db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
         let database = Database::open(&db_path).expect("open database");
         database.apply_migrations().expect("apply migrations");
         let (root_id, folder_id) = seed_media_page_fixture(&database);
@@ -12014,7 +13337,7 @@ mod tests {
             .expect("system clock before unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "megle-db-test-{label}-{}-{suffix}",
+            "mangoo-db-test-{label}-{}-{suffix}",
             std::process::id()
         ))
     }
@@ -12550,6 +13873,53 @@ mod tests {
         assert_eq!(roots[0].path, "D:/Pictures");
         assert_eq!(roots[0].display_name, "Photos");
         assert!(roots[0].enabled);
+    }
+
+    #[test]
+    fn all_file_add_root_waits_before_reading_a_concurrent_writer_snapshot() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("catalog.sqlite");
+        let competing = Database::open(&path).unwrap();
+        competing.apply_migrations().unwrap();
+        let database = Database::open(&path).unwrap();
+        let transaction = Transaction::new_unchecked(
+            competing.connection_for_fsops(),
+            TransactionBehavior::Immediate,
+        )
+        .unwrap();
+        transaction.execute(
+            "INSERT INTO roots(path,display_name,enabled,created_at) VALUES ('D:/concurrent','Concurrent',1,1)", [],
+        ).unwrap();
+        let (started, ready) = std::sync::mpsc::channel();
+        let (finished, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            finished
+                .send(database.add_root(NewRoot {
+                    path: "D:/new-root".into(),
+                    display_name: "New root".into(),
+                }))
+                .unwrap();
+        });
+        ready.recv().unwrap();
+        // Deferred read->write fails under this overlap; Immediate waits for
+        // the reservation before taking its read snapshot.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(matches!(
+            result.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        transaction.commit().unwrap();
+        let added = result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            competing.get_root(added).unwrap().unwrap().display_name,
+            "New root"
+        );
+        assert_eq!(competing.list_roots().unwrap().len(), 2);
     }
 
     #[test]
@@ -14133,7 +15503,7 @@ mod tests {
                             ctime: None,
                             file_key: None,
                         },
-                        media_kind: "video".to_string(),
+                        media_kind: Some("video".to_string()),
                         external_identity: None,
                     },
                     ScanFileUpsert {
@@ -14147,7 +15517,7 @@ mod tests {
                             ctime: None,
                             file_key: None,
                         },
-                        media_kind: "image".to_string(),
+                        media_kind: Some("image".to_string()),
                         external_identity: None,
                     },
                 ],
@@ -14176,7 +15546,7 @@ mod tests {
                         ctime: None,
                         file_key: None,
                     },
-                    media_kind: "image".to_string(),
+                    media_kind: Some("image".to_string()),
                     external_identity: None,
                 }],
                 scan_generation: None,
@@ -14251,7 +15621,7 @@ mod tests {
                         ctime: None,
                         file_key: None,
                     },
-                    media_kind: "image".to_string(),
+                    media_kind: Some("image".to_string()),
                     external_identity: None,
                 }],
                 scan_generation: Some(first_generation),
@@ -14358,7 +15728,7 @@ mod tests {
                         ctime: None,
                         file_key: None,
                     },
-                    media_kind: "image".to_string(),
+                    media_kind: Some("image".to_string()),
                     external_identity: None,
                 }],
                 scan_generation: Some(seed_generation),
@@ -14484,7 +15854,7 @@ mod tests {
                         ctime: None,
                         file_key: None,
                     },
-                    media_kind: "image".to_string(),
+                    media_kind: Some("image".to_string()),
                     external_identity: None,
                 }],
                 scan_generation: None,
@@ -14650,6 +16020,7 @@ mod tests {
                     items_total: Some(100),
                     folders_seen: 4,
                     media_files_seen: 46,
+                    files_seen: 46,
                     skipped_files: 0,
                 },
             )
@@ -14706,6 +16077,7 @@ mod tests {
                         items_total: Some(PROGRESS_UPDATES),
                         folders_seen: index / 10,
                         media_files_seen: index + 1,
+                        files_seen: index + 1,
                         skipped_files: 0,
                     },
                     baseline.operation.updated_at + index + 1,
@@ -14763,6 +16135,7 @@ mod tests {
                     items_total: Some(1),
                     folders_seen: 0,
                     media_files_seen: 1,
+                    files_seen: 1,
                     skipped_files: 0,
                 },
                 completed_at,
@@ -14821,6 +16194,7 @@ mod tests {
                     items_total: Some(10_000),
                     folders_seen: 100,
                     media_files_seen: 10_000,
+                    files_seen: 10_000,
                     skipped_files: 0,
                 },
                 final_progress_at,
@@ -14878,6 +16252,7 @@ mod tests {
                     items_total: Some(10_000),
                     folders_seen: 100,
                     media_files_seen: 10_000,
+                    files_seen: 10_000,
                     skipped_files: 0,
                 },
                 final_progress_at,
@@ -14922,7 +16297,7 @@ mod tests {
                 .expect("system clock before unix epoch")
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "megle-notification-benchmark-{}-{suffix}",
+                "mangoo-notification-benchmark-{}-{suffix}",
                 std::process::id()
             ));
             std::fs::create_dir(&path).expect("create notification benchmark temp dir");
@@ -14949,7 +16324,7 @@ mod tests {
         const LIBRARY_COUNT: usize = 4;
         const THUMBNAIL_COMPLETIONS_PER_LIBRARY: i64 = 2_500;
         const THUMBNAIL_BLOB_BYTES: i64 = 4;
-        const PROBE_PREFIX: &str = "MEGLE_NOTIFICATION_BENCH_JSON:";
+        const PROBE_PREFIX: &str = "MANGOO_NOTIFICATION_BENCH_JSON:";
         let temp_dir = NotificationBenchmarkTempDir::new();
         let database =
             Database::open(&temp_dir.database_path("progress")).expect("open benchmark database");
@@ -14958,7 +16333,7 @@ mod tests {
             .expect("apply benchmark migrations");
         let root_id = database
             .add_root(NewRoot {
-                path: "D:/megle-notification-benchmark".to_string(),
+                path: "D:/mangoo-notification-benchmark".to_string(),
                 display_name: "Notification benchmark".to_string(),
             })
             .expect("add benchmark root");
@@ -15008,6 +16383,7 @@ mod tests {
                         items_total: Some(RAPID_PROGRESS_UPDATES),
                         folders_seen: index / 10,
                         media_files_seen: index + 1,
+                        files_seen: index + 1,
                         skipped_files: 0,
                     },
                     baseline_updated_at + index + 1,
@@ -15357,7 +16733,7 @@ mod tests {
     #[test]
     #[ignore = "invoked by tools/bench/notification-center-bench.mjs"]
     fn notification_center_benchmark_fault_probe() {
-        const PROBE_PREFIX: &str = "MEGLE_NOTIFICATION_BENCH_FAULT_JSON:";
+        const PROBE_PREFIX: &str = "MANGOO_NOTIFICATION_BENCH_FAULT_JSON:";
         let temp_dir = NotificationBenchmarkTempDir::new();
         let database_path = temp_dir.database_path("fault");
         let database = Database::open(&database_path).expect("open fault-probe database");
@@ -15366,7 +16742,7 @@ mod tests {
             .expect("apply fault-probe migrations");
         database
             .add_root(NewRoot {
-                path: "D:/megle-notification-fault-probe".to_string(),
+                path: "D:/mangoo-notification-fault-probe".to_string(),
                 display_name: "Notification fault probe".to_string(),
             })
             .expect("write fault-probe database");
@@ -15672,7 +17048,7 @@ mod tests {
     fn thumbnail_failure_snapshot_does_not_mix_count_and_details_across_a_writer_race() {
         let db_dir = unique_db_temp_dir("thumbnail-failure-snapshot-race");
         std::fs::create_dir_all(&db_dir).expect("create db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
         let reader = Database::open(&db_path).expect("open reader database");
         reader.apply_migrations().expect("migrate reader database");
         let (root_id, folder_id) = seed_thumbnail_cache_scope_fixture(&reader, "snapshot-race");
@@ -15737,7 +17113,7 @@ mod tests {
     fn thumbnail_failure_snapshot_does_not_mix_new_details_into_a_zero_count() {
         let db_dir = unique_db_temp_dir("thumbnail-failure-snapshot-new-failure-race");
         std::fs::create_dir_all(&db_dir).expect("create db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
         let reader = Database::open(&db_path).expect("open reader database");
         reader.apply_migrations().expect("migrate reader database");
         let (root_id, folder_id) =
@@ -18843,7 +20219,7 @@ mod tests {
     fn thumbnail_request_waits_for_concurrent_writer_instead_of_returning_locked() {
         let db_dir = unique_db_temp_dir("thumbnail-request-lock");
         std::fs::create_dir_all(&db_dir).expect("create temp db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
         let database = Database::open(&db_path).expect("open database");
         database.apply_migrations().expect("apply migrations");
         let (root_id, folder_id) = seed_media_page_fixture(&database);
@@ -18914,6 +20290,23 @@ mod tests {
     fn upsert_file_reuses_reliable_identity_across_path_changes_and_keeps_thumbnail() {
         let database = migrated_database();
         let (root_id, root_folder_id) = seed_media_page_fixture(&database);
+        let temporary =
+            std::env::temp_dir().join(format!("mangoo-browse-rename-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(temporary.join("source")).unwrap();
+        std::fs::create_dir_all(temporary.join("target")).unwrap();
+        database
+            .connection
+            .execute(
+                "UPDATE roots SET path=?1 WHERE id=?2",
+                rusqlite::params![temporary.to_string_lossy(), root_id],
+            )
+            .unwrap();
+        let source = temporary.join("source/before.jpg");
+        let target = temporary.join("target/after.jpg");
+        std::fs::write(&source, vec![0x41; 4096]).unwrap();
+        let volume = crate::library_path::local_file_identity(&temporary).unwrap();
+        let identity = crate::library_path::local_file_identity(&source).unwrap();
+        let fingerprint = crate::sync::identity::stable_content_fingerprint(&source).unwrap();
         let source_folder = database
             .upsert_folder(FolderUpsert {
                 root_id,
@@ -18933,16 +20326,23 @@ mod tests {
             })
             .expect("insert target folder");
         let file_id = database
-            .upsert_file(FileUpsert {
-                root_id,
-                folder_id: source_folder,
-                name: "before.jpg".to_string(),
-                ext: ".jpg".to_string(),
-                size: 4096,
-                mtime: 123,
-                ctime: None,
-                file_key: Some("stable-identity".to_string()),
-            })
+            .upsert_external_media_file(
+                FileUpsert {
+                    root_id,
+                    folder_id: source_folder,
+                    name: "before.jpg".to_string(),
+                    ext: ".jpg".to_string(),
+                    size: 4096,
+                    mtime: 123,
+                    ctime: None,
+                    file_key: Some(identity.clone()),
+                },
+                Some("image"),
+                volume.as_bytes(),
+                identity.as_bytes(),
+                Some(&fingerprint),
+                &source,
+            )
             .expect("insert source file");
         database
             .upsert_media_kind(file_id, "image")
@@ -18979,17 +20379,50 @@ mod tests {
             })
             .expect("seed thumb blob");
 
+        // An OS identity alone cannot establish a rename while both directory
+        // entries exist. Keep a live hard link, then physically move the source
+        // so the observation can prove which prior entry disappeared.
+        let link = temporary.join("source/link.jpg");
+        std::fs::hard_link(&source, &link).unwrap();
+        let linked = database
+            .upsert_external_media_file(
+                FileUpsert {
+                    root_id,
+                    folder_id: source_folder,
+                    name: "link.jpg".into(),
+                    ext: ".jpg".into(),
+                    size: 4096,
+                    mtime: 123,
+                    ctime: None,
+                    file_key: Some(identity.clone()),
+                },
+                Some("image"),
+                volume.as_bytes(),
+                identity.as_bytes(),
+                Some(&fingerprint),
+                &link,
+            )
+            .unwrap();
+        assert_ne!(linked, file_id);
+        std::fs::rename(&source, &target).unwrap();
         let reused_file_id = database
-            .upsert_file(FileUpsert {
-                root_id,
-                folder_id: target_folder,
-                name: "after.jpg".to_string(),
-                ext: ".jpg".to_string(),
-                size: 4096,
-                mtime: 123,
-                ctime: None,
-                file_key: Some("stable-identity".to_string()),
-            })
+            .upsert_external_media_file(
+                FileUpsert {
+                    root_id,
+                    folder_id: target_folder,
+                    name: "after.jpg".to_string(),
+                    ext: ".jpg".to_string(),
+                    size: 4096,
+                    mtime: 123,
+                    ctime: None,
+                    file_key: Some(identity.clone()),
+                },
+                Some("image"),
+                volume.as_bytes(),
+                identity.as_bytes(),
+                Some(&fingerprint),
+                &target,
+            )
             .expect("upsert moved file");
 
         assert_eq!(reused_file_id, file_id);
@@ -19017,6 +20450,11 @@ mod tests {
             )
             .expect("count old path rows");
         assert_eq!(old_path_rows, 0);
+        assert_eq!(
+            database.get_media(linked).unwrap().unwrap().name,
+            "link.jpg"
+        );
+        std::fs::remove_dir_all(temporary).unwrap();
     }
 
     #[test]
@@ -19155,7 +20593,7 @@ mod tests {
     {
         let db_dir = unique_db_temp_dir("thumbnail-attempt-lock");
         std::fs::create_dir_all(&db_dir).expect("create temp db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
         let database = Database::open(&db_path).expect("open database");
         database.apply_migrations().expect("apply migrations");
         let (root_id, folder_id) = seed_media_page_fixture(&database);
@@ -20470,6 +21908,7 @@ mod tests {
                     items_total: None,
                     folders_seen: 2,
                     media_files_seen: 3,
+                    files_seen: 3,
                     skipped_files: 1,
                 },
             )
@@ -20495,6 +21934,7 @@ mod tests {
                 items_total: None,
                 folders_seen: 2,
                 media_files_seen: 4,
+                files_seen: 4,
                 skipped_files: 1,
             },
         );
@@ -21952,37 +23392,20 @@ mod tests {
             })
             .expect("insert root folder");
 
-        let net_file_id = database
-            .upsert_file(FileUpsert {
-                root_id,
-                folder_id,
-                name: "net.jpg".to_string(),
-                ext: ".jpg".to_string(),
-                size: 100,
-                mtime: 100,
-                ctime: None,
-                file_key: None,
-            })
-            .expect("insert net file");
-        database
-            .upsert_media_kind(net_file_id, "image")
-            .expect("insert net media kind");
-
-        let fmt_file_id = database
-            .upsert_file(FileUpsert {
-                root_id,
-                folder_id,
-                name: "fmt.avif".to_string(),
-                ext: ".avif".to_string(),
-                size: 100,
-                mtime: 100,
-                ctime: None,
-                file_key: None,
-            })
-            .expect("insert fmt file");
-        database
-            .upsert_media_kind(fmt_file_id, "image")
-            .expect("insert fmt media kind");
+        // This fixture deliberately targets both pre-0018 and current schemas.
+        // Insert the historically available columns directly; current browse
+        // helpers require later classification indexes and columns.
+        let insert_file = |name: &str, ext: &str| {
+            database.connection.execute("INSERT INTO files(root_id,folder_id,name,ext,size,mtime,status) VALUES (?1,?2,?3,?4,100,100,'active')",rusqlite::params![root_id,folder_id,name,ext]).expect("insert historical file");
+            let id = database.connection.last_insert_rowid();
+            database
+                .connection
+                .execute("INSERT INTO media(file_id,kind) VALUES (?1,'image')", [id])
+                .expect("insert historical media");
+            id
+        };
+        let net_file_id = insert_file("net.jpg", ".jpg");
+        let fmt_file_id = insert_file("fmt.avif", ".avif");
 
         for (file_id, error) in [(net_file_id, net_error), (fmt_file_id, fmt_error)] {
             database

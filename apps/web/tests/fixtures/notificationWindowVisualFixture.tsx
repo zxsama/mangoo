@@ -1,4 +1,4 @@
-import { Activity, History, ScrollText, X } from "lucide-react";
+import { Activity, History, ScrollText, X } from "../../src/design/icons";
 import { StrictMode, useCallback, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type {
@@ -10,9 +10,10 @@ import type {
   DesktopProcessLogLine,
   NotificationWindowIntent,
   ThumbnailFailureDetail
-} from "@megle/notification-contract";
+} from "@mangoo/notification-contract";
 import { useOverlayScrollbars } from "../../src/app-shell/useOverlayScrollbars";
 import { LiquidGlassLayer, LiquidGlassSurface } from "../../src/design/liquid-glass";
+import { OverlayProvider } from "../../src/design/overlays";
 import { NotificationHistoryView } from "../../src/features/notifications/NotificationHistoryView";
 import { NotificationStatusView } from "../../src/features/notifications/NotificationStatusView";
 import { useNotificationTabOrientation } from "../../src/features/notifications/NotificationWindow";
@@ -488,4 +489,4 @@ function pageLogs(query: DesktopProcessLogFilter) {
 
 const root = document.getElementById("root");
 if (!root) throw new Error("notification window fixture root is missing");
-createRoot(root).render(<StrictMode><NotificationWindowVisualFixture /></StrictMode>);
+createRoot(root).render(<StrictMode><OverlayProvider><NotificationWindowVisualFixture /></OverlayProvider></StrictMode>);

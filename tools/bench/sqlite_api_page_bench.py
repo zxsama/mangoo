@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SQLite page API serialization benchmark for Megle Phase 0.
+SQLite page API serialization benchmark for Mangoo Phase 0.
 
 Measures query + row mapping + JSON serialization for paged media responses.
 This approximates the data path from Core Service to React virtual grid.

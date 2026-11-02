@@ -190,7 +190,7 @@ canvas, `<img>`, and `<video>` lanes all already carry. Two data attributes on
 the preview stage select the rule:
 
 - **Filter** → `image-rendering: auto | pixelated`.
-- **Channel** → `filter: url(#megle-channel-…)` referencing an inline SVG
+- **Channel** → `filter: url(#mangoo-channel-…)` referencing an inline SVG
   `feColorMatrix`. The matrices are static, defined once in a hidden `<svg>` in
   the app shell; switching swaps which `#id` is referenced.
 

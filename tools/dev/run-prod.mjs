@@ -1,11 +1,11 @@
-// Production one-click launcher for the Megle DESKTOP app.
+// Production one-click launcher for the Mangoo DESKTOP app.
 //
 // Behavior (what start-desktop-prod.bat runs):
 //   - Hash all build and packaging inputs. If the hash matches the last
 //     successful package AND every runtime artifact exists, launch immediately.
 //   - If anything changed (or an output is missing), build the production
 //     artifacts — web `vite build`, desktop `tsc`, Core `cargo build --release`
-//     — package a real Windows `Megle.exe`, then record the new hash.
+//     — package a real Windows `Mangoo.exe`, then record the new hash.
 //   - Launch the packaged executable and exit. The runtime contains no Node,
 //     npm, CMD, or Vite preview parent process.
 //
@@ -17,12 +17,16 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { assertSelectedInventory, parsePluginArgs, readInventory, validateArtifact } from "../build/plugin-artifacts.mjs";
 
 const root = path.resolve(import.meta.dirname, "..", "..");
 const dataDir = path.join(root, ".data");
-const hostDir = path.join(dataDir, "host");
+const hostDir = path.join(dataDir, "mangoo", "host");
 const hashFile = path.join(root, ".data", ".prod-build-hash");
-const packagedExecutable = path.join(root, ".data", "desktop-release", "win-unpacked", "Megle.exe");
+const packagedExecutable = path.join(root, ".data", "desktop-release", "win-unpacked", "Mangoo.exe");
+const { externalPlugins } = parsePluginArgs(process.argv.slice(2));
+const externalArtifacts = externalPlugins.map((artifact) => validateArtifact(artifact));
+const externalPluginArgs = externalPlugins.flatMap((artifact) => ["--external-plugin", artifact]);
 
 fs.mkdirSync(dataDir, { recursive: true });
 
@@ -31,7 +35,7 @@ if (process.platform !== "win32") {
 }
 
 function shouldUseShell(command) {
-  return process.platform === "win32" && !path.isAbsolute(command);
+  return process.platform === "win32" && ["npm", "npx"].includes(command);
 }
 
 function run(command, args, label) {
@@ -70,8 +74,6 @@ const HASH_INPUTS = [
   "crates/core/host_migrations",
   "crates/fake-provider/src",
   "crates/fake-provider/tests",
-  "crates/onedrive-provider/src",
-  "crates/onedrive-provider/tests",
   "bundled-plugins",
   "packages/core-client/src",
   "packages/notification-contract/src"
@@ -81,7 +83,6 @@ const HASH_FILES = [
   "Cargo.lock",
   "crates/core/Cargo.toml",
   "crates/fake-provider/Cargo.toml",
-  "crates/onedrive-provider/Cargo.toml",
   "tsconfig.base.json",
   "apps/web/index.html",
   "apps/web/tsconfig.json",
@@ -91,11 +92,14 @@ const HASH_FILES = [
   "apps/desktop/package.json",
   "packages/core-client/package.json",
   "packages/core-client/tsconfig.json",
+  "packages/core-client/tsconfig.build.json",
   "packages/notification-contract/package.json",
   "packages/notification-contract/tsconfig.json",
   "package.json",
   "package-lock.json",
   "tools/build/build-bundled-plugins.mjs",
+  "tools/build/plugin-artifacts.mjs",
+  "tools/dev/run-prod.mjs",
   "tools/build/package-desktop.mjs",
   "tools/build/generate-desktop-icon.mjs"
 ];
@@ -105,6 +109,9 @@ const HASH_EXCLUDED_FILES = new Set([
 
 function hashInputs() {
   const hash = crypto.createHash("sha256");
+  for (const artifact of externalArtifacts.toSorted((a, b) => a.row.id.localeCompare(b.row.id))) {
+    hash.update(JSON.stringify(artifact.row));
+  }
   const walk = (dir) => {
     if (!fs.existsSync(dir)) return;
     for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
@@ -132,24 +139,25 @@ function hashInputs() {
 const requiredOutputs = [
   path.join(root, "apps", "web", "dist", "index.html"),
   path.join(root, "apps", "desktop", "dist", "main.js"),
-  path.join(root, "target", "release", "megle-core.exe"),
-  path.join(root, "target", "release", "bundled-plugins", "com.megle.fake-sync", "plugin.json"),
-  path.join(root, "target", "release", "bundled-plugins", "com.megle.fake-sync", "bin", "megle-fake-provider.exe"),
-  path.join(root, "target", "release", "bundled-plugins", "com.megle.onedrive", "plugin.json"),
-  path.join(root, "target", "release", "bundled-plugins", "com.megle.onedrive", "bin", "megle-onedrive-provider.exe"),
+  path.join(root, "target", "release", "mangoo-core.exe"),
   packagedExecutable,
   path.join(root, ".data", "desktop-release", "win-unpacked", "resources", "app.asar"),
   path.join(root, ".data", "desktop-release", "win-unpacked", "resources", "icon.png"),
   path.join(root, ".data", "desktop-release", "win-unpacked", "resources", "web", "index.html"),
-  path.join(root, ".data", "desktop-release", "win-unpacked", "resources", "core", "megle-core.exe"),
-  path.join(root, ".data", "desktop-release", "win-unpacked", "resources", "core", "bundled-plugins", "com.megle.fake-sync", "plugin.json"),
-  path.join(root, ".data", "desktop-release", "win-unpacked", "resources", "core", "bundled-plugins", "com.megle.fake-sync", "bin", "megle-fake-provider.exe"),
-  path.join(root, ".data", "desktop-release", "win-unpacked", "resources", "core", "bundled-plugins", "com.megle.onedrive", "plugin.json"),
-  path.join(root, ".data", "desktop-release", "win-unpacked", "resources", "core", "bundled-plugins", "com.megle.onedrive", "bin", "megle-onedrive-provider.exe")
+  path.join(root, ".data", "desktop-release", "win-unpacked", "resources", "core", "mangoo-core.exe")
 ];
 
 function missingOutputs() {
-  return requiredOutputs.filter((output) => !fs.existsSync(output) || !fs.statSync(output).isFile());
+  const missing = requiredOutputs.filter((output) => !fs.existsSync(output) || !fs.statSync(output).isFile());
+  try {
+    const built = readInventory(path.join(root, "target", "release", "bundled-plugins"));
+    const packaged = readInventory(path.join(root, ".data", "desktop-release", "win-unpacked", "resources", "core", "bundled-plugins"));
+    assertSelectedInventory(built, externalArtifacts);
+    if (JSON.stringify(built) !== JSON.stringify(packaged)) throw new Error("packaged plugin inventory differs from release build");
+  } catch (error) {
+    missing.push(`plugin artifacts: ${error.message}`);
+  }
+  return missing;
 }
 
 function outputsExist() {
@@ -168,13 +176,11 @@ if (upToDate) {
   // Build order: Core (slowest, release) can run while we build the JS, but keep
   // it simple and sequential for clear output. Each tool skips its own unchanged
   // work internally, so a partial change is still fast.
-  // A local product-mode launch needs optimized artifacts. OneDrive application
-  // identity is self-managed at runtime, so release artifacts contain no Client ID.
-  run("node", ["tools/build/build-bundled-plugins.mjs", "--release-profile"], "build bundled Providers");
-  run(findCargoCommand(), ["build", "--release", "-p", "megle-core"], "build core (release)");
-  run("npm", ["--workspace", "@megle/web", "run", "build"], "build web");
-  run("npm", ["--workspace", "@megle/desktop", "run", "build"], "build desktop");
-  run("node", ["tools/build/generate-desktop-icon.mjs"], "generate desktop icon");
+  // The selected artifact hashes also participate in the warm-launch cache key.
+  run("node", ["tools/build/build-bundled-plugins.mjs", "--release-profile", ...externalPluginArgs], "build bundled Providers");
+  run(findCargoCommand(), ["build", "--release", "-p", "mangoo-core"], "build core (release)");
+  run("npm", ["--workspace", "@mangoo/web", "run", "build"], "build web");
+  run("npm", ["--workspace", "@mangoo/desktop", "run", "build"], "build desktop");
   run("node", ["tools/build/package-desktop.mjs"], "package desktop");
   const missing = missingOutputs();
   if (missing.length > 0) {
@@ -185,12 +191,15 @@ if (upToDate) {
 }
 
 console.log(`[prod] launching ${packagedExecutable}`);
-const desktop = spawn(packagedExecutable, [], {
+const desktopArgs = process.env.MANGOO_ELECTRON_USER_DATA_DIR
+  ? [`--user-data-dir=${path.resolve(process.env.MANGOO_ELECTRON_USER_DATA_DIR)}`]
+  : [];
+const desktop = spawn(packagedExecutable, desktopArgs, {
   cwd: path.dirname(packagedExecutable),
   env: {
     ...process.env,
-    MEGLE_HOST_DB_PATH: process.env.MEGLE_HOST_DB_PATH ?? path.join(hostDir, "host.sqlite"),
-    MEGLE_LIBRARIES_DIR: process.env.MEGLE_LIBRARIES_DIR ?? path.join(hostDir, "libraries")
+    MANGOO_HOST_DB_PATH: process.env.MANGOO_HOST_DB_PATH ?? path.join(hostDir, "host.sqlite"),
+    MANGOO_LIBRARIES_DIR: process.env.MANGOO_LIBRARIES_DIR ?? path.join(hostDir, "libraries")
   },
   detached: true,
   stdio: "ignore",
@@ -202,4 +211,4 @@ await new Promise((resolve, reject) => {
   desktop.once("error", reject);
 });
 desktop.unref();
-console.log("[prod] Megle started; build launcher exiting.");
+console.log("[prod] Mangoo started; build launcher exiting.");

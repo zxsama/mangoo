@@ -16,11 +16,11 @@ function parseArgs(argv) {
 const options = parseArgs(process.argv.slice(2));
 const runDirectory = await createRunDirectory("integration", options.output);
 const targetRoot = process.env.CARGO_TARGET_DIR ? path.resolve(root, process.env.CARGO_TARGET_DIR) : path.join(root, "target");
-const cargoEnvironment = { MEGLE_SYNC_BUNDLED_PLUGINS_DIR: path.join(targetRoot, "debug", "bundled-plugins") };
+const cargoEnvironment = { MANGOO_SYNC_BUNDLED_PLUGINS_DIR: path.join(targetRoot, "debug", "bundled-plugins") };
 const cargo = async (name, filter, extra = [], env = {}) => runCommand({
   name,
   command: "cargo",
-  args: ["test", "-p", "megle-core", filter, "--", ...extra, "--nocapture"],
+  args: ["test", "-p", "mangoo-core", filter, "--", ...extra, "--nocapture"],
   env: { ...cargoEnvironment, ...env },
   runDirectory,
   timeoutMs: 30 * 60 * 1000,
@@ -45,7 +45,7 @@ rows.push(await cargo(
   "real-provider-two-device-third-restore",
   "library_manager::tests::real_provider_two_device_and_third_device_restore",
   ["--ignored"],
-  { MEGLE_SYNC_BUNDLED_PLUGINS_DIR: path.join(targetRoot, "debug", "bundled-plugins") },
+  { MANGOO_SYNC_BUNDLED_PLUGINS_DIR: path.join(targetRoot, "debug", "bundled-plugins") },
 ));
 rows.push(await cargo("two-device-conflict-matrix", "sync::test_model::reducer_converges_for_permutations_and_duplicates"));
 rows.push(await cargo("two-device-delete-restore", "sync::test_model::restore_only_observed_delete_tokens"));

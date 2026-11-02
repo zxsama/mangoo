@@ -7,9 +7,7 @@ use axum::{Json, Router};
 use axum_extra::extract::Query as ExtraQuery;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::Path as FilePath;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -17,7 +15,8 @@ use std::time::{Duration, Instant};
 use crate::api::AppState;
 use crate::db::notification_outbox::NotificationOutboxEvent;
 use crate::db::{
-    Database, FolderRecord, MarkRootForPurge, MediaPageQuery, MediaRecord, NewRoot,
+    Database, DirectorySortMutationResult, DirectorySortRule, DirectorySortState, DirectoryTarget,
+    FolderChildrenPage, FolderRecord, MarkRootForPurge, MediaPageQuery, MediaRecord, NewRoot,
     NotificationOrigin, PreviewBlobRecord, PreviewFailureRecord, RootRecord, SearchQuery, TagError,
     TagRecord, TaskRecord, ThumbBlobRecord, ThumbnailCacheClearResult, ThumbnailCacheEnqueueResult,
     ThumbnailCacheRefreshMode, ThumbnailCacheScope, ThumbnailCacheSnapshot, ThumbnailCacheStats,
@@ -94,6 +93,8 @@ pub const PHASE1_API_PATHS: &[&str] = &[
     "/api/libraries",
     "/api/libraries/active",
     "/api/libraries/preflight",
+    "/api/libraries/open",
+    "/api/libraries/{libraryUuid}/registration",
     "/api/libraries/{libraryUuid}/activate",
     "/api/libraries/{libraryUuid}",
     "/api/libraries/{libraryUuid}/local-copy",
@@ -150,7 +151,11 @@ pub const PHASE1_API_PATHS: &[&str] = &[
     "/api/libraries/{libraryUuid}/sync/diagnostics",
     "/api/libraries/{libraryUuid}/sync/diagnostics/export",
     "/api/roots",
+    "/api/roots/{rootId}/appearance",
+    "/api/roots/{rootId}/sort",
+    "/api/folders/{folderId}/sort",
     "/api/roots/{rootId}",
+    "/api/folders/{folderId}/appearance",
     "/api/folders/{folderId}/children",
     "/api/folders/{folderId}/ancestors",
     "/api/media",
@@ -163,6 +168,10 @@ pub const PHASE1_API_PATHS: &[&str] = &[
     "/api/thumbnails/cache/clear",
     "/api/thumbnails/cache/cancel-bulk",
     "/api/media/{fileId}/preview",
+    "/api/media/{fileId}/playback-sessions",
+    "/api/playback-sessions/{sessionId}",
+    "/api/playback-sessions/{sessionId}/renew",
+    "/api/playback/{capability}",
     "/api/media/{fileId}/metadata",
     "/api/media/{fileId}/tags",
     "/api/media/{fileId}/tags/{tagId}",
@@ -185,6 +194,7 @@ pub const PHASE1_API_PATHS: &[&str] = &[
     "/api/plugins",
     "/api/plugins/discover",
     "/api/plugins/{pluginId}",
+    "/api/plugins/{pluginId}/views/{viewId}",
     "/api/plugins/{pluginId}/enable",
     "/api/plugins/{pluginId}/disable",
     "/api/plugins/{pluginId}/grants",
@@ -195,8 +205,9 @@ pub const PHASE1_API_PATHS: &[&str] = &[
     "/api/plugins/{pluginId}/auth/complete",
     "/api/plugins/{pluginId}/auth/cancel",
     "/api/plugins/{pluginId}/auth/sign-out",
-    "/api/plugins/com.megle.onedrive/configuration",
-    "/api/plugins/com.megle.onedrive/configuration/plan",
+    "/api/plugins/{pluginId}/external-link",
+    "/api/plugins/{pluginId}/configuration",
+    "/api/plugins/{pluginId}/configuration/plan",
     "/api/plugins/{pluginId}/health",
     "/api/plugins/{pluginId}/diagnostics",
     "/api/plugin-auth/callback/{flowId}",
@@ -276,13 +287,13 @@ struct PluginAuthCancelRequest {
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct OneDriveConfigurationPlanRequest {
-    client_id: Option<String>,
+struct PluginConfigurationPlanRequest {
+    values: std::collections::BTreeMap<String, Option<String>>,
     expected_revision: u64,
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct OneDriveConfigurationCommitRequest {
+struct PluginConfigurationCommitRequest {
     plan_uuid: String,
     expected_revision: u64,
     confirmed: bool,
@@ -693,7 +704,7 @@ struct ThumbnailResponse {
     updated_at: Option<i64>,
 }
 
-struct CoreError {
+pub(super) struct CoreError {
     status: StatusCode,
     message: String,
     code: Option<String>,
@@ -730,6 +741,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/libraries", get(list_libraries).post(create_library))
         .route("/api/libraries/active", get(get_active_library))
         .route("/api/libraries/preflight", post(preflight_library))
+        .route("/api/libraries/open", post(open_library))
+        .route("/api/libraries/:library_uuid/registration", axum::routing::delete(forget_library))
         .route(
             "/api/libraries/:library_uuid/activate",
             post(activate_library),
@@ -934,6 +947,13 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/roots", get(list_roots).post(add_root))
         .route("/api/roots/:root_id", axum::routing::delete(remove_root))
+        .route("/api/roots/:root_id/appearance", axum::routing::patch(update_root_appearance))
+        .route("/api/roots/:root_id/sort", get(get_root_sort).patch(update_root_sort).delete(reset_root_sort))
+        .route("/api/folders/:folder_id/sort", get(get_folder_sort).patch(update_folder_sort).delete(reset_folder_sort))
+        .route(
+            "/api/folders/:folder_id/appearance",
+            axum::routing::patch(update_folder_appearance),
+        )
         .route(
             "/api/folders/:folder_id/children",
             get(list_folder_children),
@@ -1008,6 +1028,7 @@ pub fn router(state: AppState) -> Router {
             get(get_plugin).delete(delete_plugin),
         )
         .route("/api/plugins/:plugin_id/enable", post(enable_plugin))
+        .route("/api/plugins/:plugin_id/views/:view_id", get(get_plugin_view_document))
         .route("/api/plugins/:plugin_id/disable", post(disable_plugin))
         .route("/api/plugins/:plugin_id/grants", put(update_plugin_grants))
         .route("/api/plugins/:plugin_id/retry", post(retry_plugin_runtime))
@@ -1035,13 +1056,14 @@ pub fn router(state: AppState) -> Router {
             "/api/plugins/:plugin_id/auth/sign-out",
             post(sign_out_plugin),
         )
+        .route("/api/plugins/:plugin_id/external-link", post(resolve_plugin_external_link))
         .route(
-            "/api/plugins/com.megle.onedrive/configuration",
-            get(get_onedrive_configuration).put(commit_onedrive_configuration),
+            "/api/plugins/:plugin_id/configuration",
+            get(get_plugin_configuration).put(commit_plugin_configuration),
         )
         .route(
-            "/api/plugins/com.megle.onedrive/configuration/plan",
-            post(plan_onedrive_configuration),
+            "/api/plugins/:plugin_id/configuration/plan",
+            post(plan_plugin_configuration),
         )
         .route("/api/plugins/:plugin_id/health", get(plugin_health))
         .route(
@@ -1059,7 +1081,8 @@ pub fn router(state: AppState) -> Router {
 #[serde(rename_all = "camelCase")]
 struct LibraryPreflightRequest {
     name: String,
-    managed_root: String,
+    database_path: String,
+    content_roots: Vec<crate::library_path::LibraryContentRootInput>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1067,7 +1090,10 @@ struct LibraryPreflightRequest {
 struct LibraryPreflightResponse {
     ok: bool,
     reason: String,
-    normalized_root: String,
+    path_role: Option<&'static str>,
+    root_index: Option<usize>,
+    normalized_database_path: Option<String>,
+    normalized_content_roots: Option<Vec<crate::library_path::LibraryContentRootInput>>,
     preflight_token: Option<String>,
     available_bytes: Option<u64>,
 }
@@ -1076,12 +1102,19 @@ struct LibraryPreflightResponse {
 #[serde(rename_all = "camelCase")]
 struct CreateLibraryRequest {
     name: String,
-    managed_root: String,
+    database_path: String,
+    content_roots: Vec<crate::library_path::LibraryContentRootInput>,
     icon: Option<String>,
     color: Option<String>,
     initial_mode: String,
     preflight_token: Option<String>,
     activate: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OpenLibraryRequest {
+    database_path: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1092,7 +1125,7 @@ struct LibrarySummaryResponse {
     name: String,
     icon: Option<String>,
     color: Option<String>,
-    managed_root: String,
+    database_path: String,
     active: bool,
     availability: String,
     lifecycle_state: String,
@@ -1222,7 +1255,7 @@ struct RestoreLegacyItem {
     account_uuid: String,
     library_uuid: String,
     name: String,
-    managed_root: String,
+    placement_base: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1276,6 +1309,57 @@ fn restore_item_identity(item: &RestoreStartItem) -> (&str, &str) {
         RestoreStartItem::Legacy(item) => (&item.account_uuid, &item.library_uuid),
         RestoreStartItem::RootAware(item) => (&item.account_uuid, &item.library_uuid),
     }
+}
+
+/// Reuse the actual endpoint DTOs when extracting sandbox target identities.
+/// The request body is retained for the normal handler's complete validation.
+pub(super) fn plugin_ui_body_targets(
+    route: &str,
+    bytes: &[u8],
+) -> Result<super::plugin_ui_admission::BodyTargets, serde_json::Error> {
+    use super::plugin_ui_admission::BodyTargets;
+    let mut targets = BodyTargets::default();
+    match route {
+        "/api/libraries/:library_uuid/sync/preflight" => {
+            let body: SyncPreflightRequest = serde_json::from_slice(bytes)?;
+            targets.plugin_id = Some(body.provider_id);
+            targets.account_uuid = Some(body.account_uuid);
+        }
+        "/api/libraries/:library_uuid/sync/enable" => {
+            let body: SyncEnableRequest = serde_json::from_slice(bytes)?;
+            targets.plugin_id = Some(body.provider_id);
+            targets.account_uuid = Some(body.account_uuid);
+            targets.plan = Some(("enable", body.preflight_token));
+        }
+        "/api/libraries/:library_uuid/sync/reconnect-preflight" => {
+            let body: ReconnectPreflightRequest = serde_json::from_slice(bytes)?;
+            targets.account_uuid = Some(body.account_uuid);
+        }
+        "/api/libraries/:library_uuid/sync/reconnect-commit" => {
+            let body: ReconnectCommitRequest = serde_json::from_slice(bytes)?;
+            targets.plan = Some(("reconnect", body.plan_uuid));
+        }
+        "/api/libraries/:library_uuid/sync/unbind-commit" => {
+            let body: UnbindCommitRequest = serde_json::from_slice(bytes)?;
+            targets.plan = Some(("unbind", body.plan_uuid));
+        }
+        "/api/sync/restores/preflight" | "/api/sync/restores" => {
+            let items = if route.ends_with("/preflight") {
+                serde_json::from_slice::<RestorePreflightRequest>(bytes)?.items
+            } else {
+                serde_json::from_slice::<RestoreStartRequest>(bytes)?.items
+            };
+            targets.restore_items = items
+                .iter()
+                .map(|item| {
+                    let (account, library) = restore_item_identity(item);
+                    (account.to_owned(), library.to_owned())
+                })
+                .collect();
+        }
+        _ => (),
+    }
+    Ok(targets)
 }
 
 #[derive(Debug, Serialize)]
@@ -1567,7 +1651,7 @@ struct SyncFolderConflictResolutionMutation {
 
 fn require_context_revision(headers: &HeaderMap) -> ApiResult<u64> {
     headers
-        .get("x-megle-context-revision")
+        .get("x-mangoo-context-revision")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
         .ok_or_else(|| {
@@ -2239,6 +2323,7 @@ async fn sync_folder_contract_write(
         .sync_folder_settings(&library_uuid)
         .map_err(sync_folder_error)?;
     if uri.path().ends_with("/enrollment/preflight") {
+        let _admission = manager.path_admission().await;
         let request: SyncFolderPathPreflightMutation = deserialize_sync_folder_body(&body)?;
         let (mode_name, mode) = preflight_mode_name(&request.mode);
         if mode != crate::sync_folders::RootPathMode::EnrollExisting {
@@ -2326,6 +2411,9 @@ async fn sync_folder_contract_write(
             })
             .map(|value| std::path::PathBuf::from(&value.local_path))
             .collect::<Vec<_>>();
+        manager
+            .admit_content_path(FilePath::new(&request.path), true)
+            .map_err(sync_folder_error)?;
         let validated = crate::sync_folders::validate_root_path(
             FilePath::new(&request.path),
             if matching_binding.is_some() || recovery_marker.is_some() {
@@ -2518,6 +2606,10 @@ async fn sync_folder_contract_write(
         return Ok(Json(result).into_response());
     }
     if uri.path().ends_with("/enrollment/commit") {
+        let _admission = manager.path_admission().await;
+        manager
+            .ensure_context_revision(require_context_revision(&headers)?)
+            .map_err(map_library_error)?;
         let submitted_request: SyncFolderEnrollmentMutation = deserialize_sync_folder_body(&body)?;
         let submitted_preflight_token = submitted_request.preflight_token.clone();
         let exact_operation = manager
@@ -2753,6 +2845,9 @@ async fn sync_folder_contract_write(
                 || existing_identity
                     .as_ref()
                     .is_some_and(|(existing_root_uuid, _)| *existing_root_uuid == root_uuid));
+        manager
+            .admit_content_path(FilePath::new(&request.path), true)
+            .map_err(sync_folder_error)?;
         let current = crate::sync_folders::validate_root_path(
             FilePath::new(&request.path),
             if matching_binding.is_some() || recovering_published_marker {
@@ -2979,6 +3074,7 @@ async fn sync_folder_contract_write(
         return Ok((StatusCode::ACCEPTED, Json(root_operation_json(&completed))).into_response());
     }
     if uri.path().ends_with("/selection/preflight") {
+        let _admission = manager.path_admission().await;
         let request: SyncFolderSelectionPreflightMutation = deserialize_sync_folder_body(&body)?;
         let token = request.items[0].operation_uuid.clone();
         let request_hash = crate::sync_folders::request_hash(&body).map_err(sync_folder_error)?;
@@ -3057,6 +3153,9 @@ async fn sync_folder_contract_write(
             {
                 return Err(sync_folder_error(anyhow::anyhow!("comparison-required")));
             }
+            manager
+                .admit_content_path(FilePath::new(&item.path), true)
+                .map_err(sync_folder_error)?;
             let validated = crate::sync_folders::validate_root_path(
                 FilePath::new(&item.path),
                 crate::sync_folders::RootPathMode::MaterializeRemote,
@@ -3104,6 +3203,10 @@ async fn sync_folder_contract_write(
         return Ok(Json(result).into_response());
     }
     if uri.path().ends_with("/selection/commit") {
+        let _admission = manager.path_admission().await;
+        manager
+            .ensure_context_revision(require_context_revision(&headers)?)
+            .map_err(map_library_error)?;
         let request: SyncFolderSelectionCommitMutation = deserialize_sync_folder_body(&body)?;
         let (_root, mode, _hash, planned, plan_result, expires_at, _) = manager
             .registry()
@@ -3261,6 +3364,9 @@ async fn sync_folder_contract_write(
                 .ok_or_else(|| sync_folder_error(anyhow::anyhow!("stale-plan")))?
                 .parse::<uuid::Uuid>()
                 .map_err(|error| sync_folder_error(error.into()))?;
+            manager
+                .admit_content_path(FilePath::new(&item.path), true)
+                .map_err(sync_folder_error)?;
             let current = crate::sync_folders::validate_root_path(
                 FilePath::new(&item.path),
                 crate::sync_folders::RootPathMode::MaterializeRemote,
@@ -3704,7 +3810,11 @@ async fn sync_folder_contract_root_write(
         return Ok((StatusCode::ACCEPTED, Json(root_operation_json(&operation))).into_response());
     }
     if uri.path().ends_with("/relocations/preflight") {
+        let _admission = manager.path_admission().await;
         let request: SyncFolderRelocationPreflightMutation = deserialize_sync_folder_body(&body)?;
+        manager
+            .admit_content_path(FilePath::new(&request.target_path), true)
+            .map_err(sync_folder_error)?;
         let binding = manager
             .registry()
             .local_root_binding(&library_uuid, &root_uuid)
@@ -3812,7 +3922,14 @@ async fn sync_folder_contract_root_write(
         return Ok(Json(result).into_response());
     }
     if uri.path().ends_with("/relocations") {
+        let admission = manager.path_admission().await;
+        manager
+            .ensure_context_revision(require_context_revision(&headers)?)
+            .map_err(map_library_error)?;
         let request: SyncFolderRelocationCommitMutation = deserialize_sync_folder_body(&body)?;
+        manager
+            .admit_content_path(FilePath::new(&request.target_path), true)
+            .map_err(sync_folder_error)?;
         let (stored_root, stored_mode, _, stored_request, result, expires_at, _) = manager
             .registry()
             .root_path_preflight(&request.preflight_token, &library_uuid)
@@ -3948,6 +4065,7 @@ async fn sync_folder_contract_root_write(
                 .consume_root_path_preflight(&request.preflight_token, &library_uuid)
                 .map_err(sync_folder_error)?;
         }
+        drop(admission);
         let operation = manager
             .execute_root_relocation(&relocation.operation.operation_uuid, marker)
             .await
@@ -4063,6 +4181,7 @@ async fn sync_folder_contract_root_write(
         return Ok((StatusCode::ACCEPTED, Json(root_operation_json(&operation))).into_response());
     }
     if uri.path().ends_with("/rebind/preflight") {
+        let _admission = manager.path_admission().await;
         let request: SyncFolderRebindPreflightMutation = deserialize_sync_folder_body(&body)?;
         let existing_binding = manager
             .registry()
@@ -4098,6 +4217,9 @@ async fn sync_folder_contract_root_write(
             .filter(|binding| binding.root_uuid != root_uuid)
             .map(|binding| std::path::PathBuf::from(binding.local_path))
             .collect::<Vec<_>>();
+        manager
+            .admit_content_path(FilePath::new(&request.path), true)
+            .map_err(sync_folder_error)?;
         let validated = crate::sync_folders::validate_root_path(
             FilePath::new(&request.path),
             crate::sync_folders::RootPathMode::RebindExisting,
@@ -4171,6 +4293,10 @@ async fn sync_folder_contract_root_write(
         return Ok(Json(plan).into_response());
     }
     if uri.path().ends_with("/rebind/commit") {
+        let _admission = manager.path_admission().await;
+        manager
+            .ensure_context_revision(require_context_revision(&headers)?)
+            .map_err(map_library_error)?;
         let request: SyncFolderRebindCommitMutation = deserialize_sync_folder_body(&body)?;
         if let Some(operation) = manager
             .registry()
@@ -4210,6 +4336,9 @@ async fn sync_folder_contract_root_write(
                 .ok_or_else(|| sync_folder_error(anyhow::anyhow!("stale-plan")))?,
         )
         .map_err(|error| sync_folder_error(error.into()))?;
+        manager
+            .admit_content_path(FilePath::new(&evidence.normalized_path), false)
+            .map_err(sync_folder_error)?;
         let marker =
             crate::sync_folders::read_root_marker(FilePath::new(&evidence.normalized_path))
                 .map_err(sync_folder_error)?;
@@ -4997,7 +5126,7 @@ fn library_summary(
         name: descriptor.name,
         icon: descriptor.icon,
         color: descriptor.color,
-        managed_root: descriptor.managed_root.to_string_lossy().into_owned(),
+        database_path: descriptor.managed_root.to_string_lossy().into_owned(),
         availability: descriptor.availability,
         lifecycle_state: descriptor.lifecycle_state,
         binding_state: descriptor.binding_state,
@@ -5008,7 +5137,7 @@ fn library_summary(
 async fn list_libraries(State(state): State<AppState>) -> ApiResult<Json<LibraryListResponse>> {
     let manager = library_manager(&state)?;
     let _gate = state.request_gate().read_owned().await;
-    let snapshot = manager.registry().snapshot()?;
+    let snapshot = manager.registry().listed_snapshot()?;
     let active_snapshot = manager.active_snapshot();
     let active = active_snapshot.library_uuid.clone();
     Ok(Json(LibraryListResponse {
@@ -5056,12 +5185,22 @@ async fn preflight_library(
     State(state): State<AppState>,
     Json(request): Json<LibraryPreflightRequest>,
 ) -> ApiResult<Json<LibraryPreflightResponse>> {
-    let result =
-        library_manager(&state)?.preflight(&request.name, FilePath::new(&request.managed_root))?;
+    let manager = library_manager(&state)?;
+    let _admission = manager.path_admission().await;
+    let result = manager.preflight_plan(
+        &request.name,
+        FilePath::new(&request.database_path),
+        &request.content_roots,
+    )?;
     Ok(Json(LibraryPreflightResponse {
         ok: result.ok,
         reason: result.reason.as_str().to_string(),
-        normalized_root: result.normalized_root.to_string_lossy().into_owned(),
+        path_role: result.path_role,
+        root_index: result.root_index,
+        normalized_database_path: result
+            .normalized_database_path
+            .map(|path| path.to_string_lossy().into_owned()),
+        normalized_content_roots: result.normalized_content_roots,
         preflight_token: result.token,
         available_bytes: result.available_bytes,
     }))
@@ -5078,11 +5217,12 @@ async fn create_library(
     }
     let manager = library_manager(&state)?;
     let (descriptor, activated, activation_error) = manager
-        .create_library(
+        .create_library_with_content(
             request.name,
             request.icon,
             request.color,
-            std::path::PathBuf::from(request.managed_root),
+            std::path::PathBuf::from(request.database_path),
+            request.content_roots,
             request.preflight_token,
             request.activate.unwrap_or(true),
         )
@@ -5103,17 +5243,72 @@ async fn create_library(
     ))
 }
 
+async fn open_library(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<OpenLibraryRequest>,
+) -> ApiResult<Json<CreateLibraryResponse>> {
+    let expected_revision = require_context_revision(&headers)?;
+    let manager = library_manager(&state)?;
+    // Keep the owned operation alive if its requesting window closes, including
+    // the blocking registration turn and runtime shutdown/publication.
+    let owner = Arc::clone(&manager);
+    let (descriptor, activated, activation_error) = tokio::spawn(async move {
+        owner
+            .open_library_with_revision(request.database_path.into(), expected_revision)
+            .await
+    })
+    .await
+    .map_err(|error| CoreError::internal(error.to_string()))?
+    .map_err(map_library_error)?;
+    let _gate = state.request_gate().read_owned().await;
+    let snapshot = manager.active_snapshot();
+    Ok(Json(CreateLibraryResponse {
+        library: library_summary(
+            descriptor,
+            snapshot.library_uuid.as_deref(),
+            snapshot.context_revision,
+        ),
+        activated,
+        activation_error,
+    }))
+}
+
+async fn forget_library(
+    State(state): State<AppState>,
+    Path(library_uuid): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ActiveLibraryResponse>> {
+    let expected_revision = require_context_revision(&headers)?;
+    let owner = library_manager(&state)?;
+    tokio::spawn(async move {
+        owner
+            .forget_library_with_revision(&library_uuid, expected_revision)
+            .await
+    })
+    .await
+    .map_err(|error| CoreError::internal(error.to_string()))?
+    .map_err(map_library_error)?;
+    get_active_library(State(state)).await
+}
+
 async fn activate_library(
     State(state): State<AppState>,
     Path(library_uuid): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<ActiveLibraryResponse>> {
     let expected_revision = require_context_revision(&headers)?;
-    let manager = library_manager(&state)?;
-    manager
-        .activate_with_revision(&library_uuid, expected_revision)
-        .await
-        .map_err(map_library_error)?;
+    let owner = library_manager(&state)?;
+    // Runtime retirement owns background joins. Keep the accepted operation
+    // alive when the requester disconnects, just as open and forget do.
+    tokio::spawn(async move {
+        owner
+            .activate_with_revision(&library_uuid, expected_revision)
+            .await
+    })
+    .await
+    .map_err(|error| CoreError::internal(error.to_string()))?
+    .map_err(map_library_error)?;
     get_active_library(State(state)).await
 }
 
@@ -5423,13 +5618,16 @@ async fn run_sync_command(
 ) -> ApiResult<Json<crate::host_registry::SyncOperation>> {
     let expected = require_context_revision(&headers)?;
     let manager = library_manager(&state)?;
-    let (operation, inserted) = manager.registry().begin_sync_operation_once(
-        &request.operation_uuid,
-        Some(&library_uuid),
-        action,
-        "active",
-        &serde_json::json!({}),
-    )?;
+    let (operation, inserted) = manager
+        .registry()
+        .begin_sync_operation_once(
+            &request.operation_uuid,
+            Some(&library_uuid),
+            action,
+            "active",
+            &serde_json::json!({}),
+        )
+        .map_err(map_library_error)?;
     if !inserted {
         return Ok(Json(operation));
     }
@@ -5700,6 +5898,34 @@ fn volume_key(path: &std::path::Path) -> String {
         .unwrap_or_else(|| text.to_lowercase())
 }
 
+fn validate_restore_batch_paths(
+    databases: &[std::path::PathBuf],
+    content: &[std::path::PathBuf],
+) -> Result<(), &'static str> {
+    if databases.iter().any(|database| {
+        content
+            .iter()
+            .any(|root| crate::library_path::paths_overlap(database, root))
+    }) {
+        return Err("database-content-overlap");
+    }
+    if databases.iter().enumerate().any(|(index, path)| {
+        databases[..index]
+            .iter()
+            .any(|previous| crate::library_path::paths_overlap(previous, path))
+    }) {
+        return Err("nested-library-root");
+    }
+    if content.iter().enumerate().any(|(index, path)| {
+        content[..index]
+            .iter()
+            .any(|previous| crate::library_path::paths_overlap(previous, path))
+    }) {
+        return Err("content-roots-overlap");
+    }
+    Ok(())
+}
+
 fn validate_restore_items(
     manager: &crate::library_manager::LibraryManager,
     items: &[RestoreStartItem],
@@ -5720,7 +5946,16 @@ fn validate_restore_items(
     {
         return Err(CoreError::bad_request("mixed-restore-modes".into()));
     }
+    for item in items {
+        validate_contract_uuid(restore_item_identity(item).1, "libraryUuid")?;
+    }
+    manager
+        .registry()
+        .ensure_restore_libraries_absent(items.iter().map(|item| restore_item_identity(item).1))
+        .map_err(map_library_error)?;
     let mut normalized_roots = Vec::with_capacity(items.len());
+    let mut batch_databases = Vec::new();
+    let mut batch_content = Vec::new();
     let mut selected_restore_paths = Vec::<std::path::PathBuf>::new();
     let remote_inventory = manager.registry().list_remote_libraries()?;
     let mut required_by_volume = std::collections::BTreeMap::<String, u64>::new();
@@ -5757,7 +5992,7 @@ fn validate_restore_items(
                 &item.account_uuid,
                 &item.library_uuid,
                 &item.name,
-                &item.managed_root,
+                &item.placement_base,
             ),
             RestoreStartItem::RootAware(item) => {
                 let Some(remote) = remote_inventory.iter().find(|remote| {
@@ -5891,7 +6126,43 @@ fn validate_restore_items(
         if !submitted_libraries.insert((account_uuid.clone(), library_uuid.clone())) {
             return Err(CoreError::bad_request("duplicate-restore-library".into()));
         }
-        let check = manager.preflight(name, FilePath::new(managed_root))?;
+        let database_path = FilePath::new(managed_root).join("Database");
+        let content_roots = match item {
+            RestoreStartItem::Legacy(_) => vec![crate::library_path::LibraryContentRootInput {
+                path: FilePath::new(managed_root)
+                    .join("Files")
+                    .to_string_lossy()
+                    .into_owned(),
+                create_if_missing: true,
+            }],
+            RestoreStartItem::RootAware(item) => item
+                .roots
+                .iter()
+                .filter_map(|choice| choice.target_path.as_ref().filter(|_| choice.selected))
+                .map(|path| crate::library_path::LibraryContentRootInput {
+                    path: path.clone(),
+                    create_if_missing: true,
+                })
+                .collect(),
+        };
+        let plan = manager.preflight_restore_plan(name, &database_path, &content_roots)?;
+        if let (Some(database), Some(roots)) = (
+            &plan.normalized_database_path,
+            &plan.normalized_content_roots,
+        ) {
+            batch_databases.push(database.clone());
+            batch_content.extend(
+                roots
+                    .iter()
+                    .map(|root| std::path::PathBuf::from(&root.path)),
+            );
+        }
+        let check = crate::library_path::PreflightResult {
+            ok: plan.ok,
+            reason: plan.reason,
+            normalized_root: plan.normalized_database_path.unwrap_or(database_path),
+            available_bytes: plan.available_bytes,
+        };
         if !check.ok {
             if root_aware {
                 root_results.push(crate::host_registry::SyncRestoreRootResult {
@@ -5979,6 +6250,22 @@ fn validate_restore_items(
         }
         normalized_roots.push(comparable);
     }
+    if let Err(reason) = validate_restore_batch_paths(&batch_databases, &batch_content) {
+        if !root_aware {
+            return Err(CoreError::conflict(reason.to_owned()));
+        }
+        root_results.push(crate::host_registry::SyncRestoreRootResult {
+            library_uuid: String::new(),
+            root_uuid: String::new(),
+            selected: false,
+            ok: false,
+            reason: Some(reason.to_owned()),
+            normalized_target_path: None,
+            required_bytes: 0,
+            available_bytes: None,
+            volume_key: None,
+        });
+    }
     if root_aware {
         for required in required_by_volume.values_mut() {
             *required = required.saturating_add(256 * 1024 * 1024);
@@ -6044,6 +6331,7 @@ async fn preflight_restore(
     Json(request): Json<RestorePreflightRequest>,
 ) -> ApiResult<Json<crate::host_registry::SyncRestorePreflight>> {
     let manager = library_manager(&state)?;
+    let _admission = manager.path_admission().await;
     Ok(Json(validate_restore_items(
         &manager,
         &request.items,
@@ -6058,12 +6346,17 @@ async fn start_restore(
     validate_contract_uuid(&request.operation_uuid, "operationUuid")?;
     validate_contract_uuid(&request.preflight_token, "preflightToken")?;
     let manager = library_manager(&state)?;
+    let admission = manager.path_admission().await;
     let request_value = restore_operation_request(&request.items);
-    if let Some(plans) = manager.registry().replay_restore_operation(
-        &request.preflight_token,
-        &request.operation_uuid,
-        &request_value,
-    )? {
+    if let Some(plans) = manager
+        .registry()
+        .replay_restore_operation(
+            &request.preflight_token,
+            &request.operation_uuid,
+            &request_value,
+        )
+        .map_err(map_library_error)?
+    {
         return Ok(Json(RestoreListResponse { items: plans }));
     }
     let validation = validate_restore_items(&manager, &request.items, false)?;
@@ -6077,7 +6370,7 @@ async fn start_restore(
                 RestoreStartItem::Legacy(item) => (
                     &item.account_uuid,
                     &item.library_uuid,
-                    &item.managed_root,
+                    &item.placement_base,
                     "legacy-library",
                     None,
                     None,
@@ -6155,7 +6448,11 @@ async fn start_restore(
         plan_inputs.push(crate::host_registry::RestorePlanInput {
             account_uuid: account_uuid.clone(),
             library_uuid: library_uuid.clone(),
-            managed_root: FilePath::new(managed_root).to_path_buf(),
+            managed_root: crate::library_path::inspect_directory_path(
+                FilePath::new(managed_root),
+                true,
+            )
+            .map_err(|reason| map_library_error(anyhow::anyhow!(reason.as_str())))?,
             restore_mode: restore_mode.to_owned(),
             inventory_fence: inventory_fence.map(ToOwned::to_owned),
             roots,
@@ -6173,11 +6470,13 @@ async fn start_restore(
     if !inserted {
         return Ok(Json(RestoreListResponse { items: plans }));
     }
+    drop(admission);
     let mut completed_plans: Vec<crate::host_registry::SyncRestorePlan> =
         Vec::with_capacity(plans.len());
     for (plan, input) in plans.into_iter().zip(plan_inputs.iter_mut()) {
         if let Err(error) = manager
-            .create_restore_library(
+            .create_planned_restore_library(
+                &plan.restore_uuid,
                 input.library_uuid.clone(),
                 plan.name.clone(),
                 input.managed_root.clone(),
@@ -6205,7 +6504,7 @@ async fn start_restore(
             let _ = manager
                 .registry()
                 .fail_restore_preflight(&request.preflight_token, &request.operation_uuid);
-            return Err(error.into());
+            return Err(map_library_error(error));
         }
         manager
             .registry()
@@ -6588,48 +6887,42 @@ fn map_library_error(error: anyhow::Error) -> CoreError {
     CoreError::coded(status, &code, message)
 }
 
-thread_local! {
-    /// Per-blocking-thread cached read connection. Read handlers run on
-    /// Tokio's blocking pool, whose threads are reused across requests, so
-    /// caching one connection per thread amortizes the SQLite open + PRAGMA +
-    /// UDF-registration cost that was previously paid on *every* tile/page
-    /// fetch. WAL autocommit reads always observe the latest committed
-    /// snapshot, so a reused connection never serves stale data.
-    static READ_DATABASE: RefCell<Option<Database>> = const { RefCell::new(None) };
-}
-
 fn read_with_cached_connection<T>(
     state: &AppState,
+    resources: &crate::library_manager::LibraryRuntimeResources,
     operation: impl FnOnce(&Database) -> ApiResult<T>,
 ) -> ApiResult<T> {
     // Callers must only reach this with a file-backed read database. The
     // in-memory/test fallback is handled in `run_read_database` (it has no
     // separate read connection, so it routes through the single writer).
-    READ_DATABASE.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if slot.is_none() {
-            *slot = state.open_read_database()?;
-        }
-        match slot.as_ref() {
-            Some(database) => operation(database),
-            None => Err(CoreError::from(anyhow::anyhow!(
-                "read database connection unavailable"
-            ))),
-        }
-    })
+    // Blocking threads outlive Library activation. Cache connections on the
+    // captured runtime instead, with one exclusive lease per concurrent read.
+    // The cache lock is never held while opening SQLite or running the query.
+    let mut lease = resources.read_database_cache.checkout()?;
+    if lease.database.is_none() {
+        lease.database = state.open_runtime_read_database(resources)?;
+    }
+    match lease.database.as_ref() {
+        Some(database) => operation(database),
+        None => Err(CoreError::from(anyhow::anyhow!(
+            "read database connection unavailable"
+        ))),
+    }
 }
 
-async fn run_read_database<T, F>(state: AppState, operation: F) -> ApiResult<T>
+pub(super) async fn run_read_database<T, F>(state: AppState, operation: F) -> ApiResult<T>
 where
     T: Send + 'static,
     F: FnOnce(&Database) -> ApiResult<T> + Send + 'static,
 {
-    if !state.has_read_database() {
+    // Capture while the request still owns admission. A dropped HTTP waiter
+    // releases its gate even when its blocking job has not started yet.
+    let resources = state.resources()?;
+    if resources.read_database_path.is_none() {
         // In-memory / test database: no separate read connection exists, so run
         // the read on the single writer connection (the only connection there is).
-        let inner = state
-            .writer()
-            .expect("active library writer")
+        let inner = resources
+            .writer
             .write(move |database: &mut Database| Ok(operation(database)))
             .await;
         return match inner {
@@ -6637,7 +6930,9 @@ where
             Err(error) => Err(CoreError::from(error)),
         };
     }
-    tokio::task::spawn_blocking(move || read_with_cached_connection(&state, operation))
+    // Checkout stays on the blocking thread: queued jobs must not hold leases
+    // that retirement could wait for ahead of those jobs in the same pool.
+    tokio::task::spawn_blocking(move || read_with_cached_connection(&state, &resources, operation))
         .await
         .map_err(|error| CoreError::from(anyhow::anyhow!("database task failed: {error}")))?
 }
@@ -6703,7 +6998,7 @@ where
 async fn get_health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
-        service: "megle-core",
+        service: "mangoo-core",
         version: env!("CARGO_PKG_VERSION"),
     })
 }
@@ -6729,11 +7024,20 @@ async fn add_root(
     State(state): State<AppState>,
     Json(payload): Json<AddRootRequest>,
 ) -> ApiResult<(StatusCode, Json<AcceptedResponse>)> {
-    let canonical_path = fs::canonicalize(&payload.path).map_err(|error| {
-        CoreError::bad_request(format!(
-            "root path does not exist or cannot be opened: {error}"
-        ))
-    })?;
+    let canonical_path = if let Some(manager) = state.library_manager.as_ref() {
+        manager
+            .admit_content_path(FilePath::new(&payload.path), false)
+            .map_err(map_library_error)?
+    } else {
+        crate::library_path::inspect_directory_path(FilePath::new(&payload.path), false).map_err(
+            |reason| {
+                CoreError::bad_request(format!(
+                    "root path does not exist or cannot be opened: {}",
+                    reason.as_str()
+                ))
+            },
+        )?
+    };
     if !canonical_path.is_dir() {
         return Err(CoreError::bad_request(format!(
             "root path is not a directory: {}",
@@ -6801,11 +7105,157 @@ async fn remove_root(
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateFolderAppearanceRequest {
+    icon: String,
+    color: String,
+}
+
+fn validate_directory_appearance(input: &UpdateFolderAppearanceRequest) -> ApiResult<()> {
+    let valid_icon = !input.icon.is_empty()
+        && input.icon.len() <= 64
+        && input
+            .icon
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_');
+    let valid_color = matches!(input.color.len(), 4 | 7)
+        && input.color.starts_with('#')
+        && input.color.as_bytes()[1..]
+            .iter()
+            .all(u8::is_ascii_hexdigit);
+    if !valid_icon || !valid_color {
+        return Err(CoreError::bad_request(
+            "invalid folder appearance".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn update_root_appearance(
+    State(state): State<AppState>,
+    Path(root_id): Path<i64>,
+    body: Result<Json<UpdateFolderAppearanceRequest>, JsonRejection>,
+) -> ApiResult<Json<RootRecord>> {
+    let Json(input) = body.map_err(|_| CoreError::bad_request("invalid root appearance".into()))?;
+    validate_directory_appearance(&input)?;
+    let mut root = state
+        .writer()
+        .expect("active library writer")
+        .write_authoritative(move |database| {
+            database.update_root_appearance(root_id, &input.icon, &input.color)
+        })
+        .await?
+        .ok_or_else(|| CoreError::not_found(format!("root not found: {root_id}")))?;
+    let reach = state
+        .root_reachability()
+        .expect("active library reachability");
+    if let Ok(map) = reach.lock() {
+        root.reachable = *map.get(&root.id).unwrap_or(&true);
+    }
+    Ok(Json(root))
+}
+
+async fn read_directory_sort(
+    state: AppState,
+    target: DirectoryTarget,
+) -> ApiResult<Json<DirectorySortState>> {
+    let sort = run_read_database(state, move |database| {
+        database
+            .read_directory_sort_state(target)?
+            .ok_or_else(|| CoreError::not_found("directory not found".into()))
+    })
+    .await?;
+    Ok(Json(sort))
+}
+
+async fn write_directory_sort(
+    state: AppState,
+    target: DirectoryTarget,
+    rule: Option<DirectorySortRule>,
+) -> ApiResult<Json<DirectorySortMutationResult>> {
+    let result = state
+        .writer()
+        .expect("active library writer")
+        .write_authoritative(move |database| database.update_directory_sort(target, rule))
+        .await?
+        .ok_or_else(|| CoreError::not_found("directory not found".into()))?;
+    Ok(Json(result))
+}
+
+async fn get_root_sort(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<DirectorySortState>> {
+    read_directory_sort(state, DirectoryTarget::Root(id)).await
+}
+
+async fn update_root_sort(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    body: Result<Json<DirectorySortRule>, JsonRejection>,
+) -> ApiResult<Json<DirectorySortMutationResult>> {
+    let Json(rule) =
+        body.map_err(|_| CoreError::bad_request("invalid directory sort rule".into()))?;
+    write_directory_sort(state, DirectoryTarget::Root(id), Some(rule)).await
+}
+
+async fn reset_root_sort(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<DirectorySortMutationResult>> {
+    write_directory_sort(state, DirectoryTarget::Root(id), None).await
+}
+
+async fn get_folder_sort(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<DirectorySortState>> {
+    read_directory_sort(state, DirectoryTarget::Folder(id)).await
+}
+
+async fn update_folder_sort(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    body: Result<Json<DirectorySortRule>, JsonRejection>,
+) -> ApiResult<Json<DirectorySortMutationResult>> {
+    let Json(rule) =
+        body.map_err(|_| CoreError::bad_request("invalid directory sort rule".into()))?;
+    write_directory_sort(state, DirectoryTarget::Folder(id), Some(rule)).await
+}
+
+async fn reset_folder_sort(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<DirectorySortMutationResult>> {
+    write_directory_sort(state, DirectoryTarget::Folder(id), None).await
+}
+
+async fn update_folder_appearance(
+    State(state): State<AppState>,
+    Path(folder_id): Path<i64>,
+    body: Result<Json<UpdateFolderAppearanceRequest>, JsonRejection>,
+) -> ApiResult<Json<FolderRecord>> {
+    let Json(input) =
+        body.map_err(|_| CoreError::bad_request("invalid folder appearance".to_string()))?;
+    validate_directory_appearance(&input)?;
+    // Local appearance is durable user metadata, without a sync outbox mutation.
+    let folder = state
+        .writer()
+        .expect("active library writer")
+        .write_authoritative(move |database| {
+            database.update_folder_appearance(folder_id, &input.icon, &input.color)
+        })
+        .await?
+        .ok_or_else(|| CoreError::not_found(format!("ordinary folder not found: {folder_id}")))?;
+    Ok(Json(folder))
+}
+
 async fn list_folder_children(
     State(state): State<AppState>,
     Path(folder_id): Path<i64>,
     Query(query): Query<ListFolderChildrenQuery>,
-) -> ApiResult<Json<ListResponse<FolderRecord>>> {
+) -> ApiResult<Json<FolderChildrenPage>> {
     let limit = query.limit.unwrap_or(200);
     let cursor = query.cursor;
     let include_descendants = query.include_descendants.unwrap_or(false);
@@ -6821,11 +7271,7 @@ async fn list_folder_children(
         Ok(page)
     })
     .await?;
-    Ok(Json(ListResponse {
-        items: page.items,
-        next_cursor: page.next_cursor,
-        total_count: page.total_count,
-    }))
+    Ok(Json(page))
 }
 
 async fn list_folder_ancestors(
@@ -6900,7 +7346,7 @@ async fn get_media_position(
         offset: None,
         cursor: None,
         sort,
-        kind: None,
+        kind: parse_media_kind(query.kind.as_deref())?.map(str::to_string),
     };
     let index = run_read_database(state, move |database| {
         database
@@ -7008,6 +7454,15 @@ async fn get_thumbnail_blob(
     // get_thumbnail readiness probe (which cost two extra joined queries per
     // tile on the hottest read path).
     let blob = run_read_database(state, move |database| {
+        if let Some(source) = database.get_thumbnail_source(file_id)? {
+            if !matches!(source.media_kind.as_deref(), Some("image" | "video"))
+                && !database
+                    .get_thumbnail(file_id, target)?
+                    .is_some_and(|thumbnail| thumbnail.state == "ready")
+            {
+                return Err(CoreError::not_found("thumbnail blob is stale".to_string()));
+            }
+        }
         let blob = database
             .get_thumb_blob(file_id, target)?
             .ok_or_else(|| CoreError::not_found("thumbnail blob missing".to_string()))?;
@@ -7017,7 +7472,7 @@ async fn get_thumbnail_blob(
     Response::builder()
         .header(CONTENT_TYPE, blob.output_format)
         .header(CACHE_CONTROL, "public, max-age=31536000, immutable")
-        .header("x-megle-served-by", "db_blob")
+        .header("x-mangoo-served-by", "db_blob")
         .body(axum::body::Body::from(blob.data))
         .map_err(|err| CoreError::bad_request(format!("failed to build thumbnail response: {err}")))
 }
@@ -7258,6 +7713,30 @@ async fn get_preview(
     use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE};
     use tokio_util::io::ReaderStream;
 
+    // Generic files may expose only a verified static result. Never stream
+    // arbitrary original bytes into the image/video preview surface.
+    let static_thumbnail = run_read_database(state.clone(), move |database| {
+        let media = database
+            .get_media(file_id)?
+            .ok_or_else(|| CoreError::not_found(format!("file not found: {file_id}")))?;
+        Ok(media.presentation.preview_kind == "static-thumbnail")
+    })
+    .await?;
+    if static_thumbnail {
+        if let Some(response) = serve_decoder_preview(state.clone(), file_id).await? {
+            return Ok(response);
+        }
+        return get_thumbnail_blob(
+            State(state),
+            Path(file_id),
+            Query(ThumbnailQuery {
+                target: Some(crate::thumbnails::GRID_320_PROFILE.to_string()),
+                priority: None,
+            }),
+        )
+        .await;
+    }
+
     let (source_path, source_root_token, media_kind, source_max_px) =
         run_read_database(state.clone(), move |database| {
             let media = database
@@ -7361,11 +7840,211 @@ async fn get_preview(
 
 /// Tells the client WHICH representation it received, so it knows whether a
 /// background full-resolution upgrade is still worth requesting.
-const PREVIEW_TIER_HEADER: &str = "x-megle-preview-tier";
+const PREVIEW_TIER_HEADER: &str = "x-mangoo-preview-tier";
 
 /// Upper bound on a reported preview viewport. Far beyond any real display,
 /// and values above it are clamped rather than rejected.
 const MAX_VIEWPORT_LONG_PX: u32 = 16384;
+
+async fn serve_decoder_preview(state: AppState, file_id: i64) -> ApiResult<Option<Response>> {
+    use crate::plugins::decoder::DecoderPurpose;
+    use crate::thumbnails::{GENERATED_FORMAT, PREVIEW_3072_PROFILE};
+    let (source, path, token, context, cached, failure) =
+        run_read_database(state.clone(), move |db| {
+            let source = db
+                .get_thumbnail_source(file_id)?
+                .ok_or_else(|| CoreError::not_found("file missing".into()))?;
+            let (path, token) = db
+                .resolve_file_source_path_with_root_token(file_id)?
+                .ok_or_else(|| CoreError::not_found("source missing".into()))?;
+            let context = db.decoder_context();
+            let extension = crate::decode::formats::lowercase_extension(&path);
+            let snapshot = context
+                .as_ref()
+                .map(|(manager, _)| manager.snapshot())
+                .unwrap_or_default();
+            let valid = db.decoder_cache_matches_candidates(
+                file_id,
+                PREVIEW_3072_PROFILE,
+                &source.source_fingerprint(PREVIEW_3072_PROFILE),
+                &snapshot,
+                &extension,
+                DecoderPurpose::Preview,
+                false,
+            )?;
+            let cached = if valid {
+                db.get_preview_blob(file_id, PREVIEW_3072_PROFILE)?
+            } else {
+                None
+            };
+            let failure = db.decoder_cache_matches_candidates(
+                file_id,
+                PREVIEW_3072_PROFILE,
+                &source.source_fingerprint(PREVIEW_3072_PROFILE),
+                &snapshot,
+                &extension,
+                DecoderPurpose::Preview,
+                true,
+            )? && db
+                .get_preview_failure(file_id, PREVIEW_3072_PROFILE)?
+                .is_some();
+            Ok((source, path, token, context, cached, failure))
+        })
+        .await?;
+    let Some((manager, library_cancel)) = context else {
+        return Ok(None);
+    };
+    let cancellation = library_cancel.child_token();
+    let _cancel_on_drop = cancellation.clone().drop_guard();
+    if cancellation.is_cancelled() {
+        return Ok(None);
+    }
+    let record = if let Some(cached) = cached {
+        cached
+    } else {
+        if failure {
+            return Ok(None);
+        }
+        let extension = crate::decode::formats::lowercase_extension(&path);
+        if let Some(token) = token.as_ref() {
+            state
+                .require_current_root_token(token)
+                .map_err(CoreError::from)?;
+        }
+        let fingerprint = source.source_fingerprint(PREVIEW_3072_PROFILE);
+        let open_path = path.clone();
+        let (file, directory_guard, stamp) =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let (file, guard) = crate::sync::file_policy::open_source(&open_path)?;
+                let stamp = crate::sync::identity::source_stamp(&open_path)?;
+                Ok((file, guard, stamp))
+            })
+            .await
+            .map_err(|error| CoreError::internal(error.to_string()))?
+            .map_err(|_| CoreError::not_found("decoder source unavailable".into()))?;
+        let source_pin = file
+            .try_clone()
+            .map_err(|error| CoreError::from(anyhow::Error::from(error)))?;
+        let result = manager
+            .decode_owned(
+                file,
+                &extension,
+                DecoderPurpose::Preview,
+                3072,
+                cancellation.clone(),
+            )
+            .await;
+        if cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        if let Some(token) = token.as_ref() {
+            state
+                .require_current_root_token(token)
+                .map_err(CoreError::from)?;
+        }
+        let raster = match result {
+            Ok(raster) => raster,
+            Err(failed) => {
+                let error = failed.error;
+                if matches!(
+                    error,
+                    crate::plugins::decoder::DecoderError::Busy
+                        | crate::plugins::decoder::DecoderError::Cancelled
+                ) {
+                    return Ok(None);
+                }
+                let Some(key) = failed.cache_key else {
+                    return Ok(None);
+                };
+                let Some(failure_guard) = failed.publication_guard else {
+                    return Ok(None);
+                };
+                let now = crate::db::unix_timestamp();
+                let failure = PreviewFailureRecord {
+                    file_id,
+                    profile: PREVIEW_3072_PROFILE.into(),
+                    failure_kind: "permanent".into(),
+                    error: error.to_string(),
+                    source_size: source.size,
+                    source_mtime: source.mtime,
+                    created_at: now,
+                    updated_at: now,
+                };
+                let _ = run_shared_database(state.clone(), move |db| {
+                    failure_guard
+                        .publish(|| -> ApiResult<()> {
+                            if cancellation.is_cancelled() {
+                                return Ok(());
+                            }
+                            db.publish_decoder_preview_failure(
+                                failure,
+                                token.as_ref(),
+                                Some((&key, &fingerprint)),
+                            )?;
+                            Ok(())
+                        })
+                        .map_err(|error| CoreError::from(anyhow::Error::from(error)))?
+                })
+                .await;
+                return Ok(None);
+            }
+        };
+        let generated = tokio::task::spawn_blocking(move || raster.into_webp())
+            .await
+            .map_err(|error| CoreError::internal(error.to_string()))?
+            .map_err(|error| CoreError::from(anyhow::Error::from(error)))?;
+        let current_stamp =
+            tokio::task::spawn_blocking(move || crate::sync::identity::source_stamp(&path))
+                .await
+                .map_err(|error| CoreError::internal(error.to_string()))?
+                .map_err(|_| CoreError::not_found("decoder source changed".into()))?;
+        if current_stamp != stamp || cancellation.is_cancelled() {
+            return Ok(None);
+        }
+        let now = crate::db::unix_timestamp();
+        let record = PreviewBlobRecord {
+            file_id,
+            profile: PREVIEW_3072_PROFILE.into(),
+            byte_size: generated.data.len() as i64,
+            data: generated.data,
+            width: generated.width,
+            height: generated.height,
+            output_format: GENERATED_FORMAT.into(),
+            source_size: source.size,
+            source_mtime: source.mtime,
+            created_at: now,
+            updated_at: now,
+        };
+        let stored = record.clone();
+        let key = generated.identity.cache_key();
+        run_shared_database(state.clone(), move |db| {
+            let (_source_pin, _directory_guard) = (source_pin, directory_guard);
+            generated
+                .publication_guard
+                .publish(|| -> ApiResult<()> {
+                    if cancellation.is_cancelled() {
+                        return Err(CoreError::not_found("decoder library stopped".into()));
+                    }
+                    db.publish_decoder_preview_blob(
+                        stored,
+                        token.as_ref(),
+                        Some((&key, &fingerprint)),
+                    )?;
+                    Ok(())
+                })
+                .map_err(|error| CoreError::from(anyhow::Error::from(error)))?
+        })
+        .await?;
+        record
+    };
+    Response::builder()
+        .header("content-type", record.output_format)
+        .header("cache-control", "private, max-age=0, must-revalidate")
+        .header(PREVIEW_TIER_HEADER, PREVIEW_3072_PROFILE)
+        .body(axum::body::Body::from(record.data))
+        .map(Some)
+        .map_err(|error| CoreError::internal(error.to_string()))
+}
 
 fn preview_failure_is_fresh(
     failure: &PreviewFailureRecord,
@@ -8010,6 +8689,60 @@ async fn discover_plugins(
     ))
 }
 
+async fn get_plugin_view_document(
+    State(state): State<AppState>,
+    Path((plugin_id, view_id)): Path<(String, String)>,
+) -> ApiResult<Json<plugins::ui::HostPluginViewDocument>> {
+    let bundled_root = resolve_plugins_dir(&state);
+    let registry = Arc::clone(host_registry(&state)?);
+    let document = tokio::task::spawn_blocking(move || {
+        registry
+            .host_plugin(&plugin_id)?
+            .ok_or_else(|| not_found_plugin(&plugin_id))?;
+        if !plugins::runtime::process::is_bundled_root(&bundled_root) {
+            return Err(CoreError::coded(
+                StatusCode::CONFLICT,
+                "plugin-ui-untrusted",
+                "Plugin UI is unavailable".into(),
+            ));
+        }
+        let platform = if cfg!(windows) {
+            plugins::manifest::Platform::WindowsX64
+        } else {
+            plugins::manifest::Platform::LinuxX64
+        };
+        plugins::ui::load_view_document(
+            &registry,
+            &bundled_root,
+            &plugin_id,
+            &view_id,
+            platform,
+            plugins::runtime::trust::embedded_trust_registry(),
+        )
+        .map_err(|error| {
+            let code = error.to_string();
+            match code.as_str() {
+                "plugin-view-not-found" => CoreError::coded(
+                    StatusCode::NOT_FOUND,
+                    &code,
+                    "Plugin view was not found".into(),
+                ),
+                "plugin-ui-unavailable" | "plugin-ui-untrusted" | "plugin-ui-changed" => {
+                    CoreError::coded(
+                        StatusCode::CONFLICT,
+                        &code,
+                        "Plugin UI is unavailable".into(),
+                    )
+                }
+                _ => CoreError::from(error),
+            }
+        })
+    })
+    .await
+    .map_err(|_| CoreError::from(anyhow::anyhow!("plugin UI read task failed")))??;
+    Ok(Json(document))
+}
+
 async fn get_plugin(
     State(state): State<AppState>,
     Path(plugin_id): Path<String>,
@@ -8024,7 +8757,22 @@ async fn enable_plugin(
     State(state): State<AppState>,
     Path(plugin_id): Path<String>,
 ) -> ApiResult<Json<crate::host_registry::HostPluginProjection>> {
-    let registry = host_registry(&state)?;
+    let manager = library_manager(&state)?;
+    let _lifecycle = manager.lock_plugin_lifecycle(&plugin_id).await;
+    let registry = manager.host_registry();
+    let current = registry
+        .host_plugin(&plugin_id)?
+        .ok_or_else(|| not_found_plugin(&plugin_id))?;
+    if current.runtime_state == "stopping" {
+        return Err(CoreError::coded(
+            StatusCode::CONFLICT,
+            "plugin_stopping",
+            "Provider stop has not completed".into(),
+        ));
+    }
+    if current.enabled_intent {
+        return Ok(Json(current));
+    }
     registry
         .set_plugin_intent(&plugin_id, true, state.secret_store.is_some())
         .map_err(|_| not_found_plugin(&plugin_id))?;
@@ -8038,19 +8786,34 @@ async fn disable_plugin(
     State(state): State<AppState>,
     Path(plugin_id): Path<String>,
 ) -> ApiResult<Json<crate::host_registry::HostPluginProjection>> {
-    let _begin_guard = state.plugin_auth_begin_gate.lock().await;
-    cancel_owned_auth_worker(&state, &plugin_id, None, true).await?;
     let manager = library_manager(&state)?;
+    let _lifecycle = manager.lock_plugin_lifecycle(&plugin_id).await;
+    let _begin_guard = state.plugin_auth_begin_gate.lock().await;
     let registry = manager.host_registry();
     registry
         .set_plugin_intent(&plugin_id, false, state.secret_store.is_some())
         .map_err(|_| not_found_plugin(&plugin_id))?;
-    let fences = registry.pause_plugin_bindings(&plugin_id)?;
-    manager.fence_plugin_bindings(&plugin_id, fences).await?;
+    manager
+        .provider_manager()
+        .close_plugin(&plugin_id, registry.plugin_lifecycle_epoch(&plugin_id)?);
+    cancel_owned_auth_worker(&state, &plugin_id, None, true).await?;
+    manager.finish_disable_plugin(&plugin_id).await?;
     let updated = registry
         .host_plugin(&plugin_id)?
         .ok_or_else(|| not_found_plugin(&plugin_id))?;
     Ok(Json(updated))
+}
+
+async fn finish_plugin_restart(state: &AppState, plugin_id: &str) -> ApiResult<()> {
+    let manager = library_manager(state)?;
+    manager.provider_manager().close_plugin(
+        plugin_id,
+        manager.host_registry().plugin_lifecycle_epoch(plugin_id)?,
+    );
+    let _begin_guard = state.plugin_auth_begin_gate.lock().await;
+    cancel_owned_auth_worker(state, plugin_id, None, true).await?;
+    manager.finish_plugin_restart(plugin_id).await?;
+    Ok(())
 }
 
 async fn delete_plugin(
@@ -8086,6 +8849,8 @@ async fn update_plugin_grants(
     Path(id): Path<String>,
     Json(body): Json<PluginGrantRequest>,
 ) -> ApiResult<Json<crate::host_registry::HostPluginProjection>> {
+    let lifecycle_manager = library_manager(&state)?;
+    let _lifecycle = lifecycle_manager.lock_plugin_lifecycle(&id).await;
     let manager = library_manager(&state)?;
     let registry = manager.host_registry();
     let json = serde_json::to_string(&body.permissions).map_err(anyhow::Error::from)?;
@@ -8099,7 +8864,11 @@ async fn update_plugin_grants(
             ),
             _ => not_found_plugin(&id),
         })?;
+    manager
+        .provider_manager()
+        .close_plugin(&id, registry.plugin_lifecycle_epoch(&id)?);
     manager.fence_plugin_bindings(&id, fences).await?;
+    finish_plugin_restart(&state, &id).await?;
     Ok(Json(
         registry
             .host_plugin(&id)?
@@ -8110,6 +8879,8 @@ async fn retry_plugin_runtime(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<(StatusCode, Json<PluginCommandResponse>)> {
+    let lifecycle_manager = library_manager(&state)?;
+    let _lifecycle = lifecycle_manager.lock_plugin_lifecycle(&id).await;
     host_registry(&state)?
         .retry_plugin_runtime(&id, state.secret_store.is_some())
         .map_err(|error| match error.to_string().as_str() {
@@ -8122,6 +8893,7 @@ async fn retry_plugin_runtime(
             }
             _ => not_found_plugin(&id),
         })?;
+    finish_plugin_restart(&state, &id).await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(PluginCommandResponse { accepted: true }),
@@ -8132,6 +8904,8 @@ async fn select_plugin_version(
     Path(id): Path<String>,
     Json(body): Json<PluginVersionRequest>,
 ) -> ApiResult<(StatusCode, Json<PluginCommandResponse>)> {
+    let lifecycle_manager = library_manager(&state)?;
+    let _lifecycle = lifecycle_manager.lock_plugin_lifecycle(&id).await;
     let manager = library_manager(&state)?;
     let fences = manager
         .host_registry()
@@ -8148,7 +8922,11 @@ async fn select_plugin_version(
                 error.to_string(),
             ),
         })?;
+    manager
+        .provider_manager()
+        .close_plugin(&id, manager.host_registry().plugin_lifecycle_epoch(&id)?);
     manager.fence_plugin_bindings(&id, fences).await?;
+    finish_plugin_restart(&state, &id).await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(PluginCommandResponse { accepted: true }),
@@ -8158,6 +8936,8 @@ async fn rollback_plugin_version(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<(StatusCode, Json<PluginCommandResponse>)> {
+    let lifecycle_manager = library_manager(&state)?;
+    let _lifecycle = lifecycle_manager.lock_plugin_lifecycle(&id).await;
     let manager = library_manager(&state)?;
     let fences = manager
         .host_registry()
@@ -8170,7 +8950,11 @@ async fn rollback_plugin_version(
                 error.to_string(),
             ),
         })?;
+    manager
+        .provider_manager()
+        .close_plugin(&id, manager.host_registry().plugin_lifecycle_epoch(&id)?);
     manager.fence_plugin_bindings(&id, fences).await?;
+    finish_plugin_restart(&state, &id).await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(PluginCommandResponse { accepted: true }),
@@ -8236,7 +9020,10 @@ async fn begin_plugin_auth(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<(StatusCode, Json<PluginAuthBeginResponse>)> {
+    let manager = library_manager(&state)?;
+    let _lifecycle = manager.lock_plugin_lifecycle(&id).await;
     let _begin_guard = state.plugin_auth_begin_gate.lock().await;
+    plugin_provider(&state, &id)?;
     cancel_owned_auth_worker(&state, &id, None, true).await?;
     let plugin = host_registry(&state)?
         .host_plugin(&id)?
@@ -8257,13 +9044,26 @@ async fn begin_plugin_auth(
                 "Provider runtime session is unavailable".into(),
             )
         })?;
-    let public_url = (id != "com.megle.onedrive")
+    let declaration = host_registry(&state)?.plugin_contributions(&id)?;
+    let auth_declaration = declaration.authentication.as_ref().ok_or_else(|| {
+        CoreError::coded(
+            StatusCode::CONFLICT,
+            "plugin_auth_unavailable",
+            "Provider has no authentication declaration".into(),
+        )
+    })?;
+    let public_url = auth_declaration
+        .modes
+        .iter()
+        .any(|mode| mode == "host-callback")
         .then(|| {
-            std::env::var("MEGLE_PUBLIC_URL")
+            std::env::var("MANGOO_PUBLIC_URL")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
         })
-        .flatten();
+        .flatten()
+        .map(|value| crate::plugins::auth_flow::PublicUrl::parse(&value, cfg!(debug_assertions)))
+        .transpose()?;
     let host_flow_id = if public_url.is_some() {
         Some(
             state
@@ -8286,22 +9086,52 @@ async fn begin_plugin_auth(
         None
     };
     let callback_url = match (public_url, host_flow_id.as_deref()) {
-        (Some(value), Some(flow_id)) => Some(
-            crate::plugins::auth_flow::PublicUrl::parse(&value, cfg!(debug_assertions))?
-                .callback_url(flow_id)?
-                .to_string(),
-        ),
+        (Some(value), Some(flow_id)) => Some(value.callback_url(flow_id)?.to_string()),
         _ => None,
     };
-    let auth = plugin_provider(&state, &id)?
-        .auth_begin(callback_url)
-        .await
-        .map_err(map_provider_error)?;
+    let provider = plugin_provider(&state, &id)?;
+    let auth = match provider.auth_begin(callback_url.clone()).await {
+        Ok(auth) => auth,
+        Err(error) => {
+            if let Some(flow_id) = host_flow_id.as_deref() {
+                state.plugin_auth_flows.cancel_host_flow(flow_id);
+            }
+            return Err(map_provider_error(error));
+        }
+    };
+    let callback_matches = match callback_url.as_deref() {
+        Some(expected) => {
+            auth.completion_mode == "host-callback"
+                && auth.redirect_uri.as_deref() == Some(expected)
+        }
+        None => auth.completion_mode != "host-callback",
+    };
+    if !callback_matches {
+        let _ = provider.auth_cancel(&auth.flow_id).await;
+        if let Some(flow_id) = host_flow_id.as_deref() {
+            state.plugin_auth_flows.cancel_host_flow(flow_id);
+        }
+        return Err(CoreError::coded(
+            StatusCode::BAD_REQUEST,
+            "invalid_provider_auth_flow",
+            "Provider callback does not match the negotiated flow".into(),
+        ));
+    }
     let provider_flow_id = auth.flow_id.clone();
     let response_flow_id = if let Some(flow_id) = host_flow_id {
-        state
+        if state
             .plugin_auth_flows
-            .attach_provider_flow(&flow_id, auth.flow_id.clone())?;
+            .attach_provider_flow(&flow_id, auth.flow_id.clone())
+            .is_err()
+        {
+            state.plugin_auth_flows.cancel_host_flow(&flow_id);
+            let _ = provider.auth_cancel(&auth.flow_id).await;
+            return Err(CoreError::coded(
+                StatusCode::BAD_REQUEST,
+                "invalid_provider_auth_flow",
+                "Provider flow identifier is invalid".into(),
+            ));
+        }
         flow_id
     } else {
         provider_flow_id.clone()
@@ -8311,6 +9141,7 @@ async fn begin_plugin_auth(
         &response_flow_id,
         &supervisor_session,
     )? {
+        state.plugin_auth_flows.cancel_host_flow(&response_flow_id);
         let _ = plugin_provider(&state, &id)?
             .auth_cancel(&provider_flow_id)
             .await;
@@ -8325,6 +9156,26 @@ async fn begin_plugin_auth(
         .unwrap_or_default()
         .as_millis() as i64
         + 10 * 60 * 1000;
+    if state
+        .plugin_auth_flows
+        .register_pending(
+            &id,
+            &response_flow_id,
+            &supervisor_session,
+            host_registry(&state)?.plugin_lifecycle_epoch(&id)?,
+            &auth,
+            auth_declaration,
+            expires_at,
+        )
+        .is_err()
+    {
+        cancel_owned_auth_worker(&state, &id, Some(&response_flow_id), true).await?;
+        return Err(CoreError::coded(
+            StatusCode::BAD_REQUEST,
+            "invalid_provider_auth_flow",
+            "Provider authorization declaration is invalid".into(),
+        ));
+    }
     if auth.completion_mode == "loopback" {
         spawn_loopback_auth_completion(
             state.clone(),
@@ -8538,6 +9389,9 @@ async fn cancel_owned_auth_worker(
     requested_flow_id: Option<&str>,
     restore_prior_state: bool,
 ) -> ApiResult<bool> {
+    state
+        .plugin_auth_flows
+        .cancel_pending(plugin_id, requested_flow_id);
     let ownership = host_registry(state)?.plugin_auth_flow_ownership(plugin_id)?;
     let matches_requested = ownership
         .as_ref()
@@ -8571,8 +9425,12 @@ async fn cancel_owned_auth_worker(
     let Some((flow_id, supervisor_session)) = ownership.filter(|_| matches_requested) else {
         return Ok(false);
     };
+    let provider_flow_id = state
+        .plugin_auth_flows
+        .cancel_host_flow(&flow_id)
+        .unwrap_or_else(|| flow_id.clone());
     if let Ok(provider) = plugin_provider(state, plugin_id) {
-        let _ = provider.auth_cancel(&flow_id).await;
+        let _ = provider.auth_cancel(&provider_flow_id).await;
     }
     if restore_prior_state {
         host_registry(state)?.cancel_plugin_auth_flow(plugin_id, &flow_id, &supervisor_session)?;
@@ -8613,28 +9471,59 @@ async fn complete_plugin_auth_callback(
             "OAuth provider flow is unavailable".into(),
         )
     })?;
-    let current_session = host_registry(&state)?
+    let registry = host_registry(&state)?;
+    if registry
         .plugin_runtime_session(&binding.plugin_id)?
-        .ok_or_else(|| {
-            CoreError::coded(
-                StatusCode::CONFLICT,
-                "provider_not_ready",
-                "Provider runtime session is unavailable".into(),
-            )
-        })?;
-    if current_session != binding.supervisor_session {
+        .as_deref()
+        != Some(binding.supervisor_session.as_str())
+    {
         return Err(CoreError::coded(
             StatusCode::CONFLICT,
             "oauth_session_changed",
             "Provider runtime restarted during authorization".into(),
         ));
     }
-    let auth = plugin_provider(&state, &binding.plugin_id)?
+    let pending = state
+        .plugin_auth_flows
+        .pending(
+            &binding.plugin_id,
+            &flow_id,
+            &binding.supervisor_session,
+            registry.plugin_lifecycle_epoch(&binding.plugin_id)?,
+        )
+        .map_err(|_| {
+            CoreError::coded(
+                StatusCode::CONFLICT,
+                "oauth_flow_invalid",
+                "Authorization flow is unavailable".into(),
+            )
+        })?;
+    if !pending.is_host_callback()
+        || !registry.claim_plugin_auth_completion(
+            &binding.plugin_id,
+            &flow_id,
+            &binding.supervisor_session,
+        )?
+    {
+        return Err(CoreError::coded(
+            StatusCode::CONFLICT,
+            "oauth_flow_invalid",
+            "Authorization flow is unavailable".into(),
+        ));
+    }
+    let auth = match plugin_provider(&state, &binding.plugin_id)?
         .auth_complete(&provider_flow_id, entries.into_iter().collect())
         .await
-        .map_err(map_provider_error)?;
-    if !host_registry(&state)?.update_plugin_account_auth_for_session(
+    {
+        Ok(auth) => auth,
+        Err(error) => {
+            cancel_owned_auth_worker(&state, &binding.plugin_id, Some(&flow_id), true).await?;
+            return Err(map_provider_error(error));
+        }
+    };
+    let Some(fences) = registry.apply_plugin_auth_result_for_flow(
         &binding.plugin_id,
+        &flow_id,
         &binding.supervisor_session,
         if auth.authenticated {
             "authenticated"
@@ -8643,32 +9532,26 @@ async fn complete_plugin_auth_callback(
         },
         auth.account_display_name.as_deref(),
         auth.account_kind.as_deref(),
-    )? {
+        auth.stable_account_identity.as_deref(),
+    )?
+    else {
         return Err(CoreError::coded(
             StatusCode::CONFLICT,
-            "oauth_session_changed",
-            "Provider runtime restarted during authorization".into(),
+            "oauth_flow_cancelled",
+            "Authorization flow is no longer current".into(),
         ));
-    }
+    };
     if auth.authenticated {
-        let Some(fences) = host_registry(&state)?.update_plugin_account_identity_for_session(
-            &binding.plugin_id,
-            &binding.supervisor_session,
-            auth.stable_account_identity.as_deref(),
-        )?
-        else {
-            return Err(CoreError::coded(
-                StatusCode::CONFLICT,
-                "oauth_session_changed",
-                "Provider runtime restarted during authorization".into(),
-            ));
-        };
         library_manager(&state)?
             .fence_plugin_bindings(&binding.plugin_id, fences)
             .await?;
     }
+    registry.finish_plugin_auth_flow(&binding.plugin_id, &flow_id, &binding.supervisor_session)?;
+    state
+        .plugin_auth_flows
+        .cancel_pending(&binding.plugin_id, Some(&flow_id));
     Ok(Html(
-        "<!doctype html><meta charset=utf-8><title>Megle</title>Authorization completed. You may close this window.",
+        "<!doctype html><meta charset=utf-8><title>Mangoo</title>Authorization completed. You may close this window.",
     ))
 }
 async fn complete_plugin_auth(
@@ -8686,7 +9569,23 @@ async fn complete_plugin_auth(
                 "OAuth flow is unavailable or no longer current".into(),
             )
         })?;
-    let auth_fields = crate::plugins::auth_flow::parse_manual_response_uri(&body.response_uri)
+    let pending = state
+        .plugin_auth_flows
+        .pending(
+            &id,
+            &body.flow_id,
+            &ownership.1,
+            host_registry(&state)?.plugin_lifecycle_epoch(&id)?,
+        )
+        .map_err(|_| {
+            CoreError::coded(
+                StatusCode::CONFLICT,
+                "oauth_flow_invalid",
+                "Authorization flow is unavailable".into(),
+            )
+        })?;
+    let auth_fields = pending
+        .parse_manual_response(&body.response_uri)
         .map_err(|_| {
             CoreError::coded(
                 StatusCode::BAD_REQUEST,
@@ -8695,6 +9594,17 @@ async fn complete_plugin_auth(
             )
         })?;
     let supervisor_session = ownership.1;
+    if host_registry(&state)?
+        .plugin_runtime_session(&id)?
+        .as_deref()
+        != Some(supervisor_session.as_str())
+    {
+        return Err(CoreError::coded(
+            StatusCode::CONFLICT,
+            "oauth_session_changed",
+            "Provider runtime restarted during authorization".into(),
+        ));
+    }
     if !host_registry(&state)?.claim_plugin_auth_completion(
         &id,
         &body.flow_id,
@@ -8757,6 +9667,9 @@ async fn complete_plugin_auth(
             .await?;
     }
     host_registry(&state)?.finish_plugin_auth_flow(&id, &body.flow_id, &supervisor_session)?;
+    state
+        .plugin_auth_flows
+        .cancel_pending(&id, Some(&body.flow_id));
     Ok((
         StatusCode::ACCEPTED,
         Json(PluginCommandResponse { accepted: true }),
@@ -8778,11 +9691,14 @@ async fn sign_out_plugin(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<(StatusCode, Json<PluginCommandResponse>)> {
+    let lifecycle_manager = library_manager(&state)?;
+    let _lifecycle = lifecycle_manager.lock_plugin_lifecycle(&id).await;
     let _begin_guard = state.plugin_auth_begin_gate.lock().await;
     let registry = Arc::clone(host_registry(&state)?);
     let account = registry
         .plugin_account_secret(&id)?
         .ok_or_else(|| not_found_plugin(&id))?;
+    let prior_flow = registry.plugin_auth_flow_ownership(&id)?;
     let fences = registry
         .sign_out_plugin_account(&id, account.generation)?
         .ok_or_else(|| {
@@ -8792,62 +9708,195 @@ async fn sign_out_plugin(
                 "Provider account changed during sign-out".into(),
             )
         })?;
+    lifecycle_manager
+        .provider_manager()
+        .close_plugin(&id, registry.plugin_lifecycle_epoch(&id)?);
+    if let Some((flow_id, _)) = prior_flow {
+        state.plugin_auth_flows.cancel_host_flow(&flow_id);
+    }
     library_manager(&state)?
         .fence_plugin_bindings(&id, fences)
         .await?;
     cancel_owned_auth_worker(&state, &id, None, false).await?;
     library_manager(&state)?.stop_plugin_runtime(&id).await?;
+    lifecycle_manager
+        .provider_manager()
+        .join_plugin_work(&id)
+        .await;
+    registry.finish_plugin_runtime_restart(&id)?;
     crate::api::reconcile_credential_retirements_once(&state)?;
     Ok((
         StatusCode::ACCEPTED,
         Json(PluginCommandResponse { accepted: true }),
     ))
 }
-async fn get_onedrive_configuration(
-    State(state): State<AppState>,
-) -> ApiResult<Json<crate::host_registry::OneDriveConfiguration>> {
-    Ok(Json(host_registry(&state)?.onedrive_configuration()?))
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginExternalLinkRequest {
+    kind: String,
+    id: String,
 }
-async fn plan_onedrive_configuration(
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginExternalLink {
+    kind: String,
+    id: String,
+    url: String,
+    expires_at: Option<i64>,
+}
+
+async fn resolve_plugin_external_link(
     State(state): State<AppState>,
-    Json(body): Json<OneDriveConfigurationPlanRequest>,
-) -> ApiResult<Json<crate::host_registry::OneDriveConfigurationPlan>> {
+    Path(plugin_id): Path<String>,
+    Json(body): Json<PluginExternalLinkRequest>,
+) -> ApiResult<Json<PluginExternalLink>> {
+    let registry = host_registry(&state)?;
+    registry
+        .host_plugin(&plugin_id)?
+        .ok_or_else(|| not_found_plugin(&plugin_id))?;
+    if body.id.is_empty() || body.id.len() > 160 {
+        return Err(CoreError::coded(
+            StatusCode::BAD_REQUEST,
+            "invalid_external_link",
+            "Invalid link identifier".into(),
+        ));
+    }
+    let (url, expires_at) = match body.kind.as_str() {
+        "authorization" => {
+            plugin_provider(&state, &plugin_id)?;
+            let ownership = registry
+                .plugin_auth_flow_ownership(&plugin_id)?
+                .filter(|(id, _)| id == &body.id)
+                .ok_or_else(|| {
+                    CoreError::coded(
+                        StatusCode::CONFLICT,
+                        "oauth_flow_invalid",
+                        "Authorization flow is unavailable".into(),
+                    )
+                })?;
+            if registry.plugin_runtime_session(&plugin_id)?.as_deref() != Some(ownership.1.as_str())
+                || !registry.plugin_auth_flow_is_current(&plugin_id, &body.id, &ownership.1)?
+            {
+                return Err(CoreError::coded(
+                    StatusCode::CONFLICT,
+                    "oauth_flow_invalid",
+                    "Authorization flow is unavailable".into(),
+                ));
+            }
+            let pending = state
+                .plugin_auth_flows
+                .pending(
+                    &plugin_id,
+                    &body.id,
+                    &ownership.1,
+                    registry.plugin_lifecycle_epoch(&plugin_id)?,
+                )
+                .map_err(|_| {
+                    CoreError::coded(
+                        StatusCode::CONFLICT,
+                        "oauth_flow_invalid",
+                        "Authorization flow is unavailable".into(),
+                    )
+                })?;
+            (pending.authorization_url, Some(pending.expires_at))
+        }
+        "help" => {
+            let declaration = registry.plugin_contributions(&plugin_id)?;
+            let link = declaration
+                .presentation
+                .as_ref()
+                .and_then(|p| p.help_links.iter().find(|l| l.id == body.id))
+                .ok_or_else(|| {
+                    CoreError::coded(
+                        StatusCode::NOT_FOUND,
+                        "plugin_link_not_found",
+                        "Provider help link is unavailable".into(),
+                    )
+                })?;
+            crate::plugins::contributions::safe_external_url(&link.url, false)?;
+            (link.url.clone(), None)
+        }
+        _ => {
+            return Err(CoreError::coded(
+                StatusCode::BAD_REQUEST,
+                "invalid_external_link",
+                "Invalid link kind".into(),
+            ))
+        }
+    };
+    Ok(Json(PluginExternalLink {
+        kind: body.kind,
+        id: body.id,
+        url,
+        expires_at,
+    }))
+}
+
+async fn get_plugin_configuration(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<crate::plugin_configuration::PluginConfiguration>> {
     host_registry(&state)?
-        .plan_onedrive_configuration(body.client_id.as_deref(), body.expected_revision)
+        .host_plugin(&id)?
+        .ok_or_else(|| not_found_plugin(&id))?;
+    Ok(Json(host_registry(&state)?.plugin_configuration(&id)?))
+}
+async fn plan_plugin_configuration(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<PluginConfigurationPlanRequest>,
+) -> ApiResult<Json<crate::plugin_configuration::PluginConfigurationPlan>> {
+    host_registry(&state)?
+        .host_plugin(&id)?
+        .ok_or_else(|| not_found_plugin(&id))?;
+    host_registry(&state)?
+        .plan_plugin_configuration(&id, &body.values, body.expected_revision)
         .map(Json)
         .map_err(|error| {
             CoreError::coded(
                 StatusCode::CONFLICT,
-                "invalid_onedrive_configuration",
+                "invalid_plugin_configuration",
                 error.to_string(),
             )
         })
 }
-async fn commit_onedrive_configuration(
+async fn commit_plugin_configuration(
     State(state): State<AppState>,
-    Json(body): Json<OneDriveConfigurationCommitRequest>,
-) -> ApiResult<Json<crate::host_registry::OneDriveConfiguration>> {
+    Path(id): Path<String>,
+    Json(body): Json<PluginConfigurationCommitRequest>,
+) -> ApiResult<Json<crate::plugin_configuration::PluginConfiguration>> {
+    let manager = library_manager(&state)?;
+    let _lifecycle = manager.lock_plugin_lifecycle(&id).await;
     let _begin_guard = state.plugin_auth_begin_gate.lock().await;
-    let commit = host_registry(&state)?
-        .commit_onedrive_configuration(&body.plan_uuid, body.expected_revision, body.confirmed)
+    let registry = host_registry(&state)?;
+    registry
+        .host_plugin(&id)?
+        .ok_or_else(|| not_found_plugin(&id))?;
+    let prior_flow = registry.plugin_auth_flow_ownership(&id)?;
+    let commit = registry
+        .commit_plugin_configuration(&id, &body.plan_uuid, body.expected_revision, body.confirmed)
         .map_err(|error| {
             CoreError::coded(
                 StatusCode::CONFLICT,
-                "invalid_onedrive_configuration",
+                "invalid_plugin_configuration",
                 error.to_string(),
             )
         })?;
-    library_manager(&state)?
-        .fence_plugin_bindings("com.megle.onedrive", commit.fences)
-        .await?;
     if commit.effective_changed {
-        cancel_owned_auth_worker(&state, "com.megle.onedrive", None, false).await?;
-        library_manager(&state)?
-            .stop_plugin_runtime("com.megle.onedrive")
-            .await?;
+        manager
+            .provider_manager()
+            .close_plugin(&id, registry.plugin_lifecycle_epoch(&id)?);
+        if let Some((flow_id, _)) = prior_flow {
+            state.plugin_auth_flows.cancel_host_flow(&flow_id);
+        }
+        manager.fence_plugin_bindings(&id, commit.fences).await?;
+        cancel_owned_auth_worker(&state, &id, None, false).await?;
+        manager.stop_plugin_runtime(&id).await?;
+        manager.provider_manager().join_plugin_work(&id).await;
+        registry.finish_plugin_configuration_stop(&id)?;
         crate::api::reconcile_credential_retirements_once(&state)?;
     }
-    Ok(Json(host_registry(&state)?.onedrive_configuration()?))
+    Ok(Json(registry.plugin_configuration(&id)?))
 }
 async fn plugin_health(
     State(state): State<AppState>,
@@ -8930,7 +9979,7 @@ fn resolve_plugins_dir(state: &AppState) -> std::path::PathBuf {
     // through `router_with_config` (test helpers, the deprecated `router`
     // alias). Match the same env-var precedence as
     // `plugins::resolve_plugins_dir` so behavior stays predictable.
-    if let Some(value) = std::env::var("MEGLE_PLUGINS_DIR")
+    if let Some(value) = std::env::var("MANGOO_PLUGINS_DIR")
         .ok()
         .filter(|s| !s.is_empty())
     {
@@ -9270,6 +10319,9 @@ fn parse_media_kind(value: Option<&str>) -> ApiResult<Option<&'static str>> {
 
 fn map_cursor_error(error: anyhow::Error) -> CoreError {
     let message = error.to_string();
+    if message.contains("invalid folder cursor: parent or sort revision changed") {
+        return CoreError::coded(StatusCode::BAD_REQUEST, "stale_folder_cursor", message);
+    }
     if message.contains("invalid media cursor")
         || message.contains("invalid folder cursor")
         || message.contains("invalid cursor hex")
@@ -9347,7 +10399,7 @@ fn forget_thumbnail_task_wakeup(key: (usize, i64, i64)) {
     wakeups.remove(&key);
 }
 
-fn preview_content_type(path: &FilePath, media_kind: Option<&str>) -> &'static str {
+pub(super) fn preview_content_type(path: &FilePath, media_kind: Option<&str>) -> &'static str {
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
@@ -9557,7 +10609,7 @@ impl CoreError {
         }
     }
 
-    fn not_found(message: String) -> Self {
+    pub(super) fn not_found(message: String) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             message,
@@ -9573,7 +10625,7 @@ impl CoreError {
         }
     }
 
-    fn coded(status: StatusCode, code: &str, message: String) -> Self {
+    pub(super) fn coded(status: StatusCode, code: &str, message: String) -> Self {
         Self {
             status,
             message,
@@ -9636,7 +10688,7 @@ mod tests {
                 "accountUuid": "account",
                 "libraryUuid": "00000000-0000-7000-8000-000000000101",
                 "name": "Legacy",
-                "managedRoot": "D:/Legacy"
+                "placementBase": "D:/Legacy"
             }]
         }))
         .expect("legacy restore request");
@@ -9648,7 +10700,7 @@ mod tests {
                     "accountUuid": "account",
                     "libraryUuid": "00000000-0000-7000-8000-000000000101",
                     "name": "Legacy",
-                    "managedRoot": "D:/Legacy"
+                    "placementBase": "D:/Legacy"
                 }]
             }))
             .is_err()
@@ -9688,6 +10740,1270 @@ mod tests {
         assert_eq!(fallback_display_name("D:\\"), "D:");
     }
 
+    mod restore_admission {
+        use super::*;
+        use crate::host_registry::{
+            DiscoveredRemoteLibrary, DiscoveredRemoteRoot, RestorePlanInput, RestoreRootPlanInput,
+        };
+        use crate::library_manager::{ActiveSnapshot, LibraryManager};
+        use crate::library_path::MARKER_FILE_NAME;
+        use std::collections::BTreeMap;
+        use std::path::Path;
+        use std::sync::RwLock;
+
+        const ACCOUNT: &str = "restore-fixture-account";
+
+        #[test]
+        fn library_reads_follow_activation_on_a_reused_blocking_thread() {
+            // One blocking thread makes a stale thread-local connection
+            // deterministic instead of depending on pool scheduling.
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(1)
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (base, manager, app) = fixture();
+                    let mut libraries = Vec::new();
+                    for name in ["First", "Second"] {
+                        libraries.push(
+                            manager
+                                .create_library(
+                                    name.into(),
+                                    None,
+                                    None,
+                                    base.join(name).join("Database"),
+                                    None,
+                                    false,
+                                )
+                                .await
+                                .unwrap()
+                                .0,
+                        );
+                    }
+                    for index in [0, 1, 0, 1] {
+                        let library = &libraries[index];
+                        let previous = manager.active_snapshot();
+                        let revision = previous.context_revision;
+                        let activated = app
+                            .clone()
+                            .oneshot(
+                                Request::builder()
+                                    .method(Method::POST)
+                                    .uri(format!(
+                                        "/api/libraries/{}/activate",
+                                        library.library_uuid
+                                    ))
+                                    .header("x-mangoo-context-revision", revision.to_string())
+                                    .body(Body::empty())
+                                    .unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(activated.status(), StatusCode::OK);
+                        if let Some(retired) = previous.runtime {
+                            assert!(retired.read_database_cache.checkout().is_err());
+                            // In particular, SQLite handles must be closed on
+                            // Windows even while this old runtime Arc survives.
+                            let catalog = retired.read_database_path.as_ref().unwrap();
+                            let moved = catalog.with_extension("retired-check");
+                            fs::rename(catalog, &moved).unwrap();
+                            fs::rename(moved, catalog).unwrap();
+                        }
+                        let expected_path = fs::canonicalize(
+                            base.join(if index == 0 { "First" } else { "Second" })
+                                .join("Database-Files"),
+                        )
+                        .unwrap();
+                        for _ in 0..2 {
+                            let response = app
+                                .clone()
+                                .oneshot(
+                                    Request::builder()
+                                        .uri("/api/roots")
+                                        .body(Body::empty())
+                                        .unwrap(),
+                                )
+                                .await
+                                .unwrap();
+                            assert_eq!(response.status(), StatusCode::OK);
+                            assert_eq!(
+                                response.headers()["x-mangoo-library-id"],
+                                library.library_uuid
+                            );
+                            assert_eq!(
+                                response.headers()["x-mangoo-context-revision"],
+                                (revision + 1).to_string()
+                            );
+                            let body = response_json(response).await;
+                            assert_eq!(body["items"].as_array().unwrap().len(), 1);
+                            assert_eq!(
+                                Path::new(body["items"][0]["path"].as_str().unwrap()),
+                                expected_path
+                            );
+                        }
+                    }
+                    manager
+                        .active_snapshot()
+                        .runtime
+                        .unwrap()
+                        .shutdown()
+                        .await
+                        .unwrap();
+                });
+        }
+
+        #[test]
+        fn cancelled_queued_read_cannot_adopt_a_new_library_runtime() {
+            use crate::api::routes::run_read_database;
+            use std::future::Future;
+            use std::task::Poll;
+
+            let reads = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(1)
+                .build()
+                .unwrap();
+            // Activation needs its own blocking executor so the delayed read
+            // can stay queued until the old runtime is completely retired.
+            let activation = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(1)
+                .build()
+                .unwrap();
+            reads.block_on(async {
+                let (base, manager, app, state) = fixture_with_state();
+                manager
+                    .create_library(
+                        "First".into(),
+                        None,
+                        None,
+                        base.join("First/Database"),
+                        None,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                let (second, _, _) = manager
+                    .create_library(
+                        "Second".into(),
+                        None,
+                        None,
+                        base.join("Second/Database"),
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                let retired = state.resources().unwrap();
+                let revision = manager.active_snapshot().context_revision;
+                // Do not strand unrelated startup scan jobs behind the read
+                // barrier: real runtime retirement must join those jobs too.
+                tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                    loop {
+                        let tasks = retired
+                            .writer
+                            .write(|database| database.list_tasks())
+                            .await
+                            .unwrap();
+                        if tasks
+                            .iter()
+                            .all(|task| !matches!(task.status.as_str(), "pending" | "running"))
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let (started, ready) = tokio::sync::oneshot::channel();
+                let (release, released) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    started.send(()).unwrap();
+                    released.recv().unwrap();
+                });
+                ready.await.unwrap();
+
+                let gate = state.request_gate().read_owned().await;
+                let (observed, observation) = tokio::sync::oneshot::channel();
+                let mut read = Box::pin(run_read_database(state, move |database| {
+                    let roots = database.list_roots()?;
+                    observed
+                        .send(roots.into_iter().map(|root| root.path).collect::<Vec<_>>())
+                        .unwrap();
+                    Ok(())
+                }));
+                std::future::poll_fn(|cx| {
+                    assert!(read.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                // Match a disconnected HTTP request: its waiter and admission
+                // guard disappear, but spawn_blocking work remains submitted.
+                drop(read);
+                drop(gate);
+                let switched = activation
+                    .spawn(async move {
+                        app.oneshot(
+                            Request::builder()
+                                .method(Method::POST)
+                                .uri(format!("/api/libraries/{}/activate", second.library_uuid))
+                                .header("x-mangoo-context-revision", revision.to_string())
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap()
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(switched.status(), StatusCode::OK);
+                assert!(retired.read_database_cache.checkout().is_err());
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                let queried = tokio::time::timeout(std::time::Duration::from_secs(10), observation)
+                    .await
+                    .unwrap();
+                assert!(
+                    queried.is_err(),
+                    "retired request queried a new Library: {queried:?}"
+                );
+                manager
+                    .active_snapshot()
+                    .runtime
+                    .unwrap()
+                    .shutdown()
+                    .await
+                    .unwrap();
+            });
+        }
+
+        #[tokio::test]
+        async fn separated_storage_create_add_root_and_activate_serialize_without_deadlock() {
+            use std::future::Future;
+            use std::task::Poll;
+
+            let (base, manager, app) = fixture();
+            let (first, _, _) = manager
+                .create_library(
+                    "First".into(),
+                    None,
+                    None,
+                    base.join("First/Database"),
+                    None,
+                    true,
+                )
+                .await
+                .unwrap();
+            let (second, _, _) = manager
+                .create_library(
+                    "Second".into(),
+                    None,
+                    None,
+                    base.join("Second/Database"),
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+            let revision = manager.active_snapshot().context_revision;
+            let extra = base.join("additional-root");
+            fs::create_dir(&extra).unwrap();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("/api/roots")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-mangoo-context-revision", revision.to_string())
+                .body(Body::from(
+                    serde_json::json!({"path":extra,"displayName":"Extra"}).to_string(),
+                ))
+                .unwrap();
+            let admission = manager.path_admission().await;
+            let activated = manager.activate_with_revision(&second.library_uuid, revision);
+            let added = app.clone().oneshot(request);
+            let created = manager.create_library(
+                "Third".into(),
+                None,
+                None,
+                base.join("Third/Database"),
+                None,
+                false,
+            );
+            tokio::pin!(activated, added, created);
+            // Queue activation first while holding operation ownership. A root
+            // request that takes the read gate before operation ownership would
+            // now block activation's write gate, deterministically forming the
+            // lock cycle instead of depending on join!'s polling order.
+            std::future::poll_fn(|cx| {
+                assert!(activated.as_mut().poll(cx).is_pending());
+                assert!(added.as_mut().poll(cx).is_pending());
+                assert!(created.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            drop(admission);
+            // This bounds a deadlock, not filesystem/runtime-start performance:
+            // full-suite contention must not consume a short timing assertion.
+            let (created, added, activated) =
+                tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                    tokio::join!(created, added, activated)
+                })
+                .await
+                .expect("operation mutex must precede the ordinary-root request gate");
+            assert!(created.is_ok());
+            let status = added.unwrap().status();
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert!(activated.is_ok());
+            assert_eq!(manager.registry().snapshot().unwrap().libraries.len(), 3);
+            for library in [&first, &second] {
+                let catalog =
+                    Database::open_existing(library.local_data_dir.join("catalog.sqlite")).unwrap();
+                assert!(catalog.list_roots().unwrap().iter().all(|root| {
+                    !crate::library_path::paths_overlap(
+                        Path::new(&root.path),
+                        &library.local_data_dir,
+                    )
+                }));
+            }
+            manager
+                .active_snapshot()
+                .runtime
+                .unwrap()
+                .shutdown()
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn separated_storage_restore_batch_checks_both_path_roles_in_both_orders() {
+            for root_aware in [false, true] {
+                for reverse in [false, true] {
+                    let (base, manager, _app) = fixture();
+                    let first = uuid::Uuid::now_v7().to_string();
+                    let second = uuid::Uuid::now_v7().to_string();
+                    discover(&manager, &first);
+                    discover(&manager, &second);
+                    let mut items = vec![
+                        item(&manager, &base, &first, root_aware),
+                        item(&manager, &base, &second, root_aware),
+                    ];
+                    let first_base = PathBuf::from(items[0]["placementBase"].as_str().unwrap());
+                    if root_aware {
+                        items[1]["roots"][0]["targetPath"] =
+                            serde_json::json!(first_base.join("Database/nested"));
+                    } else {
+                        items[1]["placementBase"] = serde_json::json!(first_base.join("Files"));
+                    }
+                    if reverse {
+                        items.reverse();
+                    }
+                    let parsed: RestorePreflightRequest =
+                        serde_json::from_value(serde_json::json!({"items":items})).unwrap();
+                    let result =
+                        super::super::validate_restore_items(&manager, &parsed.items, false);
+                    match result {
+                        Err(error) => {
+                            assert!(error.message.contains("overlap"), "{}", error.message)
+                        }
+                        Ok(result) => {
+                            assert!(result
+                                .root_results
+                                .iter()
+                                .any(|root| root.reason.as_deref()
+                                    == Some("database-content-overlap")))
+                        }
+                    }
+                    assert!(!first_base.exists());
+                }
+            }
+        }
+
+        fn fixture() -> (PathBuf, Arc<LibraryManager>, Router) {
+            let (base, manager, app, _) = fixture_with_state();
+            (base, manager, app)
+        }
+
+        fn fixture_with_state() -> (PathBuf, Arc<LibraryManager>, Router, AppState) {
+            let base = unique_temp_dir();
+            fs::create_dir_all(&base).unwrap();
+            let registry = Arc::new(
+                crate::host_registry::HostRegistry::open(base.join("host.sqlite")).unwrap(),
+            );
+            registry
+                .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
+                    plugin_id: "restore-fixture",
+                    version: "1.0.0",
+                    manifest_json: r#"{"manifestVersion":2}"#,
+                    entry_relative_path: "bin/provider",
+                    entry_sha256: &[7; 32],
+                    install_root: &base,
+                    trust_policy_id: "fixture",
+                    requested_permissions_json: "[]",
+                })
+                .unwrap();
+            registry
+                .upsert_plugin_account(ACCOUNT, "restore-fixture", Some("Fixture"), "authenticated")
+                .unwrap();
+            registry
+                .set_plugin_intent("restore-fixture", true, true)
+                .unwrap();
+            registry
+                .record_plugin_runtime_ready(
+                    "restore-fixture",
+                    "restore-fixture-session",
+                    &["sync-provider.v1".into()],
+                )
+                .unwrap();
+            let active = Arc::new(RwLock::new(ActiveSnapshot {
+                library_uuid: None,
+                context_revision: 0,
+                runtime_generation: 0,
+                runtime: None,
+            }));
+            let request_gate = Arc::new(tokio::sync::RwLock::new(()));
+            let manager = Arc::new(LibraryManager::new(
+                registry,
+                base.join("libraries"),
+                base.join("plugins"),
+                None,
+                active.clone(),
+                request_gate.clone(),
+            ));
+            let state = AppState {
+                playback_sessions: Arc::new(Default::default()),
+                active,
+                request_gate,
+                plugin_ui_gate: Arc::new(tokio::sync::RwLock::new(())),
+                library_manager: Some(manager.clone()),
+                plugin_auth_flows: Arc::new(Default::default()),
+                plugin_auth_workers: Arc::new(Default::default()),
+                plugin_auth_begin_gate: Arc::new(Default::default()),
+                secret_store: None,
+                notification_outbox_test_probe: None,
+            };
+            let app = router(state.clone()).layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::api::attach_library_context,
+            ));
+            (base, manager, app, state)
+        }
+
+        fn discover(manager: &LibraryManager, library: &str) {
+            let transport = manager
+                .registry()
+                .provider_root_transports()
+                .unwrap()
+                .remove(0);
+            manager
+                .registry()
+                .commit_provider_root_cursor(
+                    ACCOUNT,
+                    transport.account_generation,
+                    &transport.runtime_session_id,
+                    None,
+                    &[DiscoveredRemoteLibrary {
+                        metadata: crate::sync::provider::ObjectMetadata {
+                            key: format!("{library}/library-descriptor"),
+                            size: 42,
+                            sha256: [9; 32],
+                            etag: None,
+                        },
+                        name: Some("Remote fixture".into()),
+                        icon: None,
+                        media_count: Some(0),
+                        logical_bytes: Some(0),
+                        last_synced_at: None,
+                        compatible: true,
+                        error_code: None,
+                        evidence: None,
+                        history: BTreeMap::new(),
+                        roots: vec![DiscoveredRemoteRoot {
+                            root_uuid: uuid::Uuid::now_v7().to_string(),
+                            root_folder_uuid: uuid::Uuid::now_v7().to_string(),
+                            requested_name: "Files".into(),
+                            materialized_name: "Files".into(),
+                            materialization_fingerprint: "a".repeat(64),
+                            logical_revision: 1,
+                            logical_bytes: Some(0),
+                        }],
+                    }],
+                )
+                .unwrap();
+        }
+
+        fn item(
+            manager: &LibraryManager,
+            base: &Path,
+            library: &str,
+            root_aware: bool,
+        ) -> serde_json::Value {
+            if root_aware {
+                let inventory = manager
+                    .registry()
+                    .remote_library_root_inventory(ACCOUNT, library, None, usize::MAX)
+                    .unwrap();
+                let root = &inventory.items[0];
+                serde_json::json!({ "restoreMode":"root-aware", "accountUuid":ACCOUNT, "libraryUuid":library,
+                    "placementBase":base.join(format!("shell-{library}")), "inventoryFence":inventory.inventory_fence,
+                    "roots":[{"rootUuid":root.root_uuid,"expectedLogicalRevision":root.logical_revision,
+                        "expectedMaterializationFingerprint":root.materialization_fingerprint,"selected":true,"targetPath":base.join(format!("files-{library}"))}] })
+            } else {
+                serde_json::json!({"accountUuid":ACCOUNT,"libraryUuid":library,"name":"Remote fixture","placementBase":base.join(format!("shell-{library}"))})
+            }
+        }
+
+        async fn post(
+            app: &Router,
+            path: &str,
+            body: serde_json::Value,
+        ) -> (StatusCode, serde_json::Value) {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(path)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            (status, response_json(response).await)
+        }
+
+        fn request(items: &[serde_json::Value]) -> serde_json::Value {
+            let parsed: RestorePreflightRequest =
+                serde_json::from_value(serde_json::json!({"items":items})).unwrap();
+            restore_operation_request(&parsed.items)
+        }
+
+        fn plan_inputs(
+            manager: &LibraryManager,
+            items: &[serde_json::Value],
+        ) -> Vec<RestorePlanInput> {
+            items
+                .iter()
+                .map(|item| {
+                    let library = item["libraryUuid"].as_str().unwrap();
+                    let root_aware = item["restoreMode"] == "root-aware";
+                    let roots = if root_aware {
+                        manager
+                            .registry()
+                            .remote_library_root_inventory(ACCOUNT, library, None, usize::MAX)
+                            .unwrap()
+                            .items
+                            .into_iter()
+                            .map(|root| RestoreRootPlanInput {
+                                root_uuid: root.root_uuid,
+                                root_folder_uuid: root.root_folder_uuid,
+                                requested_name: root.requested_name,
+                                materialized_name: root.materialized_name,
+                                materialization_fingerprint: root.materialization_fingerprint,
+                                logical_revision: root.logical_revision,
+                                logical_bytes: root.logical_bytes,
+                                selected_binding: None,
+                            })
+                            .collect()
+                    } else {
+                        vec![]
+                    };
+                    RestorePlanInput {
+                        account_uuid: ACCOUNT.into(),
+                        library_uuid: library.into(),
+                        managed_root: PathBuf::from(
+                            item[if root_aware {
+                                "placementBase"
+                            } else {
+                                "placementBase"
+                            }]
+                            .as_str()
+                            .unwrap(),
+                        ),
+                        restore_mode: if root_aware {
+                            "root-aware"
+                        } else {
+                            "legacy-library"
+                        }
+                        .into(),
+                        inventory_fence: item["inventoryFence"].as_str().map(str::to_owned),
+                        roots,
+                    }
+                })
+                .collect()
+        }
+
+        // Read-only logical DB and byte-level filesystem snapshots. Host WAL bytes
+        // themselves are excluded; every table affected by admission is included.
+        fn snapshot(
+            base: &Path,
+        ) -> (
+            Vec<(String, Vec<Vec<String>>)>,
+            BTreeMap<PathBuf, Option<Vec<u8>>>,
+        ) {
+            let db = rusqlite::Connection::open_with_flags(
+                base.join("host.sqlite"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let tables = [
+                "libraries",
+                "host_meta",
+                "host_sync_local_state",
+                "host_sync_actor_epochs",
+                "sync_restore_preflights",
+                "sync_orchestration_operations",
+                "sync_restore_plans",
+                "sync_restore_root_plans",
+                "library_creation_journal",
+                "library_sync_bindings",
+                "remote_sync_roots",
+                "local_root_bindings",
+                "library_local_settings",
+                "provider_remote_libraries",
+                "provider_remote_sync_roots",
+            ];
+            let rows = tables
+                .into_iter()
+                .map(|table| {
+                    let mut statement = db
+                        .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                        .unwrap();
+                    let columns = statement.column_count();
+                    let values = statement
+                        .query_map([], |row| {
+                            (0..columns)
+                                .map(|i| {
+                                    row.get::<_, rusqlite::types::Value>(i)
+                                        .map(|value| format!("{value:?}"))
+                                })
+                                .collect::<Result<Vec<_>, _>>()
+                        })
+                        .unwrap()
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap();
+                    (table.to_owned(), values)
+                })
+                .collect();
+            fn visit(base: &Path, path: &Path, result: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+                for entry in fs::read_dir(path).unwrap() {
+                    let entry = entry.unwrap();
+                    if path == base
+                        && entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("host.sqlite")
+                    {
+                        continue;
+                    }
+                    let path = entry.path();
+                    let relative = path.strip_prefix(base).unwrap().to_path_buf();
+                    if path.is_dir() {
+                        result.insert(relative, None);
+                        visit(base, &path, result);
+                    } else {
+                        result.insert(relative, Some(fs::read(&path).unwrap()));
+                    }
+                }
+            }
+            let mut files = BTreeMap::new();
+            visit(base, base, &mut files);
+            (rows, files)
+        }
+
+        fn count(base: &Path, table: &str) -> i64 {
+            rusqlite::Connection::open_with_flags(
+                base.join("host.sqlite"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap()
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn duplicate_preflight_rejects_entire_aggregate_before_path_validation() {
+            for root_aware in [false, true] {
+                let (base, manager, app) = fixture();
+                let existing = manager
+                    .create_library(
+                        "Existing".into(),
+                        None,
+                        None,
+                        base.join("original"),
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap()
+                    .0;
+                fs::write(existing.managed_root.join("keep.txt"), b"original bytes").unwrap();
+                let other = uuid::Uuid::now_v7().to_string();
+                discover(&manager, &existing.library_uuid);
+                discover(&manager, &other);
+                let mut first = item(&manager, &base, &other, root_aware);
+                first[if root_aware {
+                    "placementBase"
+                } else {
+                    "placementBase"
+                }] = "invalid-relative-path".into();
+                let duplicate = item(&manager, &base, &existing.library_uuid, root_aware);
+                let before = snapshot(&base);
+                for items in [vec![duplicate.clone()], vec![first, duplicate]] {
+                    let (status, body) = post(
+                        &app,
+                        "/api/sync/restores/preflight",
+                        serde_json::json!({"items":items}),
+                    )
+                    .await;
+                    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+                    assert_eq!(body["code"], "library_already_present");
+                    assert_eq!(snapshot(&base), before);
+                }
+                assert_eq!(count(&base, "sync_restore_preflights"), 0);
+                assert_eq!(count(&base, "sync_restore_plans"), 0);
+                drop(app);
+                drop(manager);
+                fs::remove_dir_all(base).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn registration_after_preflight_rejects_start_and_atomic_claim_without_mutation() {
+            for root_aware in [false, true] {
+                let (base, manager, app) = fixture();
+                let ids = [
+                    uuid::Uuid::now_v7().to_string(),
+                    uuid::Uuid::now_v7().to_string(),
+                ];
+                for id in &ids {
+                    discover(&manager, id);
+                }
+                let items = ids
+                    .iter()
+                    .map(|id| item(&manager, &base, id, root_aware))
+                    .collect::<Vec<_>>();
+                let (status, preflight) = post(
+                    &app,
+                    "/api/sync/restores/preflight",
+                    serde_json::json!({"items":items}),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{preflight}");
+                assert_eq!(preflight["ok"], true, "{preflight}");
+                let token = preflight["preflightToken"].as_str().unwrap();
+                let operation = uuid::Uuid::now_v7().to_string();
+                let existing = manager
+                    .create_restore_library(
+                        ids[1].clone(),
+                        "Concurrent".into(),
+                        base.join("concurrent"),
+                        ACCOUNT,
+                    )
+                    .await
+                    .unwrap();
+                fs::write(
+                    existing.managed_root.join("keep.txt"),
+                    b"concurrent content",
+                )
+                .unwrap();
+                let before = snapshot(&base);
+                let (status,body) = post(&app,"/api/sync/restores",serde_json::json!({"operationUuid":operation,"preflightToken":token,"items":items})).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{body}");
+                assert_eq!(body["code"], "library_already_present");
+                assert_eq!(snapshot(&base), before);
+                let error = manager
+                    .registry()
+                    .claim_restore_and_record_plans(
+                        token,
+                        &operation,
+                        &request(&items),
+                        &plan_inputs(&manager, &items),
+                    )
+                    .unwrap_err();
+                assert_eq!(error.to_string(), "library-already-present");
+                assert_eq!(snapshot(&base), before);
+                assert_eq!(count(&base, "sync_restore_preflights"), 1);
+                assert_eq!(count(&base, "sync_orchestration_operations"), 0);
+                assert_eq!(count(&base, "sync_restore_root_plans"), 0);
+                assert!(!base.join(format!("shell-{}", ids[0])).exists());
+                drop(app);
+                drop(manager);
+                fs::remove_dir_all(base).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn exact_success_replay_precedes_admission_and_mismatch_preserves_all_state() {
+            for root_aware in [false, true] {
+                let (base, manager, app) = fixture();
+                let id = uuid::Uuid::now_v7().to_string();
+                discover(&manager, &id);
+                let items = vec![item(&manager, &base, &id, root_aware)];
+                let (_, preflight) = post(
+                    &app,
+                    "/api/sync/restores/preflight",
+                    serde_json::json!({"items":items}),
+                )
+                .await;
+                assert_eq!(preflight["ok"], true, "{preflight}");
+                let token = preflight["preflightToken"].as_str().unwrap();
+                let operation = uuid::Uuid::now_v7().to_string();
+                let start = serde_json::json!({"operationUuid":operation,"preflightToken":token,"items":items});
+                let (status, result) = post(&app, "/api/sync/restores", start.clone()).await;
+                assert_eq!(status, StatusCode::OK, "{result}");
+                let restore = result["items"][0]["restoreUuid"].as_str().unwrap();
+                let descriptor = manager.registry().library(&id).unwrap().unwrap();
+                assert!(!descriptor.local_data_dir.join("catalog.sqlite").exists());
+                assert_eq!(
+                    crate::library_path::read_marker(&descriptor.managed_root)
+                        .unwrap()
+                        .creation_txn_uuid,
+                    restore
+                );
+                if root_aware {
+                    assert_eq!(count(&base, "local_root_bindings"), 1);
+                }
+                let before = snapshot(&base);
+                let (status, replay) = post(&app, "/api/sync/restores", start.clone()).await;
+                assert_eq!(status, StatusCode::OK, "{replay}");
+                assert_eq!(replay["items"][0]["restoreUuid"], restore);
+                assert_eq!(snapshot(&base), before);
+                let (inserted, plans) = manager
+                    .registry()
+                    .claim_restore_and_record_plans(
+                        token,
+                        &operation,
+                        &request(&items),
+                        &plan_inputs(&manager, &items),
+                    )
+                    .unwrap();
+                assert!(!inserted);
+                assert_eq!(plans[0].restore_uuid, restore);
+                assert_eq!(snapshot(&base), before);
+                let mut changed = start;
+                changed["items"][0][if root_aware {
+                    "placementBase"
+                } else {
+                    "placementBase"
+                }] = base.join("different").to_string_lossy().into_owned().into();
+                let (status, error) = post(&app, "/api/sync/restores", changed).await;
+                assert_eq!(status, StatusCode::CONFLICT, "{error}");
+                assert_eq!(error["code"], "idempotency_key_reused");
+                assert_eq!(snapshot(&base), before);
+                let error = manager
+                    .registry()
+                    .claim_restore_and_record_plans(
+                        token,
+                        &operation,
+                        &serde_json::json!({"different":true}),
+                        &[],
+                    )
+                    .unwrap_err();
+                assert_eq!(error.to_string(), "idempotency-key-reused");
+                assert_eq!(snapshot(&base), before);
+                manager.discard_restore_plan(restore).await.unwrap();
+                assert!(manager.registry().library(&id).unwrap().is_none());
+                assert!(!descriptor.managed_root.exists());
+                assert!(!descriptor.local_data_dir.exists());
+                assert_eq!(count(&base, "local_root_bindings"), 0);
+                drop(app);
+                drop(manager);
+                fs::remove_dir_all(base).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn compensation_rejects_unowned_library_even_when_uuid_and_path_match() {
+            for with_catalog in [false, true] {
+                let (base, manager, app) = fixture();
+                let id = uuid::Uuid::now_v7().to_string();
+                discover(&manager, &id);
+                let items = vec![item(&manager, &base, &id, false)];
+                let (_, preflight) = post(
+                    &app,
+                    "/api/sync/restores/preflight",
+                    serde_json::json!({"items":items}),
+                )
+                .await;
+                let inputs = plan_inputs(&manager, &items);
+                let (_, plans) = manager
+                    .registry()
+                    .claim_restore_and_record_plans(
+                        preflight["preflightToken"].as_str().unwrap(),
+                        &uuid::Uuid::now_v7().to_string(),
+                        &request(&items),
+                        &inputs,
+                    )
+                    .unwrap();
+                let restore = &plans[0].restore_uuid;
+                let mut existing = crate::host_registry::LibraryDescriptor {
+                    library_uuid: id.clone(),
+                    root_uuid: uuid::Uuid::now_v7().to_string(),
+                    name: "Existing".into(),
+                    icon: None,
+                    color: None,
+                    managed_root: PathBuf::from(&plans[0].database_path),
+                    local_data_dir: PathBuf::from(&plans[0].database_path),
+                    lifecycle_state: "ready".into(),
+                    binding_state: "local-only".into(),
+                    availability: "available".into(),
+                    marker_identity: String::new(),
+                };
+                let other_txn = uuid::Uuid::now_v7().to_string();
+                manager
+                    .registry()
+                    .begin_creation(&crate::host_registry::CreationIntent {
+                        txn_uuid: other_txn.clone(),
+                        descriptor: existing.clone(),
+                        requested_root: existing.managed_root.clone(),
+                        staging_dir: existing.managed_root.join("staging"),
+                    })
+                    .unwrap();
+                fs::create_dir_all(&existing.managed_root).unwrap();
+                fs::write(
+                    existing.managed_root.join(MARKER_FILE_NAME),
+                    serde_json::to_vec(&crate::library_path::LibraryMarker {
+                        format_version: 2,
+                        library_uuid: id.clone(),
+                        root_uuid: existing.root_uuid.clone(),
+                        state: crate::library_path::MarkerState::Committed,
+                        creation_txn_uuid: other_txn.clone(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+                existing.marker_identity = crate::library_path::marker_identity(
+                    &existing.managed_root.join(MARKER_FILE_NAME),
+                )
+                .unwrap();
+                manager
+                    .registry()
+                    .commit_creation(&other_txn, &existing)
+                    .unwrap();
+                if with_catalog {
+                    let db =
+                        Database::open(existing.local_data_dir.join("catalog.sqlite")).unwrap();
+                    db.apply_migrations().unwrap();
+                }
+                fs::write(existing.managed_root.join("keep.txt"), b"existing content").unwrap();
+                let before = snapshot(&base);
+                assert_eq!(
+                    manager
+                        .create_planned_restore_library(
+                            restore,
+                            id.clone(),
+                            "Remote fixture".into(),
+                            inputs[0].managed_root.clone(),
+                            ACCOUNT,
+                        )
+                        .await
+                        .unwrap_err()
+                        .to_string(),
+                    "library-already-present"
+                );
+                assert_eq!(snapshot(&base), before);
+                assert_eq!(
+                    manager
+                        .discard_restore_plan(restore)
+                        .await
+                        .unwrap_err()
+                        .to_string(),
+                    "restore-ownership-mismatch"
+                );
+                assert_eq!(snapshot(&base), before);
+                assert_eq!(
+                    manager
+                        .registry()
+                        .commit_cancelled_restore_cleanup(restore, &id)
+                        .unwrap_err()
+                        .to_string(),
+                    "restore-ownership-mismatch"
+                );
+                assert_eq!(snapshot(&base), before);
+                let mut conflicting = existing.clone();
+                conflicting.root_uuid = uuid::Uuid::now_v7().to_string();
+                assert_eq!(
+                    manager
+                        .registry()
+                        .commit_creation(restore, &conflicting)
+                        .unwrap_err()
+                        .to_string(),
+                    "library-already-present"
+                );
+                assert_eq!(snapshot(&base), before);
+                assert!(existing.managed_root.join(MARKER_FILE_NAME).is_file());
+                drop(app);
+                drop(manager);
+                fs::remove_dir_all(base).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn owned_compensation_preserves_preexisting_empty_destination() {
+            let (base, manager, app) = fixture();
+            let id = uuid::Uuid::now_v7().to_string();
+            discover(&manager, &id);
+            let items = vec![item(&manager, &base, &id, false)];
+            let destination = PathBuf::from(items[0]["placementBase"].as_str().unwrap());
+            fs::create_dir(&destination).unwrap();
+            let identity = crate::library_path::SafeDirectory::open(&destination)
+                .unwrap()
+                .identity()
+                .to_owned();
+            let (_, preflight) = post(
+                &app,
+                "/api/sync/restores/preflight",
+                serde_json::json!({"items":items}),
+            )
+            .await;
+            let (status,result) = post(&app,"/api/sync/restores",serde_json::json!({"operationUuid":uuid::Uuid::now_v7().to_string(),"preflightToken":preflight["preflightToken"],"items":items})).await;
+            assert_eq!(status, StatusCode::OK, "{result}");
+            manager
+                .discard_restore_plan(result["items"][0]["restoreUuid"].as_str().unwrap())
+                .await
+                .unwrap();
+            assert!(destination.is_dir());
+            assert!(fs::read_dir(&destination).unwrap().next().is_none());
+            assert_eq!(
+                crate::library_path::SafeDirectory::open(&destination)
+                    .unwrap()
+                    .identity(),
+                identity
+            );
+            assert_eq!(count(&base, "libraries"), 0);
+            assert_eq!(count(&base, "library_sync_bindings"), 0);
+            drop(app);
+            drop(manager);
+            fs::remove_dir_all(base).unwrap();
+        }
+
+        #[tokio::test]
+        async fn uncreated_plan_compensation_cannot_touch_its_proposed_path() {
+            let (base, manager, app) = fixture();
+            let id = uuid::Uuid::now_v7().to_string();
+            discover(&manager, &id);
+            let items = vec![item(&manager, &base, &id, false)];
+            let (_, preflight) = post(
+                &app,
+                "/api/sync/restores/preflight",
+                serde_json::json!({"items":items}),
+            )
+            .await;
+            let inputs = plan_inputs(&manager, &items);
+            let (_, plans) = manager
+                .registry()
+                .claim_restore_and_record_plans(
+                    preflight["preflightToken"].as_str().unwrap(),
+                    &uuid::Uuid::now_v7().to_string(),
+                    &request(&items),
+                    &inputs,
+                )
+                .unwrap();
+            fs::create_dir(&inputs[0].managed_root).unwrap();
+            fs::write(
+                inputs[0].managed_root.join("keep.txt"),
+                b"arrived after claim",
+            )
+            .unwrap();
+            let before_files = snapshot(&base).1;
+            let cancelled = manager
+                .discard_restore_plan(&plans[0].restore_uuid)
+                .await
+                .unwrap();
+            assert_eq!(cancelled.state, "cancelled");
+            assert_eq!(snapshot(&base).1, before_files);
+            assert_eq!(count(&base, "libraries"), 0);
+            assert_eq!(count(&base, "library_creation_journal"), 0);
+            assert_eq!(count(&base, "library_sync_bindings"), 0);
+            assert_eq!(count(&base, "local_root_bindings"), 0);
+            drop(app);
+            drop(manager);
+            fs::remove_dir_all(base).unwrap();
+        }
+
+        #[tokio::test]
+        async fn owned_shell_refuses_cleanup_after_catalog_or_unexpected_local_content() {
+            for catalog in [false, true] {
+                let (base, manager, app) = fixture();
+                let id = uuid::Uuid::now_v7().to_string();
+                discover(&manager, &id);
+                let items = vec![item(&manager, &base, &id, true)];
+                let (_, preflight) = post(
+                    &app,
+                    "/api/sync/restores/preflight",
+                    serde_json::json!({"items":items}),
+                )
+                .await;
+                let (status,result) = post(&app,"/api/sync/restores",serde_json::json!({"operationUuid":uuid::Uuid::now_v7().to_string(),"preflightToken":preflight["preflightToken"],"items":items})).await;
+                assert_eq!(status, StatusCode::OK, "{result}");
+                let descriptor = manager.registry().library(&id).unwrap().unwrap();
+                if catalog {
+                    let db =
+                        Database::open(descriptor.local_data_dir.join("catalog.sqlite")).unwrap();
+                    db.apply_migrations().unwrap();
+                } else {
+                    fs::write(
+                        descriptor.local_data_dir.join("keep.txt"),
+                        b"unowned local content",
+                    )
+                    .unwrap();
+                }
+                let before = snapshot(&base);
+                let error = manager
+                    .discard_restore_plan(result["items"][0]["restoreUuid"].as_str().unwrap())
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.to_string(), "restore-action-not-allowed");
+                assert_eq!(snapshot(&base), before);
+                drop(app);
+                drop(manager);
+                fs::remove_dir_all(base).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn unsupported_restore_creation_journal_preserves_resources_without_new_cleanup_rights(
+        ) {
+            use crate::host_registry::{CreationIntent, LibraryDescriptor};
+            use crate::library_path::{
+                atomic_write_marker_guarded, LibraryMarker, MarkerState, SafeDirectory,
+            };
+            for committed in [false, true] {
+                let (base, manager, app) = fixture();
+                fs::write(base.join("keep.txt"), b"unrelated local content").unwrap();
+                let id = uuid::Uuid::now_v7().to_string();
+                discover(&manager, &id);
+                let items = vec![item(&manager, &base, &id, false)];
+                let (_, preflight) = post(
+                    &app,
+                    "/api/sync/restores/preflight",
+                    serde_json::json!({"items":items}),
+                )
+                .await;
+                let inputs = plan_inputs(&manager, &items);
+                let (_, plans) = manager
+                    .registry()
+                    .claim_restore_and_record_plans(
+                        preflight["preflightToken"].as_str().unwrap(),
+                        &uuid::Uuid::now_v7().to_string(),
+                        &request(&items),
+                        &inputs,
+                    )
+                    .unwrap();
+                let restore = &plans[0].restore_uuid;
+                let root = uuid::Uuid::now_v7().to_string();
+                let local = base.join("libraries").join(&id);
+                let staging = base
+                    .join("libraries")
+                    .join(format!("{id}.staging.{restore}"));
+                let intent = CreationIntent {
+                    txn_uuid: restore.clone(),
+                    requested_root: PathBuf::from(&plans[0].database_path),
+                    staging_dir: staging.clone(),
+                    descriptor: LibraryDescriptor {
+                        library_uuid: id.clone(),
+                        root_uuid: root.clone(),
+                        name: "Remote fixture".into(),
+                        icon: None,
+                        color: None,
+                        local_data_dir: local.clone(),
+                        managed_root: PathBuf::from(&plans[0].database_path),
+                        lifecycle_state: "ready".into(),
+                        binding_state: "local-only".into(),
+                        availability: "available".into(),
+                        marker_identity: String::new(),
+                    },
+                };
+                manager
+                    .registry()
+                    .begin_restore_creation(&intent, ACCOUNT)
+                    .unwrap();
+                fs::create_dir_all(&intent.descriptor.managed_root).unwrap();
+                fs::create_dir_all(&staging).unwrap();
+                let root_guard = SafeDirectory::open(&intent.descriptor.managed_root).unwrap();
+                let staging_guard = SafeDirectory::open(&staging).unwrap();
+                manager
+                    .registry()
+                    .update_creation_identities(
+                        restore,
+                        Some(root_guard.identity()),
+                        Some(staging_guard.identity()),
+                    )
+                    .unwrap();
+                let marker = LibraryMarker {
+                    format_version: 1,
+                    library_uuid: id.clone(),
+                    root_uuid: root,
+                    state: if committed {
+                        MarkerState::Committed
+                    } else {
+                        MarkerState::Pending
+                    },
+                    creation_txn_uuid: restore.clone(),
+                };
+                let marker_identity = atomic_write_marker_guarded(&root_guard, &marker).unwrap();
+                let marker_bytes =
+                    fs::read(intent.descriptor.managed_root.join(MARKER_FILE_NAME)).unwrap();
+                manager
+                    .registry()
+                    .update_creation_phase(
+                        restore,
+                        if committed {
+                            "marker-committed"
+                        } else {
+                            "marker-pending"
+                        },
+                        true,
+                        true,
+                        Some(&marker_identity),
+                        None,
+                    )
+                    .unwrap();
+                drop(root_guard);
+                drop(staging_guard);
+                manager.restore_active().await.unwrap();
+                assert!(manager.registry().library(&id).unwrap().is_none());
+                assert!(intent.descriptor.managed_root.exists());
+                assert_eq!(
+                    fs::read(intent.descriptor.managed_root.join(MARKER_FILE_NAME)).unwrap(),
+                    marker_bytes
+                );
+                assert!(staging.exists());
+                assert!(!local.exists());
+                assert_eq!(
+                    fs::read(base.join("keep.txt")).unwrap(),
+                    b"unrelated local content"
+                );
+                assert_eq!(
+                    manager
+                        .registry()
+                        .restore_plan(restore)
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    "cancelled"
+                );
+                assert_eq!(
+                    manager
+                        .registry()
+                        .pending_creation_recovery()
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert_eq!(count(&base, "library_sync_bindings"), 0);
+                drop(app);
+                drop(manager);
+                fs::remove_dir_all(base).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn non_relocation_root_operation_is_not_advertised_as_cancellable() {
         let path = unique_temp_dir().join("host.sqlite");
@@ -9725,7 +12041,7 @@ mod tests {
 
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let (database, worker_database) = test_database_pair(db_dir.join("megle.sqlite"));
+        let (database, worker_database) = test_database_pair(db_dir.join("mangoo.sqlite"));
         let state = AppState::new_with_worker(database, worker_database);
         let app = router(state.clone());
 
@@ -9770,6 +12086,7 @@ mod tests {
         assert_eq!(body["items"].as_array().expect("items").len(), 1);
         assert_eq!(body["items"][0]["displayName"], "Integration Root");
         assert_eq!(body["items"][0]["mediaCount"], 2);
+        assert_eq!(body["items"][0]["fileCount"], 3);
         assert!(body["items"][0]["lastScanAt"].as_i64().is_some());
         let root_folder_id = body["items"][0]["rootFolderId"]
             .as_i64()
@@ -9791,6 +12108,7 @@ mod tests {
         assert_eq!(body["items"].as_array().expect("items").len(), 1);
         assert_eq!(body["items"][0]["name"], "photos");
         assert_eq!(body["items"][0]["mediaCount"], 1);
+        assert_eq!(body["items"][0]["fileCount"], 1);
         let photos_folder_id = body["items"][0]["id"].as_i64().expect("photos folder id");
 
         let response = app
@@ -9856,9 +12174,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
         let items = body["items"].as_array().expect("media items");
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 3);
         assert_eq!(items[0]["name"], "clip.mp4");
         assert_eq!(items[1]["name"], "image.jpg");
+        assert_eq!(items[2]["name"], "notes.txt");
+        assert!(items[2]["kind"].is_null());
+        assert_eq!(items[2]["presentation"]["thumbnail"], "unavailable");
         let first_id = items[0]["id"].as_i64().expect("media id");
 
         let response = app
@@ -9969,10 +12290,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn all_file_generic_http_is_visible_and_thumbnail_unavailable_without_jobs() {
+        let database = Database::open_in_memory().unwrap();
+        database.apply_migrations().unwrap();
+        let (_, ids) = seed_media_files_in_one_root(&database, &["ordinary.bin"]);
+        let file_id = ids[0];
+        database
+            .connection_for_fsops()
+            .execute("DELETE FROM media WHERE file_id=?1", [file_id])
+            .unwrap();
+        database
+            .connection_for_fsops()
+            .execute("UPDATE files SET ext='.bin' WHERE id=?1", [file_id])
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let state = AppState::new_with_task_queue(database, sender);
+        let app = router(state.clone());
+        for (path, expected) in [
+            (format!("/api/media/{file_id}"), StatusCode::OK),
+            (format!("/api/media/{file_id}/thumbnail"), StatusCode::OK),
+            (
+                format!("/api/media/{file_id}/preview"),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{path}");
+            let body = response_json(response).await;
+            if path.ends_with("/thumbnail") {
+                assert_eq!(body["state"], "unavailable");
+            } else if expected == StatusCode::OK {
+                assert!(body["kind"].is_null());
+                assert_eq!(body["presentation"]["previewKind"], "static-thumbnail");
+            }
+        }
+        assert!(receiver.try_recv().is_err());
+        let tasks = state
+            .writer()
+            .unwrap()
+            .write(|db| db.list_tasks())
+            .await
+            .unwrap();
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
     async fn thumbnail_route_queues_missing_grid_320_row() {
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
         let database = Database::open(&db_path).expect("open database");
         database.apply_migrations().expect("apply migrations");
         let (root_id, file_ids) = seed_media_files_in_one_root(&database, &["a.jpg"]);
@@ -10146,7 +12516,7 @@ mod tests {
     /// rejects the payload. That is the degradation path the route has to
     /// survive without turning a working original-byte 200 into a 500.
     const UNDECODABLE_SOURCE_BYTES: &[u8] =
-        b"megle-test-raw-sensor-payload-no-decoder-handles-this";
+        b"mangoo-test-raw-sensor-payload-no-decoder-handles-this";
 
     /// A JPEG header with no scan data behind it: the file OPENS fine (so the
     /// route reaches the tier path) and then fails to decode, which is what a
@@ -10199,44 +12569,31 @@ mod tests {
         fs::create_dir_all(&temp_root).expect("create preview root");
         let source_path = temp_root.join(name);
         write_source(&source_path);
-        let size = fs::metadata(&source_path)
-            .expect("stat preview source image")
-            .len() as i64;
-
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let db_path = db_dir.join("megle.sqlite");
-        let (database, worker_database) = test_database_pair(db_path.clone());
+        let db_path = db_dir.join("mangoo.sqlite");
+        let (mut database, worker_database) = test_database_pair(db_path.clone());
         let root_id = database
             .add_root(NewRoot {
                 path: temp_root.to_string_lossy().into_owned(),
                 display_name: "Preview Harness Root".to_string(),
             })
             .expect("add root");
-        let folder_id = database
-            .upsert_folder(crate::db::FolderUpsert {
-                root_id,
-                parent_id: None,
-                name: String::new(),
-                path_hash: format!("preview-harness-root-{name}"),
-                mtime: Some(1),
-            })
-            .expect("insert root folder");
+        // Initialize actual source identity and complete collection before
+        // seeding decoded dimensions. An automatic upgrade scan would rightly
+        // invalidate dimensions attached to the old synthetic mtime/key.
+        let root = database.get_root(root_id).unwrap().unwrap();
+        let scan = crate::scan::scan_root(&mut database, &root).expect("scan preview source");
+        assert_eq!(scan.files_seen, 1);
+        assert_eq!(scan.media_files_seen, 1);
         let file_id = database
-            .upsert_file(crate::db::FileUpsert {
-                root_id,
-                folder_id,
-                name: name.to_string(),
-                ext: crate::decode::formats::lowercase_extension(&source_path),
-                size,
-                mtime: 2,
-                ctime: None,
-                file_key: None,
-            })
-            .expect("insert file");
-        database
-            .upsert_media_kind(file_id, "image")
-            .expect("insert media kind");
+            .connection_for_fsops()
+            .query_row(
+                "SELECT id FROM files WHERE root_id=?1 AND name=?2 AND status='active'",
+                (root_id, name),
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("scanned source file");
         // `source_max_px` is read from the indexed dimensions, exactly as it is
         // in production once the thumbnail pass has filled them in.
         database
@@ -10324,7 +12681,7 @@ mod tests {
         assert_eq!(
             response
                 .headers()
-                .get("x-megle-preview-tier")
+                .get("x-mangoo-preview-tier")
                 .and_then(|value| value.to_str().ok()),
             Some("original")
         );
@@ -10346,7 +12703,7 @@ mod tests {
         assert_eq!(
             response
                 .headers()
-                .get("x-megle-preview-tier")
+                .get("x-mangoo-preview-tier")
                 .and_then(|value| value.to_str().ok()),
             Some("original")
         );
@@ -10435,7 +12792,7 @@ mod tests {
         assert_eq!(
             response
                 .headers()
-                .get("x-megle-preview-tier")
+                .get("x-mangoo-preview-tier")
                 .and_then(|value| value.to_str().ok()),
             Some("original")
         );
@@ -10562,7 +12919,7 @@ mod tests {
         assert_eq!(
             response
                 .headers()
-                .get("x-megle-preview-tier")
+                .get("x-mangoo-preview-tier")
                 .and_then(|value| value.to_str().ok()),
             Some("original")
         );
@@ -10604,7 +12961,7 @@ mod tests {
         assert_eq!(
             response
                 .headers()
-                .get("x-megle-preview-tier")
+                .get("x-mangoo-preview-tier")
                 .and_then(|value| value.to_str().ok()),
             Some("original")
         );
@@ -10624,7 +12981,7 @@ mod tests {
         assert_eq!(
             first
                 .headers()
-                .get("x-megle-preview-tier")
+                .get("x-mangoo-preview-tier")
                 .and_then(|value| value.to_str().ok()),
             Some(PREVIEW_2048_PROFILE)
         );
@@ -10666,7 +13023,7 @@ mod tests {
         assert_eq!(
             second
                 .headers()
-                .get("x-megle-preview-tier")
+                .get("x-mangoo-preview-tier")
                 .and_then(|value| value.to_str().ok()),
             Some(PREVIEW_2048_PROFILE)
         );
@@ -10710,6 +13067,10 @@ mod tests {
             .get_preview_blob(harness.file_id, PREVIEW_2048_PROFILE)
             .expect("query")
             .expect("row");
+        assert_eq!(
+            response.headers()[super::PREVIEW_TIER_HEADER],
+            PREVIEW_2048_PROFILE
+        );
         assert_ne!(refreshed.source_size, 1, "stale tier must be regenerated");
     }
 
@@ -10728,7 +13089,7 @@ mod tests {
         assert_eq!(
             response
                 .headers()
-                .get("x-megle-preview-tier")
+                .get("x-mangoo-preview-tier")
                 .and_then(|value| value.to_str().ok()),
             Some(PREVIEW_NATIVE_PROFILE)
         );
@@ -10874,7 +13235,7 @@ mod tests {
     async fn thumbnail_route_distinguishes_ready_and_skipped_small_states() {
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
         let database = Database::open(&db_path).expect("open database");
         database.apply_migrations().expect("apply migrations");
         let ready_file_id = seed_media_file(&database);
@@ -11037,7 +13398,7 @@ mod tests {
             "image/webp"
         );
         assert_eq!(
-            response.headers().get("x-megle-served-by").unwrap(),
+            response.headers().get("x-mangoo-served-by").unwrap(),
             "db_blob"
         );
         let bytes = to_bytes(response.into_body(), usize::MAX)
@@ -11118,7 +13479,7 @@ mod tests {
     async fn thumbnail_cache_enqueue_route_queues_bulk_candidates() {
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
         let (database, inspector) = test_database_pair(db_path);
         let (root_id, folder_id) =
             seed_thumbnail_cache_scope_fixture(&database, "cache-enqueue-route");
@@ -11178,7 +13539,7 @@ mod tests {
     async fn thumbnail_cache_enqueue_route_respects_include_descendants() {
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
         let (database, inspector) = test_database_pair(db_path);
         let (root_id, folder_id) =
             seed_thumbnail_cache_scope_fixture(&database, "cache-enqueue-descendants");
@@ -11253,7 +13614,7 @@ mod tests {
     async fn thumbnail_cache_enqueue_route_retries_failed_only_when_requested() {
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
         let (database, inspector) = test_database_pair(db_path);
         let (root_id, folder_id) =
             seed_thumbnail_cache_scope_fixture(&database, "cache-enqueue-retry");
@@ -11333,7 +13694,7 @@ mod tests {
     async fn thumbnail_cache_enqueue_route_skips_retry_on_unreachable_root() {
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
         let (database, inspector) = test_database_pair(db_path);
         let (root_id, folder_id) =
             seed_thumbnail_cache_scope_fixture(&database, "cache-enqueue-unreachable");
@@ -11446,7 +13807,7 @@ mod tests {
     async fn thumbnail_cache_enqueue_route_stale_mode_ignores_root_reachability_gate() {
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
         let (database, inspector) = test_database_pair(db_path);
         let (root_id, folder_id) =
             seed_thumbnail_cache_scope_fixture(&database, "cache-enqueue-stale-unreachable");
@@ -11518,7 +13879,7 @@ mod tests {
     async fn thumbnail_cache_enqueue_route_accepts_explicit_file_ids() {
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
         let (database, inspector) = test_database_pair(db_path);
         let (root_id, folder_id) =
             seed_thumbnail_cache_scope_fixture(&database, "cache-explicit-route");
@@ -11567,7 +13928,7 @@ mod tests {
     async fn thumbnail_cache_clear_route_clears_blobs_and_resets_states() {
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
         let (database, inspector) = test_database_pair(db_path);
         let (root_id, folder_id) =
             seed_thumbnail_cache_scope_fixture(&database, "cache-clear-route");
@@ -11675,7 +14036,7 @@ mod tests {
     async fn thumbnail_route_handles_queued_failed_bad_profile_and_missing_media() {
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
         let database = Database::open(&db_path).expect("open database");
         database.apply_migrations().expect("apply migrations");
         let queued_file_id = seed_media_file(&database);
@@ -11841,7 +14202,7 @@ mod tests {
         fs::create_dir_all(&temp_root).expect("create root dir");
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let (database, worker_database) = test_database_pair(db_dir.join("megle.sqlite"));
+        let (database, worker_database) = test_database_pair(db_dir.join("mangoo.sqlite"));
         let root_id = database
             .add_root(crate::db::NewRoot {
                 path: temp_root.to_string_lossy().into_owned(),
@@ -11895,7 +14256,7 @@ mod tests {
 
         wait_for_task_status(&app, task_id, "succeeded").await;
         let notification_database =
-            Database::open(db_dir.join("megle.sqlite")).expect("open notification database");
+            Database::open(db_dir.join("mangoo.sqlite")).expect("open notification database");
         let operation = notification_database
             .notification_heads_for_test()
             .expect("read route notification")
@@ -11955,7 +14316,7 @@ mod tests {
         fs::create_dir_all(temp_root.join("selected")).expect("create selected dir");
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let (database, worker_database) = test_database_pair(db_dir.join("megle.sqlite"));
+        let (database, worker_database) = test_database_pair(db_dir.join("mangoo.sqlite"));
         let root_id = database
             .add_root(crate::db::NewRoot {
                 path: temp_root.to_string_lossy().into_owned(),
@@ -12039,7 +14400,7 @@ mod tests {
         fs::write(temp_root.join("image.jpg"), b"fake jpg").expect("write image");
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
 
         let database = Database::open(&db_path).expect("open database");
         database.apply_migrations().expect("apply migrations");
@@ -12074,10 +14435,10 @@ mod tests {
         fs::create_dir_all(temp_root.join("photos")).expect("create photos dir");
         fs::write(temp_root.join("photos").join("image.jpg"), b"fake jpg").expect("write image");
         fs::write(temp_root.join("clip.mp4"), b"fake mp4").expect("write video");
-        fs::write(temp_root.join("notes.txt"), b"not media").expect("write skipped file");
+        fs::write(temp_root.join("notes.txt"), b"not media").expect("write ordinary file");
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let (database, worker_database) = test_database_pair(db_dir.join("megle.sqlite"));
+        let (database, worker_database) = test_database_pair(db_dir.join("mangoo.sqlite"));
         let root_id = database
             .add_root(crate::db::NewRoot {
                 path: temp_root.to_string_lossy().into_owned(),
@@ -12111,7 +14472,8 @@ mod tests {
         assert!(task["itemsTotal"].is_null());
         assert_eq!(task["foldersSeen"], 2);
         assert_eq!(task["mediaFilesSeen"], 2);
-        assert_eq!(task["skippedFiles"], 1);
+        assert_eq!(task["filesSeen"], 3);
+        assert_eq!(task["skippedFiles"], 0);
 
         drop(app);
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -12126,7 +14488,7 @@ mod tests {
         fs::write(temp_root.join("image.jpg"), b"fake jpg").expect("write image");
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
 
         let database = Database::open(&db_path).expect("open database");
         database.apply_migrations().expect("apply migrations");
@@ -12470,7 +14832,7 @@ mod tests {
         fs::write(temp_root.join("image.jpg"), b"fake jpg").expect("write image");
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let (database, worker_database) = test_database_pair(db_dir.join("megle.sqlite"));
+        let (database, worker_database) = test_database_pair(db_dir.join("mangoo.sqlite"));
         let root_id = database
             .add_root(crate::db::NewRoot {
                 path: temp_root.to_string_lossy().into_owned(),
@@ -12597,7 +14959,7 @@ mod tests {
         fs::write(temp_root.join("image.jpg"), b"fake jpg").expect("write image");
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let db_path = db_dir.join("megle.sqlite");
+        let db_path = db_dir.join("mangoo.sqlite");
 
         let database = Database::open(&db_path).expect("open database");
         database.apply_migrations().expect("apply migrations");
@@ -12838,7 +15200,7 @@ mod tests {
                 Request::builder()
                     .method(Method::GET)
                     .uri("/api/health")
-                    .header("x-megle-session", "wrong-session")
+                    .header("x-mangoo-session", "wrong-session")
                     .body(Body::empty())
                     .expect("build request"),
             )
@@ -12851,7 +15213,7 @@ mod tests {
                 Request::builder()
                     .method(Method::GET)
                     .uri("/api/health")
-                    .header("x-megle-session", "test-session")
+                    .header("x-mangoo-session", "test-session")
                     .body(Body::empty())
                     .expect("build request"),
             )
@@ -12875,6 +15237,635 @@ mod tests {
             .expect("wake sync before Library activation");
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn directory_preferences_routes_validate_context_offline_roots_and_stale_cursors() {
+        let base = tempfile::tempdir().unwrap();
+        let state = AppState::new_host(
+            base.path().join("host.sqlite"),
+            base.path().join("libraries"),
+        )
+        .await
+        .unwrap();
+        let manager = state.library_manager.clone().unwrap();
+        // Provision the later switch target before any active Library workers.
+        // This test exercises context fencing, not concurrent Library creation.
+        let second = manager
+            .create_library(
+                "Second".into(),
+                None,
+                None,
+                base.path().join("second"),
+                None,
+                false,
+            )
+            .await
+            .unwrap()
+            .0;
+        let first = manager
+            .create_library(
+                "First".into(),
+                None,
+                None,
+                base.path().join("first"),
+                None,
+                true,
+            )
+            .await
+            .unwrap()
+            .0;
+        let offline = base.path().join("offline");
+        let root_path = offline.to_string_lossy().to_string();
+        let sorting_root = base.path().join("sorting");
+        // Populate before registering the root: any scan must observe the same
+        // children as this fixture, independent of background worker timing.
+        for name in ["a", "b", "c"] {
+            fs::create_dir_all(sorting_root.join(name)).unwrap();
+        }
+        let sorting_root_path = sorting_root.to_string_lossy().to_string();
+        let (root_id, sort_root_id, sentinel, child) = state
+            .writer()
+            .unwrap()
+            .write(move |db| {
+                let root_id = db.add_root(NewRoot {
+                    path: root_path,
+                    display_name: "Offline".into(),
+                })?;
+                let other = db.add_root(NewRoot {
+                    path: sorting_root_path,
+                    display_name: "Sorting fixture".into(),
+                })?;
+                let sentinel = db.upsert_folder(crate::db::FolderUpsert {
+                    root_id: other,
+                    parent_id: None,
+                    name: String::new(),
+                    path_hash: "sort-root".into(),
+                    mtime: None,
+                })?;
+                let mut child = 0;
+                for name in ["a", "b", "c"] {
+                    child = db.upsert_folder(crate::db::FolderUpsert {
+                        root_id: other,
+                        parent_id: Some(sentinel),
+                        name: name.into(),
+                        path_hash: format!("sort-{name}"),
+                        mtime: None,
+                    })?;
+                }
+                Ok((root_id, other, sentinel, child))
+            })
+            .await
+            .unwrap();
+        // Reconcile the actual filesystem through the same writer path used by
+        // background scans before asserting that paging has multiple children.
+        let catalog_path = first.local_data_dir.join("catalog.sqlite");
+        let scan_writer = state.writer().unwrap();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut worker_database = Database::open(&catalog_path)?;
+            let root = worker_database.get_root(sort_root_id)?.unwrap();
+            crate::scan::scan_root_with_options(
+                &mut worker_database,
+                &root,
+                crate::scan::ScanOptions {
+                    writer: Some(scan_writer),
+                    ..crate::scan::ScanOptions::background()
+                },
+            )?;
+            let folders = worker_database.list_folder_children(sentinel)?;
+            assert_eq!(
+                folders
+                    .iter()
+                    .map(|folder| folder.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["a", "b", "c"],
+                "real scan must retain the physical paging fixture"
+            );
+            assert_eq!(
+                folders[2].id, child,
+                "scan must preserve the fixture identity"
+            );
+            Ok(())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        state
+            .root_reachability()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .insert(root_id, false);
+        let revision = manager.active_snapshot().context_revision;
+        let app = router(state.clone()).layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::api::attach_library_context,
+        ));
+        let request = |method: Method, path: String, rev: Option<u64>, body: serde_json::Value| {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(rev) = rev {
+                builder = builder.header("x-mangoo-context-revision", rev.to_string());
+            }
+            builder.body(Body::from(body.to_string())).unwrap()
+        };
+        let appearance = serde_json::json!({"icon":"archive","color":"#a1B2c3"});
+        let descending = serde_json::json!({"order":"name_desc","recursive":true});
+        for path in [
+            format!("/api/roots/{root_id}/appearance"),
+            format!("/api/roots/{root_id}/sort"),
+            format!("/api/folders/{child}/sort"),
+        ] {
+            for rev in [None, Some(revision - 1)] {
+                let response = app
+                    .clone()
+                    .oneshot(request(
+                        Method::PATCH,
+                        path.clone(),
+                        rev,
+                        descending.clone(),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+            }
+        }
+        let saved = app
+            .clone()
+            .oneshot(request(
+                Method::PATCH,
+                format!("/api/roots/{root_id}/appearance"),
+                Some(revision),
+                appearance.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+        let saved = response_json(saved).await;
+        assert_eq!(saved["rootFolderId"], serde_json::Value::Null);
+        assert_eq!(saved["reachable"], false);
+        assert_eq!(saved["icon"], "archive");
+        assert!(!offline.exists());
+        for invalid in [
+            serde_json::json!({"icon":"archive"}),
+            serde_json::json!({"icon":null,"color":"#fff"}),
+            serde_json::json!({"icon":"archive","color":"red"}),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    Method::PATCH,
+                    format!("/api/roots/{root_id}/appearance"),
+                    Some(revision),
+                    invalid,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        for invalid in [
+            serde_json::json!({"order":"mtime_desc","recursive":true}),
+            serde_json::json!({"order":"name_desc"}),
+            serde_json::json!({"order":"name_desc","recursive":true,"extra":1}),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    Method::PATCH,
+                    format!("/api/roots/{root_id}/sort"),
+                    Some(revision),
+                    invalid,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let changed = app
+            .clone()
+            .oneshot(request(
+                Method::PATCH,
+                format!("/api/roots/{root_id}/sort"),
+                Some(revision),
+                descending.clone(),
+            ))
+            .await
+            .unwrap();
+        let changed_status = changed.status();
+        let changed = response_json(changed).await;
+        assert_eq!(changed_status, StatusCode::OK, "sort response: {changed}");
+        assert_eq!(changed["state"]["folderId"], serde_json::Value::Null);
+        assert_eq!(changed["invalidateDescendants"], true);
+        let reset = app
+            .clone()
+            .oneshot(request(
+                Method::DELETE,
+                format!("/api/roots/{root_id}/sort"),
+                Some(revision),
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reset.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(reset).await["state"]["effectiveOrder"],
+            "name_asc"
+        );
+        let sentinel_write = app
+            .clone()
+            .oneshot(request(
+                Method::PATCH,
+                format!("/api/folders/{sentinel}/sort"),
+                Some(revision),
+                descending.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(sentinel_write.status(), StatusCode::NOT_FOUND);
+        let page = app
+            .clone()
+            .oneshot(request(
+                Method::GET,
+                format!("/api/folders/{sentinel}/children?limit=1"),
+                None,
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        let page = response_json(page).await;
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert_eq!(page["items"][0]["name"], "a");
+        assert_eq!(page["sortState"]["effectiveOrder"], "name_asc");
+        let cursor = page["nextCursor"].as_str().unwrap();
+        let invalid = app
+            .clone()
+            .oneshot(request(
+                Method::GET,
+                format!("/api/folders/{child}/children?cursor={cursor}"),
+                None,
+                serde_json::Value::Null,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(invalid).await["code"], "stale_folder_cursor");
+        manager.activate(&second.library_uuid).await.unwrap();
+        let stale = app
+            .oneshot(request(
+                Method::PATCH,
+                format!("/api/roots/{root_id}/sort"),
+                Some(revision),
+                descending,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        manager.shutdown_sync_coordinator().await.unwrap();
+        if let Some(runtime) = manager.active_snapshot().runtime {
+            runtime.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn folder_appearance_route_validates_pair_and_pins_library_context() {
+        let base = tempfile::tempdir().unwrap();
+        let state = AppState::new_host(
+            base.path().join("host.sqlite"),
+            base.path().join("libraries"),
+        )
+        .await
+        .unwrap();
+        let manager = state.library_manager.clone().unwrap();
+        let first = manager
+            .create_library(
+                "First".into(),
+                None,
+                None,
+                base.path().join("first"),
+                None,
+                true,
+            )
+            .await
+            .unwrap()
+            .0;
+        let content_path = state
+            .writer()
+            .unwrap()
+            .write(|database| Ok(PathBuf::from(&database.list_roots()?[0].path)))
+            .await
+            .unwrap();
+        fs::create_dir_all(content_path.join("child")).unwrap();
+        let (sentinel, child) = state
+            .writer()
+            .unwrap()
+            .write(|database| {
+                let root = database.list_roots()?.remove(0);
+                let sentinel = database.upsert_folder(crate::db::FolderUpsert {
+                    root_id: root.id,
+                    parent_id: None,
+                    name: String::new(),
+                    path_hash: "root".into(),
+                    mtime: None,
+                })?;
+                let child = database.upsert_folder(crate::db::FolderUpsert {
+                    root_id: root.id,
+                    parent_id: Some(sentinel),
+                    name: "child".into(),
+                    path_hash: "child".into(),
+                    mtime: None,
+                })?;
+                Ok((sentinel, child))
+            })
+            .await
+            .unwrap();
+        let revision = manager.active_snapshot().context_revision;
+        let app = router(state.clone()).layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::api::attach_library_context,
+        ));
+        let request = |id: i64, rev: Option<u64>, body: serde_json::Value| {
+            let mut builder = Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/api/folders/{id}/appearance"));
+            if let Some(rev) = rev {
+                builder = builder.header("x-mangoo-context-revision", rev.to_string());
+            }
+            builder
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let pair = serde_json::json!({"icon":"future-icon","color":"#a1B2c3"});
+        for rev in [None, Some(revision - 1)] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(request(child, rev, pair.clone()))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::CONFLICT
+            );
+        }
+        for invalid in [
+            serde_json::json!({"icon":"camera"}),
+            serde_json::json!({"icon":null,"color":"#fff"}),
+            serde_json::json!({"icon":"bad key","color":"#fff"}),
+            serde_json::json!({"icon":"x".repeat(65),"color":"#fff"}),
+            serde_json::json!({"icon":"camera","color":"red"}),
+            serde_json::json!({"icon":"camera","color":"#ffff"}),
+            serde_json::json!({"icon":"camera","color":"#fff","extra":true}),
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(request(child, Some(revision), invalid))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        for id in [sentinel, i64::MAX] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(request(id, Some(revision), pair.clone()))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::NOT_FOUND
+            );
+        }
+        let saved = app
+            .clone()
+            .oneshot(request(child, Some(revision), pair.clone()))
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+        let saved = response_json(saved).await;
+        assert_eq!(saved["icon"], "future-icon");
+        assert_eq!(saved["color"], "#a1B2c3");
+        assert_eq!(fs::read_dir(content_path.join("child")).unwrap().count(), 0);
+        let second = manager
+            .create_library(
+                "Second".into(),
+                None,
+                None,
+                base.path().join("second"),
+                None,
+                true,
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_ne!(first.library_uuid, second.library_uuid);
+        assert_eq!(
+            app.clone()
+                .oneshot(request(child, Some(revision), pair.clone()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        manager.activate(&first.library_uuid).await.unwrap();
+        let read = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/folders/{child}/ancestors"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
+        let body = response_json(read).await;
+        let folder = body["items"].as_array().unwrap().last().unwrap();
+        assert_eq!(folder["icon"], "future-icon");
+        assert_eq!(folder["color"], "#a1B2c3");
+        let reset = app
+            .oneshot(request(
+                child,
+                Some(manager.active_snapshot().context_revision),
+                serde_json::json!({"icon":"folder","color":"#ffffff"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reset.status(), StatusCode::OK);
+        assert_eq!(response_json(reset).await["icon"], "folder");
+        manager.shutdown_sync_coordinator().await.unwrap();
+        if let Some(runtime) = manager.active_snapshot().runtime {
+            runtime.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn safe_library_routes_use_revision_headers_and_non_destructive_registration_path() {
+        let base = tempfile::tempdir().unwrap();
+        let state = AppState::new_host(
+            base.path().join("host.sqlite"),
+            base.path().join("libraries"),
+        )
+        .await
+        .unwrap();
+        let manager = state.library_manager.clone().unwrap();
+        let library = manager
+            .create_library(
+                "Retained".into(),
+                None,
+                None,
+                base.path().join("managed"),
+                None,
+                true,
+            )
+            .await
+            .unwrap()
+            .0;
+        let revision = manager.active_snapshot().context_revision;
+        fs::write(library.managed_root.join("sentinel"), b"preserved").unwrap();
+        let app = router(state.clone());
+        let uri = format!("/api/libraries/{}/registration", library.library_uuid);
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(&uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::CONFLICT);
+        let stale = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(&uri)
+                    .header("x-mangoo-context-revision", (revision - 1).to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let forgotten = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(&uri)
+                    .header("x-mangoo-context-revision", revision.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forgotten.status(), StatusCode::OK);
+        let result: serde_json::Value =
+            serde_json::from_slice(&to_bytes(forgotten.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert!(result["library"].is_null());
+        assert_eq!(result["contextRevision"], revision + 1);
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/libraries")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let list: serde_json::Value =
+            serde_json::from_slice(&to_bytes(listed.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(list["items"], serde_json::json!([]));
+        let opened = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/libraries/open")
+                    .header("x-mangoo-context-revision", (revision + 1).to_string())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"databasePath": library.managed_root}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(opened.status(), StatusCode::OK);
+        let result: serde_json::Value =
+            serde_json::from_slice(&to_bytes(opened.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(result["activated"], true);
+        assert_eq!(result["library"]["libraryUuid"], library.library_uuid);
+        assert_eq!(
+            fs::read(library.managed_root.join("sentinel")).unwrap(),
+            b"preserved"
+        );
+        assert!(library.local_data_dir.join("catalog.sqlite").is_file());
+        // A closing requester cannot abandon shutdown handles. Host shutdown
+        // waits for that detached operation before retiring its own workers.
+        let runtime = manager.active_snapshot().runtime.unwrap();
+        let cancellation = runtime.cancellation_token();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let release_worker = Arc::clone(&release);
+        let worker_cancellation = cancellation.clone();
+        runtime.own_background_task(tokio::spawn(async move {
+            worker_cancellation.cancelled().await;
+            release_worker.notified().await;
+        }));
+        let request = Request::builder()
+            .method(Method::DELETE)
+            .uri(&uri)
+            .header(
+                "x-mangoo-context-revision",
+                manager.active_snapshot().context_revision.to_string(),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let requester = tokio::spawn(app.oneshot(request));
+        tokio::time::timeout(std::time::Duration::from_secs(5), cancellation.cancelled())
+            .await
+            .unwrap();
+        requester.abort();
+        assert!(requester.await.unwrap_err().is_cancelled());
+        let closing_manager = Arc::clone(&manager);
+        let shutdown =
+            tokio::spawn(async move { closing_manager.shutdown_sync_coordinator().await });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), shutdown)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(manager.active_snapshot().library_uuid.is_none());
+        assert!(!manager
+            .registry()
+            .is_library_listed(&library.library_uuid)
+            .unwrap());
+        assert!(runtime.cancellation_token().is_cancelled());
+        assert_eq!(
+            fs::read(library.managed_root.join("sentinel")).unwrap(),
+            b"preserved"
+        );
+        assert_eq!(
+            manager
+                .open_library_with_revision(
+                    library.managed_root,
+                    manager.active_snapshot().context_revision
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+            "host-shutting-down"
+        );
     }
 
     #[tokio::test]
@@ -12940,7 +15931,7 @@ mod tests {
                         "/api/libraries/{library_uuid}/sync-folders/00000000-0000-7000-8000-000000000010/rename/commit"
                     ))
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header("x-megle-context-revision", context_revision.to_string())
+                    .header("x-mangoo-context-revision", context_revision.to_string())
                     .body(Body::from(
                         serde_json::json!({
                             "operationUuid": "00000000-0000-7000-8000-000000000011",
@@ -12971,7 +15962,7 @@ mod tests {
                         "/api/libraries/{library_uuid}/sync-folders/00000000-0000-7000-8000-000000000010/rename/commit"
                     ))
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header("x-megle-context-revision", context_revision.to_string())
+                    .header("x-mangoo-context-revision", context_revision.to_string())
                     .body(Body::from(
                         serde_json::json!({
                             "operationUuid": "00000000-0000-7000-8000-000000000011",
@@ -13003,7 +15994,7 @@ mod tests {
                         "/api/libraries/{library_uuid}/sync-folders/00000000-0000-7000-8000-000000000010/commands/stop-sync"
                     ))
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header("x-megle-context-revision", (context_revision + 1).to_string())
+                    .header("x-mangoo-context-revision", (context_revision + 1).to_string())
                     .body(Body::from(
                         serde_json::json!({
                             "operationUuid": "00000000-0000-7000-8000-000000000014",
@@ -13032,7 +16023,7 @@ mod tests {
                         "/api/libraries/{library_uuid}/sync-folders/00000000-0000-7000-8000-000000000010/commands/stop-sync"
                     ))
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header("x-megle-context-revision", context_revision.to_string())
+                    .header("x-mangoo-context-revision", context_revision.to_string())
                     .body(Body::from(
                         serde_json::json!({
                             "operationUuid": "00000000-0000-7000-8000-000000000015",
@@ -13134,185 +16125,213 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
-    #[tokio::test]
-    async fn sync_folder_reads_do_not_schedule_work_and_refresh_deduplicates_placement() {
+    #[test]
+    fn sync_folder_reads_do_not_schedule_work_and_refresh_deduplicates_placement() {
         let base = unique_temp_dir();
         fs::create_dir_all(&base).unwrap();
-        let state = AppState::new_host(base.join("host.sqlite"), base.join("libraries"))
-            .await
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
             .unwrap();
-        let manager = state.library_manager.clone().unwrap();
-        manager.shutdown_sync_coordinator().await.unwrap();
-        let library = manager
-            .create_library(
-                "Read-only inventory".into(),
-                None,
-                None,
-                base.join("managed"),
-                None,
-                true,
-            )
-            .await
-            .unwrap()
-            .0;
-        let library_uuid = &library.library_uuid;
-        let registry = manager.registry();
-        registry
-            .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
-                plugin_id: "com.megle.read-fixture",
-                version: "1.0.0",
-                manifest_json: "{}",
-                entry_relative_path: "fake-provider",
-                entry_sha256: &[0; 32],
-                install_root: &base,
-                trust_policy_id: "test",
-                requested_permissions_json: "[]",
-            })
-            .unwrap();
-        registry
-            .upsert_plugin_account(
-                "read-fixture-account",
-                "com.megle.read-fixture",
-                None,
-                "authenticated",
-            )
-            .unwrap();
-        registry
-            .set_plugin_intent("com.megle.read-fixture", true, true)
-            .unwrap();
-        registry
-            .record_plugin_runtime_ready(
-                "com.megle.read-fixture",
-                "test-session",
-                &["sync-provider.v1".into()],
-            )
-            .unwrap();
-        registry
-            .begin_sync_binding(
-                library_uuid,
-                "com.megle.read-fixture",
-                "read-fixture-account",
-            )
-            .unwrap();
-        let root_uuid = uuid::Uuid::now_v7();
-        let descriptor = crate::db::SyncRootDescriptorRecord {
-            root_uuid: *root_uuid.as_bytes(),
-            root_folder_uuid: *uuid::Uuid::now_v7().as_bytes(),
-            library_root_uuid: *uuid::Uuid::parse_str(&library.root_uuid)
-                .unwrap()
-                .as_bytes(),
-            creation_event_uuid: None,
-            winning_location_revision_uuid: None,
-            requested_name: "Photos".into(),
-            materialized_name: "Photos".into(),
-            materialization_fingerprint: [1; 32],
-            lifecycle: "active".into(),
-            logical_revision: 1,
-            updated_at: 1,
-        };
-        let root_text = root_uuid.to_string();
-        let runtime = state.resources().unwrap();
-        let catalog = state.open_read_database().unwrap().unwrap();
-        let app = router(state.clone());
-        let sync_status = || {
-            let mut status =
-                serde_json::to_value(registry.sync_status_snapshot().unwrap()).unwrap();
-            status.as_object_mut().unwrap().remove("generatedAt");
-            status
-        };
-        for revision in [1, 2] {
-            let mut descriptor = descriptor.clone();
-            descriptor.logical_revision = revision;
-            descriptor.materialization_fingerprint = [revision as u8; 32];
-            runtime
-                .writer
-                .write(move |database| database.upsert_sync_root_descriptor(&descriptor))
+        executor.block_on(async {
+            let state = AppState::new_host(base.join("host.sqlite"), base.join("libraries"))
                 .await
                 .unwrap();
-            // A real authoritative-commit hook would reset this future poll
-            // and increment the Host status revision, even with no scheduler.
+            let manager = state.library_manager.clone().unwrap();
+            let library = manager
+                .create_library(
+                    "Read-only inventory".into(),
+                    None,
+                    None,
+                    base.join("managed"),
+                    None,
+                    true,
+                )
+                .await
+                .unwrap()
+                .0;
+            // Build the fixture before Host shutdown closes Library lifecycle
+            // admission; the scheduler stays stopped for the read assertions.
+            manager.shutdown_sync_coordinator().await.unwrap();
+            let library_uuid = &library.library_uuid;
+            let registry = manager.registry();
             registry
-                .record_sync_turn_success(library_uuid, true)
+                .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
+                    plugin_id: "com.mangoo.read-fixture",
+                    version: "1.0.0",
+                    manifest_json: "{}",
+                    entry_relative_path: "fake-provider",
+                    entry_sha256: &[0; 32],
+                    install_root: &base,
+                    trust_policy_id: "test",
+                    requested_permissions_json: "[]",
+                })
                 .unwrap();
-            let before = sync_status();
-            assert!(before["libraries"][0]["pollAfter"].as_i64().unwrap() > 0);
-            let inventory = registry.remote_sync_roots(library_uuid).unwrap();
-            let notifications = catalog.list_notification_outbox(0, 100).unwrap();
-            let mut suffixes = vec![String::new(), "/settings".into()];
-            if revision > 1 {
-                suffixes.push(format!("/{root_uuid}"));
+            registry
+                .upsert_plugin_account(
+                    "read-fixture-account",
+                    "com.mangoo.read-fixture",
+                    None,
+                    "authenticated",
+                )
+                .unwrap();
+            registry
+                .set_plugin_intent("com.mangoo.read-fixture", true, true)
+                .unwrap();
+            registry
+                .record_plugin_runtime_ready(
+                    "com.mangoo.read-fixture",
+                    "test-session",
+                    &["sync-provider.v1".into()],
+                )
+                .unwrap();
+            registry
+                .begin_sync_binding(
+                    library_uuid,
+                    "com.mangoo.read-fixture",
+                    "read-fixture-account",
+                )
+                .unwrap();
+            let root_uuid = uuid::Uuid::now_v7();
+            let descriptor = crate::db::SyncRootDescriptorRecord {
+                root_uuid: *root_uuid.as_bytes(),
+                root_folder_uuid: *uuid::Uuid::now_v7().as_bytes(),
+                library_root_uuid: *uuid::Uuid::parse_str(&library.root_uuid)
+                    .unwrap()
+                    .as_bytes(),
+                creation_event_uuid: None,
+                winning_location_revision_uuid: None,
+                requested_name: "Photos".into(),
+                materialized_name: "Photos".into(),
+                materialization_fingerprint: [1; 32],
+                lifecycle: "active".into(),
+                logical_revision: 1,
+                updated_at: 1,
+            };
+            let root_text = root_uuid.to_string();
+            let runtime = state.resources().unwrap();
+            let catalog = state.open_read_database().unwrap().unwrap();
+            let app = router(state.clone());
+            // Collection now starts for ordinary managed roots too. Observe its
+            // completion before attributing any later work to inventory reads.
+            for task in catalog.list_tasks().unwrap() {
+                assert_eq!(task.kind, "root_scan");
+                wait_for_task_status(&app, task.id, "succeeded").await;
             }
-            for _ in 0..2 {
-                for suffix in &suffixes {
-                    let response = app
-                        .clone()
-                        .oneshot(
-                            Request::builder()
-                                .uri(format!(
-                                    "/api/libraries/{library_uuid}/sync-folders{suffix}"
-                                ))
-                                .body(Body::empty())
-                                .unwrap(),
-                        )
-                        .await
-                        .unwrap();
-                    assert_eq!(response.status(), StatusCode::OK);
-                    let response = response_json(response).await;
-                    if suffix.is_empty() {
-                        assert_eq!(response["items"].as_array().unwrap().len(), inventory.len());
+            let startup_notifications = catalog.list_notification_outbox(0, 100).unwrap();
+            let sync_status = || {
+                let mut status =
+                    serde_json::to_value(registry.sync_status_snapshot().unwrap()).unwrap();
+                status.as_object_mut().unwrap().remove("generatedAt");
+                status
+            };
+            for revision in [1, 2] {
+                let mut descriptor = descriptor.clone();
+                descriptor.logical_revision = revision;
+                descriptor.materialization_fingerprint = [revision as u8; 32];
+                runtime
+                    .writer
+                    .write(move |database| database.upsert_sync_root_descriptor(&descriptor))
+                    .await
+                    .unwrap();
+                // A real authoritative-commit hook would reset this future poll
+                // and increment the Host status revision, even with no scheduler.
+                registry
+                    .record_sync_turn_success(library_uuid, true)
+                    .unwrap();
+                let before = sync_status();
+                assert!(before["libraries"][0]["pollAfter"].as_i64().unwrap() > 0);
+                let inventory = registry.remote_sync_roots(library_uuid).unwrap();
+                let notifications = catalog.list_notification_outbox(0, 100).unwrap();
+                let mut suffixes = vec![String::new(), "/settings".into()];
+                if revision > 1 {
+                    suffixes.push(format!("/{root_uuid}"));
+                }
+                for _ in 0..2 {
+                    for suffix in &suffixes {
+                        let response = app
+                            .clone()
+                            .oneshot(
+                                Request::builder()
+                                    .uri(format!(
+                                        "/api/libraries/{library_uuid}/sync-folders{suffix}"
+                                    ))
+                                    .body(Body::empty())
+                                    .unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(response.status(), StatusCode::OK);
+                        let response = response_json(response).await;
+                        if suffix.is_empty() {
+                            assert_eq!(
+                                response["items"].as_array().unwrap().len(),
+                                inventory.len()
+                            );
+                        }
                     }
                 }
-            }
-            assert_eq!(
-                sync_status(),
-                before,
-                "GET must not invoke the active writer's authoritative-commit wake"
-            );
-            assert_eq!(registry.remote_sync_roots(library_uuid).unwrap(), inventory);
-            assert!(registry
-                .local_root_bindings(library_uuid)
-                .unwrap()
-                .is_empty());
-            assert!(registry
-                .root_operations(library_uuid, &root_text, None, 100, "all")
-                .unwrap()
-                .is_empty());
-            assert_eq!(
-                catalog.list_notification_outbox(0, 100).unwrap(),
-                notifications
-            );
-            assert_eq!(
-                manager
+                assert_eq!(
+                    sync_status(),
+                    before,
+                    "GET must not invoke the active writer's authoritative-commit wake"
+                );
+                assert_eq!(registry.remote_sync_roots(library_uuid).unwrap(), inventory);
+                assert!(registry
+                    .local_root_bindings(library_uuid)
+                    .unwrap()
+                    .is_empty());
+                assert!(registry
+                    .root_operations(library_uuid, &root_text, None, 100, "all")
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(
+                    catalog.list_notification_outbox(0, 100).unwrap(),
+                    notifications
+                );
+                assert_eq!(
+                    manager
+                        .refresh_sync_folder_inventory(library_uuid)
+                        .await
+                        .unwrap(),
+                    vec![root_text.clone()]
+                );
+                let published = catalog.list_notification_outbox(0, 100).unwrap();
+                assert_eq!(
+                    published.len(),
+                    startup_notifications.len() + revision as usize
+                );
+                assert_eq!(
+                    &published[..startup_notifications.len()],
+                    startup_notifications.as_slice()
+                );
+                let notification = &published.last().unwrap().operation;
+                assert_eq!(
+                    notification.library_uuid.as_deref(),
+                    Some(library_uuid.as_str())
+                );
+                assert_eq!(notification.root_uuid.as_deref(), Some(root_text.as_str()));
+                assert_eq!(
+                    notification.operation_id,
+                    format!("sync-folder-placement:{library_uuid}:{root_uuid}:{revision}")
+                );
+                assert!(manager
                     .refresh_sync_folder_inventory(library_uuid)
                     .await
-                    .unwrap(),
-                vec![root_text.clone()]
-            );
-            let published = catalog.list_notification_outbox(0, 100).unwrap();
-            assert_eq!(published.len(), revision as usize);
-            let notification = &published.last().unwrap().operation;
-            assert_eq!(
-                notification.library_uuid.as_deref(),
-                Some(library_uuid.as_str())
-            );
-            assert_eq!(notification.root_uuid.as_deref(), Some(root_text.as_str()));
-            assert_eq!(
-                notification.operation_id,
-                format!("sync-folder-placement:{library_uuid}:{root_uuid}:{revision}")
-            );
-            assert!(manager
-                .refresh_sync_folder_inventory(library_uuid)
-                .await
-                .unwrap()
-                .is_empty());
-            assert_eq!(catalog.list_notification_outbox(0, 100).unwrap(), published);
-        }
-        drop(catalog);
-        runtime.shutdown().await.unwrap();
-        drop(app);
-        drop(state);
-        drop(manager);
-        drop(runtime);
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(catalog.list_notification_outbox(0, 100).unwrap(), published);
+            }
+            drop(catalog);
+            runtime.shutdown().await.unwrap();
+            drop(app);
+            drop(state);
+            drop(manager);
+            drop(runtime);
+        });
+        // Read handlers cache SQLite connections on blocking-pool threads.
+        // Join those threads before removing the fixture files on Windows.
+        drop(executor);
         fs::remove_dir_all(base).unwrap();
     }
 
@@ -13385,6 +16404,18 @@ mod tests {
             .as_i64()
             .expect("scan task id");
         wait_for_task_status(&app, task_id, "succeeded").await;
+
+        // This fixture repeatedly changes marker identities to exercise API
+        // validation. Mismatched markers are ordinary user files and the live
+        // watcher legitimately pins them while fingerprinting. Join it before
+        // fault injection; later activation starts a fresh runtime normally.
+        manager
+            .active_snapshot()
+            .runtime
+            .unwrap()
+            .stop_watcher_for_marker_fixture()
+            .await
+            .unwrap();
 
         let foreign_library_uuid = manager
             .create_library(
@@ -13691,7 +16722,7 @@ mod tests {
                         "/api/libraries/{library_uuid}/sync-folders/enrollment/commit"
                     ))
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header("x-megle-context-revision", context_revision.to_string())
+                    .header("x-mangoo-context-revision", context_revision.to_string())
                     .body(Body::from(replacement_commit.to_string()))
                     .expect("build replacement enrollment commit"),
             )
@@ -13756,7 +16787,7 @@ mod tests {
                                 "/api/libraries/{library_uuid}/sync-folders/enrollment/commit"
                             ))
                             .header(header::CONTENT_TYPE, "application/json")
-                            .header("x-megle-context-revision", context_revision.to_string())
+                            .header("x-mangoo-context-revision", context_revision.to_string())
                             .body(Body::from(replacement_commit.to_string()))
                             .unwrap(),
                     )
@@ -13870,7 +16901,7 @@ mod tests {
                         "/api/libraries/{library_uuid}/sync-folders/enrollment/commit"
                     ))
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header("x-megle-context-revision", context_revision.to_string())
+                    .header("x-mangoo-context-revision", context_revision.to_string())
                     .body(Body::from(replacement_commit.to_string()))
                     .expect("build corrected replacement enrollment commit"),
             )
@@ -14043,7 +17074,7 @@ mod tests {
                         "/api/libraries/{library_uuid}/sync-folders/enrollment/commit"
                     ))
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header("x-megle-context-revision", context_revision.to_string())
+                    .header("x-mangoo-context-revision", context_revision.to_string())
                     .body(Body::from(
                         serde_json::json!({
                             "operationUuid": changed_operation_uuid,
@@ -14106,7 +17137,7 @@ mod tests {
                         "/api/libraries/{library_uuid}/sync-folders/enrollment/commit"
                     ))
                     .header(header::CONTENT_TYPE, "application/json")
-                    .header("x-megle-context-revision", context_revision.to_string())
+                    .header("x-mangoo-context-revision", context_revision.to_string())
                     .body(Body::from(
                         serde_json::json!({
                             "operationUuid": repair_operation_uuid,
@@ -14147,7 +17178,7 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
-    /// Empty-string env vars (e.g. `${MEGLE_SESSION_TOKEN:-}` from
+    /// Empty-string env vars (e.g. `${MANGOO_SESSION_TOKEN:-}` from
     /// `compose.yaml`) used to be threaded into `ApiConfig.session_token` as
     /// `Some("")`, which made the auth middleware compare every incoming
     /// request to the empty string and reject `/api/health` with 401. Startup
@@ -14157,7 +17188,7 @@ mod tests {
     /// reachable without any session header.
     #[tokio::test]
     async fn empty_string_session_token_does_not_reject_health() {
-        // What `main.rs` produces from `MEGLE_SESSION_TOKEN=""`: filtered to
+        // What `main.rs` produces from `MANGOO_SESSION_TOKEN=""`: filtered to
         // `None`, identical to the var being unset.
         let session_token = Some(String::new()).filter(|s: &String| !s.is_empty());
         assert!(
@@ -14173,7 +17204,7 @@ mod tests {
             },
         );
 
-        // No `X-Megle-Session` header at all should now succeed.
+        // No `X-Mangoo-Session` header at all should now succeed.
         let response = app
             .clone()
             .oneshot(
@@ -14194,13 +17225,99 @@ mod tests {
                 Request::builder()
                     .method(Method::GET)
                     .uri("/api/health")
-                    .header("x-megle-session", "")
+                    .header("x-mangoo-session", "")
                     .body(Body::empty())
                     .expect("build request"),
             )
             .await
             .expect("empty header request");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn configured_cors_allows_library_patch_preflight_without_widening_access() {
+        let origin = "http://127.0.0.1:5173";
+        let app = router_with_config(
+            test_database(),
+            ApiConfig {
+                session_token: Some("test-session".to_string()),
+                allowed_origin: Some(origin.parse().expect("origin")),
+                ..ApiConfig::default()
+            },
+        );
+        let path = "/api/libraries/00000000-0000-4000-8000-000000000001";
+        for (request_origin, method) in [
+            (origin, "PATCH"),
+            ("http://127.0.0.1:5174", "PATCH"),
+            (origin, "TRACE"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::OPTIONS)
+                        .uri(path)
+                        .header(header::ORIGIN, request_origin)
+                        .header(header::ACCESS_CONTROL_REQUEST_METHOD, method)
+                        .header(
+                            header::ACCESS_CONTROL_REQUEST_HEADERS,
+                            "content-type,x-mangoo-session,x-mangoo-context-revision",
+                        )
+                        .body(Body::empty())
+                        .expect("build library preflight"),
+                )
+                .await
+                .expect("library preflight");
+            assert_eq!(response.status(), StatusCode::OK);
+            // CORS denial is represented by a mismatched origin or an absent
+            // allowed method, not necessarily an HTTP error status.
+            assert_eq!(
+                response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+                origin
+            );
+            let methods = response.headers()[header::ACCESS_CONTROL_ALLOW_METHODS]
+                .to_str()
+                .expect("allow methods")
+                .split(',')
+                .map(str::trim)
+                .collect::<Vec<_>>();
+            assert!(methods.contains(&"PATCH"));
+            assert!(!methods.contains(&"TRACE"));
+            assert!(!methods.contains(&"*"));
+            let browser_permitted = request_origin == origin && methods.contains(&method);
+            assert_eq!(
+                browser_permitted,
+                request_origin == origin && method == "PATCH"
+            );
+            let headers = response.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS]
+                .to_str()
+                .expect("allow headers")
+                .split(',')
+                .map(str::trim)
+                .collect::<Vec<_>>();
+            for required in [
+                "content-type",
+                "x-mangoo-session",
+                "x-mangoo-context-revision",
+            ] {
+                assert!(headers.contains(&required));
+            }
+            assert!(!headers.contains(&"*"));
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri(path)
+                    .header(header::ORIGIN, origin)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"Renamed"}"#))
+                    .expect("build unauthenticated patch"),
+            )
+            .await
+            .expect("unauthenticated patch");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -14224,7 +17341,7 @@ mod tests {
                     .header(header::ACCESS_CONTROL_REQUEST_METHOD, "PUT")
                     .header(
                         header::ACCESS_CONTROL_REQUEST_HEADERS,
-                        "content-type,x-megle-session,x-megle-context-revision",
+                        "content-type,x-mangoo-session,x-mangoo-context-revision",
                     )
                     .body(Body::empty())
                     .expect("build request"),
@@ -14244,8 +17361,8 @@ mod tests {
             .expect("allow headers")
             .to_ascii_lowercase();
         assert!(allow_headers.contains("content-type"));
-        assert!(allow_headers.contains("x-megle-session"));
-        assert!(allow_headers.contains("x-megle-context-revision"));
+        assert!(allow_headers.contains("x-mangoo-session"));
+        assert!(allow_headers.contains("x-mangoo-context-revision"));
         let allow_methods = response
             .headers()
             .get(header::ACCESS_CONTROL_ALLOW_METHODS)
@@ -14264,7 +17381,7 @@ mod tests {
         // The renderer and Core sit on different loopback PORTS, so every
         // browser request is cross-origin and JS can read only CORS-safelisted
         // response headers unless they are explicitly exposed. Without this the
-        // preview client reads `x-megle-preview-tier` as null, falls back to
+        // preview client reads `x-mangoo-preview-tier` as null, falls back to
         // "original", and silently never requests the sharpening upgrade — a
         // >4096px image stays at tier resolution however far you zoom. Caught
         // only by driving the real app; no unit test saw it.
@@ -14287,7 +17404,7 @@ mod tests {
             .expect("expose headers")
             .to_ascii_lowercase();
         assert!(
-            expose_headers.contains("x-megle-preview-tier"),
+            expose_headers.contains("x-mangoo-preview-tier"),
             "preview tier header must be readable cross-origin, got: {expose_headers}"
         );
 
@@ -14298,7 +17415,7 @@ mod tests {
                     .uri("/api/health")
                     .header(header::ORIGIN, "http://127.0.0.1:5174")
                     .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
-                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "x-megle-session")
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "x-mangoo-session")
                     .body(Body::empty())
                     .expect("build request"),
             )
@@ -14680,7 +17797,7 @@ mod tests {
         fs::write(temp_root.join("beta.jpg"), b"b").expect("write beta");
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let database = Database::open(db_dir.join("megle.sqlite")).expect("open db");
+        let database = Database::open(db_dir.join("mangoo.sqlite")).expect("open db");
         database.apply_migrations().expect("apply migrations");
         let root_id = database
             .add_root(NewRoot {
@@ -14807,7 +17924,7 @@ mod tests {
         fs::write(temp_root.join("source.jpg"), b"source").expect("write source");
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let database = Database::open(db_dir.join("megle.sqlite")).expect("open db");
+        let database = Database::open(db_dir.join("mangoo.sqlite")).expect("open db");
         database.apply_migrations().expect("apply migrations");
         let root_id = database
             .add_root(NewRoot {
@@ -14906,7 +18023,7 @@ mod tests {
         fs::write(temp_root.join("m.jpg"), b"m").expect("write m");
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let database = Database::open(db_dir.join("megle.sqlite")).expect("open db");
+        let database = Database::open(db_dir.join("mangoo.sqlite")).expect("open db");
         database.apply_migrations().expect("apply migrations");
         let root_id = database
             .add_root(NewRoot {
@@ -15025,7 +18142,7 @@ mod tests {
         fs::write(temp_root.join("p.jpg"), b"p").expect("write p");
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let database = Database::open(db_dir.join("megle.sqlite")).expect("open db");
+        let database = Database::open(db_dir.join("mangoo.sqlite")).expect("open db");
         database.apply_migrations().expect("apply migrations");
         let root_id = database
             .add_root(NewRoot {
@@ -15108,7 +18225,7 @@ mod tests {
         fs::create_dir_all(&temp_root).expect("create root dir");
         let db_dir = unique_temp_dir();
         fs::create_dir_all(&db_dir).expect("create db dir");
-        let database = Database::open(db_dir.join("megle.sqlite")).expect("open db");
+        let database = Database::open(db_dir.join("mangoo.sqlite")).expect("open db");
         database.apply_migrations().expect("apply migrations");
         let root_id = database
             .add_root(NewRoot {
@@ -15501,7 +18618,7 @@ mod tests {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
         std::env::temp_dir().join(format!(
-            "megle_api_test_{}_{}_{}",
+            "mangoo_api_test_{}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -16184,7 +19301,7 @@ mod tests {
         let authorized = app
             .oneshot(
                 request()
-                    .header("x-megle-session", "notification-session")
+                    .header("x-mangoo-session", "notification-session")
                     .body(Body::from(r#"{"maxSequence":0}"#))
                     .expect("build authenticated ack"),
             )
@@ -16202,6 +19319,19 @@ mod tests {
             .await
             .unwrap();
         let app = router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/plugins/com.example.missing/views/setup")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response_json(response).await["code"], "plugin_not_found");
 
         // GET /api/plugins -> empty list (no rows persisted).
         let response = app
@@ -16254,23 +19384,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_retry_route_recovers_runnable_phase_and_preserves_command_fences() {
+    async fn generic_host_callback_claims_current_flow_and_rejects_cancel_epoch_replay() {
         let base = unique_temp_dir();
         std::fs::create_dir_all(&base).unwrap();
         let state = AppState::new_host(base.join("host.sqlite"), base.join("libraries"))
             .await
             .unwrap();
         let manager = state.library_manager.clone().unwrap();
-        // Drive actual coordinator turns explicitly so assertions cannot race
-        // the scheduler or the test-only Provider supervisor.
-        manager.shutdown_sync_coordinator().await.unwrap();
-        let registry = manager.registry();
+        let registry = manager.host_registry();
+        let id = "com.mangoo.callback-fixture";
         registry
             .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
-                plugin_id: "com.megle.fake",
+                plugin_id: id,
                 version: "1.0.0",
-                manifest_json: "{}",
-                entry_relative_path: "fake-provider",
+                manifest_json: include_str!(
+                    "../../../../bundled-plugins/com.mangoo.fake-sync/plugin.template.json"
+                ),
+                entry_relative_path: "fixture",
                 entry_sha256: &[0; 32],
                 install_root: &base,
                 trust_policy_id: "test",
@@ -16278,31 +19408,702 @@ mod tests {
             })
             .unwrap();
         registry
-            .upsert_plugin_account(
-                "fake-account",
-                "com.megle.fake",
-                Some("Test"),
-                "authenticated",
-            )
+            .upsert_plugin_account("callback-account", id, None, "signed-out")
             .unwrap();
+        registry.set_plugin_intent(id, true, true).unwrap();
         registry
-            .set_plugin_intent("com.megle.fake", true, true)
-            .unwrap();
-        registry
-            .record_plugin_runtime_ready(
-                "com.megle.fake",
-                "test-session",
-                &["sync-provider.v1".into()],
-            )
+            .record_plugin_runtime_ready(id, "callback-session", &["sync-provider.v1".into()])
             .unwrap();
         manager
             .provider_manager()
             .register(
-                "com.megle.fake",
-                "fake-account",
-                std::sync::Arc::new(crate::sync::provider::InMemorySyncProvider::default()),
+                id,
+                "callback-account",
+                Arc::new(crate::sync::provider::InMemorySyncProvider::default()),
             )
             .unwrap();
+        let app = router(state.clone());
+        for scenario in ["cancel", "epoch", "success"] {
+            let host_flow = state
+                .plugin_auth_flows
+                .create(crate::plugins::auth_flow::AuthFlowBinding {
+                    plugin_id: id.into(),
+                    account_uuid: "callback-account".into(),
+                    supervisor_session: "callback-session".into(),
+                    provider_flow_id: None,
+                })
+                .unwrap();
+            let callback =
+                format!("https://core.example.test/api/plugin-auth/callback/{host_flow}");
+            let auth = super::plugin_provider(&state, id)
+                .map_err(|e| e.message)
+                .unwrap()
+                .auth_begin(Some(callback))
+                .await
+                .unwrap();
+            state
+                .plugin_auth_flows
+                .attach_provider_flow(&host_flow, auth.flow_id.clone())
+                .unwrap();
+            assert!(registry
+                .begin_plugin_auth_flow(id, &host_flow, "callback-session")
+                .unwrap());
+            let epoch = registry.plugin_lifecycle_epoch(id).unwrap();
+            state
+                .plugin_auth_flows
+                .register_pending(
+                    id,
+                    &host_flow,
+                    "callback-session",
+                    epoch,
+                    &auth,
+                    &registry
+                        .plugin_contributions(id)
+                        .unwrap()
+                        .authentication
+                        .unwrap(),
+                    crate::host_registry::unix_timestamp_millis() + 60_000,
+                )
+                .unwrap();
+            match scenario {
+                "cancel" => {
+                    assert!(
+                        super::cancel_owned_auth_worker(&state, id, Some(&host_flow), true)
+                            .await
+                            .map_err(|e| e.message)
+                            .unwrap()
+                    );
+                }
+                "epoch" => {
+                    registry.connection.lock().unwrap().execute("UPDATE plugin_installations SET lifecycle_epoch=lifecycle_epoch+1 WHERE plugin_id=?1",[id]).unwrap();
+                }
+                _ => {}
+            }
+            let path = format!("/api/plugin-auth/callback/{host_flow}?code=ok&state=test");
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                match scenario {
+                    "cancel" => StatusCode::BAD_REQUEST,
+                    "epoch" => StatusCode::CONFLICT,
+                    _ => StatusCode::OK,
+                },
+                "{scenario}"
+            );
+            let replay = app
+                .clone()
+                .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+            if scenario == "epoch" {
+                super::cancel_owned_auth_worker(&state, id, Some(&host_flow), true)
+                    .await
+                    .map_err(|e| e.message)
+                    .unwrap();
+            } else {
+                assert!(registry.plugin_auth_flow_ownership(id).unwrap().is_none());
+            }
+            if scenario != "success" {
+                assert_eq!(
+                    registry
+                        .host_plugin(id)
+                        .unwrap()
+                        .unwrap()
+                        .auth_state
+                        .as_deref(),
+                    Some("signed-out")
+                );
+            }
+        }
+        assert_eq!(
+            registry
+                .host_plugin(id)
+                .unwrap()
+                .unwrap()
+                .auth_state
+                .as_deref(),
+            Some("authenticated")
+        );
+        manager.shutdown_sync_coordinator().await.unwrap();
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn generic_provider_real_child_configuration_auth_links_and_restart() {
+        use crate::library_manager::{ActiveSnapshot, LibraryManager};
+        use std::{sync::RwLock, time::Duration};
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).unwrap();
+        let bundled = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("bundled-plugins")
+            .canonicalize()
+            .unwrap();
+        let id = "com.mangoo.fake-sync";
+        let account = "generic-account";
+        let manifest =
+            crate::plugins::parse_manifest(&bundled.join(id).join("plugin.json")).unwrap();
+        let platform = if cfg!(windows) {
+            crate::plugins::manifest::Platform::WindowsX64
+        } else {
+            crate::plugins::manifest::Platform::LinuxX64
+        };
+        let entry = manifest.entry_for(platform).unwrap();
+        let hash = crate::plugins::manifest::sha256_file(&bundled.join(id).join(entry)).unwrap();
+        let registry =
+            Arc::new(crate::host_registry::HostRegistry::open(base.join("host.sqlite")).unwrap());
+        let permissions = serde_json::to_string(&manifest.requested_permissions).unwrap();
+        registry
+            .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
+                plugin_id: id,
+                version: &manifest.version,
+                manifest_json: &serde_json::to_string(&manifest).unwrap(),
+                entry_relative_path: entry,
+                entry_sha256: &hash,
+                install_root: &bundled.join(id),
+                trust_policy_id: "embedded-v1",
+                requested_permissions_json: &permissions,
+            })
+            .unwrap();
+        registry.set_plugin_grants(id, &permissions, true).unwrap();
+        registry
+            .upsert_plugin_account(account, id, Some("Fixture account"), "signed-out")
+            .unwrap();
+        registry.set_plugin_intent(id, true, true).unwrap();
+        let active = Arc::new(RwLock::new(ActiveSnapshot {
+            library_uuid: None,
+            context_revision: 0,
+            runtime_generation: 0,
+            runtime: None,
+        }));
+        let request_gate = Arc::new(tokio::sync::RwLock::new(()));
+        let secret_store: Option<Arc<dyn crate::plugins::secret_store::SecretStore>> = Some(
+            Arc::new(crate::plugins::secret_store::MemorySecretStore::default()),
+        );
+        let manager = Arc::new(LibraryManager::new(
+            registry.clone(),
+            base.join("libraries"),
+            bundled,
+            secret_store.clone(),
+            active.clone(),
+            request_gate.clone(),
+        ));
+        let state = AppState {
+            playback_sessions: Arc::new(Default::default()),
+            active,
+            request_gate,
+            plugin_ui_gate: Arc::new(tokio::sync::RwLock::new(())),
+            library_manager: Some(manager.clone()),
+            plugin_auth_flows: Arc::new(Default::default()),
+            plugin_auth_workers: Arc::new(Default::default()),
+            plugin_auth_begin_gate: Arc::new(Default::default()),
+            secret_store,
+            notification_outbox_test_probe: None,
+        };
+        let app = router(state);
+        manager.start_plugin_runtime_supervisors();
+        async fn session(
+            registry: &crate::host_registry::HostRegistry,
+            id: &str,
+            old: Option<&str>,
+        ) -> String {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(value) = registry.plugin_runtime_session(id).unwrap() {
+                        if old != Some(value.as_str()) {
+                            return value;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap()
+        }
+        let original = session(&registry, id, None).await;
+        async fn json_request(
+            app: &Router,
+            path: &str,
+            method: Method,
+            body: serde_json::Value,
+        ) -> axum::response::Response {
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+        let configuration = response_json(
+            json_request(
+                &app,
+                "/api/plugins/com.mangoo.fake-sync/configuration",
+                Method::GET,
+                serde_json::json!({}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(configuration["values"]["workspace"], "fixture");
+        let plan=response_json(json_request(&app,"/api/plugins/com.mangoo.fake-sync/configuration/plan",Method::POST,serde_json::json!({"values":{"workspace":"next"},"expectedRevision":configuration["revision"]})).await).await;
+        let response=json_request(&app,"/api/plugins/com.mangoo.fake-sync/configuration",Method::PUT,serde_json::json!({"planUuid":plan["planUuid"],"expectedRevision":plan["expectedRevision"],"confirmed":true})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["values"]["workspace"], "next");
+        let restarted = session(&registry, id, Some(&original)).await;
+        let response = json_request(
+            &app,
+            "/api/plugins/com.mangoo.fake-sync/auth/begin",
+            Method::POST,
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let flow = response_json(response).await;
+        let response = json_request(
+            &app,
+            "/api/plugins/com.mangoo.fake-sync/external-link",
+            Method::POST,
+            serde_json::json!({"kind":"authorization","id":flow["flowId"]}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let link = response_json(response).await;
+        assert_eq!(link["url"], flow["authorizationUrl"]);
+        assert!(link["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://auth.example.test/"));
+        let response=json_request(&app,"/api/plugins/com.mangoo.fake-sync/external-link",Method::POST,serde_json::json!({"kind":"authorization","id":flow["flowId"],"url":"https://arbitrary.example.test/"})).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let response=json_request(&app,"/api/plugins/com.mangoo.fake-sync/auth/complete",Method::POST,serde_json::json!({"flowId":flow["flowId"],"responseUri":"https://wrong.example.test/return?code=ok&state=s"})).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response=json_request(&app,"/api/plugins/com.mangoo.fake-sync/auth/complete",Method::POST,serde_json::json!({"flowId":flow["flowId"],"responseUri":"https://auth.example.test/return?code=ok&state=fixture-state&session_hint=discarded"})).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let response = json_request(
+            &app,
+            "/api/plugins/com.mangoo.fake-sync/external-link",
+            Method::POST,
+            serde_json::json!({"kind":"authorization","id":flow["flowId"]}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = json_request(
+            &app,
+            "/api/plugins/com.mangoo.fake-sync/auth/sign-out",
+            Method::POST,
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let signedout = session(&registry, id, Some(&restarted)).await;
+        assert_ne!(signedout, restarted);
+        let response = json_request(
+            &app,
+            "/api/plugins/com.mangoo.fake-sync/auth/begin",
+            Method::POST,
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let pending = response_json(response).await;
+        let response = json_request(
+            &app,
+            "/api/plugins/com.mangoo.fake-sync/disable",
+            Method::POST,
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = json_request(
+            &app,
+            "/api/plugins/com.mangoo.fake-sync/external-link",
+            Method::POST,
+            serde_json::json!({"kind":"authorization","id":pending["flowId"]}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = json_request(
+            &app,
+            "/api/plugins/com.mangoo.fake-sync/external-link",
+            Method::POST,
+            serde_json::json!({"kind":"help","id":"guide"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await["url"],
+            "https://docs.example.test/setup"
+        );
+        assert!(!registry.host_plugin(id).unwrap().unwrap().enabled_intent);
+        manager.shutdown_sync_coordinator().await.unwrap();
+        drop(manager);
+        drop(registry);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plugin_lifecycle_real_child_disable_joins_discovery_and_rejects_aba() {
+        use crate::library_manager::{ActiveSnapshot, LibraryManager};
+        use std::sync::RwLock;
+        use std::time::Duration;
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).unwrap();
+        let bundled = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("bundled-plugins")
+            .canonicalize()
+            .unwrap();
+        let id = "com.mangoo.fake-sync";
+        let account = "lifecycle-account";
+        let manifest =
+            crate::plugins::parse_manifest(&bundled.join(id).join("plugin.json")).unwrap();
+        let platform = if cfg!(windows) {
+            crate::plugins::manifest::Platform::WindowsX64
+        } else {
+            crate::plugins::manifest::Platform::LinuxX64
+        };
+        let entry = manifest.entry_for(platform).unwrap();
+        let hash = crate::plugins::manifest::sha256_file(&bundled.join(id).join(entry)).unwrap();
+        let registry =
+            Arc::new(crate::host_registry::HostRegistry::open(base.join("host.sqlite")).unwrap());
+        let permissions = serde_json::to_string(&manifest.requested_permissions).unwrap();
+        registry
+            .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
+                plugin_id: id,
+                version: &manifest.version,
+                manifest_json: &serde_json::to_string(&manifest).unwrap(),
+                entry_relative_path: entry,
+                entry_sha256: &hash,
+                install_root: &bundled.join(id),
+                trust_policy_id: "embedded-v1",
+                requested_permissions_json: &permissions,
+            })
+            .unwrap();
+        registry.set_plugin_grants(id, &permissions, true).unwrap();
+        registry
+            .upsert_plugin_account(account, id, Some("Retained account"), "authenticated")
+            .unwrap();
+        registry.set_plugin_intent(id, true, true).unwrap();
+        let active = Arc::new(RwLock::new(ActiveSnapshot {
+            library_uuid: None,
+            context_revision: 0,
+            runtime_generation: 0,
+            runtime: None,
+        }));
+        let request_gate = Arc::new(tokio::sync::RwLock::new(()));
+        let secret_store: Option<Arc<dyn crate::plugins::secret_store::SecretStore>> = Some(
+            Arc::new(crate::plugins::secret_store::MemorySecretStore::default()),
+        );
+        let manager = Arc::new(LibraryManager::new(
+            registry.clone(),
+            base.join("libraries"),
+            bundled,
+            secret_store.clone(),
+            active.clone(),
+            request_gate.clone(),
+        ));
+        let state = AppState {
+            playback_sessions: Arc::new(Default::default()),
+            active,
+            request_gate,
+            plugin_ui_gate: Arc::new(tokio::sync::RwLock::new(())),
+            library_manager: Some(manager.clone()),
+            plugin_auth_flows: Arc::new(Default::default()),
+            plugin_auth_workers: Arc::new(Default::default()),
+            plugin_auth_begin_gate: Arc::new(Default::default()),
+            secret_store,
+            notification_outbox_test_probe: None,
+        };
+        let app = router(state);
+        manager.start_plugin_runtime_supervisors();
+        let old_session = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(session) = registry.plugin_runtime_session(id).unwrap() {
+                    break session;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let old_fingerprint = registry.plugin_runtime_launches().unwrap()[0].fingerprint();
+        let old_provider = manager
+            .provider_manager()
+            .resolve(id, account)
+            .unwrap()
+            .unwrap();
+        let provider_state = base
+            .join("plugin-state")
+            .join(id)
+            .join(account)
+            .join("provider-state");
+        std::fs::write(
+            provider_state.join("lifecycle-barrier-method"),
+            "delta.list",
+        )
+        .unwrap();
+        let coordinator = crate::sync::coordinator::SyncCoordinator::with_providers(
+            registry.clone(),
+            Default::default(),
+            manager.provider_manager(),
+        );
+        let discovery =
+            tokio::spawn(async move { coordinator.run_root_discovery_for_test().await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !provider_state.join("lifecycle-barrier-entered").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // A queued local completion is part of the same Provider stop barrier.
+        #[cfg(windows)]
+        let child_handle = {
+            use std::os::windows::io::{FromRawHandle, OwnedHandle};
+            let pid: u32 =
+                std::fs::read_to_string(provider_state.join("lifecycle-barrier-entered"))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+            let handle = unsafe {
+                windows_sys::Win32::System::Threading::OpenProcess(
+                    windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE,
+                    0,
+                    pid,
+                )
+            };
+            assert!(!handle.is_null());
+            unsafe { OwnedHandle::from_raw_handle(handle) }
+        };
+        let queued = manager.provider_manager().begin_work(id).unwrap();
+        let disable_app = app.clone();
+        let disable = tokio::spawn(async move {
+            disable_app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/plugins/com.mangoo.fake-sync/disable")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while registry.host_plugin(id).unwrap().unwrap().runtime_state != "stopping" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!disable.is_finished());
+        assert!(queued.check_current().is_err());
+        assert!(old_provider.health().await.is_err());
+        drop(queued);
+        let response = tokio::time::timeout(Duration::from_secs(10), disable)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["runtimeState"], "disabled");
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            assert_eq!(
+                unsafe {
+                    windows_sys::Win32::System::Threading::WaitForSingleObject(
+                        child_handle.as_raw_handle(),
+                        0,
+                    )
+                },
+                windows_sys::Win32::Foundation::WAIT_OBJECT_0,
+                "disabled response must wait for the original process to exit"
+            );
+        }
+        assert!(discovery.await.unwrap().is_err());
+        assert!(manager
+            .provider_manager()
+            .resolve(id, account)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            registry
+                .host_plugin(id)
+                .unwrap()
+                .unwrap()
+                .auth_state
+                .as_deref(),
+            Some("authenticated")
+        );
+        assert!(!registry
+            .plugin_runtime_launch_is_current(id, &old_fingerprint)
+            .unwrap());
+        std::fs::remove_file(provider_state.join("lifecycle-barrier-method")).unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/plugins/com.mangoo.fake-sync/enable")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let new_session = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(session) = registry.plugin_runtime_session(id).unwrap() {
+                    break session;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_ne!(old_session, new_session);
+        assert!(old_provider.health().await.is_err());
+        let before_retry = manager
+            .provider_manager()
+            .resolve(id, account)
+            .unwrap()
+            .unwrap();
+        let retry_epoch = registry.plugin_lifecycle_epoch(id).unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/plugins/com.mangoo.fake-sync/retry")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(registry.plugin_lifecycle_epoch(id).unwrap() > retry_epoch + 1);
+        assert!(before_retry.health().await.is_err());
+        let restarted_session = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(session) = registry.plugin_runtime_session(id).unwrap() {
+                    if session != new_session {
+                        break session;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_ne!(restarted_session, new_session);
+        assert!(manager
+            .provider_manager()
+            .resolve(id, account)
+            .unwrap()
+            .unwrap()
+            .health()
+            .await
+            .is_ok());
+        let (library, _, _) = manager
+            .create_library(
+                "Local usable".into(),
+                None,
+                None,
+                base.join("managed"),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        registry
+            .begin_sync_binding(&library.library_uuid, id, account)
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/plugins/com.mangoo.fake-sync/disable")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let status_revision = registry.sync_status_snapshot().unwrap().revision;
+        let context_revision = registry.snapshot().unwrap().context_revision;
+        for command in ["resume", "retry", "sync-now"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!(
+                            "/api/libraries/{}/sync/{command}",
+                            library.library_uuid
+                        ))
+                        .header("X-Mangoo-Context-Revision", context_revision.to_string())
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({"operationUuid":uuid::Uuid::now_v7().to_string()})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{command}");
+            assert_eq!(response_json(response).await["code"], "provider_not_ready");
+        }
+        assert_eq!(
+            registry.sync_status_snapshot().unwrap().revision,
+            status_revision
+        );
+        let browse = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/libraries")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(browse.status(), StatusCode::OK);
+        manager.shutdown_sync_coordinator().await.unwrap();
+        drop(manager);
+        drop(registry);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn sync_retry_route_recovers_runnable_phase_and_preserves_command_fences() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).unwrap();
+        let state = AppState::new_host(base.join("host.sqlite"), base.join("libraries"))
+            .await
+            .unwrap();
+        let manager = state.library_manager.clone().unwrap();
+        // Library creation precedes shutdown's lifecycle admission fence.
+        // No Provider is registered yet, so fixture setup cannot schedule sync.
         let created = manager
             .create_library(
                 "Retry Library".into(),
@@ -16315,10 +20116,52 @@ mod tests {
             .await
             .unwrap()
             .0;
+        // Drive actual coordinator turns explicitly so assertions cannot race
+        // the scheduler or the test-only Provider supervisor.
+        manager.shutdown_sync_coordinator().await.unwrap();
+        let registry = manager.registry();
+        registry
+            .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
+                plugin_id: "com.mangoo.fake",
+                version: "1.0.0",
+                manifest_json: "{}",
+                entry_relative_path: "fake-provider",
+                entry_sha256: &[0; 32],
+                install_root: &base,
+                trust_policy_id: "test",
+                requested_permissions_json: "[]",
+            })
+            .unwrap();
+        registry
+            .upsert_plugin_account(
+                "fake-account",
+                "com.mangoo.fake",
+                Some("Test"),
+                "authenticated",
+            )
+            .unwrap();
+        registry
+            .set_plugin_intent("com.mangoo.fake", true, true)
+            .unwrap();
+        registry
+            .record_plugin_runtime_ready(
+                "com.mangoo.fake",
+                "test-session",
+                &["sync-provider.v1".into()],
+            )
+            .unwrap();
+        manager
+            .provider_manager()
+            .register(
+                "com.mangoo.fake",
+                "fake-account",
+                std::sync::Arc::new(crate::sync::provider::InMemorySyncProvider::default()),
+            )
+            .unwrap();
         let library_uuid = &created.library_uuid;
         let revision = manager.active_snapshot().context_revision;
         registry
-            .begin_sync_binding(library_uuid, "com.megle.fake", "fake-account")
+            .begin_sync_binding(library_uuid, "com.mangoo.fake", "fake-account")
             .unwrap();
         registry
             .record_sync_turn_error(library_uuid, "test_failure")
@@ -16333,7 +20176,7 @@ mod tests {
                 .method(Method::POST)
                 .uri(format!("/api/libraries/{library_uuid}/sync/retry"))
                 .header(header::CONTENT_TYPE, "application/json")
-                .header("x-megle-context-revision", context.to_string())
+                .header("x-mangoo-context-revision", context.to_string())
                 .body(Body::from(
                     serde_json::json!({"operationUuid":operation}).to_string(),
                 ))
@@ -16468,7 +20311,7 @@ mod tests {
             .record_sync_turn_error(library_uuid, "authorization_failure")
             .unwrap();
         registry
-            .update_plugin_account_auth("com.megle.fake", "expired", None)
+            .update_plugin_account_auth("com.mangoo.fake", "expired", None)
             .unwrap();
         let unauthorized = app
             .clone()
@@ -16485,7 +20328,7 @@ mod tests {
             "error"
         );
         registry
-            .update_plugin_account_auth("com.megle.fake", "authenticated", None)
+            .update_plugin_account_auth("com.mangoo.fake", "authenticated", None)
             .unwrap();
         registry.pause_binding(library_uuid).unwrap();
         let paused = registry
@@ -16525,9 +20368,11 @@ mod tests {
         manager
             .host_registry()
             .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
-                plugin_id: "com.megle.fake",
+                plugin_id: "com.mangoo.fake",
                 version: "1.0.0",
-                manifest_json: "{}",
+                manifest_json: include_str!(
+                    "../../../../bundled-plugins/com.mangoo.fake-sync/plugin.template.json"
+                ),
                 entry_relative_path: "fake-provider",
                 entry_sha256: &[0; 32],
                 install_root: &base,
@@ -16539,19 +20384,19 @@ mod tests {
             .host_registry()
             .upsert_plugin_account(
                 "fake-account",
-                "com.megle.fake",
+                "com.mangoo.fake",
                 Some("Fake account"),
                 "authenticated",
             )
             .unwrap();
         manager
             .host_registry()
-            .set_plugin_intent("com.megle.fake", true, true)
+            .set_plugin_intent("com.mangoo.fake", true, true)
             .unwrap();
         manager
             .host_registry()
             .record_plugin_runtime_ready(
-                "com.megle.fake",
+                "com.mangoo.fake",
                 "test-session",
                 &["sync-provider.v1".into()],
             )
@@ -16559,7 +20404,7 @@ mod tests {
         manager
             .provider_manager()
             .register(
-                "com.megle.fake",
+                "com.mangoo.fake",
                 "fake-account",
                 std::sync::Arc::new(crate::sync::provider::InMemorySyncProvider::default()),
             )
@@ -16576,10 +20421,14 @@ mod tests {
             .await
             .unwrap()
             .0;
-        let (binding_epoch, _) = manager
+        // This is the first authentication of this fixture Provider. Complete it
+        // before binding: an existing binding with no known remote identity must
+        // instead take the conservative scope-change fence.
+        assert!(manager
             .host_registry()
-            .begin_sync_binding(&created.library_uuid, "com.megle.fake", "fake-account")
-            .unwrap();
+            .binding_transport(&created.library_uuid, "library")
+            .unwrap()
+            .is_none());
         let app = router(state);
 
         let begin = app
@@ -16587,7 +20436,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/api/plugins/com.megle.fake/auth/begin")
+                    .uri("/api/plugins/com.mangoo.fake/auth/begin")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -16604,10 +20453,10 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/api/plugins/com.megle.fake/auth/complete")
+                    .uri("/api/plugins/com.mangoo.fake/auth/complete")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(format!(
-                        "{{\"flowId\":\"{flow_id}\",\"responseUri\":\"https://login.microsoftonline.com/common/oauth2/nativeclient?code=ok&state=test\"}}"
+                        "{{\"flowId\":\"{flow_id}\",\"responseUri\":\"https://auth.example.test/return?code=ok&state=test\"}}"
                     )))
                     .unwrap(),
             )
@@ -16615,13 +20464,27 @@ mod tests {
             .unwrap();
         assert_eq!(complete.status(), StatusCode::ACCEPTED);
 
+        let (binding_epoch, _) = manager
+            .host_registry()
+            .begin_sync_binding(&created.library_uuid, "com.mangoo.fake", "fake-account")
+            .unwrap();
+        assert_eq!(
+            manager
+                .host_registry()
+                .binding_transport(&created.library_uuid, "library")
+                .unwrap()
+                .unwrap()
+                .transport_generation,
+            1
+        );
+
         for endpoint in ["health", "diagnostics"] {
             let response = app
                 .clone()
                 .oneshot(
                     Request::builder()
                         .method(Method::GET)
-                        .uri(format!("/api/plugins/com.megle.fake/{endpoint}"))
+                        .uri(format!("/api/plugins/com.mangoo.fake/{endpoint}"))
                         .body(Body::empty())
                         .unwrap(),
                 )
@@ -16632,14 +20495,14 @@ mod tests {
 
         manager
             .provider_manager()
-            .unregister("com.megle.fake", "fake-account")
+            .unregister("com.mangoo.fake", "fake-account")
             .unwrap();
 
         let sign_out = app
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/api/plugins/com.megle.fake/auth/sign-out")
+                    .uri("/api/plugins/com.mangoo.fake/auth/sign-out")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -16648,7 +20511,7 @@ mod tests {
         assert_eq!(sign_out.status(), StatusCode::ACCEPTED);
         let account = manager
             .host_registry()
-            .plugin_account_secret("com.megle.fake")
+            .plugin_account_secret("com.mangoo.fake")
             .unwrap()
             .unwrap();
         assert!(account.secret_ref.is_none());
@@ -16704,7 +20567,7 @@ mod tests {
                 .uri("/api/tags")
                 .header(header::CONTENT_TYPE, "application/json");
             if let Some(revision) = revision_header {
-                builder = builder.header("x-megle-context-revision", revision.to_string());
+                builder = builder.header("x-mangoo-context-revision", revision.to_string());
             }
             builder
                 .body(Body::from(r#"{"name":"fenced","color":null}"#))

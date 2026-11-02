@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use anyhow::Context;
 use tokio::sync::Mutex as AsyncMutex;
@@ -10,17 +10,80 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::db::{Database, DbWriter, NewRoot, SyncRootLocalBindingRecord};
-use crate::host_registry::{CreationIntent, HostRegistry, LibraryDescriptor};
+use crate::host_registry::{
+    CreationIntent, HostRegistry, LibraryDescriptor, LibraryOpenIntent, OwnedCreationArtifact,
+};
+#[cfg(test)]
+use crate::library_path::{known_cloud_roots, preflight, PreflightResult};
 use crate::library_path::{
-    atomic_write_marker_guarded, identity_token, known_cloud_roots, marker_identity, preflight,
-    read_marker, safe_delete_tree_expected, safe_rename_directory, safe_rename_directory_expected,
-    verify_preflight_token, LibraryMarker, MarkerState, PreflightResult, SafeDirectory,
-    MARKER_FILE_NAME,
+    marker_identity, read_marker, safe_delete_tree_expected, safe_remove_empty_directory_expected,
+    safe_rename_directory_expected, ExistingLibraryRoot, LibraryContentRootInput, LibraryMarker,
+    LibraryPlanPreflight, MarkerDirectoryGuard, MarkerState, SafeDirectory, MARKER_FILE_NAME,
+    STORAGE_FORMAT_VERSION,
 };
 use crate::roots::reachability::RootReachability;
 use crate::sync::runtime::{RootRuntimeRegistry, RuntimeLease, RuntimeLeases};
 use crate::tasks::{start_managed_worker, TaskSender, TaskWorkerHandle};
 use crate::watch::{start_watcher, WatcherHandle};
+
+const MAX_CACHED_READ_DATABASES: usize = 8;
+
+#[derive(Default)]
+pub(crate) struct ReadDatabaseCache {
+    state: Mutex<ReadDatabaseCacheState>,
+    drained: Condvar,
+}
+
+#[derive(Default)]
+struct ReadDatabaseCacheState {
+    idle: Vec<Database>,
+    active: usize,
+    closed: bool,
+}
+
+pub(crate) struct ReadDatabaseLease {
+    pub database: Option<Database>,
+    cache: Arc<ReadDatabaseCache>,
+}
+
+impl ReadDatabaseCache {
+    pub(crate) fn checkout(self: &Arc<Self>) -> anyhow::Result<ReadDatabaseLease> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        anyhow::ensure!(!state.closed, "library read database cache is closed");
+        state.active += 1;
+        Ok(ReadDatabaseLease {
+            database: state.idle.pop(),
+            cache: self.clone(),
+        })
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.closed = true;
+        state.idle.clear();
+        while state.active != 0 {
+            state = self.drained.wait(state).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+}
+
+impl Drop for ReadDatabaseLease {
+    fn drop(&mut self) {
+        let mut state = self.cache.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !state.closed && state.idle.len() < MAX_CACHED_READ_DATABASES {
+            if let Some(database) = self.database.take() {
+                state.idle.push(database);
+            }
+        }
+        // Close before publishing completion, including when opening or a read
+        // failed. Shutdown must not release the Catalog lease before SQLite.
+        drop(self.database.take());
+        state.active -= 1;
+        if state.active == 0 {
+            self.cache.drained.notify_all();
+        }
+    }
+}
 
 pub struct LibraryRuntimeResources {
     #[allow(dead_code)]
@@ -33,6 +96,7 @@ pub struct LibraryRuntimeResources {
     pub fsops_database: Option<Arc<Mutex<Database>>>,
     pub task_queue: TaskSender,
     pub read_database_path: Option<PathBuf>,
+    pub(crate) read_database_cache: Arc<ReadDatabaseCache>,
     pub plugins_dir: Option<PathBuf>,
     pub root_reachability: RootReachability,
     pub root_runtime_registry: RootRuntimeRegistry,
@@ -55,6 +119,10 @@ pub struct ActiveSnapshot {
 impl LibraryRuntimeResources {
     #[cfg(test)]
     pub fn from_database_with_task_queue(database: Database, task_queue: TaskSender) -> Arc<Self> {
+        let cancellation = database
+            .decoder_context()
+            .map(|(_, cancellation)| cancellation)
+            .unwrap_or_default();
         let notification_outbox_wake = database.notification_outbox_wake();
         Arc::new(Self {
             library_uuid: None,
@@ -70,12 +138,13 @@ impl LibraryRuntimeResources {
             fsops_database: None,
             task_queue,
             read_database_path: None,
+            read_database_cache: Arc::new(ReadDatabaseCache::default()),
             plugins_dir: None,
             root_reachability: Arc::new(Mutex::new(std::collections::HashMap::new())),
             root_runtime_registry: RootRuntimeRegistry::default(),
             worker: None,
             watcher: Mutex::new(None),
-            cancellation: CancellationToken::new(),
+            cancellation,
             background_tasks: Mutex::new(Vec::new()),
             background_started: AtomicBool::new(false),
             runtime_lease: Mutex::new(None),
@@ -107,7 +176,12 @@ impl LibraryRuntimeResources {
         runtime_lease: Option<RuntimeLease>,
         authoritative_commit_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> anyhow::Result<Arc<Self>> {
+        let cancellation = database
+            .decoder_context()
+            .map(|(_, cancellation)| cancellation)
+            .unwrap_or_default();
         let notification_outbox_wake = database.notification_outbox_wake();
+        database.ensure_file_collection_upgrade_scans()?;
         let read_database_path = database.path().map(Path::to_path_buf);
         if let Err(error) = database.flush_dirty_notification_heads() {
             tracing::error!(%error, "startup notification dirty-head flush failed");
@@ -142,30 +216,56 @@ impl LibraryRuntimeResources {
             fsops_database,
             task_queue,
             read_database_path,
+            read_database_cache: Arc::new(ReadDatabaseCache::default()),
             plugins_dir,
             root_reachability: Arc::new(Mutex::new(std::collections::HashMap::new())),
             root_runtime_registry: RootRuntimeRegistry::default(),
             worker,
             watcher: Mutex::new(watcher),
-            cancellation: CancellationToken::new(),
+            cancellation,
             background_tasks: Mutex::new(Vec::new()),
             background_started: AtomicBool::new(false),
             runtime_lease: Mutex::new(runtime_lease),
         }))
     }
 
+    #[cfg(test)]
+    pub(crate) async fn stop_watcher_for_marker_fixture(&self) -> anyhow::Result<()> {
+        let watcher = self
+            .watcher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(mut watcher) = watcher {
+            tokio::task::spawn_blocking(move || watcher.shutdown()).await??;
+        }
+        Ok(())
+    }
+
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.cancellation.cancel();
+        // Requests may have detached blocking reads after an HTTP disconnect.
+        // Fence checkout and drain their connections before retiring this
+        // runtime, even if callers still retain an Arc to its resources.
+        let read_database_cache = self.read_database_cache.clone();
+        tokio::task::spawn_blocking(move || read_database_cache.close()).await?;
         let handles = self
             .background_tasks
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .drain(..)
             .collect::<Vec<_>>();
+        let mut failure = None;
         for handle in handles {
-            handle
-                .await
-                .map_err(|error| anyhow::anyhow!("runtime background task failed: {error}"))?;
+            if let Err(error) = handle.await {
+                failure.get_or_insert_with(|| {
+                    anyhow::anyhow!("runtime background task failed: {error}")
+                });
+            }
+        }
+        // Even a failed task must not detach the remaining owned handles.
+        if let Some(error) = failure {
+            return Err(error);
         }
         let watcher = self
             .watcher
@@ -179,6 +279,12 @@ impl LibraryRuntimeResources {
             worker.shutdown().await?;
         }
         self.writer.shutdown().await?;
+        if let Some(database) = &self.fsops_database {
+            database
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retire_file_connection()?;
+        }
         self.runtime_lease
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -203,12 +309,17 @@ impl LibraryRuntimeResources {
 }
 
 pub struct LibraryManager {
+    storage_snapshot: crate::sync::file_policy::StorageSnapshotSource,
+    decoder_manager: crate::plugins::decoder::DecoderManager,
     registry: Arc<HostRegistry>,
     active: Arc<RwLock<ActiveSnapshot>>,
     request_gate: Arc<tokio::sync::RwLock<()>>,
     operation: AsyncMutex<()>,
     root_relocation_operations: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    plugin_lifecycle_operations: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     runtime_generation: AtomicU64,
+    pending_runtime_stop: Mutex<Option<Arc<LibraryRuntimeResources>>>,
+    library_operations_closed: AtomicBool,
     libraries_dir: PathBuf,
     bundled_plugins_dir: PathBuf,
     secret_store: Option<Arc<dyn crate::plugins::secret_store::SecretStore>>,
@@ -228,8 +339,41 @@ struct PluginRuntimeSchedulerHandle {
 enum PluginRuntimeCommand {
     Stop {
         plugin_id: String,
-        completed: tokio::sync::oneshot::Sender<()>,
+        completed: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+}
+
+type PluginSupervisorTask = (
+    String,
+    CancellationToken,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+);
+
+async fn stop_plugin_supervisor(
+    plugin_id: &str,
+    running: &mut HashMap<String, PluginSupervisorTask>,
+    stop_errors: &mut HashMap<String, String>,
+    registry: &HostRegistry,
+    providers: &crate::sync::provider::ProviderManager,
+) -> Result<(), String> {
+    let result = if let Some((_, cancel, handle)) = running.remove(plugin_id) {
+        cancel.cancel();
+        match handle.await {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        }
+    } else if let Some(error) = stop_errors.get(plugin_id) {
+        Err(error.clone())
+    } else {
+        if let Ok(Some(account)) = registry.plugin_account_secret(plugin_id) {
+            let _ = providers.unregister(plugin_id, &account.account_uuid);
+        }
+        Ok(())
+    };
+    if let Err(error) = &result {
+        stop_errors.insert(plugin_id.to_owned(), error.clone());
+    }
+    result
 }
 
 impl LibraryManager {
@@ -250,6 +394,10 @@ impl LibraryManager {
         self.sync_coordinator.provider_manager()
     }
 
+    pub fn decoder_manager(&self) -> crate::plugins::decoder::DecoderManager {
+        self.decoder_manager.clone()
+    }
+
     pub fn reconcile_credential_retirements_once(
         &self,
         running_plugins: Option<&std::collections::HashSet<String>>,
@@ -266,6 +414,8 @@ impl LibraryManager {
     }
 
     pub async fn stop_plugin_runtime(&self, plugin_id: &str) -> anyhow::Result<()> {
+        let epoch = self.registry.plugin_lifecycle_epoch(plugin_id)?;
+        self.decoder_manager.close_plugin(plugin_id, epoch);
         let commands = self
             .plugin_runtime_scheduler
             .lock()
@@ -273,7 +423,7 @@ impl LibraryManager {
             .as_ref()
             .map(|scheduler| scheduler.commands.clone());
         let Some(commands) = commands else {
-            return Ok(());
+            return self.decoder_manager.stop_plugin(plugin_id, epoch).await;
         };
         let (completed, joined) = tokio::sync::oneshot::channel();
         commands
@@ -283,9 +433,48 @@ impl LibraryManager {
             })
             .await
             .map_err(|_| anyhow::anyhow!("plugin runtime scheduler is unavailable"))?;
-        joined
+        let result = joined
             .await
-            .map_err(|_| anyhow::anyhow!("plugin runtime stop acknowledgement was dropped"))
+            .map_err(|_| anyhow::anyhow!("plugin runtime stop acknowledgement was dropped"))?
+            .map_err(anyhow::Error::msg);
+        self.decoder_manager.stop_plugin(plugin_id, epoch).await?;
+        result
+    }
+
+    pub async fn lock_plugin_lifecycle(&self, plugin_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = self
+            .plugin_lifecycle_operations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(plugin_id.to_owned())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone();
+        gate.lock_owned().await
+    }
+
+    /// Caller holds the plugin lifecycle lock, including across auth cancellation.
+    pub async fn finish_disable_plugin(&self, plugin_id: &str) -> anyhow::Result<()> {
+        let providers = self.provider_manager();
+        providers.close_plugin(plugin_id, self.registry.plugin_lifecycle_epoch(plugin_id)?);
+        self.stop_plugin_runtime(plugin_id).await?;
+        let bindings = self.registry.plugin_binding_fences(plugin_id)?;
+        self.fence_plugin_bindings(plugin_id, bindings).await?;
+        providers.join_plugin_work(plugin_id).await;
+        self.registry.finish_plugin_stop(plugin_id)?;
+        Ok(())
+    }
+
+    /// Caller holds the lifecycle lock and has joined the account auth worker.
+    pub async fn finish_plugin_restart(&self, plugin_id: &str) -> anyhow::Result<()> {
+        let providers = self.provider_manager();
+        providers.close_plugin(plugin_id, self.registry.plugin_lifecycle_epoch(plugin_id)?);
+        self.registry.mark_plugin_stop_pending(plugin_id)?;
+        self.stop_plugin_runtime(plugin_id).await?;
+        self.fence_plugin_bindings(plugin_id, self.registry.plugin_binding_fences(plugin_id)?)
+            .await?;
+        providers.join_plugin_work(plugin_id).await;
+        self.registry.finish_plugin_runtime_restart(plugin_id)?;
+        Ok(())
     }
 
     pub fn wake_sync_after_local_mutation(&self) {
@@ -313,6 +502,7 @@ impl LibraryManager {
             .registry
             .library(library_uuid)?
             .ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
+        verify_descriptor_identity(&descriptor)?;
         let active = self.active_snapshot();
         if active.library_uuid.as_deref() == Some(library_uuid) {
             let runtime = active
@@ -518,7 +708,9 @@ impl LibraryManager {
             request["targetPath"] = serde_json::json!(evidence.target_path);
             request["pathEvidence"] = serde_json::to_value(evidence_for_request)?;
             let request_hash = crate::sync_folders::request_hash(&request)?;
-            match self.registry.begin_root_relocation(
+            let admission = self.operation.lock().await;
+            self.admit_content_path(&target, true)?;
+            let reservation = self.registry.begin_root_relocation(
                 request["operationUuid"].as_str().expect("operation UUID"),
                 library_uuid,
                 &descriptor.root_uuid,
@@ -529,7 +721,9 @@ impl LibraryManager {
                 binding.binding_generation,
                 &descriptor.materialization_fingerprint,
                 &evidence,
-            ) {
+            );
+            drop(admission);
+            match reservation {
                 Ok((relocation, _)) => {
                     let _ = self
                         .execute_root_relocation(&relocation.operation.operation_uuid, marker)
@@ -786,6 +980,8 @@ impl LibraryManager {
             }
 
             if relocation.operation.phase == "catalog-cutover" {
+                let _admission = self.operation.lock().await;
+                self.admit_content_path(Path::new(&relocation.target_path), false)?;
                 let target_path = relocation.target_path.clone();
                 let desired_name = self
                     .registry
@@ -826,6 +1022,8 @@ impl LibraryManager {
             }
 
             if relocation.operation.phase == "host-cutover" {
+                let _admission = self.operation.lock().await;
+                self.admit_content_path(Path::new(&relocation.target_path), false)?;
                 let target = Path::new(&relocation.target_path);
                 let marker = crate::sync_folders::SyncRootMarker {
                     binding_generation: generation,
@@ -1357,6 +1555,15 @@ impl LibraryManager {
         let operations = self.registry.pending_root_relocations()?;
         let mut resumed = 0;
         for relocation in operations {
+            let Some(library) = self.registry.library(&relocation.operation.library_uuid)? else {
+                continue;
+            };
+            if let Err(error) = verify_descriptor_identity(&library) {
+                self.registry
+                    .isolate_unavailable_library(&library.library_uuid)?;
+                tracing::warn!(%error, library_uuid = %library.library_uuid, "unsupported relocation preserved");
+                continue;
+            }
             let binding = self
                 .registry
                 .local_root_binding(
@@ -1964,6 +2171,7 @@ impl LibraryManager {
             .registry
             .plugin_id_for_account(account_uuid)?
             .ok_or_else(|| anyhow::anyhow!("provider-account-not-found"))?;
+        let work = self.provider_manager().begin_work(&plugin_id)?;
         let provider = self
             .provider_manager()
             .resolve(&plugin_id, account_uuid)?
@@ -2027,6 +2235,7 @@ impl LibraryManager {
                 .map(str::to_owned);
             remote_descriptor_sha256 = Some(object.metadata.sha256);
         }
+        work.check_current()?;
         self.registry.create_reconnect_plan(
             library_uuid,
             account_uuid,
@@ -2076,13 +2285,24 @@ impl LibraryManager {
             Arc::clone(&registry),
             runtime_leases.clone(),
         );
+        let decoder_manager = crate::plugins::decoder::DecoderManager::new(
+            libraries_dir
+                .parent()
+                .unwrap_or(&libraries_dir)
+                .join("decoder-temp"),
+        );
         Self {
+            decoder_manager,
+            storage_snapshot: Default::default(),
             registry,
             active,
             request_gate,
             operation: AsyncMutex::new(()),
             root_relocation_operations: Mutex::new(HashMap::new()),
+            plugin_lifecycle_operations: Mutex::new(HashMap::new()),
             runtime_generation: AtomicU64::new(0),
+            pending_runtime_stop: Mutex::new(None),
+            library_operations_closed: AtomicBool::new(false),
             libraries_dir,
             bundled_plugins_dir,
             secret_store,
@@ -2105,15 +2325,141 @@ impl LibraryManager {
         let weak = Arc::downgrade(self);
         let task = tokio::spawn(async move {
             use std::collections::HashMap;
-            let mut running: HashMap<
-                String,
-                (String, CancellationToken, tokio::task::JoinHandle<()>),
-            > = HashMap::new();
+            let mut running: HashMap<String, PluginSupervisorTask> = HashMap::new();
+            let mut stop_errors = HashMap::<String, String>::new();
             let mut blocked: HashMap<String, String> = HashMap::new();
+            let mut decoder_running = HashMap::<String, (String, i64)>::new();
+            let mut decoder_blocked = HashMap::<String, String>::new();
             loop {
                 let Some(manager) = weak.upgrade() else {
                     break;
                 };
+                // Decoders are local capabilities and never create an account,
+                // register a SyncProvider, or participate in sync reconciliation.
+                let decoder_launches = manager
+                    .registry
+                    .decoder_runtime_launches()
+                    .unwrap_or_default();
+                let desired_decoders = decoder_launches
+                    .iter()
+                    .map(|launch| (launch.plugin_id.clone(), launch.fingerprint()))
+                    .collect::<HashMap<_, _>>();
+                decoder_blocked
+                    .retain(|id, fingerprint| desired_decoders.get(id) == Some(fingerprint));
+                let available = manager.decoder_manager.snapshot();
+                let stale_decoders = decoder_running
+                    .iter()
+                    .filter(|(id, (fingerprint, _))| {
+                        desired_decoders.get(*id) != Some(fingerprint)
+                            || !available
+                                .capabilities
+                                .iter()
+                                .any(|capability| &capability.identity.plugin_id == *id)
+                    })
+                    .map(|(id, (_, epoch))| (id.clone(), *epoch))
+                    .collect::<Vec<_>>();
+                for (id, epoch) in stale_decoders {
+                    let mut expected_cancellation = false;
+                    if let Some((fingerprint, _)) = decoder_running.remove(&id) {
+                        if desired_decoders.get(&id) == Some(&fingerprint) {
+                            expected_cancellation =
+                                manager.decoder_manager.retired_after_job_cancellation(&id);
+                            if expected_cancellation {
+                                let _ = manager
+                                    .registry
+                                    .record_decoder_runtime_state(&id, epoch, "starting");
+                            } else {
+                                decoder_blocked.insert(id.clone(), fingerprint);
+                                let _ = manager.registry.record_decoder_runtime_state(
+                                    &id,
+                                    epoch,
+                                    "crashed-backoff",
+                                );
+                            }
+                        }
+                    }
+                    let stopped = if expected_cancellation {
+                        manager
+                            .decoder_manager
+                            .stop_expected_cancelled_process(&id, epoch)
+                            .await
+                    } else {
+                        manager.decoder_manager.stop_plugin(&id, epoch).await
+                    };
+                    if let Err(error) = stopped {
+                        stop_errors.insert(id, error.to_string());
+                    }
+                }
+                for launch in decoder_launches {
+                    let fingerprint = launch.fingerprint();
+                    if decoder_running.contains_key(&launch.plugin_id)
+                        || stop_errors.contains_key(&launch.plugin_id)
+                        || decoder_blocked.get(&launch.plugin_id) == Some(&fingerprint)
+                    {
+                        continue;
+                    }
+                    let result = async {
+                        let manifest: crate::plugins::manifest::ManifestRecord =
+                            serde_json::from_str(&launch.manifest_json)?;
+                        let platform = if cfg!(windows) {
+                            crate::plugins::manifest::Platform::WindowsX64
+                        } else {
+                            crate::plugins::manifest::Platform::LinuxX64
+                        };
+                        let runtime_dir = manager
+                            .libraries_dir
+                            .parent()
+                            .unwrap_or(&manager.libraries_dir)
+                            .join("decoder-temp")
+                            .join(&launch.plugin_id);
+                        let process =
+                            crate::plugins::runtime::decoder_process::DecoderProcess::activate(
+                                &manifest,
+                                &launch.install_root,
+                                platform,
+                                crate::plugins::runtime::trust::embedded_trust_registry(),
+                                runtime_dir,
+                                launch.granted_permissions.clone(),
+                            )
+                            .await?;
+                        if let Err(error) = manager.decoder_manager.register(
+                            &manifest,
+                            launch.lifecycle_epoch,
+                            process.clone(),
+                        ) {
+                            process.shutdown().await?;
+                            return Err(error);
+                        }
+                        if !manager.registry.record_decoder_runtime_state(
+                            &launch.plugin_id,
+                            launch.lifecycle_epoch,
+                            "ready",
+                        )? {
+                            manager
+                                .decoder_manager
+                                .stop_plugin(&launch.plugin_id, launch.lifecycle_epoch)
+                                .await?;
+                            anyhow::bail!("decoder launch became stale");
+                        }
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await;
+                    match result {
+                        Ok(()) => {
+                            decoder_running
+                                .insert(launch.plugin_id, (fingerprint, launch.lifecycle_epoch));
+                        }
+                        Err(error) => {
+                            let _ = manager.registry.record_decoder_runtime_state(
+                                &launch.plugin_id,
+                                launch.lifecycle_epoch,
+                                "incompatible",
+                            );
+                            tracing::warn!(plugin_id = %launch.plugin_id, %error, "decoder activation failed");
+                            decoder_blocked.insert(launch.plugin_id, fingerprint);
+                        }
+                    }
+                }
                 let running_plugins = running.keys().cloned().collect();
                 if let Err(error) =
                     manager.reconcile_credential_retirements_once(Some(&running_plugins))
@@ -2143,7 +2489,15 @@ impl LibraryManager {
                     .collect::<Vec<_>>();
                 for id in finished {
                     if let Some((_, _, handle)) = running.remove(&id) {
-                        let _ = handle.await;
+                        match handle.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                stop_errors.insert(id, error.to_string());
+                            }
+                            Err(error) => {
+                                stop_errors.insert(id, error.to_string());
+                            }
+                        }
                     }
                 }
                 let stale = running
@@ -2157,11 +2511,36 @@ impl LibraryManager {
                     .collect::<Vec<_>>();
                 for id in stale {
                     if let Some((_, cancel, handle)) = running.remove(&id) {
+                        // Preserve the retired slot's epoch. The new persisted
+                        // launch must be newer, and cannot enter until all old
+                        // provider work (including queued writes) has drained.
+                        manager.provider_manager().close_plugin(&id, 0);
                         cancel.cancel();
-                        let _ = handle.await;
+                        match handle.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                stop_errors.insert(id.clone(), error.to_string());
+                            }
+                            Err(error) => {
+                                stop_errors.insert(id.clone(), error.to_string());
+                            }
+                        }
+                        manager.provider_manager().join_plugin_work(&id).await;
                     }
                 }
                 for launch in launches {
+                    if stop_errors.contains_key(&launch.plugin_id) {
+                        continue;
+                    }
+                    if let Ok(epochs) = manager
+                        .registry
+                        .resume_plugin_suspended_bindings(&launch.plugin_id)
+                    {
+                        for epoch in epochs {
+                            manager.sync_coordinator.resume_media_binding(epoch).await;
+                            manager.sync_coordinator.wake();
+                        }
+                    }
                     if running.contains_key(&launch.plugin_id) {
                         continue;
                     }
@@ -2212,10 +2591,16 @@ impl LibraryManager {
                     let account_uuid = launch.account_uuid.clone();
                     let registry = Arc::clone(&manager.registry);
                     let providers = manager.provider_manager();
+                    if providers
+                        .open_plugin(&plugin_id, launch.lifecycle_epoch)
+                        .is_err()
+                    {
+                        continue;
+                    }
                     let child_cancel = task_cancel.child_token();
                     let supervisor_cancel = child_cancel.clone();
                     let install_root = launch.install_root.clone();
-                    let runtime_root = std::env::var_os("MEGLE_PLUGIN_STATE_DIR")
+                    let runtime_root = std::env::var_os("MANGOO_PLUGIN_STATE_DIR")
                         .filter(|value| !value.is_empty())
                         .map(PathBuf::from)
                         .unwrap_or_else(|| {
@@ -2242,8 +2627,7 @@ impl LibraryManager {
                         let activation_account = task_account_uuid.clone();
                         let activation_root = install_root.clone();
                         let activation_runtime = runtime_dir.clone();
-                        if let Err(error) =
-                            crate::plugins::runtime::supervisor::supervise_until_cancelled(
+                        let result = crate::plugins::runtime::supervisor::supervise_until_cancelled(
                                 Arc::clone(&registry),
                                 task_providers,
                                 task_plugin_id.clone(),
@@ -2263,7 +2647,7 @@ impl LibraryManager {
                                     let registry = Arc::clone(&activation_registry);
                                     let launch_fingerprint = activation_fingerprint.clone();
                                     async move {
-                                        let onedrive_client_id = registry.effective_onedrive_client_id()?;
+                                        let configuration = registry.plugin_startup_configuration(&manifest.id)?;
                                         let reverse = secret_store.map(|store| Arc::new(crate::plugins::runtime::secret_broker::SecretBroker::new(store, registry, manifest.id.clone(), account.clone(), launch_fingerprint)) as Arc<dyn crate::plugins::runtime::rpc::ReverseRpcHandler>);
                                         crate::plugins::runtime::supervisor::activate_and_register(
                                             &providers,
@@ -2276,16 +2660,17 @@ impl LibraryManager {
                                             ),
                                             runtime,
                                             reverse,
-                                            onedrive_client_id,
+                                            configuration,
                                         )
                                         .await
                                     }
                                 },
                             )
-                            .await
-                        {
+                            .await;
+                        if let Err(error) = &result {
                             tracing::error!(plugin_id = %task_plugin_id, %error, "plugin supervisor stopped with error");
                         }
+                        result
                     });
                     running.insert(plugin_id, (fingerprint, child_cancel, handle));
                 }
@@ -2295,13 +2680,13 @@ impl LibraryManager {
                         let Some(PluginRuntimeCommand::Stop { plugin_id, completed }) = command else {
                             break;
                         };
-                        if let Some((_, cancel, handle)) = running.remove(&plugin_id) {
-                            cancel.cancel();
-                            let _ = handle.await;
-                        } else if let Ok(Some(account)) = manager.registry.plugin_account_secret(&plugin_id) {
-                            let _ = manager.provider_manager().unregister(&plugin_id, &account.account_uuid);
-                        }
-                        let _ = completed.send(());
+                        let result = stop_plugin_supervisor(&plugin_id, &mut running, &mut stop_errors, &manager.registry, &manager.provider_manager()).await;
+                        let result = match manager.decoder_manager.stop_plugin(&plugin_id, manager.registry.plugin_lifecycle_epoch(&plugin_id).unwrap_or(0)).await {
+                            Ok(()) => result,
+                            Err(error) => Err(error.to_string()),
+                        };
+                        decoder_running.remove(&plugin_id);
+                        let _ = completed.send(result);
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
                 }
@@ -2309,6 +2694,11 @@ impl LibraryManager {
             for (_, (_, cancel, handle)) in running {
                 cancel.cancel();
                 let _ = handle.await;
+            }
+            if let Some(manager) = weak.upgrade() {
+                if let Err(error) = manager.decoder_manager.shutdown().await {
+                    tracing::error!(%error, "decoder runtime shutdown failed");
+                }
             }
         });
         *self
@@ -2383,6 +2773,14 @@ impl LibraryManager {
 
     #[allow(dead_code)]
     pub async fn shutdown_sync_coordinator(&self) -> anyhow::Result<()> {
+        // New HTTP lifecycle tasks outlive a cancelled requester. Close their
+        // admission before draining the shared operation lock so none can publish
+        // a runtime while Host-owned workers are being stopped.
+        self.library_operations_closed
+            .store(true, Ordering::Release);
+        let _operation = self.operation.lock().await;
+        self.finish_pending_runtime_stop().await?;
+        drop(_operation);
         let relocation_scheduler = self
             .root_relocation_scheduler
             .lock()
@@ -2419,6 +2817,7 @@ impl LibraryManager {
             Ok(())
         };
         let media_shutdown = self.sync_coordinator.shutdown_media_workers().await;
+        self.decoder_manager.shutdown().await?;
         let provider_shutdown = self.sync_coordinator.provider_manager().shutdown().await;
         scheduler_join?;
         media_shutdown?;
@@ -2441,7 +2840,19 @@ impl LibraryManager {
     }
 
     pub async fn restore_active(&self) -> anyhow::Result<()> {
+        self.refresh_storage_snapshot()?;
         self.recover_journals()?;
+        // Opening owns only a fresh Host-local catalog. Recovery never writes
+        // or deletes anything in the selected managed root.
+        let registration_storage = LibraryRegistrationStorage {
+            registry: Arc::clone(&self.registry),
+            libraries_dir: self.libraries_dir.clone(),
+        };
+        for intent in self.registry.library_open_intents()? {
+            if let Err(error) = registration_storage.finish_library_open(intent) {
+                tracing::warn!(%error, "existing Library registration remains pending");
+            }
+        }
         self.registry.recover_activation_journal()?;
         self.registry.recover_sync_orchestration_journals()?;
         // Resolve ambiguous source/target journal states before prepare_runtime
@@ -2453,7 +2864,21 @@ impl LibraryManager {
                 .registry
                 .library(&library_uuid)?
                 .ok_or_else(|| anyhow::anyhow!("active library is missing from registry"))?;
-            let runtime = self.prepare_runtime(&descriptor)?;
+            let runtime = match self.prepare_runtime(&descriptor) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::warn!(%error, %library_uuid, "Library unavailable; continuing Host startup");
+                    self.registry.isolate_unavailable_library(&library_uuid)?;
+                    let snapshot = self.registry.snapshot()?;
+                    *self.active.write().unwrap_or_else(|p| p.into_inner()) = ActiveSnapshot {
+                        library_uuid: None,
+                        context_revision: snapshot.context_revision,
+                        runtime_generation: self.runtime_generation(),
+                        runtime: None,
+                    };
+                    return Ok(());
+                }
+            };
             *self.active.write().unwrap_or_else(|p| p.into_inner()) = ActiveSnapshot {
                 library_uuid: Some(library_uuid),
                 context_revision: snapshot.context_revision,
@@ -2475,6 +2900,14 @@ impl LibraryManager {
 
     async fn recover_sync_runtime_journals(&self) -> anyhow::Result<()> {
         for recovery in self.registry.pending_sync_binding_recovery()? {
+            let Some(library) = self.registry.library(&recovery.library_uuid)? else {
+                continue;
+            };
+            if verify_descriptor_identity(&library).is_err() {
+                self.registry
+                    .isolate_unavailable_library(&library.library_uuid)?;
+                continue;
+            }
             let revision = self.registry.snapshot()?.context_revision;
             match recovery.state.as_str() {
                 "unbinding" => {
@@ -2559,6 +2992,15 @@ impl LibraryManager {
                 continue;
             }
             if let Some(descriptor) = descriptor {
+                if self
+                    .registry
+                    .ensure_restore_cleanup_owned(&restore.restore_uuid, &restore.library_uuid)
+                    .is_err()
+                {
+                    self.registry
+                        .fail_restore_plan(&restore.restore_uuid, "restore-ownership-mismatch")?;
+                    continue;
+                }
                 if descriptor.local_data_dir.join("catalog.sqlite").is_file() {
                     self.registry
                         .mark_restore_catalog_ready(&restore.library_uuid)?;
@@ -2579,231 +3021,477 @@ impl LibraryManager {
 
     fn recover_journals(&self) -> anyhow::Result<()> {
         for recovery in self.registry.pending_creation_recovery()? {
-            let marker = read_marker(&recovery.resolved_root).ok();
-            let committed = marker.as_ref().is_some_and(|marker| {
-                marker.state == MarkerState::Committed
-                    && marker.library_uuid == recovery.library_uuid
-                    && marker.root_uuid == recovery.root_uuid
-                    && marker.creation_txn_uuid == recovery.txn_uuid
-            });
-            if committed {
-                let final_dir = self.libraries_dir.join(&recovery.library_uuid);
-                if !final_dir.exists() && recovery.staging_dir.exists() {
-                    fs::create_dir_all(&self.libraries_dir)?;
-                    safe_rename_directory(&recovery.staging_dir, &final_dir)?;
-                }
-                let marker_identity =
-                    marker_identity(&recovery.resolved_root.join(MARKER_FILE_NAME))?;
-                self.registry.commit_creation(
-                    &recovery.txn_uuid,
-                    &LibraryDescriptor {
-                        library_uuid: recovery.library_uuid,
-                        root_uuid: recovery.root_uuid,
-                        name: recovery.name,
-                        icon: recovery.icon,
-                        color: recovery.color,
-                        local_data_dir: final_dir,
-                        managed_root: recovery.resolved_root,
-                        lifecycle_state: "ready".to_string(),
-                        binding_state: "local-only".to_string(),
-                        availability: "available".to_string(),
-                        marker_identity,
-                    },
-                )?;
-            } else {
-                if marker.as_ref().is_some_and(|marker| {
-                    marker.state == MarkerState::Pending
-                        && marker.library_uuid == recovery.library_uuid
-                        && marker.root_uuid == recovery.root_uuid
-                        && marker.creation_txn_uuid == recovery.txn_uuid
-                }) {
-                    let root_guard = SafeDirectory::open(&recovery.resolved_root)?;
-                    if recovery.root_identity.as_deref() != Some(root_guard.identity()) {
-                        anyhow::bail!("creation recovery root identity changed");
-                    }
-                    root_guard.delete_file_child(std::ffi::OsStr::new(MARKER_FILE_NAME))?;
-                }
-                if recovery.staging_dir.exists() {
-                    safe_delete_tree_expected(
-                        &recovery.staging_dir,
-                        recovery.staging_identity.as_deref().ok_or_else(|| {
-                            anyhow::anyhow!("creation recovery staging identity missing")
-                        })?,
-                    )?;
-                }
-                if recovery.created_root
-                    && recovery.resolved_root.is_dir()
-                    && fs::read_dir(&recovery.resolved_root)?.next().is_none()
-                {
-                    safe_delete_tree_expected(
-                        &recovery.resolved_root,
-                        recovery.root_identity.as_deref().ok_or_else(|| {
-                            anyhow::anyhow!("creation recovery root identity missing")
-                        })?,
-                    )?;
-                }
-                self.registry
-                    .mark_creation_rolled_back(&recovery.txn_uuid)?;
+            if recovery.layout_version != STORAGE_FORMAT_VERSION {
+                tracing::warn!(txn_uuid = %recovery.txn_uuid, "unsupported Library creation journal preserved");
+                continue;
+            }
+            if let Err(error) = self.recover_creation(&recovery.txn_uuid) {
+                tracing::warn!(%error, txn_uuid = %recovery.txn_uuid, "Library creation recovery remains pending");
             }
         }
         for recovery in self.registry.pending_removal_recovery()? {
-            if recovery.phase == "requested" {
-                // The rename can commit before the following journal phase
-                // update. Inspect the recorded quarantine identities instead
-                // of assuming `requested` means no filesystem work happened.
-                if let Some(local) = recovery.local_quarantine.as_ref() {
-                    if local.exists() && !recovery.local_data_dir.exists() {
-                        safe_rename_directory_expected(
-                            local,
-                            &recovery.local_data_dir,
-                            recovery
-                                .local_quarantine_identity
-                                .as_deref()
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!("local quarantine identity missing")
-                                })?,
-                        )?;
-                    }
-                }
-                if let Some(root) = recovery.root_quarantine.as_ref() {
-                    if root.exists() && !recovery.managed_root.exists() {
-                        safe_rename_directory_expected(
-                            root,
-                            &recovery.managed_root,
-                            recovery
-                                .root_quarantine_identity
-                                .as_deref()
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!("root quarantine identity missing")
-                                })?,
-                        )?;
-                    }
-                }
-                self.registry
-                    .rollback_removal(&recovery.txn_uuid, &recovery.library_uuid)?;
+            if recovery.layout_version != STORAGE_FORMAT_VERSION
+                || recovery.managed_root != recovery.local_data_dir
+                || recovery.local_quarantine.is_some()
+            {
+                tracing::warn!(txn_uuid = %recovery.txn_uuid, "unsupported Library removal journal preserved");
                 continue;
             }
-            if recovery.phase == "root-quarantined" {
-                if let Some(local) = recovery.local_quarantine.as_ref() {
-                    if local.exists() && !recovery.local_data_dir.exists() {
-                        safe_rename_directory_expected(
-                            local,
-                            &recovery.local_data_dir,
-                            recovery
-                                .local_quarantine_identity
-                                .as_deref()
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!("local quarantine identity missing")
-                                })?,
-                        )?;
-                    }
-                }
-                if let Some(root) = recovery.root_quarantine.as_ref() {
-                    if root.exists() && !recovery.managed_root.exists() {
-                        safe_rename_directory_expected(
-                            root,
-                            &recovery.managed_root,
-                            recovery
-                                .root_quarantine_identity
-                                .as_deref()
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!("root quarantine identity missing")
-                                })?,
-                        )?;
-                    }
-                }
-                self.registry
-                    .rollback_removal(&recovery.txn_uuid, &recovery.library_uuid)?;
-                continue;
-            }
-            if recovery.phase == "committed" || recovery.phase == "quarantined" {
-                let root_ok = recovery.root_quarantine.as_ref().is_some_and(|root| {
-                    !root.exists()
-                        || (SafeDirectory::open(root).is_ok_and(|guard| {
-                            recovery.root_quarantine_identity.as_deref() == Some(guard.identity())
-                        }) && marker_identity(&root.join(MARKER_FILE_NAME))
-                            .is_ok_and(|identity| identity == recovery.marker_identity))
-                });
-                let local_ok = recovery.local_quarantine.as_ref().is_some_and(|local| {
-                    !local.exists()
-                        || (SafeDirectory::open(local).is_ok_and(|guard| {
-                            recovery.local_quarantine_identity.as_deref() == Some(guard.identity())
-                        }) && local.join("catalog.sqlite").is_file())
-                });
-                if root_ok && local_ok {
-                    if recovery.phase == "quarantined" {
-                        let active_library = self.registry.snapshot()?.active_library_uuid;
-                        if active_library.as_deref() == Some(recovery.library_uuid.as_str()) {
-                            if let (Some(root), Some(local)) = (
-                                recovery.root_quarantine.as_ref(),
-                                recovery.local_quarantine.as_ref(),
-                            ) {
-                                safe_rename_directory_expected(
-                                    local,
-                                    &recovery.local_data_dir,
-                                    recovery.local_quarantine_identity.as_deref().ok_or_else(
-                                        || anyhow::anyhow!("local quarantine identity missing"),
-                                    )?,
-                                )?;
-                                safe_rename_directory_expected(
-                                    root,
-                                    &recovery.managed_root,
-                                    recovery.root_quarantine_identity.as_deref().ok_or_else(
-                                        || anyhow::anyhow!("root quarantine identity missing"),
-                                    )?,
-                                )?;
-                                self.registry
-                                    .rollback_removal(&recovery.txn_uuid, &recovery.library_uuid)?;
-                            }
-                            continue;
+            let result = (|| -> anyhow::Result<()> {
+                let Some(quarantine) = &recovery.root_quarantine else {
+                    return self
+                        .registry
+                        .rollback_removal(&recovery.txn_uuid, &recovery.library_uuid);
+                };
+                let identity = recovery
+                    .root_quarantine_identity
+                    .as_deref()
+                    .context("quarantine identity missing")?;
+                if recovery.phase == "committed" {
+                    if quarantine.exists() {
+                        if marker_identity(&quarantine.join(MARKER_FILE_NAME))?
+                            != recovery.marker_identity
+                        {
+                            anyhow::bail!("marker-identity-mismatch");
                         }
-                        self.registry
-                            .commit_removal(&recovery.txn_uuid, &recovery.library_uuid)?;
-                    }
-                    if let Some(root) = recovery.root_quarantine {
-                        if root.exists() {
-                            safe_delete_tree_expected(
-                                &root,
-                                recovery
-                                    .root_quarantine_identity
-                                    .as_deref()
-                                    .ok_or_else(|| {
-                                        anyhow::anyhow!("root quarantine identity missing")
-                                    })?,
-                            )?;
-                        }
-                    }
-                    if let Some(local) = recovery.local_quarantine {
-                        if local.exists() {
-                            safe_delete_tree_expected(
-                                &local,
-                                recovery
-                                    .local_quarantine_identity
-                                    .as_deref()
-                                    .ok_or_else(|| {
-                                        anyhow::anyhow!("local quarantine identity missing")
-                                    })?,
-                            )?;
-                        }
+                        safe_delete_tree_expected(quarantine, identity)?;
                     }
                     self.registry.mark_removal_complete(&recovery.txn_uuid)?;
+                } else {
+                    if quarantine.exists() {
+                        safe_rename_directory_expected(
+                            quarantine,
+                            &recovery.managed_root,
+                            identity,
+                        )?;
+                    }
+                    self.registry
+                        .rollback_removal(&recovery.txn_uuid, &recovery.library_uuid)?;
                 }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                tracing::warn!(%error, "Library storage removal recovery remains pending");
             }
         }
         Ok(())
     }
 
+    pub async fn path_admission(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.operation.lock().await
+    }
+
+    fn refresh_storage_snapshot(&self) -> anyhow::Result<()> {
+        let mut storage: Vec<PathBuf> = self
+            .registry
+            .snapshot()?
+            .libraries
+            .into_iter()
+            .flat_map(|library| [library.managed_root, library.local_data_dir])
+            .collect();
+        storage.extend(self.registry.pending_storage_paths(None)?.0);
+        self.storage_snapshot.publish(storage);
+        Ok(())
+    }
+
+    pub fn preflight_plan(
+        &self,
+        name: &str,
+        database: &Path,
+        roots: &[LibraryContentRootInput],
+    ) -> anyhow::Result<LibraryPlanPreflight> {
+        self.preflight_plan_internal(name, database, roots, false, None)
+    }
+
+    pub fn preflight_restore_plan(
+        &self,
+        name: &str,
+        database: &Path,
+        roots: &[LibraryContentRootInput],
+    ) -> anyhow::Result<LibraryPlanPreflight> {
+        self.preflight_plan_internal(name, database, roots, true, None)
+    }
+
+    fn admission_paths(
+        &self,
+        skip_restore: Option<&str>,
+    ) -> anyhow::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+        // Snapshot the Host first; never hold its connection while opening a Catalog.
+        let descriptors = self.registry.snapshot()?.libraries;
+        let (mut storage, mut content) = self.registry.pending_storage_paths(skip_restore)?;
+        for descriptor in descriptors {
+            let path = crate::library_path::inspect_directory_path(&descriptor.managed_root, true)
+                .unwrap_or_else(|_| descriptor.managed_root.clone());
+            storage.push(path);
+            if descriptor.local_data_dir != descriptor.managed_root {
+                storage.push(
+                    crate::library_path::inspect_directory_path(&descriptor.local_data_dir, true)
+                        .unwrap_or_else(|_| descriptor.local_data_dir.clone()),
+                );
+            }
+            let marker = read_marker(&descriptor.managed_root).ok();
+            if (descriptor.local_data_dir == descriptor.managed_root
+                || marker
+                    .as_ref()
+                    .is_some_and(|marker| marker.format_version == STORAGE_FORMAT_VERSION))
+                && !self
+                    .registry
+                    .is_pending_restore_library(&descriptor.library_uuid)?
+            {
+                content.extend(
+                    Database::inspect_existing_catalog(
+                        &descriptor.local_data_dir.join("catalog.sqlite"),
+                        Uuid::parse_str(&descriptor.library_uuid)?,
+                        self.registry.device_uuid()?,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "library-path-admission-unavailable: {}",
+                            descriptor.library_uuid
+                        )
+                    })?,
+                );
+            }
+        }
+        for path in &mut content {
+            *path = crate::library_path::inspect_directory_path(path, true).map_err(|reason| {
+                anyhow::anyhow!("library-path-admission-unavailable: {}", reason.as_str())
+            })?;
+        }
+        Ok((storage, content))
+    }
+
+    fn preflight_plan_internal(
+        &self,
+        name: &str,
+        database: &Path,
+        roots: &[LibraryContentRootInput],
+        allow_empty: bool,
+        skip_restore: Option<&str>,
+    ) -> anyhow::Result<LibraryPlanPreflight> {
+        let (storage, content) = self.admission_paths(skip_restore)?;
+        Ok(crate::library_path::preflight_plan(
+            name,
+            database,
+            roots,
+            &storage,
+            &content,
+            allow_empty,
+        ))
+    }
+
+    pub fn admit_content_path(&self, path: &Path, create: bool) -> anyhow::Result<PathBuf> {
+        let path = crate::library_path::inspect_directory_path(path, create)
+            .map_err(|reason| anyhow::anyhow!(reason.as_str()))?;
+        let (storage, _) = self.admission_paths(None)?;
+        if storage
+            .iter()
+            .any(|database| crate::library_path::paths_overlap(database, &path))
+        {
+            anyhow::bail!("database-content-overlap");
+        }
+        Ok(path)
+    }
+
+    fn create_owned_directory_chain(
+        &self,
+        txn: &str,
+        target: &Path,
+        role: &str,
+        owned: &mut Vec<OwnedCreationArtifact>,
+    ) -> anyhow::Result<()> {
+        let ancestor = crate::library_path::nearest_existing_directory(target)?;
+        let mut guard = MarkerDirectoryGuard::open(ancestor)?;
+        let mut path = ancestor.to_path_buf();
+        for component in target.strip_prefix(ancestor)?.components() {
+            let child = guard.create_directory_child(component.as_os_str())?;
+            path.push(component);
+            owned.push(OwnedCreationArtifact {
+                path: path.clone(),
+                identity: child.identity().to_owned(),
+                directory: true,
+                role: role.to_owned(),
+            });
+            self.registry.record_creation_artifacts(txn, owned)?;
+            guard = child;
+        }
+        guard.verify_unchanged()?;
+        Ok(())
+    }
+
+    fn cleanup_creation_staging(
+        &self,
+        staging: &Path,
+        artifacts: &[OwnedCreationArtifact],
+    ) -> anyhow::Result<()> {
+        cleanup_owned_creation_artifacts(
+            &artifacts
+                .iter()
+                .filter(|artifact| artifact.path.starts_with(staging))
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn recover_creation(&self, txn: &str) -> anyhow::Result<()> {
+        let Some(recovery) = self
+            .registry
+            .pending_creation_recovery()?
+            .into_iter()
+            .find(|item| item.txn_uuid == txn)
+        else {
+            return Ok(());
+        };
+        if recovery.layout_version != STORAGE_FORMAT_VERSION {
+            return Ok(());
+        }
+        let final_path = recovery
+            .final_storage_path
+            .as_ref()
+            .context("creation-storage-path-missing")?;
+        let owned: Vec<OwnedCreationArtifact> =
+            serde_json::from_str(&recovery.owned_artifacts_json)?;
+        if final_path != &recovery.resolved_root {
+            anyhow::bail!("creation-storage-path-changed");
+        }
+        if let Some(identity) = &recovery.root_identity {
+            if final_path.exists()
+                && MarkerDirectoryGuard::open_readonly(final_path)?.identity() != identity
+            {
+                anyhow::bail!("path-changed");
+            }
+        }
+        let marker = read_marker(final_path).ok();
+        if recovery.phase != "restore-cancelling"
+            && marker.as_ref().is_some_and(|marker| {
+                marker.format_version == STORAGE_FORMAT_VERSION
+                    && marker.state == MarkerState::Committed
+                    && marker.library_uuid == recovery.library_uuid
+                    && marker.root_uuid == recovery.root_uuid
+                    && marker.creation_txn_uuid == txn
+            })
+        {
+            let marker_id = marker_identity(&final_path.join(MARKER_FILE_NAME))?;
+            if !owned.iter().any(|artifact| {
+                artifact.path == final_path.join(MARKER_FILE_NAME) && artifact.identity == marker_id
+            }) {
+                anyhow::bail!("marker-identity-mismatch");
+            }
+            if !self
+                .registry
+                .is_pending_restore_library(&recovery.library_uuid)?
+            {
+                let catalog_id =
+                    crate::library_path::local_file_identity(&final_path.join("catalog.sqlite"))?;
+                if !owned.iter().any(|artifact| {
+                    artifact.path == final_path.join("catalog.sqlite")
+                        && artifact.identity == catalog_id
+                }) {
+                    anyhow::bail!("catalog-identity-mismatch");
+                }
+                let actual = Database::inspect_existing_catalog(
+                    &final_path.join("catalog.sqlite"),
+                    Uuid::parse_str(&recovery.library_uuid)?,
+                    self.registry.device_uuid()?,
+                )?;
+                let expected: Vec<LibraryContentRootInput> =
+                    serde_json::from_str(&recovery.content_roots_json)?;
+                if actual
+                    != expected
+                        .iter()
+                        .map(|root| PathBuf::from(&root.path))
+                        .collect::<Vec<_>>()
+                {
+                    anyhow::bail!("creation-root-set-changed");
+                }
+            }
+            let descriptor = LibraryDescriptor {
+                library_uuid: recovery.library_uuid,
+                root_uuid: recovery.root_uuid,
+                name: recovery.name,
+                icon: recovery.icon,
+                color: recovery.color,
+                local_data_dir: final_path.clone(),
+                managed_root: final_path.clone(),
+                lifecycle_state: "ready".into(),
+                binding_state: "local-only".into(),
+                availability: "available".into(),
+                marker_identity: marker_identity(&final_path.join(MARKER_FILE_NAME))?,
+            };
+            self.cleanup_creation_staging(&recovery.staging_dir, &owned)?;
+            self.registry.commit_creation(txn, &descriptor)?;
+        } else {
+            cleanup_owned_creation_artifacts(&owned)?;
+            if recovery.phase == "restore-cancelling" {
+                self.registry
+                    .commit_cancelled_restore_cleanup(txn, &recovery.library_uuid)?;
+            }
+            self.registry.mark_creation_rolled_back(txn)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn preflight(&self, name: &str, managed_root: &Path) -> anyhow::Result<PreflightResult> {
-        let roots = self
+        let mut roots = self
             .registry
             .snapshot()?
             .libraries
             .into_iter()
             .map(|library| library.managed_root)
             .collect::<Vec<_>>();
+        roots.extend(
+            self.registry
+                .library_open_intents()?
+                .into_iter()
+                .map(|intent| intent.descriptor.managed_root),
+        );
         Ok(preflight(name, managed_root, &roots, &known_cloud_roots()))
     }
 
+    pub async fn open_library_with_revision(
+        &self,
+        managed_root: PathBuf,
+        expected_revision: u64,
+    ) -> anyhow::Result<(LibraryDescriptor, bool, Option<String>)> {
+        let _operation = self.operation.lock().await;
+        self.ensure_library_operations_open()?;
+        self.ensure_context_revision(expected_revision)?;
+        let candidate = ExistingLibraryRoot::open(&managed_root)?;
+        let candidate_content = Database::inspect_existing_catalog(
+            &candidate.path.join("catalog.sqlite"),
+            Uuid::parse_str(&candidate.marker.library_uuid)?,
+            self.registry.device_uuid()?,
+        )?;
+        let (known_storage, known_content) = self.admission_paths(None)?;
+        if known_content
+            .iter()
+            .any(|root| crate::library_path::paths_overlap(&candidate.path, root))
+            || candidate_content.iter().any(|root| {
+                known_storage
+                    .iter()
+                    .any(|storage| crate::library_path::paths_overlap(root, storage))
+            })
+        {
+            anyhow::bail!("database-content-overlap");
+        }
+        drop(candidate);
+        let storage = LibraryRegistrationStorage {
+            registry: Arc::clone(&self.registry),
+            libraries_dir: self.libraries_dir.clone(),
+        };
+        let (descriptor, _root_guard) =
+            tokio::task::spawn_blocking(move || storage.open(managed_root)).await??;
+        // Reopening the already active identity does not churn its runtime or
+        // revision. A failed activation leaves a valid, visible registration.
+        let active = self.active_snapshot();
+        if active.library_uuid.as_deref() == Some(&descriptor.library_uuid)
+            && active.runtime.is_some()
+        {
+            return Ok((descriptor, true, None));
+        }
+        let result = self.activate_locked(&descriptor).await;
+        match result {
+            Ok(_) => Ok((descriptor, true, None)),
+            Err(error) => Ok((descriptor, false, Some(error.to_string()))),
+        }
+    }
+
+    pub async fn forget_library_with_revision(
+        &self,
+        library_uuid: &str,
+        expected_revision: u64,
+    ) -> anyhow::Result<()> {
+        let _operation = self.operation.lock().await;
+        self.ensure_library_operations_open()?;
+        self.ensure_context_revision(expected_revision)?;
+        let descriptor = self
+            .registry
+            .library(library_uuid)?
+            .ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
+        if descriptor.lifecycle_state != "ready" {
+            anyhow::bail!("library-unavailable");
+        }
+        let _gate = self.request_gate.write().await;
+        let previous = self.active_snapshot();
+        let was_active = previous.library_uuid.as_deref() == Some(library_uuid);
+        if was_active {
+            // Publish no usable runtime while stopping. A shutdown failure stays
+            // fail-closed and leaves persistent visibility/active identity intact.
+            let mut stopping = previous.clone();
+            stopping.runtime = None;
+            *self.active.write().unwrap_or_else(|p| p.into_inner()) = stopping;
+            if let Some(runtime) = &previous.runtime {
+                *self
+                    .pending_runtime_stop
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(runtime));
+            }
+            self.finish_pending_runtime_stop().await?;
+        }
+        let revision = match self
+            .registry
+            .forget_library(library_uuid, expected_revision)
+        {
+            Ok(revision) => revision,
+            Err(error) => {
+                if was_active {
+                    self.restore_previous_snapshot(&previous)?;
+                }
+                return Err(error);
+            }
+        };
+        if was_active {
+            *self.active.write().unwrap_or_else(|p| p.into_inner()) = ActiveSnapshot {
+                library_uuid: None,
+                context_revision: revision,
+                runtime_generation: previous.runtime_generation,
+                runtime: None,
+            };
+        }
+        // Host-owned synchronization is independent of browsing/list visibility.
+        // Do not pause bindings, revoke accounts, or delete their catalog/cache.
+        Ok(())
+    }
+
+    async fn finish_pending_runtime_stop(&self) -> anyhow::Result<()> {
+        let pending = self
+            .pending_runtime_stop
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(runtime) = pending {
+            runtime
+                .shutdown()
+                .await
+                .map_err(|error| anyhow::anyhow!("library-stop-failed: {error}"))?;
+            self.pending_runtime_stop
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+        }
+        Ok(())
+    }
+
+    fn ensure_library_operations_open(&self) -> anyhow::Result<()> {
+        if self.library_operations_closed.load(Ordering::Acquire) {
+            anyhow::bail!("host-shutting-down");
+        }
+        Ok(())
+    }
+
+    async fn stop_owned_runtime(
+        &self,
+        runtime: &Arc<LibraryRuntimeResources>,
+    ) -> anyhow::Result<()> {
+        *self
+            .pending_runtime_stop
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(runtime));
+        self.finish_pending_runtime_stop().await
+    }
+
+    #[cfg(test)]
     pub async fn create_library(
         &self,
         name: String,
@@ -2813,19 +3501,54 @@ impl LibraryManager {
         preflight_token: Option<String>,
         activate: bool,
     ) -> anyhow::Result<(LibraryDescriptor, bool, Option<String>)> {
-        self.create_library_internal(
+        let content = managed_root.with_file_name(format!(
+            "{}-Files",
+            managed_root
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        ));
+        self.create_library_with_content(
             name,
             icon,
             color,
             managed_root,
+            vec![LibraryContentRootInput {
+                path: content.to_string_lossy().into_owned(),
+                create_if_missing: true,
+            }],
             preflight_token,
             activate,
-            None,
-            true,
         )
         .await
     }
 
+    pub async fn create_library_with_content(
+        &self,
+        name: String,
+        icon: Option<String>,
+        color: Option<String>,
+        database_path: PathBuf,
+        content_roots: Vec<LibraryContentRootInput>,
+        preflight_token: Option<String>,
+        activate: bool,
+    ) -> anyhow::Result<(LibraryDescriptor, bool, Option<String>)> {
+        self.create_library_internal(
+            name,
+            icon,
+            color,
+            database_path,
+            content_roots,
+            preflight_token,
+            activate,
+            None,
+            true,
+            None,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     pub async fn create_restore_library(
         &self,
         library_uuid: String,
@@ -2840,10 +3563,106 @@ impl LibraryManager {
                 None,
                 None,
                 managed_root,
+                Vec::new(),
                 None,
                 false,
                 Some(library_uuid),
                 false,
+                None,
+            )
+            .await?;
+        self.registry
+            .begin_restore_binding(&descriptor.library_uuid, account_uuid)?;
+        Ok(descriptor)
+    }
+
+    #[cfg(test)]
+    async fn create_planned_restore_fixture(
+        &self,
+        library_uuid: String,
+        name: String,
+        managed_root: PathBuf,
+        account_uuid: &str,
+    ) -> anyhow::Result<LibraryDescriptor> {
+        self.registry.ensure_sync_provider_ready(account_uuid)?;
+        // Keep the integration helper on the durable restore-plan and owned
+        // shell path; discovered descriptor evidence is pinned by plan creation.
+        // HTTP preflight/path validation is covered separately by route tests.
+        let operation_uuid = Uuid::now_v7().to_string();
+        self.registry
+            .ensure_restore_libraries_absent([library_uuid.as_str()])?;
+        let request = serde_json::json!({
+            "accountUuid": account_uuid,
+            "libraryUuid": library_uuid,
+            "name": name,
+            "managedRoot": managed_root,
+        });
+        let preflight = self
+            .registry
+            .create_restore_preflight(&request, 1, 0, &[], &[])?;
+        let (_, plans) = self.registry.claim_restore_and_record_plans(
+            preflight.preflight_token.as_deref().unwrap(),
+            &operation_uuid,
+            &request,
+            &[crate::host_registry::RestorePlanInput {
+                account_uuid: account_uuid.to_owned(),
+                library_uuid: library_uuid.clone(),
+                managed_root: managed_root.clone(),
+                restore_mode: "legacy-library".into(),
+                inventory_fence: None,
+                roots: Vec::new(),
+            }],
+        )?;
+        self.create_planned_restore_library(
+            &plans[0].restore_uuid,
+            library_uuid,
+            name,
+            managed_root,
+            account_uuid,
+        )
+        .await
+    }
+
+    pub async fn create_planned_restore_library(
+        &self,
+        restore_uuid: &str,
+        library_uuid: String,
+        name: String,
+        managed_root: PathBuf,
+        account_uuid: &str,
+    ) -> anyhow::Result<LibraryDescriptor> {
+        self.registry.ensure_sync_provider_ready(account_uuid)?;
+        let plan = self
+            .registry
+            .pending_restore_recovery()?
+            .into_iter()
+            .find(|plan| plan.restore_uuid == restore_uuid)
+            .context("restore-plan-not-found")?;
+        if crate::library_path::inspect_directory_path(Path::new(&plan.placement_base), true)
+            .map_err(|reason| anyhow::anyhow!(reason.as_str()))?
+            != crate::library_path::inspect_directory_path(&managed_root, true)
+                .map_err(|reason| anyhow::anyhow!(reason.as_str()))?
+        {
+            anyhow::bail!("restore-ownership-mismatch");
+        }
+        let (descriptor, _, _) = self
+            .create_library_internal(
+                name,
+                None,
+                None,
+                PathBuf::from(&plan.database_path),
+                plan.content_paths
+                    .into_iter()
+                    .map(|path| LibraryContentRootInput {
+                        path,
+                        create_if_missing: true,
+                    })
+                    .collect(),
+                None,
+                false,
+                Some(library_uuid),
+                false,
+                Some((restore_uuid, account_uuid)),
             )
             .await?;
         self.registry
@@ -2856,183 +3675,303 @@ impl LibraryManager {
         name: String,
         icon: Option<String>,
         color: Option<String>,
-        managed_root: PathBuf,
+        database_path: PathBuf,
+        content_roots: Vec<LibraryContentRootInput>,
         preflight_token: Option<String>,
         activate: bool,
         requested_library_uuid: Option<String>,
         initialize_catalog: bool,
+        restore_owner: Option<(&str, &str)>,
     ) -> anyhow::Result<(LibraryDescriptor, bool, Option<String>)> {
         let _operation = self.operation.lock().await;
-        let validation = self.preflight(&name, &managed_root)?;
+        self.ensure_library_operations_open()?;
+        let library_uuid = requested_library_uuid.unwrap_or_else(|| Uuid::now_v7().to_string());
+        Uuid::parse_str(&library_uuid)?;
+        self.registry
+            .ensure_restore_libraries_absent([library_uuid.as_str()])?;
+        let validation = self.preflight_plan_internal(
+            &name,
+            &database_path,
+            &content_roots,
+            !initialize_catalog,
+            restore_owner.map(|(txn, _)| txn),
+        )?;
         if !validation.ok {
             anyhow::bail!("{}", validation.reason.as_str());
         }
-        if let Some(token) = preflight_token.as_deref() {
-            verify_preflight_token(&validation.normalized_root, token)
-                .map_err(|reason| anyhow::anyhow!(reason.as_str()))?;
+        if preflight_token
+            .as_ref()
+            .is_some_and(|token| Some(token) != validation.token.as_ref())
+        {
+            anyhow::bail!("path-changed");
         }
-        let library_uuid = requested_library_uuid.unwrap_or_else(|| Uuid::now_v7().to_string());
-        Uuid::parse_str(&library_uuid).map_err(|_| anyhow::anyhow!("invalid-library-uuid"))?;
-        if self.registry.library(&library_uuid)?.is_some() {
-            anyhow::bail!("library-already-present");
-        }
+        let database_path = validation
+            .normalized_database_path
+            .context("invalid-path")?;
+        let content_roots = validation
+            .normalized_content_roots
+            .context("invalid-path")?;
+        let anchors = std::iter::once(database_path.as_path())
+            .chain(content_roots.iter().map(|root| Path::new(&root.path)))
+            .map(|path| {
+                let ancestor = crate::library_path::nearest_existing_directory(path)?.to_path_buf();
+                let identity = MarkerDirectoryGuard::open_readonly(&ancestor)?
+                    .identity()
+                    .to_owned();
+                Ok((ancestor, identity))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let root_uuid = Uuid::now_v7().to_string();
-        let txn_uuid = Uuid::now_v7().to_string();
-        let local_staging_dir = self
-            .libraries_dir
-            .join(format!("{library_uuid}.staging.{txn_uuid}"));
-        let local_data_dir = self.libraries_dir.join(&library_uuid);
+        let txn_uuid = restore_owner
+            .map(|(txn, _)| txn.to_owned())
+            .unwrap_or_else(|| Uuid::now_v7().to_string());
+        let staging = database_path.join(format!(".mangoo-create-{txn_uuid}"));
         let mut descriptor = LibraryDescriptor {
             library_uuid: library_uuid.clone(),
             root_uuid: root_uuid.clone(),
-            name: name.clone(),
+            name: crate::library_path::safe_library_name(&name)
+                .map_err(|reason| anyhow::anyhow!(reason.as_str()))?,
             icon,
             color,
-            local_data_dir: local_data_dir.clone(),
-            managed_root: validation.normalized_root.clone(),
-            lifecycle_state: "ready".to_string(),
-            binding_state: "local-only".to_string(),
-            availability: "available".to_string(),
+            local_data_dir: database_path.clone(),
+            managed_root: database_path.clone(),
+            lifecycle_state: "ready".into(),
+            binding_state: "local-only".into(),
+            availability: "available".into(),
             marker_identity: String::new(),
         };
-        self.registry.begin_creation(&CreationIntent {
+        let intent = CreationIntent {
             txn_uuid: txn_uuid.clone(),
             descriptor: descriptor.clone(),
-            requested_root: managed_root,
-            staging_dir: local_staging_dir.clone(),
-        })?;
-
-        let created_root = !descriptor.managed_root.exists();
-        self.registry.update_creation_phase(
-            &txn_uuid,
-            "root-reserved",
-            created_root,
-            false,
-            None,
-            None,
-        )?;
-        let created_root_identity = if created_root {
-            let parent = descriptor
-                .managed_root
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("invalid-path"))?;
-            let leaf = descriptor
-                .managed_root
-                .file_name()
-                .ok_or_else(|| anyhow::anyhow!("invalid-path"))?;
-            let parent_guard =
-                SafeDirectory::open(parent).map_err(|_| anyhow::anyhow!("path-changed"))?;
-            parent_guard
-                .create_directory(leaf)
-                .map_err(|_| anyhow::anyhow!("path-changed"))?;
-            parent_guard
-                .verify_unchanged()
-                .map_err(|_| anyhow::anyhow!("path-changed"))?;
-            Some(
-                parent_guard
-                    .child_identity(leaf, true)
-                    .map_err(|_| anyhow::anyhow!("path-changed"))?,
-            )
-        } else {
-            None
+            requested_root: database_path.clone(),
+            staging_dir: staging.clone(),
         };
-        let root_guard = SafeDirectory::open(&descriptor.managed_root)
-            .map_err(|_| anyhow::anyhow!("path-changed"))?;
-        if created_root_identity
-            .as_deref()
-            .is_some_and(|identity| root_guard.identity() != identity)
-        {
-            self.registry.update_creation_phase(
-                &txn_uuid,
-                "error",
-                created_root,
-                false,
-                None,
-                Some("path-changed"),
-            )?;
-            anyhow::bail!("path-changed");
+        if let Some((_, account)) = restore_owner {
+            self.registry.begin_restore_creation(&intent, account)?;
+        } else {
+            self.registry.begin_creation(&intent)?;
         }
         self.registry
-            .update_creation_identities(&txn_uuid, Some(root_guard.identity()), None)?;
-        let effective_token = identity_token(&descriptor.managed_root)?;
-        if !created_root && validation.token.as_deref() != Some(effective_token.as_str()) {
+            .record_creation_layout(&txn_uuid, &database_path, &content_roots)?;
+        self.refresh_storage_snapshot()?;
+        let mut owned = Vec::new();
+        let preparation = (|| -> anyhow::Result<()> {
+            self.create_owned_directory_chain(&txn_uuid, &database_path, "database", &mut owned)?;
+            for root in &content_roots {
+                if root.create_if_missing {
+                    self.create_owned_directory_chain(
+                        &txn_uuid,
+                        Path::new(&root.path),
+                        "content-root",
+                        &mut owned,
+                    )?;
+                }
+            }
+            for (path, identity) in &anchors {
+                if MarkerDirectoryGuard::open_readonly(path)?.identity() != identity {
+                    anyhow::bail!("path-changed");
+                }
+            }
+            let content_guards = content_roots
+                .iter()
+                .map(|root| MarkerDirectoryGuard::open_readonly(Path::new(&root.path)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let root_guard = SafeDirectory::open(&database_path)?;
+            self.registry.update_creation_identities(
+                &txn_uuid,
+                Some(root_guard.identity()),
+                None,
+            )?;
+            let pending = LibraryMarker {
+                format_version: STORAGE_FORMAT_VERSION,
+                library_uuid: library_uuid.clone(),
+                root_uuid: root_uuid.clone(),
+                state: MarkerState::Pending,
+                creation_txn_uuid: txn_uuid.clone(),
+            };
+            let identity = crate::library_path::atomic_write_marker_with_ownership(
+                &root_guard,
+                &pending,
+                |temporary, identity| {
+                    for path in [
+                        database_path.join(temporary),
+                        database_path.join(MARKER_FILE_NAME),
+                    ] {
+                        owned.push(OwnedCreationArtifact {
+                            path,
+                            identity: identity.to_owned(),
+                            directory: false,
+                            role: "marker".into(),
+                        });
+                    }
+                    self.registry.record_creation_artifacts(&txn_uuid, &owned)
+                },
+            )?;
+            self.registry.record_creation_artifacts(&txn_uuid, &owned)?;
             self.registry.update_creation_phase(
                 &txn_uuid,
-                "error",
-                created_root,
+                "marker-pending",
                 false,
+                true,
+                Some(&identity),
                 None,
-                Some("path-changed"),
             )?;
-            anyhow::bail!("path-changed");
-        }
-        let pending_marker = LibraryMarker {
-            format_version: 1,
-            library_uuid: library_uuid.clone(),
-            root_uuid: root_uuid.clone(),
-            state: MarkerState::Pending,
-            creation_txn_uuid: txn_uuid.clone(),
-        };
-        let pending_identity = atomic_write_marker_guarded(&root_guard, &pending_marker)?;
-        self.registry.update_creation_phase(
-            &txn_uuid,
-            "marker-pending",
-            created_root,
-            true,
-            Some(&pending_identity),
-            None,
-        )?;
-        fs::create_dir_all(&local_staging_dir)?;
-        let staging_guard = SafeDirectory::open(&local_staging_dir)?;
-        self.registry.update_creation_identities(
-            &txn_uuid,
-            None,
-            Some(staging_guard.identity()),
-        )?;
-        if initialize_catalog {
-            let catalog_path = local_staging_dir.join("catalog.sqlite");
-            let catalog = Database::open(&catalog_path)?;
-            catalog.apply_migrations()?;
-            catalog.add_root(NewRoot {
-                path: descriptor.managed_root.to_string_lossy().into_owned(),
-                display_name: name.clone(),
-            })?;
-            catalog.initialize_sync_identity(
-                Uuid::parse_str(&library_uuid)?,
-                Uuid::parse_str(&root_uuid)?,
-                self.registry.device_uuid()?,
+            drop(root_guard);
+            if initialize_catalog {
+                self.create_owned_directory_chain(&txn_uuid, &staging, "staging", &mut owned)?;
+                let staging_guard = MarkerDirectoryGuard::open(&staging)?;
+                self.registry.update_creation_identities(
+                    &txn_uuid,
+                    None,
+                    Some(staging_guard.identity()),
+                )?;
+                // CREATE_NEW pins the Catalog identity before SQLite can write it.
+                let file = staging_guard.create_catalog()?;
+                let catalog_identity = staging_guard.file_identity(&file)?;
+                owned.push(OwnedCreationArtifact {
+                    path: staging.join("catalog.sqlite"),
+                    identity: catalog_identity.clone(),
+                    directory: false,
+                    role: "catalog".into(),
+                });
+                self.registry.record_creation_artifacts(&txn_uuid, &owned)?;
+                {
+                    let catalog = Database::open_existing(staging.join("catalog.sqlite"))?;
+                    catalog.apply_migrations()?;
+                    if initialize_catalog {
+                        for root in &content_roots {
+                            let path = crate::library_path::inspect_directory_path(
+                                Path::new(&root.path),
+                                false,
+                            )
+                            .map_err(|reason| anyhow::anyhow!(reason.as_str()))?;
+                            if path != PathBuf::from(&root.path) {
+                                anyhow::bail!("path-changed");
+                            }
+                            let root_id = catalog.add_root(NewRoot {
+                                path: root.path.clone(),
+                                display_name: path
+                                    .file_name()
+                                    .and_then(|leaf| leaf.to_str())
+                                    .unwrap_or(&name)
+                                    .to_owned(),
+                            })?;
+                            catalog.create_root_scan_task_with_origin(
+                                root_id,
+                                crate::db::NotificationOrigin::User,
+                            )?;
+                        }
+                    }
+                    catalog.initialize_sync_identity(
+                        Uuid::parse_str(&library_uuid)?,
+                        Uuid::parse_str(&root_uuid)?,
+                        self.registry.device_uuid()?,
+                    )?;
+                }
+                drop(file);
+                staging_guard.verify_unchanged()?;
+                // Closing the sole SQLite connection checkpoints/deletes its sidecars.
+                // A residual name is not ownership proof: preserve it and retry.
+                if ["catalog.sqlite-wal", "catalog.sqlite-shm"]
+                    .iter()
+                    .any(|leaf| staging.join(leaf).exists())
+                {
+                    anyhow::bail!("creation-staging-unowned-artifact");
+                }
+                self.registry.record_creation_artifacts(&txn_uuid, &owned)?;
+                self.registry.update_creation_phase(
+                    &txn_uuid,
+                    "prepared",
+                    false,
+                    true,
+                    Some(&identity),
+                    None,
+                )?;
+                let destination = MarkerDirectoryGuard::open(&database_path)?;
+                let catalog = staging_guard.open_temporary("catalog.sqlite".as_ref(), false)?;
+                if staging_guard.file_identity(&catalog)? != catalog_identity {
+                    anyhow::bail!("path-changed");
+                }
+                // Record both possible locations before no-replace publication.
+                owned.push(OwnedCreationArtifact {
+                    path: database_path.join("catalog.sqlite"),
+                    identity: catalog_identity,
+                    directory: false,
+                    role: "catalog".into(),
+                });
+                self.registry.record_creation_artifacts(&txn_uuid, &owned)?;
+                staging_guard.publish_to(
+                    &catalog,
+                    "catalog.sqlite".as_ref(),
+                    &destination,
+                    "catalog.sqlite".as_ref(),
+                )?;
+                drop(catalog);
+                drop(destination);
+                drop(staging_guard);
+                Database::inspect_existing_catalog(
+                    &database_path.join("catalog.sqlite"),
+                    Uuid::parse_str(&library_uuid)?,
+                    self.registry.device_uuid()?,
+                )?;
+            }
+            for guard in &content_guards {
+                guard.verify_unchanged()?;
+            }
+            for (path, identity) in &anchors {
+                if MarkerDirectoryGuard::open_readonly(path)?.identity() != identity {
+                    anyhow::bail!("path-changed");
+                }
+            }
+            let root_guard = SafeDirectory::open(&database_path)?;
+            if root_guard.child_identity(MARKER_FILE_NAME.as_ref(), false)? != identity {
+                anyhow::bail!("path-changed");
+            }
+            descriptor.marker_identity = crate::library_path::atomic_write_marker_with_ownership(
+                &root_guard,
+                &LibraryMarker {
+                    state: MarkerState::Committed,
+                    ..pending
+                },
+                |temporary, identity| {
+                    for path in [
+                        database_path.join(temporary),
+                        database_path.join(MARKER_FILE_NAME),
+                    ] {
+                        owned.push(OwnedCreationArtifact {
+                            path,
+                            identity: identity.to_owned(),
+                            directory: false,
+                            role: "marker".into(),
+                        });
+                    }
+                    self.registry.record_creation_artifacts(&txn_uuid, &owned)
+                },
             )?;
+            self.registry.record_creation_artifacts(&txn_uuid, &owned)?;
+            self.registry.update_creation_phase(
+                &txn_uuid,
+                "marker-committed",
+                false,
+                true,
+                Some(&descriptor.marker_identity),
+                None,
+            )?;
+            drop(root_guard);
+            drop(content_guards);
+            self.cleanup_creation_staging(&staging, &owned)?;
+            self.registry.commit_creation(&txn_uuid, &descriptor)?;
+            Ok(())
+        })();
+        if let Err(error) = preparation {
+            // A committed marker is forward-only. Compensation uses the same
+            // persisted identity evidence as restart recovery.
+            if let Err(recovery_error) = self.recover_creation(&txn_uuid) {
+                tracing::warn!(%recovery_error, %txn_uuid, "Library creation recovery remains pending");
+            }
+            return Err(error);
         }
-        self.registry.update_creation_phase(
-            &txn_uuid,
-            "prepared",
-            created_root,
-            true,
-            Some(&pending_identity),
-            None,
-        )?;
-        let committed_marker = LibraryMarker {
-            state: MarkerState::Committed,
-            ..pending_marker
-        };
-        descriptor.marker_identity = atomic_write_marker_guarded(&root_guard, &committed_marker)?;
-        root_guard
-            .verify_unchanged()
-            .map_err(|_| anyhow::anyhow!("path-changed"))?;
-        self.registry.update_creation_phase(
-            &txn_uuid,
-            "marker-committed",
-            created_root,
-            true,
-            Some(&descriptor.marker_identity),
-            None,
-        )?;
-        fs::create_dir_all(&self.libraries_dir)?;
-        fs::rename(&local_staging_dir, &local_data_dir)?;
-        self.registry.commit_creation(&txn_uuid, &descriptor)?;
-
-        let mut activated = false;
-        let mut activation_error = None;
+        let (mut activated, mut activation_error) = (false, None);
         if activate {
             match self.activate_locked(&descriptor).await {
                 Ok(_) => activated = true,
@@ -3063,14 +4002,19 @@ impl LibraryManager {
             .registry
             .library(library_uuid)?
             .ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
+        if !self.registry.is_library_listed(library_uuid)? {
+            anyhow::bail!("library-not-listed");
+        }
         self.activate_locked(&descriptor).await
     }
 
     async fn activate_locked(&self, descriptor: &LibraryDescriptor) -> anyhow::Result<u64> {
+        self.ensure_library_operations_open()?;
         if descriptor.lifecycle_state != "ready" || descriptor.availability != "available" {
             anyhow::bail!("library-unavailable");
         }
         let _gate = self.request_gate.write().await;
+        self.finish_pending_runtime_stop().await?;
         let previous_snapshot = self.active_snapshot();
         *self.active.write().unwrap_or_else(|p| p.into_inner()) = ActiveSnapshot {
             library_uuid: previous_snapshot.library_uuid.clone(),
@@ -3079,7 +4023,7 @@ impl LibraryManager {
             runtime: None,
         };
         if let Some(previous) = &previous_snapshot.runtime {
-            previous.shutdown().await.map_err(|error| {
+            self.stop_owned_runtime(previous).await.map_err(|error| {
                 anyhow::anyhow!(
                     "failed to stop previous Library runtime; Host remains fail-closed: {error}"
                 )
@@ -3099,7 +4043,7 @@ impl LibraryManager {
         {
             Ok(revision) => revision,
             Err(error) => {
-                candidate.shutdown().await.map_err(|shutdown_error| {
+                self.stop_owned_runtime(&candidate).await.map_err(|shutdown_error| {
                     anyhow::anyhow!(
                         "activation prepare failed ({error}); candidate shutdown also failed; Host remains fail-closed: {shutdown_error}"
                     )
@@ -3115,7 +4059,7 @@ impl LibraryManager {
             self.registry
                 .rollback_activation(&txn_uuid, "commit-failed")
                 .ok();
-            candidate.shutdown().await.map_err(|shutdown_error| {
+            self.stop_owned_runtime(&candidate).await.map_err(|shutdown_error| {
                 anyhow::anyhow!(
                     "activation commit failed ({error}); candidate shutdown also failed; Host remains fail-closed: {shutdown_error}"
                 )
@@ -3169,157 +4113,118 @@ impl LibraryManager {
         let descriptor = self
             .registry
             .library(library_uuid)?
-            .ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
+            .context("library-not-found")?;
         if descriptor.binding_state != "local-only" {
             anyhow::bail!("library-is-synchronized");
         }
         verify_descriptor_identity(&descriptor)?;
-        let txn_uuid = Uuid::now_v7().to_string();
-        self.registry.begin_removal(&descriptor, &txn_uuid)?;
+        if descriptor.local_data_dir != descriptor.managed_root {
+            anyhow::bail!("unsupported-library-marker");
+        }
+        let txn = Uuid::now_v7().to_string();
+        self.registry.begin_removal(&descriptor, &txn)?;
         let _gate = self.request_gate.write().await;
         let previous = self.active_snapshot();
         let was_active = previous.library_uuid.as_deref() == Some(library_uuid);
         if was_active {
             *self.active.write().unwrap_or_else(|p| p.into_inner()) = ActiveSnapshot {
-                library_uuid: previous.library_uuid.clone(),
-                context_revision: previous.context_revision,
-                runtime_generation: previous.runtime_generation,
                 runtime: None,
+                ..previous.clone()
             };
-            if let Some(active) = &previous.runtime {
-                if let Err(error) = active.shutdown().await {
-                    self.registry.rollback_removal(&txn_uuid, library_uuid)?;
+            if let Some(runtime) = &previous.runtime {
+                if let Err(error) = self.stop_owned_runtime(runtime).await {
+                    self.registry.rollback_removal(&txn, library_uuid)?;
                     return Err(error);
                 }
+            } else if let Err(error) = self.finish_pending_runtime_stop().await {
+                self.registry.rollback_removal(&txn, library_uuid)?;
+                return Err(error);
             }
         }
-        verify_descriptor_identity(&descriptor)?;
-        let root_quarantine = descriptor
+        let quarantine = descriptor
             .managed_root
-            .with_file_name(format!(".megle-quarantine-{txn_uuid}"));
-        let local_quarantine = descriptor
-            .local_data_dir
-            .with_file_name(format!(".megle-quarantine-{txn_uuid}"));
-        let root_quarantine_identity = SafeDirectory::open(&descriptor.managed_root)?
-            .identity()
-            .to_string();
-        let local_quarantine_identity = SafeDirectory::open(&descriptor.local_data_dir)?
-            .identity()
-            .to_string();
-        self.registry.update_removal_partial(
-            &txn_uuid,
-            "requested",
-            Some(&root_quarantine),
-            Some(&local_quarantine),
-            Some(&root_quarantine_identity),
-            Some(&local_quarantine_identity),
-        )?;
-        if let Err(error) = safe_rename_directory_expected(
-            &descriptor.managed_root,
-            &root_quarantine,
-            &root_quarantine_identity,
-        ) {
-            self.registry.rollback_removal(&txn_uuid, library_uuid)?;
-            if was_active {
-                self.restore_previous_snapshot(&previous)?;
-            }
-            return Err(error.into());
-        }
-        self.registry.update_removal_partial(
-            &txn_uuid,
-            "root-quarantined",
-            Some(&root_quarantine),
-            Some(&local_quarantine),
-            Some(&root_quarantine_identity),
-            None,
-        )?;
-        if let Err(error) = safe_rename_directory_expected(
-            &descriptor.local_data_dir,
-            &local_quarantine,
-            &local_quarantine_identity,
-        ) {
-            if safe_rename_directory(&root_quarantine, &descriptor.managed_root).is_ok() {
-                self.registry.rollback_removal(&txn_uuid, library_uuid)?;
+            .with_file_name(format!(".mangoo-quarantine-{txn}"));
+        let identity = match (|| -> anyhow::Result<String> {
+            verify_descriptor_identity(&descriptor)?;
+            let identity = SafeDirectory::open(&descriptor.managed_root)
+                .context("remove storage pin")?
+                .identity()
+                .to_owned();
+            self.registry.update_removal_partial(
+                &txn,
+                "requested",
+                Some(&quarantine),
+                None,
+                Some(&identity),
+                None,
+            )?;
+            Ok(identity)
+        })() {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.registry.rollback_removal(&txn, library_uuid)?;
                 if was_active {
                     self.restore_previous_snapshot(&previous)?;
                 }
-            }
-            return Err(error.into());
-        }
-        self.registry.update_removal_quarantine(
-            &txn_uuid,
-            &root_quarantine,
-            &local_quarantine,
-            &root_quarantine_identity,
-            &local_quarantine_identity,
-        )?;
-        if was_active {
-            let activation_txn = Uuid::now_v7().to_string();
-            let revision = match self.registry.begin_activation(&activation_txn, None) {
-                Ok(revision) => revision,
-                Err(error) => {
-                    safe_rename_directory(&local_quarantine, &descriptor.local_data_dir)?;
-                    safe_rename_directory(&root_quarantine, &descriptor.managed_root)?;
-                    self.registry.rollback_removal(&txn_uuid, library_uuid)?;
-                    self.restore_previous_snapshot(&previous)?;
-                    return Err(error);
-                }
-            };
-            if let Err(error) = self
-                .registry
-                .commit_activation(&activation_txn, None, revision)
-            {
-                self.registry
-                    .rollback_activation(&activation_txn, "remove-activation-failed")
-                    .ok();
-                safe_rename_directory(&local_quarantine, &descriptor.local_data_dir)?;
-                safe_rename_directory(&root_quarantine, &descriptor.managed_root)?;
-                self.registry.rollback_removal(&txn_uuid, library_uuid)?;
-                self.restore_previous_snapshot(&previous)?;
                 return Err(error);
             }
-            *self.active.write().unwrap_or_else(|p| p.into_inner()) = ActiveSnapshot {
-                library_uuid: None,
-                context_revision: revision,
-                runtime_generation: previous.runtime_generation,
-                runtime: None,
-            };
+        };
+        if let Err(error) =
+            safe_rename_directory_expected(&descriptor.managed_root, &quarantine, &identity)
+        {
+            self.registry.rollback_removal(&txn, library_uuid)?;
+            if was_active {
+                self.restore_previous_snapshot(&previous)?;
+            }
+            return Err(anyhow::Error::new(error).context("remove storage quarantine rename"));
         }
-        self.registry.commit_removal(&txn_uuid, library_uuid)?;
-        let expected_marker_identity = descriptor.marker_identity.clone();
-        let registry = Arc::clone(&self.registry);
-        let cleanup_txn_uuid = txn_uuid.clone();
-        tokio::task::spawn_blocking(move || {
-            let root_marker = root_quarantine.join(MARKER_FILE_NAME);
-            let root_identity_matches = marker_identity(&root_marker)
-                .is_ok_and(|actual| actual == expected_marker_identity);
-            let local_catalog_exists = local_quarantine.join("catalog.sqlite").is_file();
-            if root_identity_matches && local_catalog_exists {
-                let root_result =
-                    safe_delete_tree_expected(&root_quarantine, &root_quarantine_identity);
-                let local_result =
-                    safe_delete_tree_expected(&local_quarantine, &local_quarantine_identity);
-                if root_result.is_ok()
-                    && local_result.is_ok()
-                    && !root_quarantine.exists()
-                    && !local_quarantine.exists()
-                {
-                    if let Err(error) = registry.mark_removal_complete(&cleanup_txn_uuid) {
-                        tracing::error!(%error, "failed to mark Library quarantine cleanup complete");
-                    }
-                } else {
-                    tracing::error!(
-                        root_error = ?root_result.err(),
-                        local_error = ?local_result.err(),
-                        "Library quarantine cleanup remains pending"
-                    );
+        let transition = (|| -> anyhow::Result<()> {
+            self.registry.update_removal_partial(
+                &txn,
+                "quarantined",
+                Some(&quarantine),
+                None,
+                Some(&identity),
+                None,
+            )?;
+            if was_active {
+                let activation = Uuid::now_v7().to_string();
+                let revision = self.registry.begin_activation(&activation, None)?;
+                if let Err(error) = self.registry.commit_activation(&activation, None, revision) {
+                    self.registry
+                        .rollback_activation(&activation, "remove-activation-failed")?;
+                    return Err(error);
                 }
-            } else {
-                tracing::error!(
-                    root_identity_matches,
-                    local_catalog_exists,
-                    "refused to delete Library quarantine after identity verification failed"
-                );
+                *self.active.write().unwrap_or_else(|p| p.into_inner()) = ActiveSnapshot {
+                    library_uuid: None,
+                    context_revision: revision,
+                    runtime_generation: previous.runtime_generation,
+                    runtime: None,
+                };
+            }
+            self.registry.commit_removal(&txn, library_uuid)?;
+            Ok(())
+        })();
+        if let Err(error) = transition {
+            safe_rename_directory_expected(&quarantine, &descriptor.managed_root, &identity)?;
+            self.registry.rollback_removal(&txn, library_uuid)?;
+            if was_active {
+                self.restore_previous_snapshot(&previous)?;
+            }
+            return Err(error);
+        }
+        let registry = Arc::clone(&self.registry);
+        let expected_marker = descriptor.marker_identity;
+        tokio::task::spawn_blocking(move || {
+            let result = (|| -> anyhow::Result<()> {
+                if marker_identity(&quarantine.join(MARKER_FILE_NAME))? != expected_marker {
+                    anyhow::bail!("marker-identity-mismatch");
+                }
+                safe_delete_tree_expected(&quarantine, &identity)?;
+                registry.mark_removal_complete(&txn)
+            })();
+            if let Err(error) = result {
+                tracing::warn!(%error, "Library storage quarantine cleanup remains pending");
             }
         });
         Ok(())
@@ -3349,6 +4254,7 @@ impl LibraryManager {
         account_identity: &str,
     ) -> anyhow::Result<()> {
         let _operation = self.operation.lock().await;
+        let _lifecycle = self.lock_plugin_lifecycle(provider_id).await;
         self.ensure_context_revision(expected_revision)?;
         let descriptor = self
             .registry
@@ -3531,23 +4437,30 @@ impl LibraryManager {
         let plan = self
             .registry
             .restore_plan(restore_uuid)?
-            .ok_or_else(|| anyhow::anyhow!("restore-not-found"))?;
-        if plan.catalog_ready {
+            .context("restore-not-found")?;
+        if plan.catalog_ready || plan.database_path.is_empty() {
             anyhow::bail!("restore-action-not-allowed");
         }
+        self.registry
+            .ensure_restore_cleanup_owned(restore_uuid, &plan.library_uuid)?;
         let descriptor = self
             .registry
             .library(&plan.library_uuid)?
-            .ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
+            .context("library-not-found")?;
         verify_descriptor_identity(&descriptor)?;
-        if descriptor.local_data_dir.join("catalog.sqlite").exists() {
+        if read_marker(&descriptor.managed_root)?.creation_txn_uuid != restore_uuid {
+            anyhow::bail!("restore-ownership-mismatch");
+        }
+        if fs::read_dir(&descriptor.local_data_dir)?.any(|entry| {
+            entry.is_err() || entry.is_ok_and(|entry| entry.file_name() != MARKER_FILE_NAME)
+        }) {
             anyhow::bail!("restore-action-not-allowed");
         }
         if let Some(transport) = self
             .registry
             .binding_transport(&plan.library_uuid, "library")?
         {
-            let next_generation = self
+            let next = self
                 .registry
                 .begin_unbind(&plan.library_uuid, transport.binding_epoch)?;
             self.sync_coordinator
@@ -3556,53 +4469,36 @@ impl LibraryManager {
                     &transport.plugin_id,
                     &transport.account_uuid,
                     transport.binding_epoch,
-                    next_generation as u64,
+                    next as u64,
                 )
                 .await?;
             self.sync_coordinator
                 .cancel_media_binding(transport.binding_epoch)
                 .await?;
         }
-        let root_identity = SafeDirectory::open(&descriptor.managed_root)?
-            .identity()
-            .to_string();
-        let local_identity = SafeDirectory::open(&descriptor.local_data_dir)?
-            .identity()
-            .to_string();
-        let cleanup_uuid = Uuid::now_v7();
-        let root_quarantine = descriptor
-            .managed_root
-            .with_file_name(format!(".megle-restore-cancel-{cleanup_uuid}"));
-        let local_quarantine = descriptor
-            .local_data_dir
-            .with_file_name(format!(".megle-restore-cancel-{cleanup_uuid}"));
-        safe_rename_directory_expected(
-            &descriptor.local_data_dir,
-            &local_quarantine,
-            &local_identity,
-        )?;
-        if let Err(error) = safe_rename_directory_expected(
-            &descriptor.managed_root,
-            &root_quarantine,
-            &root_identity,
-        ) {
-            safe_rename_directory(&local_quarantine, &descriptor.local_data_dir)?;
-            return Err(error.into());
+        for root in self.registry.restore_root_cleanup_entries(restore_uuid)? {
+            let marker = crate::sync_folders::SyncRootMarker {
+                format_version: 1,
+                library_uuid: plan.library_uuid.clone(),
+                root_uuid: root.root_uuid,
+                root_folder_uuid: root.root_folder_uuid,
+                local_binding_uuid: root.local_binding_uuid,
+                binding_generation: root.binding_generation,
+            };
+            crate::sync_folders::remove_root_marker_if_matches(&root.target_path, &marker, false)?;
         }
-        let cancelled = match self
-            .registry
-            .commit_cancelled_restore_cleanup(restore_uuid, &plan.library_uuid)
-        {
-            Ok(plan) => plan,
-            Err(error) => {
-                safe_rename_directory(&root_quarantine, &descriptor.managed_root)?;
-                safe_rename_directory(&local_quarantine, &descriptor.local_data_dir)?;
-                return Err(error);
-            }
-        };
-        safe_delete_tree_expected(&local_quarantine, &local_identity)?;
-        safe_delete_tree_expected(&root_quarantine, &root_identity)?;
-        Ok(cancelled)
+        self.registry.update_creation_phase(
+            restore_uuid,
+            "restore-cancelling",
+            false,
+            true,
+            None,
+            None,
+        )?;
+        self.recover_creation(restore_uuid)?;
+        self.registry
+            .restore_plan(restore_uuid)?
+            .context("restore-not-found")
     }
 
     pub async fn discard_restore_plan(
@@ -3613,18 +4509,6 @@ impl LibraryManager {
             .registry
             .restore_plan(restore_uuid)?
             .ok_or_else(|| anyhow::anyhow!("restore-not-found"))?;
-        let root_cleanup = self.registry.restore_root_cleanup_entries(restore_uuid)?;
-        for root in root_cleanup {
-            let marker = crate::sync_folders::SyncRootMarker {
-                format_version: 1,
-                library_uuid: plan.library_uuid.clone(),
-                root_uuid: root.root_uuid,
-                root_folder_uuid: root.root_folder_uuid,
-                local_binding_uuid: root.local_binding_uuid,
-                binding_generation: root.binding_generation,
-            };
-            crate::sync_folders::remove_root_marker_if_matches(&root.target_path, &marker, true)?;
-        }
         if self.registry.library(&plan.library_uuid)?.is_some() {
             self.cancel_restore(restore_uuid).await
         } else {
@@ -3644,7 +4528,11 @@ impl LibraryManager {
             .registry
             .binding_transport(library_uuid, "library")?
             .ok_or_else(|| anyhow::anyhow!("sync-binding-not-found"))?;
-        self.registry.set_binding_state(library_uuid, "active")?;
+        let _lifecycle = self.lock_plugin_lifecycle(&transport.plugin_id).await;
+        self.registry
+            .require_ready_sync_provider(&transport.plugin_id, &transport.account_uuid)?;
+        let _work = self.provider_manager().begin_work(&transport.plugin_id)?;
+        self.registry.resume_binding(library_uuid, &transport)?;
         self.sync_coordinator
             .resume_media_binding(transport.binding_epoch)
             .await;
@@ -3663,6 +4551,7 @@ impl LibraryManager {
             .registry
             .binding_transport(library_uuid, "library")?
             .ok_or_else(|| anyhow::anyhow!("sync-binding-not-found"))?;
+        let _lifecycle = self.lock_plugin_lifecycle(&transport.plugin_id).await;
         self.registry
             .require_ready_sync_provider(&transport.plugin_id, &transport.account_uuid)?;
         if self
@@ -3728,6 +4617,13 @@ impl LibraryManager {
     ) -> anyhow::Result<()> {
         let _operation = self.operation.lock().await;
         self.ensure_context_revision(expected_revision)?;
+        let transport = self
+            .registry
+            .binding_transport(library_uuid, "library")?
+            .ok_or_else(|| anyhow::anyhow!("sync-binding-not-found"))?;
+        let _lifecycle = self.lock_plugin_lifecycle(&transport.plugin_id).await;
+        self.registry
+            .require_ready_sync_provider(&transport.plugin_id, &transport.account_uuid)?;
         self.registry.wake_binding(library_uuid)?;
         self.sync_coordinator.wake();
         Ok(())
@@ -3891,7 +4787,14 @@ impl LibraryManager {
     ) -> anyhow::Result<Arc<LibraryRuntimeResources>> {
         verify_descriptor_identity(descriptor)?;
         let generation = self.runtime_generation.fetch_add(1, Ordering::AcqRel) + 1;
-        let database = Database::open(descriptor.local_data_dir.join("catalog.sqlite"))?;
+        let mut database = Database::open_verified(
+            &descriptor.local_data_dir.join("catalog.sqlite"),
+            Uuid::parse_str(&descriptor.library_uuid)?,
+            self.registry.device_uuid()?,
+        )?;
+        self.refresh_storage_snapshot()?;
+        database.attach_storage_snapshot(self.storage_snapshot.clone());
+        database.attach_decoder_context(self.decoder_manager.clone(), CancellationToken::new());
         database.apply_migrations()?;
         database.initialize_sync_identity(
             Uuid::parse_str(&descriptor.library_uuid)?,
@@ -4078,8 +4981,247 @@ impl LibraryManager {
     }
 }
 
-fn verify_descriptor_identity(descriptor: &LibraryDescriptor) -> anyhow::Result<()> {
+#[cfg(test)]
+fn finish_restore_container_cleanup(
+    descriptor: &LibraryDescriptor,
+    local_quarantine: &Path,
+    root_quarantine: &Path,
+    local_identity: &str,
+    root_identity: &str,
+    created_root: bool,
+) -> anyhow::Result<()> {
+    // Empty checks before the asynchronous drain cannot grant ownership of
+    // content added afterwards. Never recursively delete these containers.
+    if safe_remove_empty_directory_expected(local_quarantine, local_identity).is_err() {
+        safe_rename_directory_expected(
+            local_quarantine,
+            &descriptor.local_data_dir,
+            local_identity,
+        )?;
+    }
+    let marker_result = (|| -> anyhow::Result<()> {
+        let root_guard = SafeDirectory::open(root_quarantine)?;
+        if root_guard.identity() != root_identity {
+            anyhow::bail!("path-changed");
+        }
+        root_guard.delete_file_child_expected(
+            std::ffi::OsStr::new(MARKER_FILE_NAME),
+            &descriptor.marker_identity,
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = marker_result {
+        safe_rename_directory_expected(root_quarantine, &descriptor.managed_root, root_identity)?;
+        return Err(error);
+    }
+    if !created_root
+        || safe_remove_empty_directory_expected(root_quarantine, root_identity).is_err()
+    {
+        safe_rename_directory_expected(root_quarantine, &descriptor.managed_root, root_identity)?;
+    }
+    Ok(())
+}
+
+// Host-local registration I/O is isolated from Tokio lifecycle coordination.
+// This owner never modifies the selected root and never uses removal recovery.
+struct LibraryRegistrationStorage {
+    registry: Arc<HostRegistry>,
+    libraries_dir: PathBuf,
+}
+
+impl LibraryRegistrationStorage {
+    fn open(
+        &self,
+        database_path: PathBuf,
+    ) -> anyhow::Result<(LibraryDescriptor, ExistingLibraryRoot)> {
+        let normalized = crate::library_path::inspect_directory_path(&database_path, false)
+            .map_err(|reason| anyhow::anyhow!(reason.as_str()))?;
+        let mut root = ExistingLibraryRoot::open(&normalized)?;
+        Database::inspect_existing_catalog(
+            &root.path.join("catalog.sqlite"),
+            Uuid::parse_str(&root.marker.library_uuid)?,
+            self.registry.device_uuid()?,
+        )?;
+        let descriptor = if let Some(existing) = self.registry.library(&root.marker.library_uuid)? {
+            if existing.root_uuid != root.marker.root_uuid
+                || existing.marker_identity != root.marker_identity
+                || !same_library_path(&existing.managed_root, &root.path)
+                || existing.local_data_dir != existing.managed_root
+            {
+                anyhow::bail!("library-identity-conflict");
+            }
+            if existing.lifecycle_state != "ready" {
+                anyhow::bail!("library-unavailable");
+            }
+            root.verify_unchanged()?;
+            self.registry.show_library(&existing.library_uuid)?;
+            existing
+        } else {
+            self.ensure_open_root_unclaimed(&root)?;
+            let pending = self
+                .registry
+                .library_open_intents()?
+                .into_iter()
+                .find(|intent| intent.descriptor.library_uuid == root.marker.library_uuid);
+            let intent = if let Some(intent) = pending {
+                intent
+            } else {
+                let intent = LibraryOpenIntent {
+                    descriptor: LibraryDescriptor {
+                        library_uuid: root.marker.library_uuid.clone(),
+                        root_uuid: root.marker.root_uuid.clone(),
+                        name: root
+                            .path
+                            .parent()
+                            .and_then(Path::file_name)
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("Library")
+                            .to_owned(),
+                        icon: None,
+                        color: None,
+                        local_data_dir: root.path.clone(),
+                        managed_root: root.path.clone(),
+                        lifecycle_state: "ready".into(),
+                        binding_state: "local-only".into(),
+                        availability: "available".into(),
+                        marker_identity: root.marker_identity.clone(),
+                    },
+                    root_identity: root.root_identity().to_owned(),
+                    local_identity: None,
+                    catalog_identity: None,
+                };
+                self.registry.begin_library_open(&intent)?;
+                intent
+            };
+            self.finish_library_open(intent)?
+        };
+        root.verify_unchanged()?;
+        Ok((descriptor, root))
+    }
+
+    fn ensure_open_root_unclaimed(&self, root: &ExistingLibraryRoot) -> anyhow::Result<()> {
+        if crate::library_path::paths_overlap(&root.path, &self.libraries_dir) {
+            anyhow::bail!("nested-library-root");
+        }
+        for existing in self.registry.snapshot()?.libraries {
+            if existing.root_uuid == root.marker.root_uuid
+                || existing.library_uuid == root.marker.library_uuid
+            {
+                anyhow::bail!("library-identity-conflict");
+            }
+            if crate::library_path::paths_overlap(&root.path, &existing.managed_root) {
+                anyhow::bail!("nested-library-root");
+            }
+        }
+        for intent in self.registry.library_open_intents()? {
+            if intent.descriptor.library_uuid != root.marker.library_uuid
+                && (intent.descriptor.root_uuid == root.marker.root_uuid
+                    || crate::library_path::paths_overlap(
+                        &root.path,
+                        &intent.descriptor.managed_root,
+                    ))
+            {
+                anyhow::bail!("library-open-conflict");
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_library_open(&self, intent: LibraryOpenIntent) -> anyhow::Result<LibraryDescriptor> {
+        let descriptor = &intent.descriptor;
+        let mut root = ExistingLibraryRoot::open(&descriptor.managed_root)?;
+        if root.marker.library_uuid != descriptor.library_uuid
+            || root.marker.root_uuid != descriptor.root_uuid
+            || root.marker_identity != descriptor.marker_identity
+            || root.root_identity() != intent.root_identity
+            || descriptor.local_data_dir != descriptor.managed_root
+        {
+            anyhow::bail!("library-identity-conflict");
+        }
+        self.ensure_open_root_unclaimed(&root)?;
+        Database::inspect_existing_catalog(
+            &descriptor.local_data_dir.join("catalog.sqlite"),
+            Uuid::parse_str(&descriptor.library_uuid)?,
+            self.registry.device_uuid()?,
+        )?;
+        let directory = MarkerDirectoryGuard::open_readonly(&descriptor.local_data_dir)?;
+        let catalog = directory.open_catalog()?;
+        let identity = directory.file_identity(&catalog)?;
+        if let Some(recorded) = intent.catalog_identity {
+            if recorded != identity {
+                anyhow::bail!("library-local-data-conflict");
+            }
+        } else {
+            if intent.local_identity.is_none() {
+                self.registry
+                    .own_library_open_directory(&descriptor.library_uuid, directory.identity())?;
+            }
+            self.registry
+                .own_library_open_catalog(&descriptor.library_uuid, &identity)?;
+        }
+        root.verify_unchanged()?;
+        self.registry.commit_library_open(descriptor)?;
+        Ok(intent.descriptor)
+    }
+}
+
+fn cleanup_owned_creation_artifacts(artifacts: &[OwnedCreationArtifact]) -> anyhow::Result<()> {
+    let mut visited = std::collections::HashSet::new();
+    for artifact in artifacts.iter().rev() {
+        if !visited.insert(&artifact.path) || !artifact.path.try_exists()? {
+            continue;
+        }
+        let actual = crate::library_path::local_file_identity(&artifact.path)?;
+        let owned = artifacts
+            .iter()
+            .find(|candidate| candidate.path == artifact.path && candidate.identity == actual)
+            .context("path-changed")?;
+        cleanup_owned_creation_artifact(owned)?;
+    }
+    Ok(())
+}
+
+fn cleanup_owned_creation_artifact(artifact: &OwnedCreationArtifact) -> anyhow::Result<()> {
+    if !artifact.path.try_exists()? {
+        return Ok(());
+    }
+    if artifact.directory {
+        let guard = MarkerDirectoryGuard::open_readonly(&artifact.path)?;
+        if guard.identity() != artifact.identity {
+            anyhow::bail!("path-changed");
+        }
+        if fs::read_dir(&artifact.path)?.next().is_some() {
+            return Ok(());
+        }
+        drop(guard);
+        safe_remove_empty_directory_expected(&artifact.path, &artifact.identity)?;
+    } else {
+        let parent = MarkerDirectoryGuard::open(artifact.path.parent().context("invalid-path")?)?;
+        parent.delete_file_child_expected(
+            artifact.path.file_name().context("invalid-path")?,
+            &artifact.identity,
+        )?;
+    }
+    Ok(())
+}
+
+fn same_library_path(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+pub(crate) fn verify_descriptor_identity(descriptor: &LibraryDescriptor) -> anyhow::Result<()> {
     let marker = read_marker(&descriptor.managed_root)?;
+    if marker.format_version != STORAGE_FORMAT_VERSION {
+        anyhow::bail!("unsupported-library-marker");
+    }
     if marker.state != MarkerState::Committed
         || marker.library_uuid != descriptor.library_uuid
         || marker.root_uuid != descriptor.root_uuid
@@ -4106,8 +5248,154 @@ fn relocation_reconciliation_succeeded(status: Option<&str>) -> anyhow::Result<b
 mod tests {
     use super::*;
 
-    const FAKE_PLUGIN_ID: &str = "com.megle.fake-sync";
+    const FAKE_PLUGIN_ID: &str = "com.mangoo.fake-sync";
     const FAKE_ACCOUNT_ID: &str = "fake-account";
+
+    #[tokio::test]
+    async fn decoder_supervisor_restores_capability_after_cancelled_or_dropped_job() {
+        use crate::plugins::decoder::{DecoderError, DecoderPurpose};
+        use std::io::{Seek, SeekFrom, Write};
+        let root = tempfile::tempdir().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let bundled = executable
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("bundled-plugins");
+        let manager = Arc::new(isolated_manager(root.path(), bundled.clone()));
+        let plugin_id = "com.mangoo.ppm-decoder";
+        let plugin_root = bundled.join(plugin_id);
+        let manifest = crate::plugins::parse_manifest(&plugin_root.join("plugin.json")).unwrap();
+        let verified = crate::plugins::runtime::trust::verify_bundled_entry(
+            &manifest,
+            &plugin_root,
+            platform(),
+            crate::plugins::runtime::trust::embedded_trust_registry(),
+        )
+        .unwrap();
+        // Unit binaries live in deps/, outside the packaged Core discovery
+        // root. Seed the verified artifact as other supervisor fixtures do;
+        // the API integration exercises discovery from the packaged binary.
+        manager
+            .registry
+            .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
+                plugin_id,
+                version: &manifest.version,
+                manifest_json: &serde_json::to_string(&manifest).unwrap(),
+                entry_relative_path: manifest.entry_for(platform()).unwrap(),
+                entry_sha256: &verified.expected_sha256(),
+                install_root: &plugin_root,
+                trust_policy_id: "embedded-v1",
+                requested_permissions_json: &serde_json::to_string(&manifest.requested_permissions)
+                    .unwrap(),
+            })
+            .unwrap();
+        manager
+            .registry
+            .set_plugin_grants(
+                plugin_id,
+                &serde_json::to_string(&manifest.requested_permissions).unwrap(),
+                true,
+            )
+            .unwrap();
+        manager.finish_plugin_restart(plugin_id).await.unwrap();
+        manager
+            .registry
+            .set_plugin_intent(plugin_id, true, true)
+            .unwrap();
+        manager.start_plugin_runtime_supervisors();
+        let decoder = manager.decoder_manager();
+        let epoch = manager.registry.plugin_lifecycle_epoch(plugin_id).unwrap();
+        for drop_waiter in [false, true] {
+            tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                while decoder.matching("ppm", DecoderPurpose::Thumbnail).is_none() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("decoder initially ready");
+            let before = decoder.snapshot().generation;
+            let mut source = tempfile::tempfile().unwrap();
+            source.write_all(b"P6\n1 1\n255\n\x11\x53\xd3").unwrap();
+            let padding = [b' '; 256 * 1024];
+            for _ in 0..192 {
+                source.write_all(&padding).unwrap();
+            }
+            source.seek(SeekFrom::Start(0)).unwrap();
+            let cancellation = CancellationToken::new();
+            let job_manager = decoder.clone();
+            let job_cancel = cancellation.clone();
+            let job = tokio::spawn(async move {
+                job_manager
+                    .decode(source, "ppm", DecoderPurpose::Thumbnail, 1024, job_cancel)
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !decoder.job_dispatched_for_test(plugin_id) {
+                    assert!(
+                        !job.is_finished(),
+                        "observe actual dispatch, not queue cancellation"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if drop_waiter {
+                job.abort();
+                assert!(job.await.is_err());
+            } else {
+                cancellation.cancel();
+                assert!(matches!(job.await.unwrap(), Err(DecoderError::Cancelled)));
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                loop {
+                    let snapshot = decoder.snapshot();
+                    if snapshot.generation > before
+                        && snapshot
+                            .matching("ppm", DecoderPurpose::Thumbnail)
+                            .is_some()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("normal cancellation must restore ready without a manual toggle");
+            assert_eq!(
+                manager.registry.plugin_lifecycle_epoch(plugin_id).unwrap(),
+                epoch
+            );
+            assert_eq!(
+                manager
+                    .registry
+                    .host_plugin(plugin_id)
+                    .unwrap()
+                    .unwrap()
+                    .runtime_state,
+                "ready"
+            );
+            let mut source = tempfile::tempfile().unwrap();
+            source.write_all(b"P3\n1 1\n255\n17 83 211\n").unwrap();
+            source.seek(SeekFrom::Start(0)).unwrap();
+            let decoded = decoder
+                .decode(
+                    source,
+                    "ppm",
+                    DecoderPurpose::Thumbnail,
+                    1024,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(decoded.rgba, [17, 83, 211, 255]);
+            drop(decoded);
+        }
+        manager.shutdown_sync_coordinator().await.unwrap();
+        assert!(decoder.snapshot().capabilities.is_empty());
+    }
 
     fn isolated_manager(base: &Path, bundled_plugins_dir: PathBuf) -> LibraryManager {
         let registry = Arc::new(HostRegistry::open(&base.join("host.sqlite")).unwrap());
@@ -4132,10 +5420,1469 @@ mod tests {
         isolated_manager(base, base.join("bundled-plugins"))
     }
 
+    #[tokio::test]
+    async fn separated_storage_old_active_with_pending_relocation_is_isolated_without_catalog_write(
+    ) {
+        let (base, manager, root_marker) = same_name_root_fixture("active").await;
+        let descriptor = manager
+            .registry
+            .library(&root_marker.library_uuid)
+            .unwrap()
+            .unwrap();
+        let binding = manager
+            .registry
+            .local_root_binding(&root_marker.library_uuid, &root_marker.root_uuid)
+            .unwrap()
+            .unwrap();
+        let operation = Uuid::now_v7().to_string();
+        let request = serde_json::json!({"targetPath":binding.local_path, "resumeState":"active"});
+        manager
+            .registry
+            .record_automatic_root_rename_preflight_failure(
+                &operation,
+                &root_marker.library_uuid,
+                &root_marker.root_uuid,
+                &crate::sync_folders::request_hash(&request).unwrap(),
+                &request,
+                binding.operation_revision,
+                binding.binding_generation,
+                &"bb".repeat(32),
+                Path::new(&binding.local_path),
+            )
+            .unwrap();
+        let host = rusqlite::Connection::open(base.join("host.sqlite")).unwrap();
+        host.execute(
+            "UPDATE root_relocation_operations SET cleanup_state='pending' WHERE operation_uuid=?1",
+            [&operation],
+        )
+        .unwrap();
+        host.execute(
+            "UPDATE host_meta SET active_library_uuid=?1 WHERE singleton=1",
+            [&root_marker.library_uuid],
+        )
+        .unwrap();
+        assert_eq!(
+            manager.registry.pending_root_relocations().unwrap().len(),
+            1
+        );
+        let mut marker = read_marker(&descriptor.managed_root).unwrap();
+        marker.format_version = 1;
+        fs::write(
+            descriptor.managed_root.join(MARKER_FILE_NAME),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        let catalog = fs::read(descriptor.local_data_dir.join("catalog.sqlite")).unwrap();
+        drop(host);
+        drop(manager);
+        let manager = test_manager(&base);
+        manager.restore_active().await.unwrap();
+        assert!(manager.active_snapshot().library_uuid.is_none());
+        assert_eq!(
+            manager
+                .registry
+                .library(&root_marker.library_uuid)
+                .unwrap()
+                .unwrap()
+                .availability,
+            "unavailable"
+        );
+        assert_eq!(
+            manager.registry.pending_root_relocations().unwrap().len(),
+            1
+        );
+        assert!(manager
+            .write_sync_folder_catalog(&root_marker.library_uuid, |_| -> anyhow::Result<()> {
+                panic!("unsupported Catalog must not open")
+            })
+            .await
+            .is_err());
+        assert_eq!(
+            fs::read(descriptor.local_data_dir.join("catalog.sqlite")).unwrap(),
+            catalog
+        );
+        drop(manager);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn separated_storage_creation_failure_phases_recover_without_touching_existing_content() {
+        for phase in ["marker-pending", "prepared", "marker-committed", "created"] {
+            let base = tempfile::tempdir().unwrap();
+            let manager = test_manager(base.path());
+            let external = base.path().join("external");
+            fs::create_dir(&external).unwrap();
+            fs::write(external.join("keep.txt"), b"untouched").unwrap();
+            let host = rusqlite::Connection::open(base.path().join("host.sqlite")).unwrap();
+            host.execute_batch(&format!("CREATE TRIGGER fail_creation_phase BEFORE UPDATE OF phase ON library_creation_journal WHEN NEW.phase='{phase}' BEGIN SELECT RAISE(ABORT,'injected-journal-failure'); END;")).unwrap();
+            let database = base.path().join("new/placement/Database");
+            let files = base.path().join("new/placement/Files");
+            let result = manager
+                .create_library_with_content(
+                    "Failure".into(),
+                    None,
+                    None,
+                    database.clone(),
+                    vec![
+                        LibraryContentRootInput {
+                            path: files.to_string_lossy().into_owned(),
+                            create_if_missing: true,
+                        },
+                        LibraryContentRootInput {
+                            path: external.to_string_lossy().into_owned(),
+                            create_if_missing: false,
+                        },
+                    ],
+                    None,
+                    false,
+                )
+                .await;
+            assert!(result.is_err(), "fault at {phase} must be observed");
+            host.execute_batch("DROP TRIGGER fail_creation_phase")
+                .unwrap();
+            manager.recover_journals().unwrap();
+            assert_eq!(fs::read(external.join("keep.txt")).unwrap(), b"untouched");
+            assert!(manager
+                .registry
+                .pending_creation_recovery()
+                .unwrap()
+                .is_empty());
+            if matches!(phase, "marker-committed" | "created") {
+                assert_eq!(
+                    read_marker(&database).unwrap().state,
+                    MarkerState::Committed
+                );
+                assert_eq!(manager.registry.snapshot().unwrap().libraries.len(), 1);
+                let catalog = Database::open_existing(database.join("catalog.sqlite")).unwrap();
+                assert_eq!(catalog.list_roots().unwrap().len(), 2);
+            } else {
+                assert!(!database.exists());
+                assert!(!files.exists());
+                assert!(!base.path().join("new").exists());
+                assert!(manager.registry.snapshot().unwrap().libraries.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn separated_storage_forward_cleanup_failure_remains_recoverable() {
+        let base = tempfile::tempdir().unwrap();
+        let manager = test_manager(base.path());
+        let (library, _, _) = manager
+            .create_library(
+                "Forward".into(),
+                None,
+                None,
+                base.path().join("Database"),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let marker = read_marker(&library.managed_root).unwrap();
+        let staging = library
+            .managed_root
+            .join(format!(".mangoo-create-{}", marker.creation_txn_uuid));
+        fs::create_dir(&staging).unwrap();
+        let original = crate::library_path::local_file_identity(&staging).unwrap();
+        let mut owned = manager
+            .registry
+            .creation_artifacts(&marker.creation_txn_uuid)
+            .unwrap();
+        owned.push(OwnedCreationArtifact {
+            path: staging.clone(),
+            identity: original,
+            directory: true,
+            role: "staging".into(),
+        });
+        manager
+            .registry
+            .record_creation_artifacts(&marker.creation_txn_uuid, &owned)
+            .unwrap();
+        let parked = library.managed_root.join("parked-staging");
+        fs::rename(&staging, &parked).unwrap();
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("catalog.sqlite-wal"), b"concurrent-user-file").unwrap();
+        let host = rusqlite::Connection::open(base.path().join("host.sqlite")).unwrap();
+        host.execute(
+            "DELETE FROM libraries WHERE library_uuid=?1",
+            [&library.library_uuid],
+        )
+        .unwrap();
+        host.execute(
+            "UPDATE library_creation_journal SET phase='marker-committed' WHERE txn_uuid=?1",
+            [&marker.creation_txn_uuid],
+        )
+        .unwrap();
+        assert!(manager.recover_creation(&marker.creation_txn_uuid).is_err());
+        assert_eq!(
+            manager.registry.pending_creation_recovery().unwrap().len(),
+            1
+        );
+        assert!(manager
+            .registry
+            .library(&library.library_uuid)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            fs::read(staging.join("catalog.sqlite-wal")).unwrap(),
+            b"concurrent-user-file"
+        );
+        let preserved = library.managed_root.join("preserved-user-directory");
+        fs::rename(&staging, &preserved).unwrap();
+        fs::rename(&parked, &staging).unwrap();
+        manager.recover_creation(&marker.creation_txn_uuid).unwrap();
+        assert!(manager
+            .registry
+            .pending_creation_recovery()
+            .unwrap()
+            .is_empty());
+        assert!(manager
+            .registry
+            .library(&library.library_uuid)
+            .unwrap()
+            .is_some());
+        assert!(!staging.exists());
+        assert_eq!(
+            fs::read(preserved.join("catalog.sqlite-wal")).unwrap(),
+            b"concurrent-user-file"
+        );
+    }
+
+    #[tokio::test]
+    async fn separated_storage_unsupported_journals_are_preserved_even_with_equal_paths() {
+        for version in [1, 99] {
+            let base = tempfile::tempdir().unwrap();
+            let manager = test_manager(base.path());
+            let (library, _, _) = manager
+                .create_library(
+                    "Version".into(),
+                    None,
+                    None,
+                    base.path().join("Database"),
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+            let marker = read_marker(&library.managed_root).unwrap();
+            manager
+                .registry
+                .begin_removal(&library, "unsupported-removal")
+                .unwrap();
+            let host = rusqlite::Connection::open(base.path().join("host.sqlite")).unwrap();
+            host.execute("UPDATE library_removal_journal SET layout_version=?1 WHERE txn_uuid='unsupported-removal'", [version]).unwrap();
+            host.execute("UPDATE library_creation_journal SET phase='marker-committed',layout_version=?1 WHERE txn_uuid=?2", rusqlite::params![version, marker.creation_txn_uuid]).unwrap();
+            let bytes = fs::read(library.managed_root.join("catalog.sqlite")).unwrap();
+            manager.recover_journals().unwrap();
+            assert_eq!(
+                manager.registry.pending_removal_recovery().unwrap()[0].layout_version,
+                version
+            );
+            assert_eq!(
+                manager.registry.pending_creation_recovery().unwrap()[0].layout_version,
+                version
+            );
+            assert_eq!(
+                fs::read(library.managed_root.join("catalog.sqlite")).unwrap(),
+                bytes
+            );
+            assert_eq!(
+                manager
+                    .registry
+                    .library(&library.library_uuid)
+                    .unwrap()
+                    .unwrap()
+                    .lifecycle_state,
+                "removing"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn separated_storage_remove_stop_failure_keeps_retry_ownership() {
+        let base = tempfile::tempdir().unwrap();
+        let manager = test_manager(base.path());
+        let (library, _, _) = manager
+            .create_library(
+                "Stop".into(),
+                None,
+                None,
+                base.path().join("Database"),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        let files = base.path().join("Database-Files");
+        fs::write(files.join("keep.txt"), b"content").unwrap();
+        manager
+            .active_snapshot()
+            .runtime
+            .unwrap()
+            .own_background_task(tokio::spawn(async {
+                panic!("injected owned task failure")
+            }));
+        let revision = manager.active_snapshot().context_revision;
+        let error = manager
+            .remove_local_library_with_revision(&library.library_uuid, revision)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("library-stop-failed"));
+        assert!(manager.pending_runtime_stop.lock().unwrap().is_some());
+        assert!(library.local_data_dir.join("catalog.sqlite").exists());
+        assert!(manager
+            .registry
+            .library(&library.library_uuid)
+            .unwrap()
+            .is_some());
+        manager
+            .remove_local_library_with_revision(&library.library_uuid, revision)
+            .await
+            .unwrap();
+        assert!(manager.pending_runtime_stop.lock().unwrap().is_none());
+        assert!(manager.active_snapshot().library_uuid.is_none());
+        assert!(!library.local_data_dir.exists());
+        assert_eq!(fs::read(files.join("keep.txt")).unwrap(), b"content");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn separated_storage_catalog_pin_prevents_replacement_until_sqlite_closes() {
+        let base = tempfile::tempdir().unwrap();
+        let path = base.path().join("catalog.sqlite");
+        let directory = MarkerDirectoryGuard::open(base.path()).unwrap();
+        let new_pin = directory.create_catalog().unwrap();
+        let identity = directory.file_identity(&new_pin).unwrap();
+        assert!(fs::rename(&path, base.path().join("replaced.sqlite")).is_err());
+        let database = Database::open_existing(&path).unwrap();
+        database.apply_migrations().unwrap();
+        drop(new_pin);
+        assert!(fs::remove_file(&path).is_err());
+        assert!(fs::rename(&path, base.path().join("replaced.sqlite")).is_err());
+        let reopened = database.reopen().unwrap().unwrap();
+        drop(database);
+        assert!(fs::remove_file(&path).is_err());
+        assert_eq!(
+            crate::library_path::local_file_identity(&path).unwrap(),
+            identity
+        );
+        drop(reopened);
+        fs::rename(&path, base.path().join("after-close.sqlite")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn separated_storage_creates_two_libraries_with_independent_populated_roots() {
+        let base = tempfile::tempdir().unwrap();
+        let manager = test_manager(base.path());
+        let external = base.path().join("external");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("user.txt"), b"keep").unwrap();
+        for name in ["First", "Second"] {
+            let parent = base.path().join("Documents/Mangoo/Libraries").join(name);
+            let database = parent.join("Database");
+            let roots = vec![
+                LibraryContentRootInput {
+                    path: parent.join("Files").to_string_lossy().into_owned(),
+                    create_if_missing: true,
+                },
+                LibraryContentRootInput {
+                    path: external.to_string_lossy().into_owned(),
+                    create_if_missing: false,
+                },
+            ];
+            let preview = manager.preflight_plan(name, &database, &roots).unwrap();
+            assert!(preview.ok, "{:?}", preview.reason);
+            assert!(!parent.exists(), "preflight must not write");
+            let (library, activated, _) = manager
+                .create_library_with_content(
+                    name.into(),
+                    None,
+                    None,
+                    database.clone(),
+                    roots,
+                    preview.token,
+                    false,
+                )
+                .await
+                .unwrap();
+            assert!(!activated);
+            assert_eq!(library.local_data_dir, library.managed_root);
+            let marker = read_marker(&database).unwrap();
+            assert_eq!(marker.format_version, 2);
+            let catalog = Database::open_existing(database.join("catalog.sqlite")).unwrap();
+            let paths = catalog.list_roots().unwrap();
+            assert_eq!(paths.len(), 2);
+            assert!(paths
+                .iter()
+                .all(|root| Path::new(&root.path) != library.managed_root));
+            let root_ids: Vec<Vec<u8>> = catalog
+                .connection_for_fsops()
+                .prepare("SELECT root_uuid FROM roots ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                root_ids
+                    .iter()
+                    .all(|id| id.as_slice()
+                        != Uuid::parse_str(&library.root_uuid).unwrap().as_bytes())
+            );
+            assert_ne!(root_ids[0], root_ids[1]);
+            assert_eq!(fs::read(external.join("user.txt")).unwrap(), b"keep");
+        }
+        assert_eq!(manager.registry.snapshot().unwrap().libraries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn separated_storage_rejects_empty_overlap_and_stale_whole_plan_without_effects() {
+        let base = tempfile::tempdir().unwrap();
+        let manager = test_manager(base.path());
+        let database = base.path().join("Library/Database");
+        assert_eq!(
+            manager
+                .preflight_plan("Library", &database, &[])
+                .unwrap()
+                .reason,
+            crate::library_path::PreflightReason::ContentRootsRequired
+        );
+        let root = LibraryContentRootInput {
+            path: base
+                .path()
+                .join("Library/Files")
+                .to_string_lossy()
+                .into_owned(),
+            create_if_missing: true,
+        };
+        let preview = manager
+            .preflight_plan("Library", &database, &[root.clone()])
+            .unwrap();
+        let error = manager
+            .create_library_with_content(
+                "Different".into(),
+                None,
+                None,
+                database.clone(),
+                vec![root.clone()],
+                preview.token,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "path-changed");
+        assert!(!database.parent().unwrap().exists());
+        let overlap = manager
+            .preflight_plan("Library", &database, &[root.clone(), root.clone()])
+            .unwrap();
+        assert_eq!(
+            overlap.reason,
+            crate::library_path::PreflightReason::ContentRootsOverlap
+        );
+        assert_eq!(overlap.root_index, Some(1));
+        assert!(overlap.normalized_content_roots.is_none());
+        let (library, _, _) = manager
+            .create_library_with_content(
+                "Library".into(),
+                None,
+                None,
+                database.clone(),
+                vec![root.clone()],
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        for forbidden in [
+            &database,
+            database.parent().unwrap(),
+            &database.join("subfolder"),
+        ] {
+            assert!(manager
+                .admit_content_path(forbidden, true)
+                .unwrap_err()
+                .to_string()
+                .contains("database-content-overlap"));
+        }
+        let blocked = manager
+            .preflight_plan(
+                "Other",
+                &Path::new(&root.path).join("Database"),
+                &[LibraryContentRootInput {
+                    path: base.path().join("Elsewhere").to_string_lossy().into_owned(),
+                    create_if_missing: true,
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            blocked.reason,
+            crate::library_path::PreflightReason::DatabaseContentOverlap
+        );
+        assert_eq!(blocked.path_role, Some("database"));
+        assert!(manager
+            .create_library_with_content(
+                "Collision".into(),
+                None,
+                None,
+                database.clone(),
+                vec![root],
+                None,
+                false
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            read_marker(&database).unwrap().library_uuid,
+            library.library_uuid
+        );
+    }
+
+    #[tokio::test]
+    async fn separated_storage_open_checks_existing_catalog_and_foreign_device_without_writes() {
+        let base = tempfile::tempdir().unwrap();
+        let manager = test_manager(base.path());
+        let (library, _, _) = manager
+            .create_library(
+                "Library".into(),
+                None,
+                None,
+                base.path().join("Database"),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let other = test_manager(foreign.path());
+        let error = other
+            .open_library_with_revision(library.managed_root.clone(), 0)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "library-device-identity-mismatch");
+        assert!(other.registry.snapshot().unwrap().libraries.is_empty());
+        fs::remove_file(library.local_data_dir.join("catalog.sqlite")).unwrap();
+        assert!(manager
+            .open_library_with_revision(library.managed_root.clone(), 0)
+            .await
+            .is_err());
+        assert!(!library.local_data_dir.join("catalog.sqlite").exists());
+        fs::write(
+            library.local_data_dir.join("catalog.sqlite"),
+            b"corrupt-user-bytes",
+        )
+        .unwrap();
+        assert!(manager
+            .open_library_with_revision(library.managed_root.clone(), 0)
+            .await
+            .is_err());
+        assert_eq!(
+            fs::read(library.local_data_dir.join("catalog.sqlite")).unwrap(),
+            b"corrupt-user-bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn separated_storage_removal_preserves_sibling_and_external_content() {
+        let base = tempfile::tempdir().unwrap();
+        let manager = test_manager(base.path());
+        let files = base.path().join("Library/Files");
+        let external = base.path().join("external");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("original.txt"), b"external").unwrap();
+        let roots = vec![
+            LibraryContentRootInput {
+                path: files.to_string_lossy().into_owned(),
+                create_if_missing: true,
+            },
+            LibraryContentRootInput {
+                path: external.to_string_lossy().into_owned(),
+                create_if_missing: false,
+            },
+        ];
+        let (library, _, _) = manager
+            .create_library_with_content(
+                "Library".into(),
+                None,
+                None,
+                base.path().join("Library/Database"),
+                roots,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        fs::write(files.join("original.txt"), b"sibling").unwrap();
+        manager
+            .remove_local_library_with_revision(&library.library_uuid, 0)
+            .await
+            .unwrap();
+        assert!(!library.local_data_dir.exists());
+        assert_eq!(fs::read(files.join("original.txt")).unwrap(), b"sibling");
+        assert_eq!(
+            fs::read(external.join("original.txt")).unwrap(),
+            b"external"
+        );
+        assert!(manager.registry.snapshot().unwrap().libraries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn safe_library_forget_preserves_active_inactive_last_catalog_and_restart() {
+        let base = tempfile::tempdir().unwrap();
+        let manager = test_manager(base.path());
+        let first = manager
+            .create_library(
+                "First".into(),
+                Some("folder".into()),
+                Some("#123456".into()),
+                base.path().join("first"),
+                None,
+                true,
+            )
+            .await
+            .unwrap()
+            .0;
+        let second = manager
+            .create_library(
+                "Second".into(),
+                None,
+                None,
+                base.path().join("second"),
+                None,
+                false,
+            )
+            .await
+            .unwrap()
+            .0;
+        let marker = fs::read(first.managed_root.join(MARKER_FILE_NAME)).unwrap();
+        fs::write(
+            first.managed_root.join("media.bin"),
+            b"original media\0\xff",
+        )
+        .unwrap();
+        fs::write(
+            first.local_data_dir.join("cache-sentinel"),
+            b"retained cache",
+        )
+        .unwrap();
+        manager.active_snapshot().runtime.unwrap().writer.write(|db| {
+            db.connection_for_fsops().execute_batch("CREATE TABLE retained_user_data(value TEXT); INSERT INTO retained_user_data VALUES ('original catalog');")?;
+            Ok(())
+        }).await.unwrap();
+        let revision = manager.active_snapshot().context_revision;
+        manager
+            .forget_library_with_revision(&second.library_uuid, revision)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.active_snapshot().library_uuid.as_deref(),
+            Some(first.library_uuid.as_str())
+        );
+        assert_eq!(manager.active_snapshot().context_revision, revision);
+        assert_eq!(
+            manager.registry.listed_snapshot().unwrap().libraries.len(),
+            1
+        );
+        manager
+            .forget_library_with_revision(&first.library_uuid, revision)
+            .await
+            .unwrap();
+        assert!(manager.active_snapshot().library_uuid.is_none());
+        assert!(manager.active_snapshot().runtime.is_none());
+        assert_eq!(manager.active_snapshot().context_revision, revision + 1);
+        assert!(manager
+            .registry
+            .listed_snapshot()
+            .unwrap()
+            .libraries
+            .is_empty());
+        assert_eq!(manager.registry.snapshot().unwrap().libraries.len(), 2);
+        assert_eq!(
+            fs::read(first.managed_root.join(MARKER_FILE_NAME)).unwrap(),
+            marker
+        );
+        assert_eq!(
+            fs::read(first.managed_root.join("media.bin")).unwrap(),
+            b"original media\0\xff"
+        );
+        assert_eq!(
+            fs::read(first.local_data_dir.join("cache-sentinel")).unwrap(),
+            b"retained cache"
+        );
+        let db = Database::open(first.local_data_dir.join("catalog.sqlite")).unwrap();
+        assert_eq!(
+            db.connection_for_fsops()
+                .query_row("SELECT value FROM retained_user_data", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "original catalog"
+        );
+        drop(db);
+        assert_eq!(
+            manager
+                .activate_with_revision(&first.library_uuid, revision + 1)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "library-not-listed"
+        );
+        manager
+            .forget_library_with_revision(&first.library_uuid, revision + 1)
+            .await
+            .unwrap();
+        assert!(
+            !manager
+                .preflight("Nested", &first.managed_root.join("nested"))
+                .unwrap()
+                .ok
+        );
+        drop(manager);
+
+        let reopened = test_manager(base.path());
+        reopened.restore_active().await.unwrap();
+        assert!(reopened.active_snapshot().library_uuid.is_none());
+        assert!(reopened
+            .registry
+            .listed_snapshot()
+            .unwrap()
+            .libraries
+            .is_empty());
+        let (restored, activated, error) = reopened
+            .open_library_with_revision(first.managed_root.clone(), revision + 1)
+            .await
+            .unwrap();
+        assert!(activated, "{error:?}");
+        assert_eq!(restored.library_uuid, first.library_uuid);
+        assert_eq!(restored.local_data_dir, first.local_data_dir);
+        assert_eq!(restored.icon, first.icon);
+        assert_eq!(restored.color, first.color);
+        let before = reopened.active_snapshot();
+        reopened
+            .open_library_with_revision(first.managed_root.clone(), before.context_revision)
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.active_snapshot().runtime_generation,
+            before.runtime_generation
+        );
+        assert_eq!(
+            reopened.active_snapshot().context_revision,
+            before.context_revision
+        );
+        assert_eq!(
+            reopened.registry.listed_snapshot().unwrap().libraries.len(),
+            1
+        );
+        assert_eq!(
+            fs::read(first.managed_root.join(MARKER_FILE_NAME)).unwrap(),
+            marker
+        );
+        assert_eq!(
+            fs::read(first.local_data_dir.join("cache-sentinel")).unwrap(),
+            b"retained cache"
+        );
+        reopened
+            .active_snapshot()
+            .runtime
+            .unwrap()
+            .writer
+            .write(|db| {
+                assert_eq!(
+                    db.connection_for_fsops().query_row(
+                        "SELECT value FROM retained_user_data",
+                        [],
+                        |row| row.get::<_, String>(0)
+                    )?,
+                    "original catalog"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        reopened
+            .active_snapshot()
+            .runtime
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn safe_library_foreign_host_rejects_device_identity_and_preserves_all_bytes() {
+        let base = tempfile::tempdir().unwrap();
+        let origin = test_manager(&base.path().join("origin"));
+        let (descriptor, _, _) = origin
+            .create_library(
+                "Origin name".into(),
+                Some("star".into()),
+                Some("#123456".into()),
+                base.path().join("shared"),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        fs::write(descriptor.managed_root.join("media.bin"), b"media").unwrap();
+        let marker = fs::read(descriptor.managed_root.join(MARKER_FILE_NAME)).unwrap();
+        let catalog = fs::read(descriptor.local_data_dir.join("catalog.sqlite")).unwrap();
+        for restart in [false, true] {
+            let host = test_manager(&base.path().join("other-host"));
+            if restart {
+                host.restore_active().await.unwrap();
+            }
+            let error = host
+                .open_library_with_revision(descriptor.managed_root.clone(), 0)
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), "library-device-identity-mismatch");
+            assert!(host.registry.snapshot().unwrap().libraries.is_empty());
+            assert!(host.registry.library_open_intents().unwrap().is_empty());
+            assert!(host.active_snapshot().library_uuid.is_none());
+            assert_eq!(
+                fs::read(descriptor.managed_root.join(MARKER_FILE_NAME)).unwrap(),
+                marker
+            );
+            assert_eq!(
+                fs::read(descriptor.local_data_dir.join("catalog.sqlite")).unwrap(),
+                catalog
+            );
+            assert_eq!(
+                fs::read(descriptor.managed_root.join("media.bin")).unwrap(),
+                b"media"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn safe_library_open_rejects_invalid_conflicting_and_unowned_paths_without_writes() {
+        let base = tempfile::tempdir().unwrap();
+        let origin = test_manager(&base.path().join("origin"));
+        let descriptor = origin
+            .create_library(
+                "Source".into(),
+                None,
+                None,
+                base.path().join("source"),
+                None,
+                false,
+            )
+            .await
+            .unwrap()
+            .0;
+        let host = test_manager(&base.path().join("host"));
+        for path in [base.path().join("missing"), base.path().join("ordinary")] {
+            if path.ends_with("ordinary") {
+                fs::create_dir(&path).unwrap();
+                fs::write(path.join("keep"), b"untouched").unwrap();
+            }
+            assert!(host.open_library_with_revision(path, 0).await.is_err());
+        }
+        let marker_path = descriptor.managed_root.join(MARKER_FILE_NAME);
+        let original = fs::read(&marker_path).unwrap();
+        for kind in ["unsupported", "pending", "noncanonical", "oversized"] {
+            let mut marker = read_marker(&descriptor.managed_root).unwrap();
+            match kind {
+                "unsupported" => marker.format_version = 99,
+                "pending" => marker.state = MarkerState::Pending,
+                "noncanonical" => marker.library_uuid = marker.library_uuid.replace('-', ""),
+                _ => {}
+            }
+            let bytes = if kind == "oversized" {
+                vec![b' '; 16 * 1024 + 1]
+            } else {
+                serde_json::to_vec(&marker).unwrap()
+            };
+            fs::write(&marker_path, &bytes).unwrap();
+            assert!(host
+                .open_library_with_revision(descriptor.managed_root.clone(), 0)
+                .await
+                .is_err());
+            assert_eq!(fs::read(&marker_path).unwrap(), bytes);
+            fs::write(&marker_path, &original).unwrap();
+        }
+        // Unowned local data may be valuable: no adoption, migration or deletion.
+        let collision = host.libraries_dir.join(&descriptor.library_uuid);
+        fs::create_dir_all(&collision).unwrap();
+        fs::write(
+            collision.join("catalog.sqlite"),
+            b"valuable unknown catalog",
+        )
+        .unwrap();
+        assert_eq!(
+            host.open_library_with_revision(descriptor.managed_root.clone(), 0)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "library-device-identity-mismatch"
+        );
+        assert_eq!(
+            fs::read(collision.join("catalog.sqlite")).unwrap(),
+            b"valuable unknown catalog"
+        );
+        assert!(host.registry.snapshot().unwrap().libraries.is_empty());
+
+        let clone = base.path().join("clone");
+        fs::create_dir(&clone).unwrap();
+        fs::write(clone.join(MARKER_FILE_NAME), &original).unwrap();
+        assert_eq!(
+            origin
+                .open_library_with_revision(clone, 0)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "library-local-data-unavailable"
+        );
+        origin
+            .forget_library_with_revision(&descriptor.library_uuid, 0)
+            .await
+            .unwrap();
+        let nested = descriptor.managed_root.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let mut marker = read_marker(&descriptor.managed_root).unwrap();
+        marker.library_uuid = Uuid::now_v7().to_string();
+        marker.root_uuid = Uuid::now_v7().to_string();
+        fs::write(
+            nested.join(MARKER_FILE_NAME),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            origin
+                .open_library_with_revision(nested, 0)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "library-local-data-unavailable"
+        );
+        assert_eq!(fs::read(&marker_path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn safe_library_forget_commit_failure_restores_previous_runtime() {
+        let base = tempfile::tempdir().unwrap();
+        let manager = test_manager(base.path());
+        let descriptor = manager
+            .create_library(
+                "Active".into(),
+                None,
+                None,
+                base.path().join("active"),
+                None,
+                true,
+            )
+            .await
+            .unwrap()
+            .0;
+        let before = manager.active_snapshot();
+        let injection = rusqlite::Connection::open(base.path().join("host.sqlite")).unwrap();
+        injection.execute_batch("CREATE TRIGGER fail_forget BEFORE INSERT ON library_list_visibility BEGIN SELECT RAISE(FAIL,'simulated persistence failure'); END;").unwrap();
+        assert!(manager
+            .forget_library_with_revision(&descriptor.library_uuid, before.context_revision)
+            .await
+            .is_err());
+        let after = manager.active_snapshot();
+        assert_eq!(after.library_uuid, before.library_uuid);
+        assert_eq!(after.context_revision, before.context_revision);
+        assert!(after.runtime.is_some());
+        assert!(manager
+            .registry
+            .is_library_listed(&descriptor.library_uuid)
+            .unwrap());
+        injection.execute_batch("DROP TRIGGER fail_forget").unwrap();
+        manager
+            .forget_library_with_revision(&descriptor.library_uuid, before.context_revision)
+            .await
+            .unwrap();
+        assert!(descriptor.managed_root.is_dir());
+        assert!(descriptor.local_data_dir.join("catalog.sqlite").is_file());
+    }
+
+    #[tokio::test]
+    async fn safe_library_open_and_forget_serialization_rechecks_context() {
+        let base = tempfile::tempdir().unwrap();
+        let manager = test_manager(base.path());
+        let descriptor = manager
+            .create_library(
+                "Active".into(),
+                None,
+                None,
+                base.path().join("active"),
+                None,
+                true,
+            )
+            .await
+            .unwrap()
+            .0;
+        let revision = manager.active_snapshot().context_revision;
+        let (forgotten, switched) = tokio::join!(
+            manager.forget_library_with_revision(&descriptor.library_uuid, revision),
+            manager.activate_with_revision(&descriptor.library_uuid, revision)
+        );
+        forgotten.unwrap();
+        assert_eq!(switched.unwrap_err().to_string(), "stale-library-context");
+        let (one, two) = tokio::join!(
+            manager.open_library_with_revision(descriptor.managed_root.clone(), revision + 1),
+            manager.open_library_with_revision(descriptor.managed_root.clone(), revision + 1)
+        );
+        assert!(one.unwrap().1);
+        assert_eq!(two.unwrap_err().to_string(), "stale-library-context");
+        assert_eq!(manager.registry.snapshot().unwrap().libraries.len(), 1);
+        manager
+            .active_snapshot()
+            .runtime
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn safe_library_open_recovers_existing_registration_and_preserves_unsupported_intent() {
+        for supported in [true, false] {
+            let base = tempfile::tempdir().unwrap();
+            let manager = test_manager(base.path());
+            let (source, _, _) = manager
+                .create_library(
+                    "Source".into(),
+                    None,
+                    None,
+                    base.path().join("Database"),
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+            let marker = fs::read(source.managed_root.join(MARKER_FILE_NAME)).unwrap();
+            let catalog = fs::read(source.local_data_dir.join("catalog.sqlite")).unwrap();
+            let host = rusqlite::Connection::open(base.path().join("host.sqlite")).unwrap();
+            host.execute(
+                "DELETE FROM libraries WHERE library_uuid=?1",
+                [&source.library_uuid],
+            )
+            .unwrap();
+            let root = ExistingLibraryRoot::open(&source.managed_root).unwrap();
+            let mut descriptor = source.clone();
+            if !supported {
+                descriptor.local_data_dir = base.path().join("old-host-data");
+                fs::create_dir(&descriptor.local_data_dir).unwrap();
+                fs::write(
+                    descriptor.local_data_dir.join("catalog.sqlite"),
+                    b"unowned crash-gap sentinel",
+                )
+                .unwrap();
+            }
+            manager
+                .registry
+                .begin_library_open(&LibraryOpenIntent {
+                    descriptor: descriptor.clone(),
+                    root_identity: root.root_identity().into(),
+                    local_identity: None,
+                    catalog_identity: None,
+                })
+                .unwrap();
+            drop(root);
+            drop(host);
+            drop(manager);
+            let restarted = test_manager(base.path());
+            restarted.restore_active().await.unwrap();
+            assert!(restarted.active_snapshot().library_uuid.is_none());
+            assert_eq!(
+                restarted
+                    .registry
+                    .listed_snapshot()
+                    .unwrap()
+                    .libraries
+                    .len(),
+                usize::from(supported)
+            );
+            assert_eq!(
+                restarted
+                    .registry
+                    .library_open_intents()
+                    .unwrap()
+                    .is_empty(),
+                supported
+            );
+            if supported {
+                assert_eq!(
+                    restarted
+                        .registry
+                        .library(&source.library_uuid)
+                        .unwrap()
+                        .unwrap()
+                        .local_data_dir,
+                    source.local_data_dir
+                );
+            } else {
+                assert_eq!(
+                    fs::read(descriptor.local_data_dir.join("catalog.sqlite")).unwrap(),
+                    b"unowned crash-gap sentinel"
+                );
+            }
+            assert_eq!(
+                fs::read(source.managed_root.join(MARKER_FILE_NAME)).unwrap(),
+                marker
+            );
+            assert_eq!(
+                fs::read(source.local_data_dir.join("catalog.sqlite")).unwrap(),
+                catalog
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn safe_library_open_partial_activation_keeps_registration_and_previous_context() {
+        let base = tempfile::tempdir().unwrap();
+        let host = test_manager(&base.path().join("host"));
+        let source = host
+            .create_library(
+                "Source".into(),
+                None,
+                None,
+                base.path().join("source"),
+                None,
+                false,
+            )
+            .await
+            .unwrap()
+            .0;
+        host.forget_library_with_revision(&source.library_uuid, 0)
+            .await
+            .unwrap();
+        let active = host
+            .create_library(
+                "Previous".into(),
+                None,
+                None,
+                base.path().join("previous"),
+                None,
+                true,
+            )
+            .await
+            .unwrap()
+            .0;
+        let revision = host.active_snapshot().context_revision;
+        let lease = host
+            .runtime_leases
+            .try_acquire(&source.library_uuid)
+            .unwrap();
+        let (opened, activated, error) = host
+            .open_library_with_revision(source.managed_root.clone(), revision)
+            .await
+            .unwrap();
+        assert!(!activated);
+        assert!(error.is_some());
+        assert_eq!(opened.library_uuid, source.library_uuid);
+        assert!(host
+            .registry
+            .is_library_listed(&source.library_uuid)
+            .unwrap());
+        assert_eq!(
+            host.active_snapshot().library_uuid.as_deref(),
+            Some(active.library_uuid.as_str())
+        );
+        assert_eq!(host.active_snapshot().context_revision, revision);
+        assert!(host.active_snapshot().runtime.is_some());
+        drop(lease);
+        assert!(
+            host.open_library_with_revision(source.managed_root, revision)
+                .await
+                .unwrap()
+                .1
+        );
+        host.active_snapshot()
+            .runtime
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn safe_library_forget_stop_failure_stays_visible_and_retry_finishes_stop() {
+        let base = tempfile::tempdir().unwrap();
+        let manager = test_manager(base.path());
+        let descriptor = manager
+            .create_library(
+                "Active".into(),
+                None,
+                None,
+                base.path().join("active"),
+                None,
+                true,
+            )
+            .await
+            .unwrap()
+            .0;
+        manager
+            .active_snapshot()
+            .runtime
+            .unwrap()
+            .own_background_task(tokio::spawn(async {
+                panic!("simulated owned task failure");
+            }));
+        let revision = manager.active_snapshot().context_revision;
+        let error = manager
+            .forget_library_with_revision(&descriptor.library_uuid, revision)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("library-stop-failed"));
+        assert!(manager
+            .registry
+            .is_library_listed(&descriptor.library_uuid)
+            .unwrap());
+        assert_eq!(
+            manager
+                .registry
+                .snapshot()
+                .unwrap()
+                .active_library_uuid
+                .as_deref(),
+            Some(descriptor.library_uuid.as_str())
+        );
+        assert!(manager.active_snapshot().runtime.is_none());
+        assert!(manager.pending_runtime_stop.lock().unwrap().is_some());
+        manager
+            .forget_library_with_revision(&descriptor.library_uuid, revision)
+            .await
+            .unwrap();
+        assert!(manager.pending_runtime_stop.lock().unwrap().is_none());
+        assert!(manager.active_snapshot().library_uuid.is_none());
+        assert!(descriptor.local_data_dir.join("catalog.sqlite").is_file());
+    }
+
+    #[tokio::test]
+    async fn safe_library_forget_retains_sync_binding_and_background_schedule() {
+        let base = tempfile::tempdir().unwrap();
+        let manager = test_manager(base.path());
+        let library = manager
+            .create_library(
+                "Synced".into(),
+                None,
+                None,
+                base.path().join("synced"),
+                None,
+                false,
+            )
+            .await
+            .unwrap()
+            .0;
+        manager
+            .registry
+            .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
+                plugin_id: "org.example.retained",
+                version: "1.0.0",
+                manifest_json: "{}",
+                entry_relative_path: "provider",
+                entry_sha256: &[0; 32],
+                install_root: base.path(),
+                trust_policy_id: "embedded-v1",
+                requested_permissions_json: "[]",
+            })
+            .unwrap();
+        manager
+            .registry
+            .upsert_plugin_account(
+                "retained-account",
+                "org.example.retained",
+                Some("Retained"),
+                "authenticated",
+            )
+            .unwrap();
+        manager
+            .registry
+            .set_plugin_intent("org.example.retained", true, true)
+            .unwrap();
+        manager
+            .registry
+            .record_plugin_runtime_ready(
+                "org.example.retained",
+                "retained-session",
+                &["sync-provider.v1".to_owned()],
+            )
+            .unwrap();
+        manager
+            .registry
+            .begin_sync_binding(
+                &library.library_uuid,
+                "org.example.retained",
+                "retained-account",
+            )
+            .unwrap();
+        manager
+            .registry
+            .set_binding_state(&library.library_uuid, "active")
+            .unwrap();
+        let before = manager
+            .registry
+            .binding_transport(&library.library_uuid, "library")
+            .unwrap()
+            .unwrap();
+        manager
+            .forget_library_with_revision(&library.library_uuid, 0)
+            .await
+            .unwrap();
+        assert!(!manager
+            .registry
+            .is_library_listed(&library.library_uuid)
+            .unwrap());
+        let after = manager
+            .registry
+            .binding_transport(&library.library_uuid, "library")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.binding_epoch, before.binding_epoch);
+        assert_eq!(after.transport_generation, before.transport_generation);
+        assert_eq!(after.account_uuid, before.account_uuid);
+        assert!(manager
+            .registry
+            .sync_bound_libraries()
+            .unwrap()
+            .iter()
+            .any(|item| item.library_uuid == library.library_uuid));
+        let (opened, activated, error) = manager
+            .open_library_with_revision(library.managed_root, 0)
+            .await
+            .unwrap();
+        assert!(activated, "{error:?}");
+        assert_eq!(opened.binding_state, "synchronized");
+        assert_eq!(
+            manager
+                .registry
+                .binding_transport(&library.library_uuid, "library")
+                .unwrap()
+                .unwrap()
+                .binding_epoch,
+            before.binding_epoch
+        );
+        manager
+            .active_snapshot()
+            .runtime
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn safe_library_open_failed_previous_stop_retains_all_owned_work() {
+        let base = tempfile::tempdir().unwrap();
+        let manager = test_manager(base.path());
+        let previous = manager
+            .create_library(
+                "Previous".into(),
+                None,
+                None,
+                base.path().join("previous"),
+                None,
+                true,
+            )
+            .await
+            .unwrap()
+            .0;
+        let target = manager
+            .create_library(
+                "Target".into(),
+                None,
+                None,
+                base.path().join("target"),
+                None,
+                false,
+            )
+            .await
+            .unwrap()
+            .0;
+        let runtime = manager.active_snapshot().runtime.unwrap();
+        let cancelled = runtime.cancellation_token();
+        let joined = Arc::new(AtomicBool::new(false));
+        let finished = Arc::clone(&joined);
+        runtime.own_background_task(tokio::spawn(async {
+            panic!("simulated stop failure");
+        }));
+        runtime.own_background_task(tokio::spawn(async move {
+            cancelled.cancelled().await;
+            tokio::task::yield_now().await;
+            finished.store(true, Ordering::Release);
+        }));
+        let revision = manager.active_snapshot().context_revision;
+        let (_, activated, error) = manager
+            .open_library_with_revision(target.managed_root.clone(), revision)
+            .await
+            .unwrap();
+        assert!(!activated && error.is_some());
+        assert!(joined.load(Ordering::Acquire));
+        assert_eq!(
+            manager.active_snapshot().library_uuid.as_deref(),
+            Some(previous.library_uuid.as_str())
+        );
+        assert!(manager.active_snapshot().runtime.is_none());
+        assert!(manager.pending_runtime_stop.lock().unwrap().is_some());
+        assert!(
+            manager
+                .open_library_with_revision(target.managed_root, revision)
+                .await
+                .unwrap()
+                .1
+        );
+        assert!(manager.pending_runtime_stop.lock().unwrap().is_none());
+        manager
+            .active_snapshot()
+            .runtime
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn safe_library_open_rejects_directory_junction_without_writing_target() {
+        let base = tempfile::tempdir().unwrap();
+        let origin = test_manager(&base.path().join("origin"));
+        let source = origin
+            .create_library(
+                "Source".into(),
+                None,
+                None,
+                base.path().join("source"),
+                None,
+                false,
+            )
+            .await
+            .unwrap()
+            .0;
+        let marker = fs::read(source.managed_root.join(MARKER_FILE_NAME)).unwrap();
+        let link = base.path().join("link");
+        let result = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&source.managed_root)
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        let host = test_manager(&base.path().join("host"));
+        assert_eq!(
+            host.open_library_with_revision(link.clone(), 0)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "library-path-unavailable-or-reparse"
+        );
+        assert!(host.registry.snapshot().unwrap().libraries.is_empty());
+        assert_eq!(
+            fs::read(source.managed_root.join(MARKER_FILE_NAME)).unwrap(),
+            marker
+        );
+        fs::remove_dir(link).unwrap();
+    }
+
     async fn same_name_root_fixture(
         state: &str,
     ) -> (PathBuf, LibraryManager, crate::sync_folders::SyncRootMarker) {
-        let base = std::env::temp_dir().join(format!("megle-same-name-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-same-name-{}", Uuid::now_v7()));
         fs::create_dir_all(&base).unwrap();
         let manager = test_manager(&base);
         let library = manager
@@ -4567,7 +7314,7 @@ mod tests {
 
     #[test]
     fn relocation_serialization_is_scoped_per_root() {
-        let base = std::env::temp_dir().join(format!("megle-root-locks-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-root-locks-{}", Uuid::now_v7()));
         fs::create_dir_all(&base).unwrap();
         let manager = test_manager(&base);
         let first = manager.root_relocation_operation_lock("root-a");
@@ -4646,6 +7393,100 @@ mod tests {
         manifest
     }
 
+    #[tokio::test]
+    async fn plugin_lifecycle_failed_stop_cannot_advance_or_reopen_restart_epoch() {
+        let base =
+            std::env::temp_dir().join(format!("mangoo_stop_failure_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&base).unwrap();
+        let bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug/bundled-plugins")
+            .canonicalize()
+            .unwrap();
+        let manager = isolated_manager(&base, bundled.clone());
+        configure_fake_provider(&manager, &bundled);
+        let epoch = manager
+            .registry
+            .plugin_lifecycle_epoch(FAKE_PLUGIN_ID)
+            .unwrap();
+        manager
+            .provider_manager()
+            .open_plugin(FAKE_PLUGIN_ID, epoch)
+            .unwrap();
+        let (commands, mut receiver) = tokio::sync::mpsc::channel(1);
+        let registry = manager.registry.clone();
+        let providers = manager.provider_manager();
+        let task = tokio::spawn(async move {
+            let mut running = HashMap::from([(
+                FAKE_PLUGIN_ID.to_owned(),
+                (
+                    String::new(),
+                    CancellationToken::new(),
+                    tokio::spawn(async { anyhow::bail!("fixture child join failure") }),
+                ),
+            )]);
+            let mut errors = HashMap::new();
+            for _ in 0..2 {
+                if let Some(PluginRuntimeCommand::Stop {
+                    plugin_id,
+                    completed,
+                }) = receiver.recv().await
+                {
+                    let result = stop_plugin_supervisor(
+                        &plugin_id,
+                        &mut running,
+                        &mut errors,
+                        &registry,
+                        &providers,
+                    )
+                    .await;
+                    let _ = completed.send(result);
+                }
+            }
+        });
+        *manager.plugin_runtime_scheduler.lock().unwrap() = Some(PluginRuntimeSchedulerHandle {
+            cancellation: CancellationToken::new(),
+            commands,
+            task,
+        });
+        assert!(manager.finish_plugin_restart(FAKE_PLUGIN_ID).await.is_err());
+        // The failed supervisor handle has been consumed, but another stop must
+        // retain that failure and must not issue a new launch epoch.
+        assert!(manager.finish_plugin_restart(FAKE_PLUGIN_ID).await.is_err());
+        assert_eq!(
+            manager
+                .registry
+                .plugin_lifecycle_epoch(FAKE_PLUGIN_ID)
+                .unwrap(),
+            epoch
+        );
+        assert_eq!(
+            manager
+                .registry
+                .host_plugin(FAKE_PLUGIN_ID)
+                .unwrap()
+                .unwrap()
+                .runtime_state,
+            "stopping"
+        );
+        assert!(manager
+            .provider_manager()
+            .open_plugin(FAKE_PLUGIN_ID, epoch)
+            .is_err());
+        assert!(manager
+            .provider_manager()
+            .begin_work(FAKE_PLUGIN_ID)
+            .is_err());
+        let scheduler = manager
+            .plugin_runtime_scheduler
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap();
+        scheduler.task.await.unwrap();
+        drop(manager);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     async fn activate_fake_provider(
         manager: &LibraryManager,
         manifest: &crate::plugins::manifest::ManifestRecord,
@@ -4662,7 +7503,7 @@ mod tests {
             crate::plugins::runtime::trust::embedded_trust_registry(),
             runtime.to_path_buf(),
             None,
-            None,
+            std::collections::BTreeMap::new(),
         )
         .await
         .unwrap()
@@ -4693,11 +7534,76 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovery_rolls_back_an_uncommitted_creation() {
-        let base = std::env::temp_dir().join(format!("megle-create-rollback-{}", Uuid::now_v7()));
-        fs::create_dir_all(&base).unwrap();
-        let manager = test_manager(&base);
-        let intent = creation_intent(&base, "rollback");
+    fn restore_cleanup_preserves_content_added_after_quarantine_and_marker_replacement() {
+        for replace_marker in [false, true] {
+            let base =
+                std::env::temp_dir().join(format!("mangoo-restore-cleanup-{}", Uuid::now_v7()));
+            fs::create_dir_all(&base).unwrap();
+            let local_quarantine = base.join("local-quarantine");
+            let root_quarantine = base.join("root-quarantine");
+            fs::create_dir(&local_quarantine).unwrap();
+            fs::create_dir(&root_quarantine).unwrap();
+            let mut descriptor = creation_intent(&base, "late-content").descriptor;
+            descriptor.local_data_dir = base.join("local");
+            let local_identity = SafeDirectory::open(&local_quarantine)
+                .unwrap()
+                .identity()
+                .to_owned();
+            let root_identity = SafeDirectory::open(&root_quarantine)
+                .unwrap()
+                .identity()
+                .to_owned();
+            let marker = root_quarantine.join(MARKER_FILE_NAME);
+            fs::write(&marker, b"owned marker").unwrap();
+            descriptor.marker_identity = marker_identity(&marker).unwrap();
+            // Model the previously unsafe interval after early empty checks and
+            // asynchronous fencing, immediately before final container cleanup.
+            fs::write(
+                local_quarantine.join("user-local.bin"),
+                b"new local content",
+            )
+            .unwrap();
+            fs::write(root_quarantine.join("user-root.bin"), b"new root content").unwrap();
+            if replace_marker {
+                fs::rename(&marker, root_quarantine.join("original-marker")).unwrap();
+                fs::write(&marker, b"replacement content").unwrap();
+            }
+            let result = finish_restore_container_cleanup(
+                &descriptor,
+                &local_quarantine,
+                &root_quarantine,
+                &local_identity,
+                &root_identity,
+                true,
+            );
+            assert_eq!(result.is_err(), replace_marker);
+            assert_eq!(
+                fs::read(descriptor.local_data_dir.join("user-local.bin")).unwrap(),
+                b"new local content"
+            );
+            assert_eq!(
+                fs::read(descriptor.managed_root.join("user-root.bin")).unwrap(),
+                b"new root content"
+            );
+            if replace_marker {
+                assert_eq!(
+                    fs::read(descriptor.managed_root.join(MARKER_FILE_NAME)).unwrap(),
+                    b"replacement content"
+                );
+            } else {
+                assert!(!descriptor.managed_root.join(MARKER_FILE_NAME).exists());
+            }
+            assert!(!local_quarantine.exists());
+            assert!(!root_quarantine.exists());
+            fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[test]
+    fn startup_recovery_preserves_unsupported_uncommitted_creation() {
+        let base = tempfile::tempdir().unwrap();
+        let manager = test_manager(base.path());
+        let intent = creation_intent(base.path(), "rollback");
         manager.registry.begin_creation(&intent).unwrap();
         fs::create_dir_all(&intent.staging_dir).unwrap();
         let staging_identity = SafeDirectory::open(&intent.staging_dir)
@@ -4709,30 +7615,27 @@ mod tests {
             .update_creation_identities(&intent.txn_uuid, None, Some(&staging_identity))
             .unwrap();
         fs::write(intent.staging_dir.join("partial"), b"partial").unwrap();
-
         manager.recover_journals().unwrap();
-
-        assert!(!intent.staging_dir.exists());
-        assert!(manager
-            .registry
-            .pending_creation_recovery()
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            fs::read(intent.staging_dir.join("partial")).unwrap(),
+            b"partial"
+        );
+        assert_eq!(
+            manager.registry.pending_creation_recovery().unwrap().len(),
+            1
+        );
         assert!(manager
             .registry
             .library(&intent.descriptor.library_uuid)
             .unwrap()
             .is_none());
-        drop(manager);
-        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
-    fn startup_recovery_finishes_committed_creation_and_quarantined_removal() {
-        let base = std::env::temp_dir().join(format!("megle-journal-recovery-{}", Uuid::now_v7()));
-        fs::create_dir_all(&base).unwrap();
-        let manager = test_manager(&base);
-        let intent = creation_intent(&base, "finish");
+    fn startup_recovery_preserves_unsupported_committed_creation() {
+        let base = tempfile::tempdir().unwrap();
+        let manager = test_manager(base.path());
+        let intent = creation_intent(base.path(), "finish");
         manager.registry.begin_creation(&intent).unwrap();
         fs::create_dir_all(&intent.descriptor.managed_root).unwrap();
         fs::create_dir_all(&intent.staging_dir).unwrap();
@@ -4744,157 +7647,236 @@ mod tests {
             state: MarkerState::Committed,
             creation_txn_uuid: intent.txn_uuid.clone(),
         };
+        let bytes = serde_json::to_vec(&marker).unwrap();
         fs::write(
             intent.descriptor.managed_root.join(MARKER_FILE_NAME),
-            serde_json::to_vec_pretty(&marker).unwrap(),
+            &bytes,
         )
         .unwrap();
         manager
             .registry
             .update_creation_phase(&intent.txn_uuid, "marker-committed", true, true, None, None)
             .unwrap();
-
         manager.recover_journals().unwrap();
-        let descriptor = manager
+        assert!(manager
             .registry
             .library(&intent.descriptor.library_uuid)
             .unwrap()
-            .expect("creation committed");
-        assert!(descriptor.local_data_dir.join("catalog.sqlite").is_file());
-
-        let removal_txn = "removal-finish";
-        manager
-            .registry
-            .begin_removal(&descriptor, removal_txn)
-            .unwrap();
-        let root_quarantine = base.join("root-quarantine");
-        let local_quarantine = base.join("local-quarantine");
-        fs::rename(&descriptor.managed_root, &root_quarantine).unwrap();
-        fs::rename(&descriptor.local_data_dir, &local_quarantine).unwrap();
-        let root_identity = SafeDirectory::open(&root_quarantine)
-            .unwrap()
-            .identity()
-            .to_string();
-        let local_identity = SafeDirectory::open(&local_quarantine)
-            .unwrap()
-            .identity()
-            .to_string();
-        manager
-            .registry
-            .update_removal_quarantine(
-                removal_txn,
-                &root_quarantine,
-                &local_quarantine,
-                &root_identity,
-                &local_identity,
-            )
-            .unwrap();
-
-        manager.recover_journals().unwrap();
-        assert!(manager
-            .registry
-            .library(&descriptor.library_uuid)
-            .unwrap()
             .is_none());
-        assert!(!root_quarantine.exists());
-        assert!(!local_quarantine.exists());
-        assert!(manager
-            .registry
-            .pending_removal_recovery()
-            .unwrap()
-            .is_empty());
-        drop(manager);
-        let _ = fs::remove_dir_all(base);
+        assert_eq!(
+            manager.registry.pending_creation_recovery().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            fs::read(intent.descriptor.managed_root.join(MARKER_FILE_NAME)).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            fs::read(intent.staging_dir.join("catalog.sqlite")).unwrap(),
+            b"catalog"
+        );
+        assert!(!intent.descriptor.local_data_dir.exists());
     }
 
     #[test]
-    fn startup_recovery_rolls_back_requested_and_partial_removal_states() {
-        let base = std::env::temp_dir().join(format!("megle-removal-matrix-{}", Uuid::now_v7()));
-        fs::create_dir_all(&base).unwrap();
-        let manager = test_manager(&base);
-
-        let first = creation_intent(&base, "requested");
-        manager.registry.begin_creation(&first).unwrap();
-        fs::create_dir_all(&first.descriptor.managed_root).unwrap();
-        fs::create_dir_all(&first.descriptor.local_data_dir).unwrap();
-        fs::write(
-            first.descriptor.local_data_dir.join("catalog.sqlite"),
-            b"catalog",
-        )
-        .unwrap();
-        let marker = LibraryMarker {
-            format_version: 1,
-            library_uuid: first.descriptor.library_uuid.clone(),
-            root_uuid: first.descriptor.root_uuid.clone(),
-            state: MarkerState::Committed,
-            creation_txn_uuid: first.txn_uuid.clone(),
-        };
-        fs::write(
-            first.descriptor.managed_root.join(MARKER_FILE_NAME),
-            serde_json::to_vec(&marker).unwrap(),
-        )
-        .unwrap();
-        let mut descriptor = first.descriptor.clone();
-        descriptor.marker_identity =
-            marker_identity(&descriptor.managed_root.join(MARKER_FILE_NAME)).unwrap();
-        manager
-            .registry
-            .commit_creation(&first.txn_uuid, &descriptor)
-            .unwrap();
-        manager
-            .registry
-            .begin_removal(&descriptor, "requested-removal")
-            .unwrap();
-        manager.recover_journals().unwrap();
-        assert_eq!(
-            manager
-                .registry
-                .library(&descriptor.library_uuid)
-                .unwrap()
-                .unwrap()
-                .lifecycle_state,
-            "ready"
-        );
-
-        manager
-            .registry
-            .begin_removal(&descriptor, "partial-removal")
-            .unwrap();
-        let root_quarantine = descriptor
-            .managed_root
-            .with_file_name("partial-root-quarantine");
-        let local_quarantine = descriptor
-            .local_data_dir
-            .with_file_name("partial-local-quarantine");
-        safe_rename_directory(&descriptor.managed_root, &root_quarantine).unwrap();
-        safe_rename_directory(&descriptor.local_data_dir, &local_quarantine).unwrap();
-        manager
-            .registry
-            .update_removal_partial(
-                "partial-removal",
-                "root-quarantined",
-                Some(&root_quarantine),
-                Some(&local_quarantine),
-                Some(SafeDirectory::open(&root_quarantine).unwrap().identity()),
-                Some(SafeDirectory::open(&local_quarantine).unwrap().identity()),
+    fn startup_recovery_preserves_unsupported_requested_and_partial_removal_states() {
+        for quarantined in [false, true] {
+            let base = tempfile::tempdir().unwrap();
+            let manager = test_manager(base.path());
+            let intent = creation_intent(base.path(), "old-removal");
+            fs::create_dir_all(&intent.descriptor.managed_root).unwrap();
+            fs::create_dir_all(&intent.descriptor.local_data_dir).unwrap();
+            fs::write(
+                intent.descriptor.local_data_dir.join("catalog.sqlite"),
+                b"catalog",
             )
             .unwrap();
-        manager.recover_journals().unwrap();
-        assert!(descriptor.managed_root.exists());
-        assert!(descriptor.local_data_dir.exists());
-        assert!(!root_quarantine.exists());
-        assert!(!local_quarantine.exists());
-        assert_eq!(
+            let marker = LibraryMarker {
+                format_version: 1,
+                library_uuid: intent.descriptor.library_uuid.clone(),
+                root_uuid: intent.descriptor.root_uuid.clone(),
+                state: MarkerState::Committed,
+                creation_txn_uuid: intent.txn_uuid.clone(),
+            };
+            let marker_bytes = serde_json::to_vec(&marker).unwrap();
+            fs::write(
+                intent.descriptor.managed_root.join(MARKER_FILE_NAME),
+                &marker_bytes,
+            )
+            .unwrap();
+            let mut descriptor = intent.descriptor.clone();
+            descriptor.marker_identity =
+                marker_identity(&descriptor.managed_root.join(MARKER_FILE_NAME)).unwrap();
+            manager.registry.begin_creation(&intent).unwrap();
             manager
                 .registry
-                .library(&descriptor.library_uuid)
+                .commit_creation(&intent.txn_uuid, &descriptor)
+                .unwrap();
+            manager
+                .registry
+                .begin_removal(&descriptor, "old-removal")
+                .unwrap();
+            let host = rusqlite::Connection::open(base.path().join("host.sqlite")).unwrap();
+            host.execute("UPDATE library_removal_journal SET layout_version=1", [])
+                .unwrap();
+            let (root, local) = if quarantined {
+                let root = base.path().join("root-quarantine");
+                let local = base.path().join("local-quarantine");
+                fs::rename(&descriptor.managed_root, &root).unwrap();
+                fs::rename(&descriptor.local_data_dir, &local).unwrap();
+                manager
+                    .registry
+                    .update_removal_quarantine(
+                        "old-removal",
+                        &root,
+                        &local,
+                        SafeDirectory::open(&root).unwrap().identity(),
+                        SafeDirectory::open(&local).unwrap().identity(),
+                    )
+                    .unwrap();
+                (root, local)
+            } else {
+                (
+                    descriptor.managed_root.clone(),
+                    descriptor.local_data_dir.clone(),
+                )
+            };
+            manager.recover_journals().unwrap();
+            assert_eq!(
+                manager.registry.pending_removal_recovery().unwrap().len(),
+                1
+            );
+            assert_eq!(
+                manager
+                    .registry
+                    .library(&descriptor.library_uuid)
+                    .unwrap()
+                    .unwrap()
+                    .lifecycle_state,
+                "removing"
+            );
+            assert_eq!(fs::read(root.join(MARKER_FILE_NAME)).unwrap(), marker_bytes);
+            assert_eq!(fs::read(local.join("catalog.sqlite")).unwrap(), b"catalog");
+            assert_eq!(descriptor.managed_root.exists(), !quarantined);
+            assert_eq!(descriptor.local_data_dir.exists(), !quarantined);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_activation_route_retains_runtime_shutdown_until_retry_or_host_exit() {
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use std::time::Duration;
+        use tower::ServiceExt;
+
+        for host_exit in [false, true] {
+            let base = tempfile::tempdir().unwrap();
+            let state = crate::api::AppState::new_host(
+                base.path().join("host.sqlite"),
+                base.path().join("libraries"),
+            )
+            .await
+            .unwrap();
+            let manager = state.library_manager.clone().unwrap();
+            manager
+                .create_library(
+                    "Previous".into(),
+                    None,
+                    None,
+                    base.path().join("previous"),
+                    None,
+                    true,
+                )
+                .await
+                .unwrap();
+            let target = manager
+                .create_library(
+                    "Target".into(),
+                    None,
+                    None,
+                    base.path().join("target"),
+                    None,
+                    false,
+                )
+                .await
                 .unwrap()
+                .0;
+            let previous = manager.active_snapshot();
+            let runtime = previous.runtime.unwrap();
+            let catalog = runtime.read_database_path.clone().unwrap();
+            let database = Database::open(&catalog).unwrap();
+            let (release, blocked) = tokio::sync::oneshot::channel();
+            runtime.own_background_task(tokio::spawn(async move {
+                blocked.await.unwrap();
+                drop(database);
+            }));
+            let app = crate::api::routes::router(state);
+            let request = || {
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/libraries/{}/activate", target.library_uuid))
+                    .header(
+                        "x-mangoo-context-revision",
+                        previous.context_revision.to_string(),
+                    )
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            let requester = tokio::spawn(app.clone().oneshot(request()));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                // Wait until shutdown owns the drained JoinHandle, not merely
+                // until it has cancelled the runtime before closing read leases.
+                while !runtime.background_tasks.lock().unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            requester.abort();
+            assert!(requester.await.unwrap_err().is_cancelled());
+            assert!(manager.operation.try_lock().is_err());
+
+            let mut continuation = if host_exit {
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    manager.shutdown_sync_coordinator().await.unwrap();
+                })
+            } else {
+                let request = request();
+                tokio::spawn(async move {
+                    let response = app.oneshot(request).await.unwrap();
+                    // The accepted first activation commits once; its retry
+                    // subsequently observes the advanced context revision.
+                    assert_eq!(response.status(), StatusCode::CONFLICT);
+                })
+            };
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut continuation)
+                    .await
+                    .is_err()
+            );
+            assert!(manager.active_snapshot().runtime.is_none());
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), continuation)
+                .await
                 .unwrap()
-                .lifecycle_state,
-            "ready"
-        );
-        drop(manager);
-        let _ = fs::remove_dir_all(base);
+                .unwrap();
+            let active = manager.active_snapshot();
+            assert_eq!(
+                active.library_uuid.as_deref(),
+                Some(target.library_uuid.as_str())
+            );
+            assert_eq!(active.context_revision, previous.context_revision + 1);
+            // The retired runtime Arc may survive, but its native handles may
+            // not: on Windows this rename fails while the blocked task owns one.
+            let moved = catalog.with_extension("retired-check");
+            fs::rename(&catalog, &moved).unwrap();
+            fs::rename(moved, catalog).unwrap();
+            if !host_exit {
+                manager.shutdown_sync_coordinator().await.unwrap();
+            }
+            active.runtime.unwrap().shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -4915,9 +7897,98 @@ mod tests {
         assert!(finished.load(Ordering::Acquire));
     }
 
+    #[test]
+    fn runtime_read_database_cache_bounds_idle_connections() {
+        let cache = Arc::new(ReadDatabaseCache::default());
+        let leases = (0..MAX_CACHED_READ_DATABASES + 2)
+            .map(|_| {
+                let mut lease = cache.checkout().unwrap();
+                lease.database = Some(Database::open_in_memory().unwrap());
+                lease
+            })
+            .collect::<Vec<_>>();
+        drop(leases);
+        assert_eq!(
+            cache.state.lock().unwrap().idle.len(),
+            MAX_CACHED_READ_DATABASES
+        );
+        cache.close();
+        assert!(cache.state.lock().unwrap().idle.is_empty());
+        assert!(cache.checkout().is_err());
+    }
+
+    #[tokio::test]
+    async fn runtime_shutdown_drains_read_databases_after_errors_and_panics() {
+        use std::time::Duration;
+
+        for panic_after_read in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let catalog = directory.path().join("catalog.sqlite");
+            let database = Database::open(&catalog).unwrap();
+            database.apply_migrations().unwrap();
+            let runtime =
+                LibraryRuntimeResources::from_database(None, 1, database, None, None).unwrap();
+            let mut idle = runtime.read_database_cache.checkout().unwrap();
+            idle.database = Some(Database::open(&catalog).unwrap());
+            drop(idle);
+            let mut lease = runtime.read_database_cache.checkout().unwrap();
+            assert!(
+                lease.database.is_some(),
+                "reuse the runtime's idle connection"
+            );
+            // A second independently owned connection remains cached while
+            // this read is running; shutdown must drain both kinds of owner.
+            let mut idle = runtime.read_database_cache.checkout().unwrap();
+            idle.database = Some(Database::open(&catalog).unwrap());
+            drop(idle);
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let read = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let database = lease.database.as_mut().unwrap();
+                database.list_roots()?;
+                started.send(()).unwrap();
+                released.recv().unwrap();
+                if panic_after_read {
+                    panic!("read lease unwind fixture");
+                }
+                anyhow::bail!("read lease error fixture")
+            });
+            ready.await.unwrap();
+            let retiring = runtime.clone();
+            let shutdown = tokio::spawn(async move { retiring.shutdown().await });
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !runtime.read_database_cache.state.lock().unwrap().closed {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                !shutdown.is_finished(),
+                "active reads must keep retirement pending"
+            );
+            assert!(runtime.read_database_cache.checkout().is_err());
+            release.send(()).unwrap();
+            let outcome = read.await;
+            if panic_after_read {
+                assert!(outcome.unwrap_err().is_panic());
+            } else {
+                assert!(outcome.unwrap().is_err());
+            }
+            tokio::time::timeout(Duration::from_secs(10), shutdown)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let moved = catalog.with_extension("retired-check");
+            fs::rename(&catalog, &moved).unwrap();
+            fs::rename(moved, &catalog).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn duplicate_create_for_same_root_converges_to_one_library() {
-        let base = std::env::temp_dir().join(format!("megle-double-create-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-double-create-{}", Uuid::now_v7()));
         let root = base.join("managed");
         fs::create_dir_all(&base).unwrap();
         let manager = test_manager(&base);
@@ -4941,7 +8012,7 @@ mod tests {
     /// selector or root-adoption compatibility branch.
     #[tokio::test]
     async fn clean_managed_bootstrap_reopens_current_schema() {
-        let base = std::env::temp_dir().join(format!("megle-clean-bootstrap-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-clean-bootstrap-{}", Uuid::now_v7()));
         let managed_root = base.join("managed-root");
         fs::create_dir_all(&base).unwrap();
 
@@ -4986,7 +8057,16 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(migration, 33);
+        assert_eq!(migration, 39);
+        let presentation_tables: i64 = database
+            .connection_for_fsops()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('file_browse_fts_progress','decoder_presentations')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(presentation_tables, 2);
         assert_eq!(
             Uuid::from_slice(&identity.0).unwrap().to_string(),
             created.library_uuid
@@ -5031,15 +8111,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "invoked twice by the exact-tree Docker release harness"]
     async fn docker_volume_restart_persists_library_catalog_and_sync_state() {
-        let phase = std::env::var("MEGLE_DOCKER_PERSISTENCE_PHASE")
-            .expect("MEGLE_DOCKER_PERSISTENCE_PHASE must be create or verify");
+        let phase = std::env::var("MANGOO_DOCKER_PERSISTENCE_PHASE")
+            .expect("MANGOO_DOCKER_PERSISTENCE_PHASE must be create or verify");
         let base = PathBuf::from(
-            std::env::var("MEGLE_DOCKER_PERSISTENCE_ROOT")
-                .expect("MEGLE_DOCKER_PERSISTENCE_ROOT must be mounted from a Docker volume"),
+            std::env::var("MANGOO_DOCKER_PERSISTENCE_ROOT")
+                .expect("MANGOO_DOCKER_PERSISTENCE_ROOT must be mounted from a Docker volume"),
         );
         let bundled_root = PathBuf::from(
-            std::env::var("MEGLE_SYNC_BUNDLED_PLUGINS_DIR")
-                .expect("MEGLE_SYNC_BUNDLED_PLUGINS_DIR must identify packaged Providers"),
+            std::env::var("MANGOO_SYNC_BUNDLED_PLUGINS_DIR")
+                .expect("MANGOO_SYNC_BUNDLED_PLUGINS_DIR must identify packaged Providers"),
         );
         fs::create_dir_all(&base).unwrap();
         let state_file = base.join("expected.json");
@@ -5099,7 +8179,7 @@ mod tests {
                 binding_epoch: binding.binding_epoch.to_string(),
                 transport_generation: u64::try_from(binding.transport_generation).unwrap(),
             };
-            let marker = b"megle-docker-volume-sync-state".to_vec();
+            let marker = b"mangoo-docker-volume-sync-state".to_vec();
             let hash = crate::sync::codec::sha256(&marker);
             provider
                 .provider
@@ -5204,10 +8284,91 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "invoked by tools/checks/sync-integration.mjs"]
     async fn real_provider_two_device_and_third_device_restore() {
-        let bundled_root = std::env::var_os("MEGLE_SYNC_BUNDLED_PLUGINS_DIR")
+        async fn discover_fixture_library(manager: &LibraryManager, library_uuid: &str) {
+            // This single-library fake Provider exposes library-scoped Delta only;
+            // this adapter does not cover Root-scope discovery. Validate its real
+            // framed-RPC objects with the production descriptor validator before
+            // installing the same account/session-bound candidate evidence.
+            let transport = manager
+                .registry
+                .provider_root_transports()
+                .unwrap()
+                .into_iter()
+                .find(|transport| transport.account_uuid == FAKE_ACCOUNT_ID)
+                .unwrap();
+            let provider = manager
+                .provider_manager()
+                .resolve(FAKE_PLUGIN_ID, FAKE_ACCOUNT_ID)
+                .unwrap()
+                .unwrap();
+            let context = crate::sync::provider::TransportContext {
+                namespace: library_uuid.to_owned(),
+                binding_epoch: Uuid::nil().to_string(),
+                transport_generation: 1,
+            };
+            let mut page_token = None;
+            for _ in 0..1024 {
+                let requested_page = page_token.clone();
+                let page = provider
+                    .delta_list(
+                        crate::sync::provider::DeltaScope::Library {
+                            namespace: context.namespace.clone(),
+                            binding_epoch: context.binding_epoch.clone(),
+                            transport_generation: context.transport_generation,
+                        },
+                        None,
+                        page_token.as_deref(),
+                        100,
+                    )
+                    .await
+                    .unwrap();
+                let mut candidates = Vec::new();
+                for metadata in page
+                    .objects
+                    .iter()
+                    .filter(|metadata| crate::sync::descriptor::is_descriptor_key(&metadata.key))
+                {
+                    let (candidate, _, _) = crate::sync::descriptor::download_candidate(
+                        provider.as_ref(),
+                        &context,
+                        metadata,
+                    )
+                    .await
+                    .unwrap();
+                    candidates.push(candidate);
+                }
+                manager
+                    .registry
+                    .commit_provider_root_cursor(
+                        FAKE_ACCOUNT_ID,
+                        transport.account_generation,
+                        &transport.runtime_session_id,
+                        None,
+                        &candidates,
+                    )
+                    .unwrap();
+                page_token = page.page_token;
+                if page_token.is_none() {
+                    assert!(manager
+                        .registry
+                        .list_remote_libraries()
+                        .unwrap()
+                        .iter()
+                        .any(|remote| remote.library_uuid == library_uuid
+                            && remote.account_uuid == FAKE_ACCOUNT_ID
+                            && remote.compatible
+                            && !remote.bound_locally));
+                    return;
+                }
+                assert_ne!(page_token, requested_page, "non-advancing fixture Delta");
+            }
+            panic!("fixture discovery exceeded its page limit");
+        }
+
+        let bundled_root = std::env::var_os("MANGOO_SYNC_BUNDLED_PLUGINS_DIR")
             .map(PathBuf::from)
-            .expect("MEGLE_SYNC_BUNDLED_PLUGINS_DIR must identify the packaged Provider root");
-        let base = std::env::temp_dir().join(format!("megle-real-two-device-{}", Uuid::now_v7()));
+            .expect("MANGOO_SYNC_BUNDLED_PLUGINS_DIR must identify the packaged Provider root");
+        let base = std::env::temp_dir().join(format!("mangoo-real-two-device-{}", Uuid::now_v7()));
         let device_a_root = base.join("device-a");
         let device_b_root = base.join("device-b");
         let device_c_root = base.join("device-c");
@@ -5264,13 +8425,28 @@ mod tests {
                 root_id,
                 folder_id,
                 name: "seed.png".into(),
-                ext: "png".into(),
+                ext: crate::decode::formats::lowercase_extension(Path::new("seed.png")),
                 size: 16,
                 mtime: 1,
                 ctime: None,
                 file_key: Some("seed-file".into()),
             })
             .unwrap();
+        // This corpus exercises media-derived state. File identity alone is
+        // format-neutral; seed the same classification a normal PNG scan adds.
+        database_a.upsert_media_kind(file_id_a, "image").unwrap();
+        let source_presentation: (String, String, bool, i64) = database_a
+            .connection_for_fsops()
+            .query_row(
+                "SELECT f.ext,m.kind,f.browse_visible,(SELECT COUNT(*) FROM media_fts WHERE rowid=f.id AND media_fts MATCH 'seed') FROM files f JOIN media m ON m.file_id=f.id WHERE f.id=?1",
+                [file_id_a],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            source_presentation,
+            (".png".into(), "image".into(), true, 1)
+        );
         let source_path = PathBuf::from(
             database_a
                 .connection_for_fsops()
@@ -5345,8 +8521,9 @@ mod tests {
             .provider_manager()
             .register(FAKE_PLUGIN_ID, FAKE_ACCOUNT_ID, provider_a.provider.clone())
             .unwrap();
+        discover_fixture_library(&manager_b, &library_a.library_uuid).await;
         let library_b = manager_b
-            .create_restore_library(
+            .create_planned_restore_fixture(
                 library_a.library_uuid.clone(),
                 "Shared Library".into(),
                 device_b_root.join("managed"),
@@ -5561,8 +8738,9 @@ mod tests {
             .provider_manager()
             .register(FAKE_PLUGIN_ID, FAKE_ACCOUNT_ID, provider_a.provider.clone())
             .unwrap();
+        discover_fixture_library(&manager_c, &library_a.library_uuid).await;
         let library_c = manager_c
-            .create_restore_library(
+            .create_planned_restore_fixture(
                 library_a.library_uuid.clone(),
                 "Shared Library".into(),
                 device_c_root.join("managed"),
@@ -5732,7 +8910,7 @@ mod tests {
     #[tokio::test]
     async fn failed_activation_reopens_previous_runtime_without_publishing_target() {
         let base =
-            std::env::temp_dir().join(format!("megle-activation-rollback-{}", Uuid::now_v7()));
+            std::env::temp_dir().join(format!("mangoo-activation-rollback-{}", Uuid::now_v7()));
         fs::create_dir_all(&base).unwrap();
         let manager = test_manager(&base);
         let first = manager
@@ -5780,7 +8958,7 @@ mod tests {
 
     #[tokio::test]
     async fn queued_library_control_rechecks_revision_under_operation_lock() {
-        let base = std::env::temp_dir().join(format!("megle-control-revision-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-control-revision-{}", Uuid::now_v7()));
         fs::create_dir_all(&base).unwrap();
         let manager = test_manager(&base);
         let first = manager
@@ -5825,13 +9003,13 @@ mod tests {
 
     #[tokio::test]
     async fn sync_enable_requires_a_live_ready_provider_before_creating_a_binding() {
-        let base = std::env::temp_dir().join(format!("megle-sync-enable-{}", Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("mangoo-sync-enable-{}", Uuid::now_v7()));
         fs::create_dir_all(&base).unwrap();
         let manager = test_manager(&base);
         manager
             .registry
             .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
-                plugin_id: "com.megle.fake",
+                plugin_id: "com.mangoo.fake",
                 version: "1.0.0",
                 manifest_json: r#"{"manifestVersion":2}"#,
                 entry_relative_path: "bin/provider",
@@ -5845,19 +9023,19 @@ mod tests {
             .registry
             .upsert_plugin_account(
                 "fake-account",
-                "com.megle.fake",
+                "com.mangoo.fake",
                 Some("Fake"),
                 "authenticated",
             )
             .unwrap();
         manager
             .registry
-            .set_plugin_intent("com.megle.fake", true, true)
+            .set_plugin_intent("com.mangoo.fake", true, true)
             .unwrap();
         manager
             .registry
             .record_plugin_runtime_ready(
-                "com.megle.fake",
+                "com.mangoo.fake",
                 "test-session",
                 &["sync-provider.v1".into()],
             )
@@ -5880,7 +9058,7 @@ mod tests {
                 .enable_library_sync_with_revision(
                     &library.library_uuid,
                     0,
-                    "com.megle.fake",
+                    "com.mangoo.fake",
                     "fake-account",
                 )
                 .await
@@ -5901,7 +9079,7 @@ mod tests {
         manager
             .provider_manager()
             .register(
-                "com.megle.fake",
+                "com.mangoo.fake",
                 "fake-account",
                 Arc::new(crate::sync::provider::InMemorySyncProvider::default()),
             )
@@ -5910,7 +9088,7 @@ mod tests {
             .enable_library_sync_with_revision(
                 &library.library_uuid,
                 0,
-                "com.megle.fake",
+                "com.mangoo.fake",
                 "fake-account",
             )
             .await

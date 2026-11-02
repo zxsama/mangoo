@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Let Megle switch between multiple libraries (one library = one `.sqlite` file with many root folders), show a centred loading card during startup and switching, and manage libraries/roots from a switcher popup + Settings.
+**Goal:** Let Mangoo switch between multiple libraries (one library = one `.sqlite` file with many root folders), show a centred loading card during startup and switching, and manage libraries/roots from a switcher popup + Settings.
 
 **Architecture:** One active library = one Core process bound to one `.sqlite`. Switching = the Electron main process gracefully restarts Core pointed at the new file, **reusing the same bind port + session token** so the renderer never reloads. A `userData/libraries.json` registry (main process) records the library list + active id. Core is unchanged (a fresh `.sqlite` self-migrates on first open). UI is built against a frozen bridge interface so the switcher/loading-card/sidebar/settings work can proceed in parallel.
 
-**Tech Stack:** Electron main (Node/TS) · React + TypeScript UI (`apps/web`) · Rust/Axum Core (unchanged) · SQLite · existing `@megle/core-client` for roots.
+**Tech Stack:** Electron main (Node/TS) · React + TypeScript UI (`apps/web`) · Rust/Axum Core (unchanged) · SQLite · existing `@mangoo/core-client` for roots.
 
 ## Global Constraints
 
@@ -19,7 +19,7 @@
 - Create-library and open-library **auto-switch** on success (spec Decision 7).
 - Inactive-library "add folder"/"remove folder" buttons are greyed out and non-clickable (spec Decision 8).
 - Core (`crates/core`) gets **zero changes** unless Task 9's optional test is added. No new OpenAPI paths / tables / indexes.
-- UI code must not use raw `fetch`, duplicate Core DTOs, or import Node fs — go through `@megle/core-client` / the desktop bridge. Guard with `npm run check:web` / `check:ui-design` / `check:desktop`.
+- UI code must not use raw `fetch`, duplicate Core DTOs, or import Node fs — go through `@mangoo/core-client` / the desktop bridge. Guard with `npm run check:web` / `check:ui-design` / `check:desktop`.
 - Every task ends by running the narrowest check for its area; broad/integration tasks run `npm test`.
 - Never weaken a validation script to pass; update the check in the same task that changes the guarded pattern.
 
@@ -30,7 +30,7 @@
 - `apps/desktop/src/preload.cjs` **(modify)** — expose new bridge methods + phase subscription.
 - `apps/desktop/src/core-session.ts` **(modify)** — allow building a session with an explicit dbPath + reused bind/token.
 - `apps/web/src/core/libraryTypes.ts` **(new)** — `LibrarySummary`, `LibraryLoadPhase`.
-- `apps/web/src/core/desktop.ts` **(modify)** — extend `MegleDesktopBridge` + wrapper helpers.
+- `apps/web/src/core/desktop.ts` **(modify)** — extend `MangooDesktopBridge` + wrapper helpers.
 - `apps/web/src/features/library/LibrarySwitcher.tsx` **(new)** — switcher popup.
 - `apps/web/src/features/library/LibraryLoadingOverlay.tsx` **(new)** — centred loading/error card.
 - `apps/web/src/features/library/LibrarySidebar.tsx` **(modify)** — top refactor.
@@ -73,7 +73,7 @@ import {
 } from "./library-registry.ts";
 
 function tmpDir(): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "megle-reg-"));
+  return fs.mkdtempSync(path.join(os.tmpdir(), "mangoo-reg-"));
 }
 
 test("loadRegistry returns empty registry when file is missing", () => {
@@ -237,7 +237,7 @@ Expected: PASS — 7 tests.
 
 - [ ] **Step 5: Typecheck + commit**
 
-Run: `npm --workspace @megle/desktop run typecheck`
+Run: `npm --workspace @mangoo/desktop run typecheck`
 Expected: no output (clean).
 
 ```bash
@@ -253,7 +253,7 @@ Unblocks all UI tasks. No behavior yet — types + wrapper helpers + preload stu
 
 **Files:**
 - Create: `apps/web/src/core/libraryTypes.ts`
-- Modify: `apps/web/src/core/desktop.ts` (add to `MegleDesktopBridge` + helper wrappers)
+- Modify: `apps/web/src/core/desktop.ts` (add to `MangooDesktopBridge` + helper wrappers)
 - Modify: `apps/desktop/src/preload.cjs` (expose new methods)
 
 **Interfaces:**
@@ -289,7 +289,7 @@ export function isErrorPhase(
 
 - [ ] **Step 2: Extend the bridge interface + wrappers in `desktop.ts`**
 
-Add to the `MegleDesktopBridge` interface (after `shell?: DesktopShellActions;`):
+Add to the `MangooDesktopBridge` interface (after `shell?: DesktopShellActions;`):
 
 ```ts
   listLibraries?: () => Promise<LibrarySummary[]>;
@@ -345,28 +345,28 @@ export function subscribeLibraryPhase(cb: (phase: LibraryLoadPhase) => void): ()
 
 - [ ] **Step 3: Add preload stubs in `preload.cjs`**
 
-Inside the `exposeInMainWorld("megleDesktop", { ... })` object (after the `shell: {...}` block), add:
+Inside the `exposeInMainWorld("mangooDesktop", { ... })` object (after the `shell: {...}` block), add:
 
 ```js
-  listLibraries: () => ipcRenderer.invoke("megle:list-libraries"),
-  getActiveLibraryId: () => ipcRenderer.invoke("megle:get-active-library-id"),
-  switchLibrary: (libraryId) => ipcRenderer.invoke("megle:switch-library", libraryId),
-  createLibrary: (input) => ipcRenderer.invoke("megle:create-library", input),
-  openLibrary: (dbPath) => ipcRenderer.invoke("megle:open-library", dbPath),
-  removeLibraryFromList: (libraryId) => ipcRenderer.invoke("megle:remove-library-from-list", libraryId),
-  renameLibrary: (libraryId, name) => ipcRenderer.invoke("megle:rename-library", libraryId, name),
-  pickLibraryFile: () => ipcRenderer.invoke("megle:pick-library-file"),
-  pickNewLibraryPath: (defaultName) => ipcRenderer.invoke("megle:pick-new-library-path", defaultName),
+  listLibraries: () => ipcRenderer.invoke("mangoo:list-libraries"),
+  getActiveLibraryId: () => ipcRenderer.invoke("mangoo:get-active-library-id"),
+  switchLibrary: (libraryId) => ipcRenderer.invoke("mangoo:switch-library", libraryId),
+  createLibrary: (input) => ipcRenderer.invoke("mangoo:create-library", input),
+  openLibrary: (dbPath) => ipcRenderer.invoke("mangoo:open-library", dbPath),
+  removeLibraryFromList: (libraryId) => ipcRenderer.invoke("mangoo:remove-library-from-list", libraryId),
+  renameLibrary: (libraryId, name) => ipcRenderer.invoke("mangoo:rename-library", libraryId, name),
+  pickLibraryFile: () => ipcRenderer.invoke("mangoo:pick-library-file"),
+  pickNewLibraryPath: (defaultName) => ipcRenderer.invoke("mangoo:pick-new-library-path", defaultName),
   onLibraryPhase: (cb) => {
     const listener = (_event, phase) => cb(phase);
-    ipcRenderer.on("megle:library-load-phase", listener);
-    return () => ipcRenderer.removeListener("megle:library-load-phase", listener);
+    ipcRenderer.on("mangoo:library-load-phase", listener);
+    return () => ipcRenderer.removeListener("mangoo:library-load-phase", listener);
   },
 ```
 
 - [ ] **Step 4: Typecheck web + web check**
 
-Run: `npm --workspace @megle/web run typecheck`
+Run: `npm --workspace @mangoo/web run typecheck`
 Expected: clean.
 Run: `node tools/checks/validate-web-client.mjs`
 Expected: `PASS: web client boundaries` (if it fails on a new-symbol pin, that is Task 4's job — note it and continue only if the failure is unrelated).
@@ -440,7 +440,7 @@ Expected: PASS.
 
 - [ ] **Step 5: Typecheck + commit**
 
-Run: `npm --workspace @megle/desktop run typecheck`
+Run: `npm --workspace @mangoo/desktop run typecheck`
 Expected: clean.
 
 ```bash
@@ -460,7 +460,7 @@ The largest task. Wires the registry, restart routine, IPC handlers, phase event
 
 **Interfaces:**
 - Consumes: `library-registry.ts` (Task 1), `sessionForDbPath` (Task 3), existing `startCoreProcess`/`waitForCoreHealth`/`createCoreSession`/`stopCoreProcessTree`, existing module state (`coreProcess`, `coreSession`, `coreReadyPromise`).
-- Produces (consumed by preload IPC channels from Task 2): the handlers for `megle:list-libraries`, `megle:get-active-library-id`, `megle:switch-library`, `megle:create-library`, `megle:open-library`, `megle:remove-library-from-list`, `megle:rename-library`, `megle:pick-library-file`, `megle:pick-new-library-path`, and the `megle:library-load-phase` push. Phase strings match `LibraryLoadPhase`.
+- Produces (consumed by preload IPC channels from Task 2): the handlers for `mangoo:list-libraries`, `mangoo:get-active-library-id`, `mangoo:switch-library`, `mangoo:create-library`, `mangoo:open-library`, `mangoo:remove-library-from-list`, `mangoo:rename-library`, `mangoo:pick-library-file`, `mangoo:pick-new-library-path`, and the `mangoo:library-load-phase` push. Phase strings match `LibraryLoadPhase`.
 
 - [ ] **Step 1: Add imports + registry helpers near the top of `main.ts`**
 
@@ -489,7 +489,7 @@ function persistRegistry(next: libraryRegistry.LibraryRegistry): void {
 }
 function pushLibraryPhase(phase: unknown): void {
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send("megle:library-load-phase", phase);
+    mainWindow.webContents.send("mangoo:library-load-phase", phase);
   }
 }
 function toSummaries(reg: libraryRegistry.LibraryRegistry): Array<{
@@ -590,10 +590,10 @@ async function createColdStartSession(): Promise<CoreSession> {
 Add near the other `ipcMain.handle(...)` blocks:
 
 ```ts
-ipcMain.handle("megle:list-libraries", () => toSummaries(getRegistry()));
-ipcMain.handle("megle:get-active-library-id", () => getRegistry().activeLibraryId);
+ipcMain.handle("mangoo:list-libraries", () => toSummaries(getRegistry()));
+ipcMain.handle("mangoo:get-active-library-id", () => getRegistry().activeLibraryId);
 
-ipcMain.handle("megle:switch-library", async (_e, libraryId: string) => {
+ipcMain.handle("mangoo:switch-library", async (_e, libraryId: string) => {
   const reg = getRegistry();
   const target = reg.libraries.find((l) => l.id === libraryId);
   if (!target) return { ok: false, error: "library not found" };
@@ -609,7 +609,7 @@ ipcMain.handle("megle:switch-library", async (_e, libraryId: string) => {
   }
 });
 
-ipcMain.handle("megle:create-library", async (_e, input: { name: string; dbPath: string }) => {
+ipcMain.handle("mangoo:create-library", async (_e, input: { name: string; dbPath: string }) => {
   const reg = getRegistry();
   try {
     // A brand-new empty file: Core builds the schema on first open.
@@ -628,7 +628,7 @@ ipcMain.handle("megle:create-library", async (_e, input: { name: string; dbPath:
   }
 });
 
-ipcMain.handle("megle:open-library", async (_e, dbPath: string) => {
+ipcMain.handle("mangoo:open-library", async (_e, dbPath: string) => {
   const reg = getRegistry();
   if (!fsSync.existsSync(dbPath)) return { ok: false, error: "file not found" };
   try {
@@ -645,41 +645,41 @@ ipcMain.handle("megle:open-library", async (_e, dbPath: string) => {
   }
 });
 
-ipcMain.handle("megle:remove-library-from-list", (_e, libraryId: string) => {
+ipcMain.handle("mangoo:remove-library-from-list", (_e, libraryId: string) => {
   persistRegistry(libraryRegistry.removeLibrary(getRegistry(), libraryId));
   return { ok: true };
 });
 
-ipcMain.handle("megle:rename-library", (_e, libraryId: string, name: string) => {
+ipcMain.handle("mangoo:rename-library", (_e, libraryId: string, name: string) => {
   persistRegistry(libraryRegistry.renameLibrary(getRegistry(), libraryId, name));
   return { ok: true };
 });
 
-ipcMain.handle("megle:pick-library-file", async () => {
+ipcMain.handle("mangoo:pick-library-file", async () => {
   const result = mainWindow
-    ? await dialog.showOpenDialog(mainWindow, { properties: ["openFile"], filters: [{ name: "Megle Library", extensions: ["sqlite"] }] })
-    : await dialog.showOpenDialog({ properties: ["openFile"], filters: [{ name: "Megle Library", extensions: ["sqlite"] }] });
+    ? await dialog.showOpenDialog(mainWindow, { properties: ["openFile"], filters: [{ name: "Mangoo Library", extensions: ["sqlite"] }] })
+    : await dialog.showOpenDialog({ properties: ["openFile"], filters: [{ name: "Mangoo Library", extensions: ["sqlite"] }] });
   return result.canceled ? null : (result.filePaths[0] ?? null);
 });
 
-ipcMain.handle("megle:pick-new-library-path", async (_e, defaultName?: string) => {
+ipcMain.handle("mangoo:pick-new-library-path", async (_e, defaultName?: string) => {
   const result = mainWindow
-    ? await dialog.showSaveDialog(mainWindow, { defaultPath: `${defaultName ?? "library"}.sqlite`, filters: [{ name: "Megle Library", extensions: ["sqlite"] }] })
-    : await dialog.showSaveDialog({ defaultPath: `${defaultName ?? "library"}.sqlite`, filters: [{ name: "Megle Library", extensions: ["sqlite"] }] });
+    ? await dialog.showSaveDialog(mainWindow, { defaultPath: `${defaultName ?? "library"}.sqlite`, filters: [{ name: "Mangoo Library", extensions: ["sqlite"] }] })
+    : await dialog.showSaveDialog({ defaultPath: `${defaultName ?? "library"}.sqlite`, filters: [{ name: "Mangoo Library", extensions: ["sqlite"] }] });
   return result.canceled ? null : (result.filePath ?? null);
 });
 ```
 
 - [ ] **Step 5: Update the desktop boundary check**
 
-Open `tools/checks/validate-desktop-core.mjs`. Find the list of pinned IPC channel names or bridge methods (grep for `megle:pick-folder` or `ipcMain.handle`). Add the new channel names to whatever allowlist/required-list the check enforces so the new handlers pass. If the check has no such list (only structural), skip — but run it to confirm.
+Open `tools/checks/validate-desktop-core.mjs`. Find the list of pinned IPC channel names or bridge methods (grep for `mangoo:pick-folder` or `ipcMain.handle`). Add the new channel names to whatever allowlist/required-list the check enforces so the new handlers pass. If the check has no such list (only structural), skip — but run it to confirm.
 
 Run: `node tools/checks/validate-desktop-core.mjs`
 Expected: `PASS: desktop core orchestration boundaries`. If it fails naming a new channel, add that channel to the pinned list in the check and re-run.
 
 - [ ] **Step 6: Typecheck + commit**
 
-Run: `npm --workspace @megle/desktop run typecheck`
+Run: `npm --workspace @mangoo/desktop run typecheck`
 Expected: clean.
 
 ```bash
@@ -719,7 +719,7 @@ useEffect(() => {
 
 - [ ] **Step 2: Typecheck**
 
-Run: `npm --workspace @megle/web run typecheck`
+Run: `npm --workspace @mangoo/web run typecheck`
 Expected: clean.
 
 - [ ] **Step 3: Commit**
@@ -819,7 +819,7 @@ export function LibraryLoadingOverlay({
 
 - [ ] **Step 3: Typecheck + web check**
 
-Run: `npm --workspace @megle/web run typecheck` → clean.
+Run: `npm --workspace @mangoo/web run typecheck` → clean.
 Run: `node tools/checks/validate-web-client.mjs` → PASS.
 
 - [ ] **Step 4: Commit**
@@ -892,7 +892,7 @@ centerPane={
 
 - [ ] **Step 3: Typecheck + web + ui-design checks**
 
-Run: `npm --workspace @megle/web run typecheck` → clean.
+Run: `npm --workspace @mangoo/web run typecheck` → clean.
 Run: `node tools/checks/validate-web-client.mjs` → PASS.
 Run: `node tools/checks/validate-ui-design.mjs` → PASS.
 
@@ -1037,7 +1037,7 @@ Note: "remove folder" opens a submenu to pick which root to remove (there can be
 
 - [ ] **Step 3: Typecheck + checks**
 
-Run: `npm --workspace @megle/web run typecheck` → clean.
+Run: `npm --workspace @mangoo/web run typecheck` → clean.
 Run: `node tools/checks/validate-web-client.mjs` → PASS.
 Run: `node tools/checks/validate-ui-design.mjs` → PASS.
 
@@ -1098,7 +1098,7 @@ Add `ChevronsUpDown` to the `lucide-react` import; add `onOpenSwitcher: () => vo
 
 - [ ] **Step 3: Typecheck + checks**
 
-Run: `npm --workspace @megle/web run typecheck` → clean.
+Run: `npm --workspace @mangoo/web run typecheck` → clean.
 Run: `node tools/checks/validate-web-client.mjs` → PASS.
 Run: `node tools/checks/validate-ui-design.mjs` → PASS.
 
@@ -1136,7 +1136,7 @@ fn brand_new_empty_file_migrates_and_lists_no_roots() {
 
 - [ ] **Step 2: Run the test**
 
-Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p megle-core brand_new_empty_file_migrates`
+Run: `export PATH="$HOME/.cargo/bin:$PATH" && cargo test -p mangoo-core brand_new_empty_file_migrates`
 Expected: PASS.
 
 - [ ] **Step 3: fmt + commit**
@@ -1169,12 +1169,12 @@ In `LibrarySwitcher.tsx`, replace the remove-folder no-op with a small inline me
 
 - [ ] **Step 3: Typecheck + full web/ui checks**
 
-Run: `npm --workspace @megle/web run typecheck` → clean.
+Run: `npm --workspace @mangoo/web run typecheck` → clean.
 Run: `node tools/checks/validate-web-client.mjs` and `node tools/checks/validate-ui-design.mjs` → PASS.
 
 - [ ] **Step 4: Real-window verification (CDP)**
 
-Launch the dev harness (`MEGLE_REMOTE_DEBUG=1 MEGLE_AUTO_ADD_ROOT=... npm run dev`), then with the user (screenshots don't reflect everything): open the switcher, create a new library (auto-switches, loading card shows, new empty library loads), switch back (loading card, chrome + glass persist, old library reloads), add a folder to the active library. Confirm no `window.reload()` white flash.
+Launch the dev harness (`MANGOO_REMOTE_DEBUG=1 MANGOO_AUTO_ADD_ROOT=... npm run dev`), then with the user (screenshots don't reflect everything): open the switcher, create a new library (auto-switches, loading card shows, new empty library loads), switch back (loading card, chrome + glass persist, old library reloads), add a folder to the active library. Confirm no `window.reload()` white flash.
 
 - [ ] **Step 5: Commit**
 
@@ -1200,7 +1200,7 @@ Add a `LibrariesTab` / section to `settingsPanels.tsx` reusing `listLibraries`/`
 
 - [ ] **Step 2: Typecheck + checks + commit**
 
-Run: `npm --workspace @megle/web run typecheck` → clean; `node tools/checks/validate-ui-design.mjs` → PASS.
+Run: `npm --workspace @mangoo/web run typecheck` → clean; `node tools/checks/validate-ui-design.mjs` → PASS.
 ```bash
 git add apps/web/src/features/settings/settingsPanels.tsx
 git commit -m "feat(web): Settings library management section"
@@ -1213,7 +1213,7 @@ git commit -m "feat(web): Settings library management section"
 - [ ] **Step 1: Run the full suite**
 
 Run: `npm test`
-Expected: all 8 checks PASS + rust tests pass (the known `file_ops_list_returns_keyset_page` parallel flake may need one re-run in isolation — verify with `cargo test -p megle-core file_ops_list_returns_keyset_page`).
+Expected: all 8 checks PASS + rust tests pass (the known `file_ops_list_returns_keyset_page` parallel flake may need one re-run in isolation — verify with `cargo test -p mangoo-core file_ops_list_returns_keyset_page`).
 
 - [ ] **Step 2: Real-window pass** — cold start shows the loading card and settles to the active library; switching preserves chrome + glass; create/open auto-switch. Confirm with the user.
 

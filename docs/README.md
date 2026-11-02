@@ -1,8 +1,8 @@
-# Megle Docs
+# Mangoo Docs
 
 ## Current Decision
 
-Megle will be built as:
+Mangoo will be built as:
 
 ```text
 Electron desktop shell
@@ -62,17 +62,20 @@ The current plan is component-based. We are not forking an existing image-manage
 15. [Testing Strategy](testing-strategy.md)
    - Fast checks, schema validation, and future test gates.
 
-16. [UI Layered Acrylic Frosted Glass Design](superpowers/specs/2026-05-16-megle-ui-liquid-glass-design.md)
+16. [UI Layered Acrylic Frosted Glass Design](superpowers/specs/2026-05-16-mangoo-ui-liquid-glass-design.md)
    - Approved UI direction, shell model, component rules, and performance constraints.
 
-17. [UI Foundation Implementation Plan](superpowers/plans/2026-05-16-megle-ui-foundation.md)
+17. [UI Foundation Implementation Plan](superpowers/plans/2026-05-16-mangoo-ui-foundation.md)
    - Implementation plan for the shared app shell, frameless chrome, design tokens, and UI primitives.
 
-18. [Complete Product Implementation Plan](superpowers/plans/2026-05-16-megle-complete-product-plan.md)
+18. [Complete Product Implementation Plan](superpowers/plans/2026-05-16-mangoo-complete-product-plan.md)
    - Master execution order that inserts the UI plan into the full product roadmap through release hardening.
 
 19. [Unified Overlay UI Design](superpowers/specs/2026-07-27-unified-overlay-ui-design.md)
    - Shared overlay, dialog, context-menu, notification, and appearance rules.
+
+- [All-file Library Presentation](superpowers/specs/2026-09-24-all-file-library-presentation.md)
+  - Ordinary-file browsing, static format fallback, decoder plugins and bounded video hover playback.
 
 20. [Unified Overlay UI Implementation Plan](superpowers/plans/2026-07-27-unified-overlay-ui.md)
    - Task-by-task implementation and verification plan.
@@ -111,8 +114,14 @@ Archived documents:
 
 ## Current Work
 
+OneDrive Sync moved to an independent repository on 2026-09-22. The
+[extraction note](onedrive-extraction.md) describes current ownership, optional
+build-time integration, and retained compatibility. Earlier combined sync and
+OneDrive reports below preserve their dated evidence and do not qualify the
+new repository split or close outstanding restore/performance verification.
+
 Phase 10 (Release Hardening) is complete: the master plan in
-[`superpowers/plans/2026-05-16-megle-complete-product-plan.md`](superpowers/plans/2026-05-16-megle-complete-product-plan.md)
+[`superpowers/plans/2026-05-16-mangoo-complete-product-plan.md`](superpowers/plans/2026-05-16-mangoo-complete-product-plan.md)
 has all ten tasks ticked, and the manual smoke-test list lives in
 [`release-checklist.md`](release-checklist.md). Phases 1–10 ship the full product loop —
 add a root, browse, preview, organize, file-ops, watcher, plugins, Web/Docker reuse, and a
@@ -127,9 +136,9 @@ See [`release-checklist.md` §2.1](release-checklist.md) for the automated CDP-d
 smoke test that catches these issues end-to-end.
 
 The approved UI direction is layered acrylic frosted glass with a shared desktop app shell. The
-foundation track lives in `docs/superpowers/plans/2026-05-16-megle-ui-foundation.md`. The
+foundation track lives in `docs/superpowers/plans/2026-05-16-mangoo-ui-foundation.md`. The
 full-product execution order lives in
-`docs/superpowers/plans/2026-05-16-megle-complete-product-plan.md`.
+`docs/superpowers/plans/2026-05-16-mangoo-complete-product-plan.md`.
 
 Completed Phase 0 gates:
 

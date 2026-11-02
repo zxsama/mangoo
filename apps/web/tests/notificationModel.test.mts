@@ -8,7 +8,7 @@ import type {
   DesktopNotificationsBridge,
   DesktopProcessLogBatch,
   DesktopThumbnailCacheSummary
-} from "@megle/notification-contract";
+} from "@mangoo/notification-contract";
 import {
   buildCompactNotificationModel,
   mergeNotificationHistoryPages,
@@ -241,7 +241,7 @@ describe("notification reporting", () => {
       );
 
       (globalThis as { window?: unknown }).window = {
-        megleDesktop: {
+        mangooDesktop: {
           notifications: bridge({
             reportError: async () => {
               throw new Error("notification store unavailable");
@@ -290,7 +290,7 @@ describe("notification reporting", () => {
     let calls = 0;
     try {
       (globalThis as { window?: unknown }).window = {
-        megleDesktop: {
+        mangooDesktop: {
           notifications: bridge({
             reportError: async (input) => {
               calls += 1;
@@ -355,7 +355,7 @@ describe("notification reporting", () => {
     const reports: unknown[] = [];
     try {
       (globalThis as { window?: unknown }).window = {
-        megleDesktop: {
+        mangooDesktop: {
           notifications: bridge({
             reportError: async (input) => {
               reports.push(input);
@@ -411,7 +411,7 @@ describe("notification reporting", () => {
     const reports: Array<{ source: string; reportId?: string }> = [];
     try {
       (globalThis as { window?: unknown }).window = {
-        megleDesktop: {
+        mangooDesktop: {
           notifications: bridge({
             reportError: async (input) => {
               reports.push(input);
@@ -488,7 +488,7 @@ describe("notification reporting", () => {
     const reports: unknown[] = [];
     try {
       (globalThis as { window?: unknown }).window = {
-        megleDesktop: {
+        mangooDesktop: {
           notifications: bridge({
             reportError: async (input) => {
               reports.push(input);
@@ -545,7 +545,7 @@ describe("notification reporting", () => {
     let libraryReads = 0;
     try {
       (globalThis as { window?: unknown }).window = {
-        megleDesktop: {
+        mangooDesktop: {
           listLibraries: async () => [
             {
               id: "lib-b",
@@ -567,8 +567,8 @@ describe("notification reporting", () => {
           })
         }
       };
-      const desktop = (globalThis as { window: { megleDesktop: { listLibraries: () => Promise<unknown> } } }).window
-        .megleDesktop;
+      const desktop = (globalThis as { window: { mangooDesktop: { listLibraries: () => Promise<unknown> } } }).window
+        .mangooDesktop;
       const listLibraries = desktop.listLibraries;
       desktop.listLibraries = async () => {
         libraryReads += 1;
@@ -655,7 +655,7 @@ describe("notification reporting", () => {
     let publishCalls = 0;
     try {
       (globalThis as { window?: unknown }).window = {
-        megleDesktop: {
+        mangooDesktop: {
           windowRole: "settings",
           notifications: bridge({
             publishThumbnailSummary: async () => {
@@ -699,7 +699,7 @@ describe("notification reporting", () => {
     let publishCalls = 0;
     try {
       (globalThis as { window?: unknown }).window = {
-        megleDesktop: {
+        mangooDesktop: {
           windowRole: "main",
           notifications: bridge({
             publishThumbnailSummary: async () => {
@@ -739,7 +739,7 @@ describe("notification reporting", () => {
     let publishCalls = 0;
     try {
       (globalThis as { window?: unknown }).window = {
-        megleDesktop: {
+        mangooDesktop: {
           windowRole: "main",
           notifications: bridge({
             publishThumbnailSummary: async () => {
@@ -787,7 +787,7 @@ describe("notification reporting", () => {
     const batches: unknown[] = [];
     try {
       (globalThis as { window?: unknown }).window = {
-        megleDesktop: {
+        mangooDesktop: {
           windowRole: "main",
           notifications: bridge({
             emitRendererLogs: (entries) => batches.push(entries)
@@ -799,7 +799,7 @@ describe("notification reporting", () => {
       assert.equal(emitRendererStartupLog(), false);
       assert.deepEqual(batches, [[{
         level: "info",
-        message: "Megle renderer ready",
+        message: "Mangoo renderer ready",
         metadata: { eventKind: "startup_ready", windowRole: "main" }
       }]]);
     } finally {
@@ -972,7 +972,7 @@ describe("notification selectors", () => {
         syncHealth: {
           state: "degraded",
           libraryId: "library-a",
-          detail: "通知同步已暂停",
+          detail: "通知服务已暂停",
           updatedAt: 2
         }
       })
@@ -994,8 +994,8 @@ describe("notification selectors", () => {
     assert.deepEqual(present?.(degraded), {
       failureCue: null,
       health: "degraded",
-      healthLabel: "同步受限",
-      idleLabel: "等待通知同步恢复"
+      healthLabel: "通知服务受限",
+      idleLabel: "等待通知服务恢复"
     });
     assert.deepEqual(present?.(active), {
       failureCue: null,

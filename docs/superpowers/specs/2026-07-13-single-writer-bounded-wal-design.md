@@ -66,7 +66,7 @@ fast SQLite commits, so serializing them through one actor is cheap and yields t
 checkpoint window for free.
 
 **Concurrency safety:** the `DbWriter` actor runs on a dedicated `std::thread`
-(`db/writer.rs:36-39`, named `megle-db-writer`), NOT tokio's blocking pool, so it
+(`db/writer.rs:36-39`, named `mangoo-db-writer`), NOT tokio's blocking pool, so it
 can never be starved by the `spawn_blocking` threads that park on it via
 `write_blocking()` → `blocking_recv()`. N blocking threads → 1 actor is safe; no
 deadlock.

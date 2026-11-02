@@ -1,7 +1,8 @@
-import type { PluginRuntimeState } from "@megle/core-client";
+import type { PluginRuntimeState } from "@mangoo/core-client";
 
 const STATUS_LABEL: Record<PluginRuntimeState, string> = {
   disabled: "Disabled",
+  stopping: "Stopping",
   "permission-required": "Permission required",
   starting: "Starting",
   ready: "Enable",

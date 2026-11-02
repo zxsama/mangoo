@@ -94,8 +94,8 @@ for (const value of [
   "coreLifecycleQueue.enqueue",
   "coreLifecycleQueue.shutdown",
   "additionalArguments",
-  "--megle-core-url=",
-  "--megle-session-token=",
+  "--mangoo-core-url=",
+  "--mangoo-session-token=",
   "before-quit"
 ]) {
   if (!main.includes(value)) {
@@ -103,7 +103,7 @@ for (const value of [
   }
 }
 
-for (const value of ["baseUrl", "bindAddress", "hostDbPath", "librariesDir", "sessionToken", "MEGLE_CORE_ADDR"]) {
+for (const value of ["baseUrl", "bindAddress", "hostDbPath", "librariesDir", "sessionToken", "MANGOO_CORE_ADDR"]) {
   if (!session.includes(value)) {
     fail(`core session missing ${value}`);
   }
@@ -112,12 +112,12 @@ if (session.includes("47321")) {
   fail("desktop core session must not default Electron-owned Core to fixed 127.0.0.1:47321");
 }
 for (const value of [
-  "MEGLE_CORE_EXTERNAL",
-  "MEGLE_CORE_URL is required when MEGLE_CORE_EXTERNAL=1",
-  "MEGLE_SESSION_TOKEN is required when MEGLE_CORE_EXTERNAL=1",
+  "MANGOO_CORE_EXTERNAL",
+  "MANGOO_CORE_URL is required when MANGOO_CORE_EXTERNAL=1",
+  "MANGOO_SESSION_TOKEN is required when MANGOO_CORE_EXTERNAL=1",
   "normalizeLoopbackHost",
   "Unsupported Core host",
-  "MEGLE_CORE_ADDR and MEGLE_CORE_URL must point to the same host/port",
+  "MANGOO_CORE_ADDR and MANGOO_CORE_URL must point to the same host/port",
   "isLoopbackOrIpLiteral"
 ]) {
   if (!session.includes(value)) {
@@ -126,14 +126,14 @@ for (const value of [
 }
 
 for (const value of [
-  "MEGLE_CORE_EXTERNAL",
-  "MEGLE_HOST_DB_PATH",
-  "MEGLE_LIBRARIES_DIR",
-  "MEGLE_CORE_ADDR",
-  "MEGLE_SESSION_TOKEN",
-  "MEGLE_ALLOWED_ORIGIN",
+  "MANGOO_CORE_EXTERNAL",
+  "MANGOO_HOST_DB_PATH",
+  "MANGOO_LIBRARIES_DIR",
+  "MANGOO_CORE_ADDR",
+  "MANGOO_SESSION_TOKEN",
+  "MANGOO_ALLOWED_ORIGIN",
   "health",
-  "x-megle-session",
+  "x-mangoo-session",
   "windowsHide",
   "repoRoot"
 ]) {
@@ -142,11 +142,11 @@ for (const value of [
   }
 }
 const cargoRunCoreLaunchPattern =
-  /spawn\(\s*[\s\S]*?,\s*\[\s*["']run["']\s*,\s*["']-p["']\s*,\s*["']megle-core["']\s*\]/;
+  /spawn\(\s*[\s\S]*?,\s*\[\s*["']run["']\s*,\s*["']-p["']\s*,\s*["']mangoo-core["']\s*\]/;
 if (cargoRunCoreLaunchPattern.test(processFile)) {
   fail("desktop internal Core launch must not use cargo run because it rewrites the Windows debug exe");
 }
-for (const value of ["coreBinaryPath", "target", "debug", "megle-core.exe", "fs.existsSync"]) {
+for (const value of ["coreBinaryPath", "target", "debug", "mangoo-core.exe", "fs.existsSync"]) {
   if (!processFile.includes(value)) {
     fail(`core process must spawn the prebuilt internal Core binary directly: ${value}`);
   }
@@ -156,18 +156,18 @@ for (const value of ["taskkill", "/T", "/F", "stopCoreProcessTree"]) {
     fail(`core process cleanup missing ${value}`);
   }
 }
-for (const value of ["MEGLE_CORE_BINARY", "path.resolve(configuredBinary)"]) {
+for (const value of ["MANGOO_CORE_BINARY", "path.resolve(configuredBinary)"]) {
   if (!processFile.includes(value)) {
     fail(`core process orchestration missing packaged binary path contract: ${value}`);
   }
 }
-for (const value of ["MEGLE_SERVE_WEB", "packagedRendererOrigin"]) {
+for (const value of ["MANGOO_SERVE_WEB", "packagedRendererOrigin"]) {
   if (!session.includes(value)) {
     fail(`core session missing packaged renderer origin contract: ${value}`);
   }
 }
 
-for (const value of ["contextBridge", "coreUrl", "sessionToken", "notifyShellReady", 'ipcRenderer.invoke("megle:shell-ready")']) {
+for (const value of ["contextBridge", "coreUrl", "sessionToken", "notifyShellReady", 'ipcRenderer.invoke("mangoo:shell-ready")']) {
   if (!preload.includes(value)) {
     fail(`preload bridge missing ${value}`);
   }
@@ -175,7 +175,7 @@ for (const value of ["contextBridge", "coreUrl", "sessionToken", "notifyShellRea
 
 for (const value of [
   "notifySecondaryWindowReady",
-  'ipcRenderer.invoke("megle:secondary-window-ready", role)'
+  'ipcRenderer.invoke("mangoo:secondary-window-ready", role)'
 ]) {
   if (!preload.includes(value)) {
     fail(`preload bridge missing secondary renderer-ready contract: ${value}`);
@@ -185,8 +185,8 @@ for (const value of [
 for (const value of [
   "openPluginsWindow",
   "closePluginsWindow",
-  'ipcRenderer.invoke("megle:open-plugins-window")',
-  'ipcRenderer.invoke("megle:close-plugins-window")'
+  'ipcRenderer.invoke("mangoo:open-plugins-window")',
+  'ipcRenderer.invoke("mangoo:close-plugins-window")'
 ]) {
   if (!preload.includes(value)) {
     fail(`preload bridge missing Plugins secondary-window contract: ${value}`);
@@ -202,11 +202,11 @@ for (const value of [
   'route: "#/settings"',
   'route: "#/plugins"',
   'route: "#/notifications"',
-  'ipcMain.handle("megle:open-plugins-window"',
-  'ipcMain.handle("megle:close-plugins-window"',
+  'ipcMain.handle("mangoo:open-plugins-window"',
+  'ipcMain.handle("mangoo:close-plugins-window"',
   'ipcMain.handle(NOTIFICATION_IPC_CHANNELS.openWindow',
   'ipcMain.handle(NOTIFICATION_IPC_CHANNELS.closeWindow',
-  'ipcMain.handle("megle:secondary-window-ready"',
+  'ipcMain.handle("mangoo:secondary-window-ready"',
   "openSecondaryWindow",
   "closeSecondaryWindow",
   "closeAllSecondaryWindows"
@@ -250,7 +250,7 @@ if (!openSecondaryWindowBody || !createSecondaryWindowBody || !focusSecondaryWin
     "SECONDARY_WINDOW_READY_TIMEOUT_MS",
     'window.once("ready-to-show"',
     "revealSecondaryWindowWhenReady(role, window)",
-    "--megle-window=${role}",
+    "--mangoo-window=${role}",
     "config.route"
   ]) {
     if (!createSecondaryWindowBody.includes(value)) {
@@ -390,7 +390,7 @@ if (!preload.includes("notifications: notificationsBridge") ||
     !webDesktopBridge.includes("notifications?: DesktopNotificationsBridge")) {
   fail("preload and Web bridge must expose one nested notifications surface");
 }
-if (!webDesktopBridge.includes('from "@megle/notification-contract"') ||
+if (!webDesktopBridge.includes('from "@mangoo/notification-contract"') ||
     !notificationContract.includes("interface NotificationIpcBridge") ||
     notificationContract.includes("onLogs")) {
   fail("Desktop and Web must share the tokenized type-only notification IPC contract");
@@ -434,24 +434,34 @@ for (const value of [
 for (const value of [
   "canAccessDesktopIpc",
   "PRIVILEGED_WINDOW_ROLES",
-  '"megle:pick-new-library-path"',
-  '"megle:shell-open-path"',
-  '"megle:open-external-authorization-url"'
+  '"mangoo:pick-new-library-path"',
+  '"mangoo:shell-open-path"',
+  '"mangoo:open-plugin-external-link"'
 ]) {
   if (!desktopIpcPermissions.includes(value)) {
     fail(`desktop sender-role allowlist missing ${value}`);
   }
 }
 for (const channel of [
-  "megle:retry-library-load",
-  "megle:pick-new-library-path",
-  "megle:shell-reveal-path",
-  "megle:shell-open-path",
-  "megle:open-external-authorization-url"
+  "mangoo:retry-library-load",
+  "mangoo:pick-new-library-path",
+  "mangoo:shell-reveal-path",
+  "mangoo:shell-open-path",
+  "mangoo:open-plugin-external-link"
 ]) {
   if (!main.includes(`requireDesktopIpcAccess(event, "${channel}")`)) {
     fail(`desktop Main must authorize the real sender before ${channel}`);
   }
+}
+const pluginExternalLink = read("apps/desktop/src/plugin-external-link.ts");
+for (const value of ["parsePluginExternalLinkInput", "client.resolvePluginExternalLink", "sessionToken: session.sessionToken", "onAuthorizationOpened", "!app.isPackaged"]) {
+  if (!main.includes(value)) fail(`Desktop plugin external-link Host authority missing ${value}`);
+}
+for (const value of ["Object.keys(record).length !== 3", "link.id !== request.id", "link.kind !== request.kind", "link.expiresAt <= Date.now()", "isSafePluginExternalUrl", "options.isCurrent"]) {
+  if (!pluginExternalLink.includes(value)) fail(`Desktop exact plugin external-link boundary missing ${value}`);
+}
+for (const source of [main, preload, desktopIpcPermissions]) {
+  if (/mangoo:open-external-authorization-url|mangoo:open-entra-app-registration-page/.test(source)) fail("Desktop must not expose retired raw authorization or vendor-specific help IPC");
 }
 for (const value of [
   "await options.quiesceNotifications()",
@@ -494,7 +504,7 @@ for (const value of [
   }
 }
 for (const value of [
-  'ipcMain.handle("megle:secondary-window-ready", async (event, role: unknown)',
+  'ipcMain.handle("mangoo:secondary-window-ready", async (event, role: unknown)',
   "isSecondaryWindowRole(role)",
   "windowForIpcEvent(event)",
   "secondaryWindows[role] !== window",
@@ -614,6 +624,9 @@ for (const script of ['"typecheck"', '"test"']) {
 if (desktopPackage.includes("vite --host")) {
   fail("desktop package dev script must not start Vite directly; use root dev runner");
 }
+if (!JSON.parse(desktopPackage).scripts.prebuild.includes("node ../../tools/build/generate-desktop-icon.mjs")) {
+  fail("desktop prebuild must generate its development and packaged icons");
+}
 if (!rootPackage.includes('"check:desktop"')) {
   fail("root package missing check:desktop script");
 }
@@ -621,7 +634,7 @@ if (!rootPackage.includes('"dev"')) {
   fail("root package missing dev script");
 }
 
-for (const value of ["@megle/web", "@megle/desktop", "MEGLE_WEB_URL", "MEGLE_HOST_DB_PATH", "MEGLE_LIBRARIES_DIR", "electron"]) {
+for (const value of ['"apps", "web"', '"vite", "bin", "vite.js"', "@mangoo/desktop", "MANGOO_WEB_URL", "MANGOO_HOST_DB_PATH", "MANGOO_LIBRARIES_DIR", "electron", "resolveWebDevUrl", "waitForMangooWebServer", "shell: false"]) {
   if (!devRunner.includes(value)) {
     fail(`dev runner missing ${value}`);
   }
@@ -631,18 +644,18 @@ for (const value of ["--port", "5173", "--strictPort"]) {
     fail(`dev runner must start Vite with explicit ${value}`);
   }
 }
-for (const value of ["MEGLE_CORE_EXTERNAL", "findCargoCommand", "cargo", "build", "-p", "megle-core"]) {
+for (const value of ["MANGOO_CORE_EXTERNAL", "findCargoCommand", "cargo", "build", "-p", "mangoo-core"]) {
   if (!devRunner.includes(value)) {
     fail(`dev runner must build internal Core before Electron startup: ${value}`);
   }
 }
-if (!/run\(\s*findCargoCommand\(\)\s*,\s*\[\s*"build"\s*,\s*"-p"\s*,\s*"megle-core"\s*\]\s*\)/.test(devRunner)) {
-  fail("dev runner must use cargo build -p megle-core instead of leaving Core build to Electron startup");
+if (!/run\(\s*findCargoCommand\(\)\s*,\s*\[\s*"build"\s*,\s*"-p"\s*,\s*"mangoo-core"\s*\]\s*\)/.test(devRunner)) {
+  fail("dev runner must use cargo build -p mangoo-core instead of leaving Core build to Electron startup");
 }
 if (!/build-bundled-plugins\.mjs"\s*,\s*"--release-profile"/.test(prodRunner)) {
   fail("local production runner must build optimized Providers without invoking formal release credential validation");
 }
-for (const forbidden of ["ensureMeglePreview", "vite preview", "electron.cmd", "MEGLE_WEB_URL: previewUrl"]) {
+for (const forbidden of ["ensureMangooPreview", "vite preview", "electron.cmd", "MANGOO_WEB_URL: previewUrl"]) {
   if (prodRunner.includes(forbidden)) {
     fail(`production runner must not retain preview/dev runtime dependency: ${forbidden}`);
   }
@@ -652,12 +665,12 @@ for (const retiredPreviewPath of ["tools/dev/prod-preview.mjs", "tools/dev/prod-
     fail(`retired production preview helper must be removed: ${retiredPreviewPath}`);
   }
 }
-for (const value of ["import.meta.dirname", "desktop-release", "win-unpacked", "Megle.exe", "detached: true", "desktop.unref()", "shell: false", "missingOutputs()", "desktop package is incomplete"]) {
+for (const value of ["import.meta.dirname", "desktop-release", "win-unpacked", "Mangoo.exe", "detached: true", "desktop.unref()", "shell: false", "missingOutputs()", "desktop package is incomplete"]) {
   if (!prodRunner.includes(value)) {
     fail(`production runner missing packaged executable launch contract: ${value}`);
   }
 }
-for (const value of ["electron-builder", "Platform.WINDOWS", 'createTarget(["dir"])', "electronDist", "extraResources", "megle-core.exe", "core/bundled-plugins", "megle-fake-provider.exe", "megle-onedrive-provider.exe", "apps", "web", "dist", "icon.ico"]) {
+for (const value of ["electron-builder", "Platform.WINDOWS", 'createTarget(["dir"])', "electronDist", "extraResources", "mangoo-core.exe", "core/bundled-plugins", "readInventory", "inventory.plugins.flatMap", "renderTrust", "apps", "web", "dist", "icon.ico"]) {
   if (!packageDesktop.includes(value)) {
     fail(`desktop packager missing ${value}`);
   }
@@ -667,24 +680,37 @@ for (const value of ["favicon.svg", "icon.png", "icon.ico", "sharp"]) {
     fail(`desktop icon generator missing ${value}`);
   }
 }
-for (const value of ["MEGLE_APP_USER_MODEL_ID", "MEGLE_CORE_BINARY", "MEGLE_SERVE_WEB", "MEGLE_WEB_DIR", "MEGLE_PARENT_PID", "packagedApplicationIdentity", "packagedWindowIconPath", "mainWindowSkipsTaskbarDuringBootstrap", "rendererUrlForSession", "withDefaultHostStorage"]) {
+for (const value of ["MANGOO_APP_USER_MODEL_ID", "MANGOO_CORE_BINARY", "MANGOO_SERVE_WEB", "MANGOO_WEB_DIR", "MANGOO_PARENT_PID", "applicationIdentity", "windowIconPath", "mainWindowSkipsTaskbarDuringBootstrap", "rendererUrlForSession", "withDefaultHostStorage"]) {
   if (!productRuntime.includes(value)) {
     fail(`packaged desktop runtime missing ${value}`);
   }
 }
-for (const value of ["MEGLE_PARENT_PID", "wait_for_windows_parent_exit", "OpenProcess", "SYNCHRONIZE_ACCESS", "WaitForSingleObject"]) {
+for (const value of ["MANGOO_PARENT_PID", "wait_for_windows_parent_exit", "OpenProcess", "SYNCHRONIZE_ACCESS", "WaitForSingleObject"]) {
   if (!coreMain.includes(value)) {
     fail(`Core parent-process watchdog missing ${value}`);
   }
 }
-for (const value of ["isPackagedWindowsGuiProcess", "megle.exe", "process.stdout?.isTTY", "desktopConsole"]) {
+for (const value of ["isPackagedWindowsGuiProcess", "mangoo.exe", "process.stdout?.isTTY", "desktopConsole"]) {
   if (!desktopLogger.includes(value)) {
     fail(`desktop logger missing packaged no-console guard: ${value}`);
   }
 }
-for (const value of ["configurePackagedRuntime", "app.setName", "app.setAppUserModelId", "app.requestSingleInstanceLock", "packagedWindowIconPath", "mainWindowSkipsTaskbarDuringBootstrap", "rendererUrlForSession"]) {
+for (const value of ["configurePackagedRuntime", "app.setName", "app.setAppUserModelId", "app.requestSingleInstanceLock", "windowIconPath", "mainWindowSkipsTaskbarDuringBootstrap", "rendererUrlForSession"]) {
   if (!main.includes(value)) {
     fail(`desktop main missing packaged application identity/runtime contract: ${value}`);
+  }
+}
+if ((main.match(/\.\.\.\(windowIcon \? \{ icon: windowIcon \} : \{\}\)/g) ?? []).length !== 2) {
+  fail("main and secondary BrowserWindows must omit the icon option when the development icon is absent");
+}
+for (const [source, label] of [[devRunner, "dev runner"], [prodRunner, "prod runner"]]) {
+  for (const marker of [
+    'const hostDir = path.join(dataDir, "mangoo", "host")',
+    'process.env.MANGOO_HOST_DB_PATH ?? path.join(hostDir, "host.sqlite")',
+    'process.env.MANGOO_LIBRARIES_DIR ?? path.join(hostDir, "libraries")',
+    '--user-data-dir=${path.resolve(process.env.MANGOO_ELECTRON_USER_DATA_DIR)}'
+  ]) {
+    if (!source.includes(marker)) fail(`${label} must preserve branded storage and explicit overrides: ${marker}`);
   }
 }
 for (const value of ["electron-builder", "esbuild", "sharp"]) {
@@ -692,20 +718,24 @@ for (const value of ["electron-builder", "esbuild", "sharp"]) {
     fail(`root package missing desktop packaging dependency ${value}`);
   }
 }
-if (!rootPackage.includes('"build:desktop-package"') || !rootPackage.includes("build-bundled-plugins.mjs --release-profile") || !rootPackage.includes("cargo build --release -p megle-core")) {
+if (!rootPackage.includes('"build:desktop-package"') || !rootPackage.includes("build-bundled-plugins.mjs --release-profile") || !rootPackage.includes("cargo build --release -p mangoo-core")) {
   fail("build:desktop-package must build release Core, Providers, Web, and Desktop before packaging");
 }
 for (const value of [
   "crates/fake-provider/src",
-  "crates/onedrive-provider/src",
   "bundled-plugins",
   "generated_trust.rs",
-  "com.megle.fake-sync",
-  "com.megle.onedrive"
+  "externalArtifacts",
+  "assertSelectedInventory",
+  "readInventory"
 ]) {
   if (!prodRunner.includes(value)) {
     fail(`production runner cache/output validation missing ${value}`);
   }
+}
+
+for (const [name, source] of [["production runner", prodRunner], ["desktop packager", packageDesktop]]) {
+  if (["mangoo-onedrive-provider", "com.mangoo.onedrive", "crates/onedrive-provider"].some((marker) => source.includes(marker))) fail(`${name} must use the explicit generic plugin inventory`);
 }
 
 // Core is started from exactly two call sites: the initial cold-start/retry
@@ -725,17 +755,17 @@ const lifecycleEnqueueCalls = [...main.matchAll(/coreLifecycleQueue\.enqueue\(/g
 if (lifecycleEnqueueCalls < 2) {
   fail("desktop Host startup/retry lifecycle operations must enter the shared Core lifecycle queue");
 }
-for (const forbidden of ["libraries.json", "sessionForDbPath(", "restartCoreForLibrary(", 'ipcMain.handle("megle:open-library"', 'ipcMain.handle("megle:pick-library-file"']) {
+for (const forbidden of ["libraries.json", "sessionForDbPath(", "restartCoreForLibrary(", 'ipcMain.handle("mangoo:open-library"', 'ipcMain.handle("mangoo:pick-library-file"']) {
   if (executableMain.includes(forbidden)) fail(`desktop Host must not retain legacy Library product path: ${forbidden}`);
 }
 for (const [source, label] of [[processFile, "desktop Core process"], [devRunner, "dev runner"], [prodRunner, "prod runner"]]) {
-  if (source.includes("MEGLE_DB_PATH")) fail(`${label} must not retain the retired single-Library MEGLE_DB_PATH input`);
+  if (source.includes("MANGOO_DB_PATH")) fail(`${label} must not retain the retired single-Library MANGOO_DB_PATH input`);
 }
 for (const [source, label] of migratedHostHarnesses) {
-  if (source.includes("MEGLE_DB_PATH")) fail(`${label} must not retain the retired single-Library MEGLE_DB_PATH input`);
+  if (source.includes("MANGOO_DB_PATH")) fail(`${label} must not retain the retired single-Library MANGOO_DB_PATH input`);
   if (!source.includes("managedLibraryHostEnv")) fail(`${label} must launch through the shared managed Library Host environment`);
 }
-for (const marker of ["MEGLE_HOST_DB_PATH", "MEGLE_LIBRARIES_DIR", "createAndActivateManagedLibrary", "addExistingMediaRoot"]) {
+for (const marker of ["MANGOO_HOST_DB_PATH", "MANGOO_LIBRARIES_DIR", "createAndActivateManagedLibrary", "addExistingMediaRoot"]) {
   if (!managedLibraryHarness.includes(marker)) fail(`managed Library harness missing ${marker}`);
 }
 for (const value of ["publish(phase", "snapshot()", "this.current = phase"]) {
@@ -744,8 +774,8 @@ for (const value of ["publish(phase", "snapshot()", "this.current = phase"]) {
   }
 }
 for (const value of [
-  'ipcMain.handle("megle:get-library-load-phase"',
-  'ipcMain.handle("megle:retry-library-load"',
+  'ipcMain.handle("mangoo:get-library-load-phase"',
+  'ipcMain.handle("mangoo:retry-library-load"',
   "await ensureCoreReady()",
   "attachNotificationServiceForSession(currentSession, generation, signal)"
 ]) {
@@ -822,7 +852,7 @@ if (!startCoreSessionBody) {
   if (!startCoreSessionBody.includes("AUTO_CORE_STARTUP_MAX_ATTEMPTS")) {
     fail("desktop main must bound auto Core startup retries");
   }
-  if (!startCoreSessionBody.includes("[megle] Core startup attempt")) {
+  if (!startCoreSessionBody.includes("[mangoo] Core startup attempt")) {
     fail("desktop main must log Core startup retry/failure attempts clearly");
   }
   if (startCoreSessionBody.includes("coreSession = await createCoreSession")) {
@@ -867,7 +897,7 @@ const shouldRetryBody = functionBody(main, "function shouldRetryAutoCoreStartup(
 if (!shouldRetryBody) {
   fail("desktop main must expose a helper for auto Core startup retry eligibility");
 } else {
-  for (const value of ["MEGLE_CORE_EXTERNAL", "MEGLE_CORE_ADDR", "MEGLE_CORE_URL"]) {
+  for (const value of ["MANGOO_CORE_EXTERNAL", "MANGOO_CORE_ADDR", "MANGOO_CORE_URL"]) {
     if (!shouldRetryBody.includes(value)) {
       fail(`auto Core startup retry eligibility must preserve explicit/external setting: ${value}`);
     }
@@ -889,7 +919,7 @@ if (!createWindowBody) {
   }
 }
 
-const shellReadyHandlerBody = functionBody(main, 'ipcMain.handle("megle:shell-ready", async (event) =>');
+const shellReadyHandlerBody = functionBody(main, 'ipcMain.handle("mangoo:shell-ready", async (event) =>');
 if (!shellReadyHandlerBody) {
   fail("desktop main must handle the shell-ready IPC handshake");
 } else {

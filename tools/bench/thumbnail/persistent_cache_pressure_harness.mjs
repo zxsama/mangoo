@@ -13,10 +13,10 @@ const sweepSummaryPath = path.join(
   "artists-million-desktop-sweep-summary.json"
 );
 const resultsDir = path.join(root, "tools", "bench", "thumbnail", "results");
-const defaultArtistsRoot = process.env.MEGLE_ARTISTS_SWEEP_ROOT ?? "Y:\\Repository\\Billfish\\Artists";
-const defaultOperationCount = process.env.MEGLE_ARTISTS_SWEEP_OPERATION_COUNT ?? "500";
-const defaultWebUrl = process.env.MEGLE_ARTISTS_SWEEP_WEB_URL ?? "http://127.0.0.1:5181";
-const defaultDebugPort = Number(process.env.MEGLE_ARTISTS_SWEEP_DEBUG_PORT ?? "9251");
+const defaultArtistsRoot = process.env.MANGOO_ARTISTS_SWEEP_ROOT ?? "Y:\\Repository\\Billfish\\Artists";
+const defaultOperationCount = process.env.MANGOO_ARTISTS_SWEEP_OPERATION_COUNT ?? "500";
+const defaultWebUrl = process.env.MANGOO_ARTISTS_SWEEP_WEB_URL ?? "http://127.0.0.1:5181";
+const defaultDebugPort = Number(process.env.MANGOO_ARTISTS_SWEEP_DEBUG_PORT ?? "9251");
 const scenarioDebugPortBase = defaultDebugPort + 10;
 const runId = new Date().toISOString().replace(/[:.]/g, "-");
 const sharedHotCacheDataDir = path.join(
@@ -36,29 +36,29 @@ const scenarios = [
   {
     name: "cold-cache",
     env: {
-      MEGLE_ARTISTS_SWEEP_DATA_DIR: sharedHotCacheDataDir,
-      MEGLE_ARTISTS_SWEEP_RESET_DB: "1",
-      MEGLE_ARTISTS_SWEEP_THUMBNAIL_CACHE_MODE: "clear",
-      MEGLE_ARTISTS_SWEEP_OPERATION_COUNT: defaultOperationCount
+      MANGOO_ARTISTS_SWEEP_DATA_DIR: sharedHotCacheDataDir,
+      MANGOO_ARTISTS_SWEEP_RESET_DB: "1",
+      MANGOO_ARTISTS_SWEEP_THUMBNAIL_CACHE_MODE: "clear",
+      MANGOO_ARTISTS_SWEEP_OPERATION_COUNT: defaultOperationCount
     }
   },
   {
     name: "warm-seen-thumbnails",
     env: {
-      MEGLE_ARTISTS_SWEEP_DATA_DIR: sharedHotCacheDataDir,
-      MEGLE_ARTISTS_SWEEP_RESET_DB: "0",
-      MEGLE_ARTISTS_SWEEP_THUMBNAIL_CACHE_MODE: "warmSeen",
-      MEGLE_ARTISTS_SWEEP_WARM_FILE_IDS_PATH: warmSeenFileIdsPath,
-      MEGLE_ARTISTS_SWEEP_OPERATION_COUNT: "0"
+      MANGOO_ARTISTS_SWEEP_DATA_DIR: sharedHotCacheDataDir,
+      MANGOO_ARTISTS_SWEEP_RESET_DB: "0",
+      MANGOO_ARTISTS_SWEEP_THUMBNAIL_CACHE_MODE: "warmSeen",
+      MANGOO_ARTISTS_SWEEP_WARM_FILE_IDS_PATH: warmSeenFileIdsPath,
+      MANGOO_ARTISTS_SWEEP_OPERATION_COUNT: "0"
     }
   },
   {
     name: "hot-cache",
     env: {
-      MEGLE_ARTISTS_SWEEP_DATA_DIR: sharedHotCacheDataDir,
-      MEGLE_ARTISTS_SWEEP_RESET_DB: "0",
-      MEGLE_ARTISTS_SWEEP_THUMBNAIL_CACHE_MODE: "none",
-      MEGLE_ARTISTS_SWEEP_OPERATION_COUNT: defaultOperationCount
+      MANGOO_ARTISTS_SWEEP_DATA_DIR: sharedHotCacheDataDir,
+      MANGOO_ARTISTS_SWEEP_RESET_DB: "0",
+      MANGOO_ARTISTS_SWEEP_THUMBNAIL_CACHE_MODE: "none",
+      MANGOO_ARTISTS_SWEEP_OPERATION_COUNT: defaultOperationCount
     }
   }
 ];
@@ -66,9 +66,9 @@ const scenarios = [
 async function runScenario(scenario, index) {
   const env = {
     ...process.env,
-    MEGLE_ARTISTS_SWEEP_ROOT: defaultArtistsRoot,
-    MEGLE_ARTISTS_SWEEP_WEB_URL: defaultWebUrl,
-    MEGLE_ARTISTS_SWEEP_DEBUG_PORT: String(scenarioDebugPortBase + index),
+    MANGOO_ARTISTS_SWEEP_ROOT: defaultArtistsRoot,
+    MANGOO_ARTISTS_SWEEP_WEB_URL: defaultWebUrl,
+    MANGOO_ARTISTS_SWEEP_DEBUG_PORT: String(scenarioDebugPortBase + index),
     ...scenario.env
   };
   await new Promise((resolve, reject) => {

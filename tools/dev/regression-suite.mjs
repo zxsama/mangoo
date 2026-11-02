@@ -8,7 +8,7 @@
 // Usage:
 //   1. Launch the app with the CDP port open (a warm, already-scanned DB is best
 //      so thumbnails exist to load):
-//        MEGLE_HOST_DB_PATH=... MEGLE_LIBRARIES_DIR=... MEGLE_REMOTE_DEBUG=1 npm run dev
+//        MANGOO_HOST_DB_PATH=... MANGOO_LIBRARIES_DIR=... MANGOO_REMOTE_DEBUG=1 npm run dev
 //   2. Run this suite:  node tools/dev/regression-suite.mjs
 //      (optional: REG_PORT=9500 to override the CDP port)
 //
@@ -30,7 +30,7 @@ async function main() {
   const wsUrl = await resolvePageWsUrl(PORT);
   if (!wsUrl) {
     console.error(
-      `No real page target on CDP port ${PORT}. Launch the app first: MEGLE_REMOTE_DEBUG=1 npm run dev`
+      `No real page target on CDP port ${PORT}. Launch the app first: MANGOO_REMOTE_DEBUG=1 npm run dev`
     );
     process.exit(2);
   }
@@ -67,7 +67,7 @@ async function main() {
         scrollH: Math.round((g&&g.scrollHeight)||0)
       };
     })()`);
-  const scheduler = () => evalJson(`(window.__megleCoreScheduler?window.__megleCoreScheduler():{active:-1,queued:-1,max:-1})`);
+  const scheduler = () => evalJson(`(window.__mangooCoreScheduler?window.__mangooCoreScheduler():{active:-1,queued:-1,max:-1})`);
 
   try {
     // ---- 1. App loads: tree + a media wall at the root ------------------------

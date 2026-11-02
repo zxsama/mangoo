@@ -5,7 +5,7 @@ Status: Design (brainstorming) — pending implementation plan
 
 ## 1. Problem & principle
 
-Two problems in Megle share one root principle — **decode once, into a
+Two problems in Mangoo share one root principle — **decode once, into a
 paint-ready form, ahead of time** — plus a shared need for pluggable format
 support:
 

@@ -18,6 +18,7 @@ function read(relativePath) {
 const openApi = read("contracts/core-api/openapi.yaml");
 const routesRs = read("crates/core/src/api/routes.rs");
 const apiModRs = read("crates/core/src/api/mod.rs");
+const playbackRs = read("crates/core/src/api/playback.rs");
 const dbModRs = read("crates/core/src/db/mod.rs");
 const notificationOutboxRs = read("crates/core/src/db/notification_outbox.rs");
 const tasksRs = read("crates/core/src/tasks.rs");
@@ -69,7 +70,7 @@ for (const rustPath of rustContractPaths) {
 }
 
 const axumRoutes = new Set(
-  [...routesRs.matchAll(/\.route\(\s*"([^"]+)"/g)].map((match) => match[1])
+  [...`${routesRs}\n${playbackRs}`.matchAll(/\.route\(\s*"([^"]+)"/g)].map((match) => match[1])
 );
 
 const expectedAxumRoutes = [
@@ -84,6 +85,10 @@ const expectedAxumRoutes = [
   "/api/media/:file_id/thumbnail",
   "/api/thumbnails/cache/failures",
   "/api/media/:file_id/preview",
+  "/api/media/:file_id/playback-sessions",
+  "/api/playback-sessions/:session_id",
+  "/api/playback-sessions/:session_id/renew",
+  "/api/playback/:capability",
   "/api/media/:file_id/metadata",
   "/api/media/:file_id/tags",
   "/api/media/:file_id/tags/:tag_id",
@@ -189,30 +194,30 @@ if (!mainRs.includes("axum::serve")) {
   fail("main.rs must start the Axum server");
 }
 
-if (!openApi.includes("name: X-Megle-Session")) {
-  fail("OpenAPI must keep X-Megle-Session header security");
+if (!openApi.includes("name: X-Mangoo-Session")) {
+  fail("OpenAPI must keep X-Mangoo-Session header security");
 }
-if (!mainRs.includes("MEGLE_SESSION_TOKEN")) {
-  fail("main.rs must read MEGLE_SESSION_TOKEN");
+if (!mainRs.includes("MANGOO_SESSION_TOKEN")) {
+  fail("main.rs must read MANGOO_SESSION_TOKEN");
 }
-if (!mainRs.includes("MEGLE_ALLOWED_ORIGIN")) {
-  fail("main.rs must read MEGLE_ALLOWED_ORIGIN for dev CORS");
+if (!mainRs.includes("MANGOO_ALLOWED_ORIGIN")) {
+  fail("main.rs must read MANGOO_ALLOWED_ORIGIN for dev CORS");
 }
-if (!mainRs.includes("MEGLE_SERVE_WEB")) {
-  fail("main.rs must read MEGLE_SERVE_WEB to opt into static UI serving");
+if (!mainRs.includes("MANGOO_SERVE_WEB")) {
+  fail("main.rs must read MANGOO_SERVE_WEB to opt into static UI serving");
 }
-if (!mainRs.includes("MEGLE_WEB_DIR")) {
-  fail("main.rs must read MEGLE_WEB_DIR to locate the built web UI");
+if (!mainRs.includes("MANGOO_WEB_DIR")) {
+  fail("main.rs must read MANGOO_WEB_DIR to locate the built web UI");
 }
-if (!mainRs.includes("MEGLE_BASIC_AUTH")) {
-  fail("main.rs must read MEGLE_BASIC_AUTH to enable HTTP Basic auth");
+if (!mainRs.includes("MANGOO_BASIC_AUTH")) {
+  fail("main.rs must read MANGOO_BASIC_AUTH to enable HTTP Basic auth");
 }
 for (const value of ["pub web_dir", "pub basic_auth", "BasicAuthCredentials", "ServeDir", "ServeFile", "content-security-policy"]) {
   if (!apiModRs.includes(value)) {
     fail(`Core API static-serve / basic-auth wiring missing ${value}`);
   }
 }
-for (const value of ["X-Megle-Session", "tower_http::cors", "CorsLayer", "allow_headers"]) {
+for (const value of ["X-Mangoo-Session", "tower_http::cors", "CorsLayer", "allow_headers"]) {
   if (!apiModRs.includes(value)) {
     fail(`Core API auth/CORS wiring missing ${value}`);
   }
@@ -627,7 +632,7 @@ for (const value of ["get_thumb_blob", "target", "db_blob"]) {
   }
 }
 const thumbnailBlobOperation = operationBlock("/media/{fileId}/thumbnail/blob", "get");
-for (const value of ["target", "image/webp", "x-megle-served-by", "db_blob"]) {
+for (const value of ["target", "image/webp", "x-mangoo-served-by", "db_blob"]) {
   if (!thumbnailBlobOperation.includes(value)) {
     fail(`OpenAPI GET /media/{fileId}/thumbnail/blob missing ${value}`);
   }

@@ -11,13 +11,13 @@ display session and is not marked passed.
 - Plan range: `28ade3c08157c14346179839f759b8f6965019ce..e2cbae835b3f551fe9ce735afea55ff665aff9af`.
 - Review-fix round 4 source range: `22a720496aebd504941f8ac64443406c1cb2a30a..4d2636b41dbf024c2982d809b6c7e4d8470dddfc`.
 - Review-fix round 4 exact visual source: `4d2636b41dbf024c2982d809b6c7e4d8470dddfc` (tree `44ec7deaee8fd67b70893bc43f835ee04d221ba9`).
-- Archive: `D:\Megle\.tmp\task8-exact-4d2636b-20260809-round4-final.tar`.
+- Archive: `D:\Mangoo\.tmp\task8-exact-4d2636b-20260809-round4-final.tar`.
 - Archive SHA-256: `21957B33D7718FB2DD365903486B06FBF1D27E4A61819C8F419178E963185536`.
-- Extraction: `D:\Megle\.tmp\task8-exact-4d2636b-20260809-round4-final`; ordinary `git archive` directory, no `.git`, worktree, junction, symlink, or reparse dependency.
+- Extraction: `D:\Mangoo\.tmp\task8-exact-4d2636b-20260809-round4-final`; ordinary `git archive` directory, no `.git`, worktree, junction, symlink, or reparse dependency.
 - Review-fix round 5 source range: `fbc604fe488bbcd413184f4417b8f698c9832ba8..e316c183e2f3cc505b17613d7ae093fdcd1ff506`.
 - Latest exact visual source: `e316c183e2f3cc505b17613d7ae093fdcd1ff506` (tree `67f1b74d5b519323752f96b6ff29b74b8c359757`).
-- Latest archive: `D:\Megle\.tmp\task8-exact-e316c18-20260809-round5-final.tar`; SHA-256 `916446077BEB984E2D9C8B0DA2A69FE00717C27BC278031A369A8589218AADAB`.
-- Latest extraction: `D:\Megle\.tmp\task8-exact-e316c18-20260809-round5-final`; ordinary directory, no `.git`, worktree, junction, symlink, or reparse point.
+- Latest archive: `D:\Mangoo\.tmp\task8-exact-e316c18-20260809-round5-final.tar`; SHA-256 `916446077BEB984E2D9C8B0DA2A69FE00717C27BC278031A369A8589218AADAB`.
+- Latest extraction: `D:\Mangoo\.tmp\task8-exact-e316c18-20260809-round5-final`; ordinary directory, no `.git`, worktree, junction, symlink, or reparse point.
 - Only `node_modules\.bin\electron.cmd` was added as an ordinary forwarding file, targeting the already-installed Electron executable. No install, reset, checkout, cleanup, or evidence deletion was used. Each visual run built and launched the archive-local Core binary rather than dirty live-tree output.
 
 The live-worktree guard returned to the protected 17 modified plus 12 untracked
@@ -28,14 +28,14 @@ and no Settings/Plugins production diff.
 ## Round 4 exact automated results
 
 Evidence directory:
-`D:\Megle\.tmp\task8-exact-4d2636b-20260809-round4-final\.tmp\visual-check\logs\task8-round4-4d2636b`.
+`D:\Mangoo\.tmp\task8-exact-4d2636b-20260809-round4-final\.tmp\visual-check\logs\task8-round4-4d2636b`.
 
 | Command | Exit | Result |
 | --- | ---: | --- |
 | `node --test .tmp\visual-check\task8-harness-reproducibility.test.mjs` | 0 | 14/14; actual late-output finalization, phase-aware network classification, Cargo diagnostics, controlled media, raw identity, DPI/fallback, product-request lifecycle, and notification handshake coverage |
-| `$env:MEGLE_VISUAL_NOTIFICATIONS_ONLY='1'; node .tmp\visual-check\desktop-ui-regression.mjs` | 0 | run `megle-visual-msl55wkh-22300`; scenario/startup/console/network/hard failures 0; Cargo diagnostics 0 |
-| `$env:MEGLE_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-regression.mjs` | 0 | run `megle-visual-msl56z4d-49812`; `required-os-composited: passed`; all five failure counts 0; actual child/stream finalization complete |
-| `node .tmp\visual-check\desktop-ui-exhaustive-interaction-sweep.mjs` | 0 | run `megle-exhaustive-msl595vd-68720`; 18/18; all five failure counts 0; `networkProblems=[]`, `networkFailures=[]` |
+| `$env:MANGOO_VISUAL_NOTIFICATIONS_ONLY='1'; node .tmp\visual-check\desktop-ui-regression.mjs` | 0 | run `mangoo-visual-msl55wkh-22300`; scenario/startup/console/network/hard failures 0; Cargo diagnostics 0 |
+| `$env:MANGOO_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-regression.mjs` | 0 | run `mangoo-visual-msl56z4d-49812`; `required-os-composited: passed`; all five failure counts 0; actual child/stream finalization complete |
+| `node .tmp\visual-check\desktop-ui-exhaustive-interaction-sweep.mjs` | 0 | run `mangoo-exhaustive-msl595vd-68720`; 18/18; all five failure counts 0; `networkProblems=[]`, `networkFailures=[]` |
 | `npm test` in the exact archive | 0 | every structure/API/client/notification/desktop/web/UI/schema/Rust gate passed |
 | `git diff --check` | 0 | no whitespace errors |
 
@@ -43,15 +43,15 @@ The exact full gate reports core-client 46/46, desktop 222/222, web 372/372,
 and Rust 472 passed, 0 failed, 2 ignored. The notification-contract boundary is
 its alignment check plus TypeScript typecheck, followed by the same alignment
 check as its `test` script; it has no TAP count. The 46/46 count belongs only to
-`@megle/core-client`.
+`@mangoo/core-client`.
 
 ## Round 4 run IDs, summaries, and raw identity
 
 | Run | Copied summary | Raw stdout / stderr |
 | --- | --- | --- |
-| Notification-only `megle-visual-msl55wkh-22300` | `notification-megle-visual-msl55wkh-22300-summary.json` | `desktop-ui-regression-megle-visual-msl55wkh-22300.stdout.log` / `.stderr.log` |
-| Required OS `megle-visual-msl56z4d-49812` | `required-os-megle-visual-msl56z4d-49812-summary.json` | `desktop-ui-regression-megle-visual-msl56z4d-49812.stdout.log` / `.stderr.log` |
-| Exhaustive `megle-exhaustive-msl595vd-68720` | `exhaustive-megle-exhaustive-msl595vd-68720-summary.json` | `desktop-ui-exhaustive-megle-exhaustive-msl595vd-68720.stdout.log` / `.stderr.log` |
+| Notification-only `mangoo-visual-msl55wkh-22300` | `notification-mangoo-visual-msl55wkh-22300-summary.json` | `desktop-ui-regression-mangoo-visual-msl55wkh-22300.stdout.log` / `.stderr.log` |
+| Required OS `mangoo-visual-msl56z4d-49812` | `required-os-mangoo-visual-msl56z4d-49812-summary.json` | `desktop-ui-regression-mangoo-visual-msl56z4d-49812.stdout.log` / `.stderr.log` |
+| Exhaustive `mangoo-exhaustive-msl595vd-68720` | `exhaustive-mangoo-exhaustive-msl595vd-68720-summary.json` | `desktop-ui-exhaustive-mangoo-exhaustive-msl595vd-68720.stdout.log` / `.stderr.log` |
 
 All six raw files exist, every raw filename contains the matching summary
 `run.id`, and no run shares a raw path. Every run reports
@@ -66,7 +66,7 @@ injects warning/error output after 340 ms and proves it reaches final diagnostic
 before the summary is constructed.
 
 The first notification-only archive attempt, run
-`megle-visual-msl4eu8t-55176`, did not reach the app because the initially copied
+`mangoo-visual-msl4eu8t-55176`, did not reach the app because the initially copied
 stock `electron.cmd` referenced the absent archive-local Electron package. The
 tool call reached its timeout after the archive-local Core had built; inspection
 was limited to that run ID and its harness PID, and only PID 55176 was stopped.
@@ -92,15 +92,15 @@ final visual runs above; no unrelated process or prior evidence was touched.
 
 ## Round 4 controlled coverage
 
-- Notification generated, validated, and auto-added 10 media files under `D:\Megle\.tmp\task8-exact-4d2636b-20260809-round4-final\.tmp\visual-check\runtime-media\megle-visual-msl55wkh-22300\outputs`.
-- Exhaustive generated and invoked `D:\Megle\.tmp\task8-exact-4d2636b-20260809-round4-final\.tmp\visual-check\runtime-media\megle-exhaustive-msl595vd-68720\outputs`; `invokedTree` records the archive harness, repository root, child cwd, controlled root, and `http://127.0.0.1:5178/`.
+- Notification generated, validated, and auto-added 10 media files under `D:\Mangoo\.tmp\task8-exact-4d2636b-20260809-round4-final\.tmp\visual-check\runtime-media\mangoo-visual-msl55wkh-22300\outputs`.
+- Exhaustive generated and invoked `D:\Mangoo\.tmp\task8-exact-4d2636b-20260809-round4-final\.tmp\visual-check\runtime-media\mangoo-exhaustive-msl595vd-68720\outputs`; `invokedTree` records the archive harness, repository root, child cwd, controlled root, and `http://127.0.0.1:5178/`.
 - Notification navigation waits for ready state, foreground focus, one explicit `open()`, matching requested/rendered IDs, `open=true`, and a mounted root. Navigation diagnostics contain zero console and network problems.
 - Required production surfaces: 18/18. Appearance controls: 14/14 at min/default/max/restored. Unexpected changed paths and unaffected leakage: 0; media grid and preview canvas remained stable.
 - The Settings range slider exposes exactly one production pointer owner. At screen `(592.6, 593)`, the owner recorded local `(75, 14)`, opacity 1, while the range input did not become a competing owner.
 - Controlled DPR: effective 1.25, 1.5, then 1.0 reset. Reduced motion matched with animation `none`, duration `0s`, and transform `none`. Reduced transparency matched with opaque fill and all effective filters `none`.
 - Production solid fallback uses the same declarations as `@supports not`: popover, nested, context, and modal all had an opaque 0.98 backdrop, no effective blur, 10.39:1 composited contrast, focus, and real CDP Enter activation.
 - The exhaustive phase classifier records `scenario` or `teardown` on raw network problems. Only the exact teardown canceled-abort signature is expected; the focused behavior test proves the same signature in `scenario` remains an unexpected failure. The final sweep had no raw or unexpected network failures.
-- OS capture: `ui-window-backdrop-evidence-megle-visual-msl56z4d-49812.png`; Electron PID 74848, window 1456x928, `maxDelta=169.74`, `bottomMaxDelta=79.21`, `uiSurfaceDelta=205.31`; status `passed`.
+- OS capture: `ui-window-backdrop-evidence-mangoo-visual-msl56z4d-49812.png`; Electron PID 74848, window 1456x928, `maxDelta=169.74`, `bottomMaxDelta=79.21`, `uiSurfaceDelta=205.31`; status `passed`.
 
 ## Round 5 lifecycle closure and exact verification
 
@@ -131,28 +131,28 @@ fetch plus un-aborted active/retired ownership at both hard boundaries. The same
 tests pass on `e316c18`.
 
 Evidence directory:
-`D:\Megle\.tmp\task8-exact-e316c18-20260809-round5-final\.tmp\visual-check\logs\task8-round5-e316c18`.
+`D:\Mangoo\.tmp\task8-exact-e316c18-20260809-round5-final\.tmp\visual-check\logs\task8-round5-e316c18`.
 
 | Command | Exit | Result |
 | --- | ---: | --- |
 | `node --test .tmp\visual-check\task8-harness-reproducibility.test.mjs` | 0 | 14/14 |
-| `$env:MEGLE_VISUAL_NOTIFICATIONS_ONLY='1'; node .tmp\visual-check\desktop-ui-regression.mjs` | 0 | run `megle-visual-msl6mekq-62904`; scenario/startup/console/network/hard arrays 0; Cargo diagnostics 0 |
-| required-OS unchanged harness with native Enter delivered to the exact appearance-fixture popup | 0 | run `megle-visual-msl7058m-42544`; `required-os-composited`; all six failure/diagnostic arrays 0; finalization complete |
-| `$env:MEGLE_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-exhaustive-interaction-sweep.mjs` | 0 | run `megle-exhaustive-msl71zh2-51372`; 18/18; failures and all required arrays 0 |
+| `$env:MANGOO_VISUAL_NOTIFICATIONS_ONLY='1'; node .tmp\visual-check\desktop-ui-regression.mjs` | 0 | run `mangoo-visual-msl6mekq-62904`; scenario/startup/console/network/hard arrays 0; Cargo diagnostics 0 |
+| required-OS unchanged harness with native Enter delivered to the exact appearance-fixture popup | 0 | run `mangoo-visual-msl7058m-42544`; `required-os-composited`; all six failure/diagnostic arrays 0; finalization complete |
+| `$env:MANGOO_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-exhaustive-interaction-sweep.mjs` | 0 | run `mangoo-exhaustive-msl71zh2-51372`; 18/18; failures and all required arrays 0 |
 | exact archive `npm test` | 0 | core-client 51/51; notification boundary green; desktop 222/222; web 372/372; Rust 472 passed, 0 failed, 2 ignored |
 | current dirty-tree `npm test` | 0 | core-client 51/51; desktop 222/222; web 376/376; current WIP Rust 479 passed, 0 failed, 2 ignored |
 
 | Run | Copied summary | Raw stdout / stderr |
 | --- | --- | --- |
-| Notification-only `megle-visual-msl6mekq-62904` | `notification-megle-visual-msl6mekq-62904-summary.json` | `desktop-ui-regression-megle-visual-msl6mekq-62904.stdout.log` / `.stderr.log` |
-| Required OS `megle-visual-msl7058m-42544` | `required-os-megle-visual-msl7058m-42544-summary.json` | `desktop-ui-regression-megle-visual-msl7058m-42544.stdout.log` / `.stderr.log` |
-| Exhaustive `megle-exhaustive-msl71zh2-51372` | `exhaustive-megle-exhaustive-msl71zh2-51372-summary.json` | `desktop-ui-exhaustive-megle-exhaustive-msl71zh2-51372.stdout.log` / `.stderr.log` |
+| Notification-only `mangoo-visual-msl6mekq-62904` | `notification-mangoo-visual-msl6mekq-62904-summary.json` | `desktop-ui-regression-mangoo-visual-msl6mekq-62904.stdout.log` / `.stderr.log` |
+| Required OS `mangoo-visual-msl7058m-42544` | `required-os-mangoo-visual-msl7058m-42544-summary.json` | `desktop-ui-regression-mangoo-visual-msl7058m-42544.stdout.log` / `.stderr.log` |
+| Exhaustive `mangoo-exhaustive-msl71zh2-51372` | `exhaustive-mangoo-exhaustive-msl71zh2-51372-summary.json` | `desktop-ui-exhaustive-mangoo-exhaustive-msl71zh2-51372.stdout.log` / `.stderr.log` |
 
 All six raw paths exist, are unique, and contain their run ID in the filename;
 each stdout also contains its run ID. Notification and required-OS controlled
 roots each contain 10 generated/validated files, and exhaustive records 18
 successful result names with no failure. The required native capture is
-`ui-window-backdrop-evidence-megle-visual-msl7058m-42544.png`; Electron PID
+`ui-window-backdrop-evidence-mangoo-visual-msl7058m-42544.png`; Electron PID
 5912, window 1456x928, `maxDelta=146.58`, `bottomMaxDelta=17.34`, and
 `uiSurfaceDelta=19.73`.
 
@@ -179,7 +179,7 @@ then this verification remains `NEEDS_CONTEXT`.
 
 At each of 100%, 125%, and 150%:
 
-1. Set Scale through Windows Settings > System > Display. Do not edit the registry. Fully exit Megle, then relaunch from `D:\Megle\.tmp\task8-exact-e316c18-20260809-round5-final` with `$env:MEGLE_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-regression.mjs; $code=$LASTEXITCODE; Remove-Item Env:\MEGLE_VISUAL_OS_BACKDROP; exit $code`.
+1. Set Scale through Windows Settings > System > Display. Do not edit the registry. Fully exit Mangoo, then relaunch from `D:\Mangoo\.tmp\task8-exact-e316c18-20260809-round5-final` with `$env:MANGOO_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-regression.mjs; $code=$LASTEXITCODE; Remove-Item Env:\MANGOO_VISUAL_OS_BACKDROP; exit $code`.
 2. Exercise titlebar filter/sort/layout/notification roots; nested library removal; file/folder/root context menus at all four corners; one keyboard-only dialog; compact and full notifications; and the narrow notification-window layout.
 3. Confirm 12 CSS-pixel overlay gutters, readable 32 px controls, no clipped text/action, no one-pixel divider gap, visible focus, correct anchor attachment, and successful close/return behavior.
 4. Record configured scale, Windows effective scale, monitor identifier, resolution, commit, timestamp, run ID, summary and raw paths, screenshot/video paths, pass/fail, and notes for each row.

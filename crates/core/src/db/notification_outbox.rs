@@ -473,7 +473,7 @@ mod tests {
     fn temporary_database_path(label: &str) -> PathBuf {
         let serial = NEXT_TEMP_DATABASE.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "megle-notification-{label}-{}-{}-{serial}.sqlite",
+            "mangoo-notification-{label}-{}-{}-{serial}.sqlite",
             std::process::id(),
             super::super::unix_timestamp_millis()
         ))

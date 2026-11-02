@@ -1,10 +1,10 @@
-# Megle Final Solution
+# Mangoo Final Solution
 
 Updated: 2026-05-16
 
 ## Final Direction
 
-Build Megle as a Windows-first local media browser and manager that indexes existing folders without importing originals into a private library.
+Build Mangoo as a Windows-first local media browser and manager that indexes existing folders without importing originals into a private library.
 
 Final architecture:
 
@@ -28,7 +28,7 @@ This is not a clone of any existing product and does not depend on reverse engin
 - Only index existing directories.
 - Do not copy originals into a managed library.
 - Left folder tree maps real directories.
-- Tags, ratings, notes, favorites live in Megle database.
+- Tags, ratings, notes, favorites live in Mangoo database.
 - Real file rename, move, and delete are allowed.
 - Default delete goes to recycle bin.
 - Plugin system is prepared from the start.
@@ -73,7 +73,7 @@ This architecture prevents those problems by moving all heavy work to a Core Ser
 ## Process Model
 
 ```text
-Megle.exe
+Mangoo.exe
   |
   |-- Electron main
   |     - window lifecycle
@@ -88,7 +88,7 @@ Megle.exe
   |     - metadata panel
   |     - settings/plugins/tasks
   |
-  |-- megle-core.exe
+  |-- mangoo-core.exe
         - HTTP/named pipe API
         - SQLite
         - scan queue
@@ -225,7 +225,7 @@ Incremental scan:
 
 ## File Operations
 
-Because Megle operates on real directories, every file operation must be transactional from the user's point of view.
+Because Mangoo operates on real directories, every file operation must be transactional from the user's point of view.
 
 Rename:
 
@@ -276,7 +276,7 @@ Plugin types:
 Browser extension later becomes an import provider:
 
 ```text
-Browser extension -> Megle Native Host/Core -> user-selected real folder -> watcher/indexer
+Browser extension -> Mangoo Native Host/Core -> user-selected real folder -> watcher/indexer
 ```
 
 WASM plugins through Wasmtime/Extism are optional later, mainly for logic plugins rather than native media decoders.

@@ -1,9 +1,9 @@
-import { CircleDashed, Image, ListTodo } from "lucide-react";
+import { CircleDashed, Image, ListTodo } from "../../design/icons";
 import { useRef, type CSSProperties, type ReactNode } from "react";
 import type {
   DesktopThumbnailCacheSummary,
   NotificationWindowIntent
-} from "@megle/notification-contract";
+} from "@mangoo/notification-contract";
 import { LiquidGlassButton } from "../../design/liquid-glass";
 import { AnchoredOverlay } from "../../design/overlays";
 import type {
@@ -38,7 +38,7 @@ export function NotificationPopover({
     <>
       {model.degraded ? (
         <p className="notification-health-detail">
-          {model.healthDetail?.trim() || "通知同步暂时不可用，当前进度可能延迟。"}
+          {model.healthDetail?.trim() || "通知服务暂时不可用，当前进度可能延迟。"}
         </p>
       ) : null}
 

@@ -1,6 +1,6 @@
 {
   "manifestVersion": 2,
-  "id": "com.megle.bad-permission",
+  "id": "com.mangoo.bad-permission",
   "name": "Bad Permission",
   "version": "1.0.0",
   "engine": "process",

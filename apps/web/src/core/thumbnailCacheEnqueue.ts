@@ -2,7 +2,7 @@ import type {
   ThumbnailCacheEnqueueResponse,
   ThumbnailCacheRefreshMode,
   ThumbnailCacheTaskRequest
-} from "@megle/core-client";
+} from "@mangoo/core-client";
 
 // One bounded enqueue window. Kept equal to the media page window (256): each
 // request scans at most this many files, so every DB-writer job stays short.

@@ -2,15 +2,15 @@
 
 ## Project Structure & Module Organization
 
-Megle is a Windows-first, contract-first local media browser. The main stack is Electron desktop, React + TypeScript + Vite UI, Rust + Axum Core, and SQLite WAL.
+Mangoo is a Windows-first, contract-first local media browser. The main stack is Electron desktop, React + TypeScript + Vite UI, Rust + Axum Core, and SQLite WAL.
 
 - `apps/desktop/`: Electron shell, Windows desktop adapter, window lifecycle, native dialogs, session-token handoff, and Core process lifecycle.
-- `apps/web/`: React UI shared by desktop and future Web/Docker modes. UI code must talk to Core through `@megle/core-client` wrappers/hooks, not direct filesystem access.
+- `apps/web/`: React UI shared by desktop and future Web/Docker modes. UI code must talk to Core through `@mangoo/core-client` wrappers/hooks, not direct filesystem access.
 - `contracts/core-api/`: OpenAPI contract for Core HTTP endpoints, DTO names, and status codes.
 - `contracts/plugins/`: plugin manifest and permission contract.
 - `crates/core/`: single Phase 1 Rust Core crate. Keep API, DB, roots, scan, thumbnails, fsops, plugins, watch, and tasks as internal modules until boundaries are proven.
 - `packages/core-client/`: TypeScript Core API client/types boundary.
-- Multi-library: Desktop starts one Host Core from `MEGLE_HOST_DB_PATH` + `MEGLE_LIBRARIES_DIR`. Core owns the registry, managed-root identity/journals, and atomic active-Library runtime; switching uses the `/libraries/{libraryUuid}/activate` API without restarting Core or reloading the renderer. Web uses `@megle/core-client` for Library lifecycle and ordinary mutations carry the active context revision.
+- Multi-library: Desktop starts one Host Core from `MANGOO_HOST_DB_PATH` + `MANGOO_LIBRARIES_DIR`. Core owns the registry, managed-root identity/journals, and atomic active-Library runtime; switching uses the `/libraries/{libraryUuid}/activate` API without restarting Core or reloading the renderer. Web uses `@mangoo/core-client` for Library lifecycle and ordinary mutations carry the active context revision.
 - `tools/checks/`: fast structure, contract, schema, desktop, web, and UI-design checks.
 - `tools/bench/`: heavier benchmark harnesses and generated-data tooling.
 - `docs/`: durable architecture, product, design, plans, benchmark reports, and release documentation.
@@ -34,7 +34,7 @@ Run from the repository root.
 - `npm test`: full verification gate: structure, contracts, Core client, desktop, web, UI design, SQLite schema, and Rust checks.
 - `npm run check:structure`: required directory, script, and boundary checks.
 - `npm run check:core-api`: validate OpenAPI/Core API alignment.
-- `npm run check:core-client`: validate `@megle/core-client` contract alignment, typecheck, and tests.
+- `npm run check:core-client`: validate `@mangoo/core-client` contract alignment, typecheck, and tests.
 - `npm run check:desktop`: desktop boundary validation and TypeScript typecheck.
 - `npm run check:web`: web boundary validation and TypeScript typecheck.
 - `npm run check:ui-design`: acrylic/frosted-glass / desktop shell / UI design guardrails.
@@ -43,21 +43,21 @@ Run from the repository root.
 
 Workspace-scoped commands:
 
-- `npm --workspace @megle/web run dev|build|typecheck|preview`
-- `npm --workspace @megle/desktop run build|typecheck`
-- `npm --workspace @megle/core-client run check|typecheck|test`
-- `cargo test -p megle-core <test_name>`
-- `cargo run -p megle-core` with `MEGLE_SESSION_TOKEN` set.
+- `npm --workspace @mangoo/web run dev|build|typecheck|preview`
+- `npm --workspace @mangoo/desktop run build|typecheck`
+- `npm --workspace @mangoo/core-client run check|typecheck|test`
+- `cargo test -p mangoo-core <test_name>`
+- `cargo run -p mangoo-core` with `MANGOO_SESSION_TOKEN` set.
 
 Desktop glass regressions require the explicit OS-backdrop harness:
 
 ```powershell
-$env:MEGLE_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-regression.mjs; Remove-Item Env:\MEGLE_VISUAL_OS_BACKDROP
+$env:MANGOO_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-regression.mjs; Remove-Item Env:\MANGOO_VISUAL_OS_BACKDROP
 ```
 
 ## Coding Style & Naming Conventions
 
-- Use TypeScript/React patterns already present in `apps/web`; keep UI data access behind hooks and `@megle/core-client`.
+- Use TypeScript/React patterns already present in `apps/web`; keep UI data access behind hooks and `@mangoo/core-client`.
 - Do not add raw `fetch` calls, duplicate Core DTOs, or Node filesystem imports in `apps/web`.
 - Keep Electron-only work in `apps/desktop`; do not bypass Core HTTP boundaries from feature UI code.
 - Rust code should follow `cargo fmt` and stay inside `crates/core` modules unless a real split is planned and validated.
@@ -66,9 +66,9 @@ $env:MEGLE_VISUAL_OS_BACKDROP='1'; node .tmp\visual-check\desktop-ui-regression.
 
 ## UI And Desktop Shell Rules
 
-The approved UI direction is documented in `docs/superpowers/specs/2026-05-16-megle-ui-liquid-glass-design.md`.
+The approved UI direction is documented in `docs/superpowers/specs/2026-05-16-mangoo-ui-liquid-glass-design.md`.
 
-- Preserve the Eagle-like information architecture while keeping Megle visually distinct.
+- Preserve the Eagle-like information architecture while keeping Mangoo visually distinct.
 - Keep the Library workspace aligned with the Eagle-inspired browsing model now present in the app: titlebar layout switching, subfolder strip + content split in the center pane, and preview-toolbar parity for layout controls.
 - Library layout modes are first-class product behavior. Treat `adaptive`, `waterfall`, `grid`, and `list` as a shared contract across App state, titlebar controls, MediaGrid geometry, scroll restoration, keyboard navigation, and visible/ahead thumbnail priority logic.
 - Use one layered acrylic frosted-glass design language across Library, Settings, Plugins, Tasks, menus, dialogs, context menus, inspectors, and desktop chrome.
@@ -76,6 +76,7 @@ The approved UI direction is documented in `docs/superpowers/specs/2026-05-16-me
 - Acrylic and frosted-glass materials belong on chrome, control, floating, and overlay layers. Media grids, preview canvases, and heavy content surfaces should remain sharp and stable.
 - All interactive elements share ONE hover highlight: a single cursor-centred circular glow driven globally by `apps/web/src/design/liquid-glass/LiquidGlassSurface.tsx` (`updateInteractiveAffordancePointers`), styled on `[data-interactive-pointer-target]::before/::after` in `styles.css`, with params in `features/settings/interfaceStyle.ts`. Never add a per-element `:hover` border/background or a second glow subsystem. Opt an element out with `data-pointer-glow="off"`. Selection/active state uses a background fill, not a border ring. See CLAUDE.md → "Unified Pointer-Highlight System" for the full contract (the mask-composite corner-AA limitation and the O(near-cursor) driver design are documented there).
 - Popup and dialog work must use the shared glass popup surface conventions rather than ad hoc transparency. Titlebar menus, task drawers, recent-op drawers, and modal surfaces should sit above shell chrome with blur, fill, and z-index behavior that stays consistent across the app.
+- A control or surface may have only one thin visible boundary for its shape. Never combine base borders, inset/bevel strokes, sharp shadow rings and an outer focus ring on the same shape. Keyboard focus must remain clear by emphasizing the single boundary; preserve the global pointer effect without introducing another concentric edge. Enforce this in the shared UI-design checks. Separate parent-panel and child-control boundaries are legitimate.
 - Shell, pointer highlight, titlebar drag, acrylic, rounded-corner, and dialog material changes must be guarded by `npm run check:ui-design` and the desktop visual regression harness.
 - CDP `Page.captureScreenshot` does not reflect real on-display anti-aliasing (screenshots look smoother than the physical compositor at dpr=1). For AA-sensitive UI, verify on the real window with the user; screenshots stay reliable for layout, state, and whether elements rendered. Electron is pinned to `43.1.0` to keep acrylic on drag-maximize — do not downgrade without re-testing.
 
@@ -117,7 +118,7 @@ Use `rg` for literal text search, docs/config lookup, and cases where LSP return
 Useful local Serena commands:
 
 ```powershell
-serena project create . --name Megle --language typescript --language rust
+serena project create . --name Mangoo --language typescript --language rust
 serena project health-check .
 serena project index .
 ```

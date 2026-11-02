@@ -67,6 +67,13 @@ export function useShortcuts({
 
   useEffect(() => {
     function handler(event: KeyboardEvent) {
+      // Registered overlay surfaces own their keyboard interaction. In particular,
+      // Tab must navigate their controls instead of toggling the Library sidebars.
+      if (event.defaultPrevented ||
+        (event.target instanceof HTMLElement && overlays.getContainingLayer(event.target)) ||
+        (document.activeElement instanceof HTMLElement && overlays.getContainingLayer(document.activeElement))) {
+        return;
+      }
       if (isShortcutCaptureTarget(event.target)) {
         return;
       }
@@ -144,7 +151,7 @@ export function useShortcuts({
       if (matchShortcut(event, bindings, "zoomIn")) {
         if (previewOpen) {
           event.preventDefault();
-          window.dispatchEvent(new CustomEvent("megle:preview-zoom", { detail: { direction: "in" } }));
+          window.dispatchEvent(new CustomEvent("mangoo:preview-zoom", { detail: { direction: "in" } }));
         }
         return;
       }
@@ -152,7 +159,7 @@ export function useShortcuts({
       if (matchShortcut(event, bindings, "zoomOut")) {
         if (previewOpen) {
           event.preventDefault();
-          window.dispatchEvent(new CustomEvent("megle:preview-zoom", { detail: { direction: "out" } }));
+          window.dispatchEvent(new CustomEvent("mangoo:preview-zoom", { detail: { direction: "out" } }));
         }
         return;
       }

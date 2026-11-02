@@ -5,7 +5,7 @@ const result = spawnSync(
   [
     "test",
     "-p",
-    "megle-core",
+    "mangoo-core",
     "--release",
     "sync::coordinator::tests::sync_protocol_acceptance_probe",
     "--",
@@ -44,7 +44,7 @@ const thresholds = {
   libraries: 8,
   applyP95Ms: 10,
   applyP99Ms: 25,
-  assets: Number.parseInt(process.env.MEGLE_SYNC_BENCH_ASSETS ?? "1000000", 10),
+  assets: Number.parseInt(process.env.MANGOO_SYNC_BENCH_ASSETS ?? "1000000", 10),
   localCaptureP95Ms: 5,
   localCaptureP99Ms: 15,
   maxAppliedEvents: 100,
@@ -82,7 +82,7 @@ console.log(`PASS: measured sync protocol benchmark ${JSON.stringify({ metrics, 
 
 const kill = spawnSync(
   "cargo",
-  ["test", "-p", "megle-core", "--release", "sync::coordinator::tests::sync_protocol_abrupt_kill_replay_probe", "--", "--ignored", "--nocapture"],
+  ["test", "-p", "mangoo-core", "--release", "sync::coordinator::tests::sync_protocol_abrupt_kill_replay_probe", "--", "--ignored", "--nocapture"],
   { cwd: process.cwd(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30 * 60 * 1000 },
 );
 process.stdout.write(kill.stdout ?? "");

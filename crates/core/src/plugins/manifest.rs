@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -22,6 +23,8 @@ pub struct ManifestRecord {
     pub activation_events: Vec<ActivationEvent>,
     pub requested_permissions: Vec<Permission>,
     pub integrity: Integrity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contributions: Option<super::contributions::PluginContributions>,
     #[serde(skip)]
     pub manifest_path: PathBuf,
 }
@@ -45,12 +48,31 @@ pub struct RpcDeclaration {
     pub wire_versions: Vec<u16>,
     pub capabilities: Vec<Capability>,
     pub method_versions: BTreeMap<String, u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decoder: Option<DecoderDeclaration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DecoderDeclaration {
+    pub implementation_version: String,
+    pub extensions: Vec<String>,
+    pub purposes: Vec<DecoderPurpose>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DecoderPurpose {
+    Thumbnail,
+    Preview,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Capability {
     #[serde(rename = "sync-provider.v1")]
     SyncProviderV1,
+    #[serde(rename = "file-decoder.v1")]
+    FileDecoderV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -59,6 +81,7 @@ pub enum ActivationEvent {
     SyncEnabled,
     AuthRequested,
     DiagnosticsRequested,
+    FileDecodeRequested,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +102,19 @@ pub enum Permission {
         #[serde(rename = "maxBytes")]
         max_bytes: u64,
     },
+    HostUi {
+        operations: Vec<HostUiOperation>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HostUiOperation {
+    CoreApi,
+    PickFolder,
+    RevealPath,
+    ClipboardWrite,
+    ExternalLink,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -132,8 +168,29 @@ impl From<serde_json::Error> for ManifestError {
 }
 
 pub fn parse_manifest(path: &Path) -> Result<ManifestRecord, ManifestError> {
-    let bytes = fs::read(path)?;
-    let raw: serde_json::Value = serde_json::from_slice(&bytes)?;
+    use std::io::Read;
+    let parent = path
+        .parent()
+        .ok_or(ManifestError::Invalid("manifest has no parent"))?;
+    let directory = crate::library_path::MarkerDirectoryGuard::open_readonly(parent)?;
+    let leaf = path
+        .file_name()
+        .ok_or(ManifestError::Invalid("manifest has no name"))?;
+    let file = directory.open_marker(leaf, false)?;
+    let mut bytes = Vec::new();
+    file.take(256 * 1024 + 1).read_to_end(&mut bytes)?;
+    directory.verify_unchanged()?;
+    parse_manifest_bytes(&bytes, path)
+}
+
+pub(crate) fn parse_manifest_bytes(
+    bytes: &[u8],
+    path: &Path,
+) -> Result<ManifestRecord, ManifestError> {
+    if bytes.len() > 256 * 1024 {
+        return Err(ManifestError::Invalid("plugin manifest is too large"));
+    }
+    let raw: serde_json::Value = serde_json::from_slice(bytes)?;
     let entries = raw
         .get("entry")
         .and_then(|value| value.as_object())
@@ -148,6 +205,11 @@ pub fn parse_manifest(path: &Path) -> Result<ManifestRecord, ManifestError> {
 }
 
 fn validate(m: &ManifestRecord) -> Result<(), ManifestError> {
+    if let Some(contributions) = &m.contributions {
+        contributions
+            .validate(&m.requested_permissions)
+            .map_err(|_| ManifestError::Invalid("invalid plugin contributions"))?;
+    }
     if m.manifest_version != 2 {
         return Err(ManifestError::Invalid("manifestVersion must be 2"));
     }
@@ -184,10 +246,66 @@ fn validate(m: &ManifestRecord) -> Result<(), ManifestError> {
             "capabilities must be unique and non-empty",
         ));
     }
-    if m.rpc.method_versions != required_sync_provider_method_versions() {
+    let decoder_only = m.rpc.capabilities == [Capability::FileDecoderV1];
+    let provider_only = m.rpc.capabilities == [Capability::SyncProviderV1];
+    if !decoder_only && !provider_only {
+        return Err(ManifestError::Invalid("unsupported capability combination"));
+    }
+    let required_methods = if decoder_only {
+        required_file_decoder_method_versions()
+    } else {
+        required_sync_provider_method_versions()
+    };
+    if m.rpc.method_versions != required_methods {
         return Err(ManifestError::Invalid(
-            "sync-provider method versions must match the v1 contract",
+            "method versions must match the capability v1 contract",
         ));
+    }
+    match (&m.rpc.decoder, decoder_only) {
+        (Some(decoder), true) => {
+            if !valid_semver(&decoder.implementation_version)
+                || decoder.extensions.is_empty()
+                || decoder.extensions.len() > 64
+                || !unique(&decoder.extensions)
+                || decoder.extensions.iter().any(|extension| {
+                    extension.is_empty()
+                        || extension.len() > 16
+                        || !extension
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                })
+                || decoder.purposes.is_empty()
+                || !unique(&decoder.purposes)
+                || m.activation_events.iter().any(|event| {
+                    !matches!(
+                        event,
+                        ActivationEvent::FileDecodeRequested
+                            | ActivationEvent::DiagnosticsRequested
+                    )
+                })
+                || m.requested_permissions.iter().any(|permission| {
+                    !matches!(permission,
+                    Permission::TempStorage { max_bytes } if *max_bytes <= 256 * 1024 * 1024)
+                })
+                || m.contributions.is_some()
+            {
+                return Err(ManifestError::Invalid("invalid file decoder declaration"));
+            }
+        }
+        (None, false) => {
+            if m.activation_events
+                .contains(&ActivationEvent::FileDecodeRequested)
+            {
+                return Err(ManifestError::Invalid(
+                    "decoder activation requires decoder capability",
+                ));
+            }
+        }
+        _ => {
+            return Err(ManifestError::Invalid(
+                "decoder declaration and capability must agree",
+            ))
+        }
     }
     if m.activation_events.is_empty() || !unique(&m.activation_events) {
         return Err(ManifestError::Invalid("activation events must be unique"));
@@ -205,6 +323,13 @@ fn validate(m: &ManifestRecord) -> Result<(), ManifestError> {
     }
     for permission in &m.requested_permissions {
         validate_permission(permission)?;
+    }
+    if m.requested_permissions
+        .iter()
+        .enumerate()
+        .any(|(index, permission)| m.requested_permissions[..index].contains(permission))
+    {
+        return Err(ManifestError::Invalid("duplicate requested permission"));
     }
     Ok(())
 }
@@ -234,6 +359,13 @@ pub fn required_sync_provider_method_versions() -> BTreeMap<String, u16> {
     .into_iter()
     .map(|method| (method.to_owned(), 1))
     .collect()
+}
+
+pub fn required_file_decoder_method_versions() -> BTreeMap<String, u16> {
+    ["health", "diagnostics", "shutdown", "decoder.decode"]
+        .into_iter()
+        .map(|method| (method.to_owned(), 1))
+        .collect()
 }
 fn unique<T: Eq + std::hash::Hash>(values: &[T]) -> bool {
     let mut s = HashSet::new();
@@ -278,6 +410,11 @@ pub fn validate_relative_entry(path: &Path) -> Result<(), ManifestError> {
 }
 fn validate_permission(p: &Permission) -> Result<(), ManifestError> {
     match p {
+        Permission::HostUi { operations }
+            if operations.is_empty() || operations.len() > 5 || !unique(operations) =>
+        {
+            Err(ManifestError::Invalid("invalid host UI permission"))
+        }
         Permission::Network { schemes, hosts }
             if schemes.is_empty() || hosts.is_empty() || !unique(schemes) || !unique(hosts) =>
         {
@@ -358,7 +495,7 @@ pub fn sha256_file(path: &Path) -> Result<[u8; 32], std::io::Error> {
 mod tests {
     use super::*;
     fn valid() -> &'static str {
-        r#"{"manifestVersion":2,"id":"com.megle.test","name":"Test","version":"1.2.3","engine":"process","entry":{"windowsX64":"bin/provider.exe","linuxX64":"bin/provider"},"rpc":{"wireVersions":[1],"capabilities":["sync-provider.v1"],"methodVersions":{"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.poll":1,"auth.cancel":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.get_range":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1}},"activationEvents":["sync-enabled"],"requestedPermissions":[{"kind":"network","schemes":["https"],"hosts":["graph.microsoft.com"]}],"integrity":{"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}}"#
+        r#"{"manifestVersion":2,"id":"com.mangoo.test","name":"Test","version":"1.2.3","engine":"process","entry":{"windowsX64":"bin/provider.exe","linuxX64":"bin/provider"},"rpc":{"wireVersions":[1],"capabilities":["sync-provider.v1"],"methodVersions":{"describe":1,"health":1,"diagnostics":1,"shutdown":1,"auth.begin":1,"auth.complete":1,"auth.poll":1,"auth.cancel":1,"auth.status":1,"auth.sign_out":1,"delta.list":1,"object.head":1,"object.get":1,"object.get_range":1,"object.put_immutable":1,"upload.begin":1,"upload.write":1,"upload.commit":1,"upload.abort":1}},"activationEvents":["sync-enabled"],"requestedPermissions":[{"kind":"network","schemes":["https"],"hosts":["graph.microsoft.com"]}],"integrity":{"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}}"#
     }
     #[test]
     fn strict_v2_manifest_decodes() {
@@ -402,8 +539,126 @@ mod tests {
     #[test]
     fn contract_fixture_matches_decoder() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../contracts/plugins/fixtures/valid-sync-provider-v2.json");
+            .join("../../contracts/plugins/fixtures/valid-sync-provider-v2.json")
+            .canonicalize()
+            .unwrap();
         let manifest = parse_manifest(&fixture).expect("shared v2 fixture");
-        assert_eq!(manifest.id, "com.megle.fake-sync");
+        assert_eq!(manifest.id, "com.mangoo.fake-sync");
+    }
+
+    #[test]
+    fn ui_manifest_is_strict_bounded_and_requires_host_permission() {
+        let valid: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../contracts/plugins/fixtures/valid-ui-provider-v2.json"
+        ))
+        .unwrap();
+        let parse = |value: &serde_json::Value| {
+            parse_manifest_bytes(
+                &serde_json::to_vec(value).unwrap(),
+                Path::new("plugin.json"),
+            )
+        };
+        let parsed = parse(&valid).unwrap();
+        let ui = parsed.contributions.as_ref().unwrap().ui.as_ref().unwrap();
+        let status = ui.views.iter().find(|view| view.id == "status").unwrap();
+        assert_eq!(
+            status.slot,
+            super::super::contributions::PluginUiSlot::NotificationCenter
+        );
+        assert_eq!(
+            serde_json::to_value(status).unwrap()["slot"],
+            "notification-center"
+        );
+        for (pointer, value) in [
+            ("/contributions/ui/apiVersion", serde_json::json!(2)),
+            (
+                "/contributions/ui/entry",
+                serde_json::json!("../index.html"),
+            ),
+            (
+                "/contributions/ui/entry",
+                serde_json::json!("ui\\index.html"),
+            ),
+            (
+                "/contributions/ui/entry",
+                serde_json::json!("ui./index.html"),
+            ),
+            (
+                "/contributions/ui/views/0/slot",
+                serde_json::json!("unknown"),
+            ),
+            ("/contributions/ui/views/0/title", serde_json::json!("\n")),
+            (
+                "/contributions/ui/views/0/title",
+                serde_json::json!("界".repeat(129)),
+            ),
+            (
+                "/contributions/ui/sha256",
+                serde_json::json!("G".repeat(64)),
+            ),
+            ("/contributions/ui/views", serde_json::json!([])),
+            ("/contributions/ui", serde_json::Value::Null),
+            ("/requestedPermissions", serde_json::json!([])),
+            (
+                "/requestedPermissions/0/operations",
+                serde_json::json!(["unknown"]),
+            ),
+            (
+                "/requestedPermissions/0/operations",
+                serde_json::json!(["core-api", "core-api"]),
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            *invalid.pointer_mut(pointer).unwrap() = value;
+            assert!(parse(&invalid).is_err(), "{pointer}");
+        }
+        let mut duplicate = valid.clone();
+        duplicate["contributions"]["ui"]["views"][1]["id"] = serde_json::json!("setup");
+        assert!(parse(&duplicate).is_err());
+        let mut unknown = valid.clone();
+        unknown["contributions"]["ui"]["url"] = serde_json::json!("https://example.test/");
+        assert!(parse(&unknown).is_err());
+        let mut no_ui = valid;
+        no_ui["contributions"].as_object_mut().unwrap().remove("ui");
+        no_ui["requestedPermissions"] = serde_json::json!([]);
+        assert!(parse(&no_ui).is_ok());
+    }
+}
+#[test]
+fn file_decoder_manifest_is_exact_and_provider_stays_strict() {
+    let bytes = include_bytes!("../../../../contracts/plugins/fixtures/valid-file-decoder-v2.json");
+    let manifest = parse_manifest_bytes(bytes, Path::new("plugin.json")).unwrap();
+    assert_eq!(manifest.rpc.capabilities, [Capability::FileDecoderV1]);
+    assert_eq!(manifest.rpc.decoder.unwrap().extensions, ["ppm"]);
+    let base: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    for mutate in [
+        |value: &mut serde_json::Value| {
+            value["rpc"]["capabilities"] =
+                serde_json::json!(["file-decoder.v1", "sync-provider.v1"]);
+        },
+        |value: &mut serde_json::Value| {
+            value["rpc"]["methodVersions"]["auth.begin"] = 1.into();
+        },
+        |value: &mut serde_json::Value| {
+            value["rpc"]["decoder"]["extensions"] = serde_json::json!(["*"]);
+        },
+        |value: &mut serde_json::Value| {
+            value["rpc"]["decoder"]["purposes"] = serde_json::json!(["preview", "preview"]);
+        },
+        |value: &mut serde_json::Value| {
+            value["activationEvents"] = serde_json::json!(["auth-requested"]);
+        },
+        |value: &mut serde_json::Value| {
+            value["requestedPermissions"] =
+                serde_json::json!([{"kind":"network","schemes":["https"],"hosts":["example.com"]}]);
+        },
+    ] {
+        let mut value = base.clone();
+        mutate(&mut value);
+        assert!(parse_manifest_bytes(
+            &serde_json::to_vec(&value).unwrap(),
+            Path::new("plugin.json")
+        )
+        .is_err());
     }
 }

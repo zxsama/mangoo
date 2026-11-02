@@ -1,5 +1,5 @@
-import { Heart, Star, X } from "lucide-react";
-import type { TagRecord } from "@megle/core-client";
+import { Heart, Star, X } from "../../design/icons";
+import type { TagRecord } from "@mangoo/core-client";
 
 type Kind = "image" | "video" | "other";
 type MinRating = 1 | 2 | 3 | 4 | 5;
@@ -71,7 +71,7 @@ export function FilterChips({
             onClick={() => onSetMinRating(minRating === r ? undefined : r)}
             type="button"
           >
-            <Star aria-hidden="true" size={12} />
+            <Star aria-hidden="true" size={12} weight={minRating === r ? "fill" : "regular"} />
             <span>{r}+</span>
           </button>
         ))}
@@ -84,7 +84,7 @@ export function FilterChips({
         onClick={onToggleFavorite}
         type="button"
       >
-        <Heart aria-hidden="true" size={13} />
+        <Heart aria-hidden="true" size={13} weight={favorite === true ? "fill" : "regular"} />
         <span>Favorites</span>
       </button>
 

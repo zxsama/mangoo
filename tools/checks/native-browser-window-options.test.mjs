@@ -149,3 +149,23 @@ const nestedSpread = inspectNativeBrowserWindowOptions(`
 assert.equal(nestedSpread.browserWindowOptionsFound, true);
 assert.deepEqual(nestedSpread.unsafeTopLevelSpreads, []);
 assert.deepEqual(nestedSpread.missingRequiredProperties, []);
+
+function windowWithOptionalIcon(spread) {
+  return inspectNativeBrowserWindowOptions(`new BrowserWindow({
+    frame: false, transparent: false, backgroundColor: "#00000000",
+    roundedCorners: true, backgroundMaterial: "acrylic", ${spread}
+  })`);
+}
+
+const optionalIcon = windowWithOptionalIcon("...(windowIcon ? { icon: windowIcon } : {})");
+assert.deepEqual(optionalIcon.missingRequiredProperties, []);
+assert.deepEqual(optionalIcon.unsafeTopLevelSpreads, []);
+for (const spread of [
+  "...(windowIcon ? { icon: windowIcon, transparent: true } : {})",
+  '...(windowIcon ? { icon: windowIcon } : { backgroundMaterial: "none" })',
+  "...(windowIcon ? { icon: windowIcon, ...otherOptions } : {})",
+  "...(windowIcon ? otherOptions : {})",
+  "...getWindowOptions()"
+]) {
+  assert.equal(windowWithOptionalIcon(spread).unsafeTopLevelSpreads.length, 1, spread);
+}

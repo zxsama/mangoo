@@ -1,4 +1,4 @@
-import type { CoreRequestPriority, MediaRecord, ThumbnailResponse } from "@megle/core-client";
+import type { CoreRequestPriority, MediaRecord, ThumbnailResponse } from "@mangoo/core-client";
 import { createCoreClient } from "./client";
 import {
   mediaContentSignature as createMediaContentSignature,
@@ -21,6 +21,17 @@ export {
 } from "./thumbnailObjectUrlCache";
 
 export type ThumbnailStateByMediaId = Record<number, ThumbnailResponse>;
+
+export function mediaPreviewKind(media: MediaRecord) {
+  if (media.presentation) return media.presentation.previewKind;
+  if (media.kind === "image") return "original-image";
+  if (media.kind === "video") return "original-video";
+  return "static-thumbnail";
+}
+
+export function isThumbnailUnavailable(media: MediaRecord): boolean {
+  return media.presentation?.thumbnail === "unavailable" || (!media.presentation && mediaPreviewKind(media) === "static-thumbnail");
+}
 export type ThumbnailRequestPriority = "background" | "ahead" | "visible" | "selected";
 type CachedThumbnailEntry = {
   mediaSignature: string;
@@ -163,6 +174,14 @@ export async function requestThumbnailState(
     } else {
       thumbnailResourceCache.delete(mediaId);
     }
+  }
+
+  if (isThumbnailUnavailable(mediaRecord) && mediaRecord.thumbnailState !== "ready") {
+    return {
+      fileId: mediaId, target: GRID_THUMBNAIL_TARGET, state: "unavailable", updatedAt: null,
+      shortSidePx: 320, outputFormat: "image/webp", width: null, height: null,
+      byteSize: null, servedBy: null, asset: null, error: null
+    };
   }
 
   const inFlight = inFlightThumbnailRequests.get(requestKey);
@@ -459,7 +478,10 @@ export function requestOriginalPreviewBlob(
   mediaRecord: MediaRecord,
   options: OriginalPreviewRequestOptions = {}
 ): Promise<Blob> {
-  const mediaSignature = mediaFileContentSignature(mediaRecord);
+  if (mediaPreviewKind(mediaRecord) === "static-thumbnail" && isThumbnailUnavailable(mediaRecord)) {
+    return Promise.reject(new Error("Original preview unavailable for this file"));
+  }
+  const mediaSignature = mediaPreviewContentSignature(mediaRecord);
   const cached = originalPreviewBlobCache.get(mediaRecord.id);
   if (cached) {
     if (cached.mediaSignature === mediaSignature) {
@@ -544,8 +566,9 @@ export function readCachedThumbnailStates(mediaRecords: MediaRecord[]): Thumbnai
 }
 
 export function shouldRequestThumbnailState(mediaRecord: MediaRecord): boolean {
+  if (isThumbnailUnavailable(mediaRecord) && mediaRecord.thumbnailState !== "ready") return false;
   const mediaState = normalizeMediaThumbnailState(mediaRecord.thumbnailState);
-  if (mediaState === "failed" || mediaState === "skipped_small") {
+  if (mediaState === "failed" || mediaState === "skipped_small" || mediaState === "unavailable") {
     return false;
   }
   return true;
@@ -647,7 +670,8 @@ function explicitMediaThumbnailState(
     value === "queued" ||
     value === "ready" ||
     value === "failed" ||
-    value === "skipped_small"
+    value === "skipped_small" ||
+    value === "unavailable"
   ) {
     return value;
   }
@@ -655,7 +679,7 @@ function explicitMediaThumbnailState(
 }
 
 function isTerminalThumbnailState(value: ThumbnailResponse["state"]): boolean {
-  return value === "ready" || value === "failed" || value === "skipped_small";
+  return value === "ready" || value === "failed" || value === "skipped_small" || value === "unavailable";
 }
 
 export function previewPlaceholderDataUrl(mediaRecord: MediaRecord): string | null {
@@ -681,7 +705,7 @@ function thumbnailStateSchedulerPriority(
 }
 
 function originalPreviewRequestKey(mediaRecord: MediaRecord): string {
-  return [mediaCacheEpoch, mediaFileContentSignature(mediaRecord), "original"].join(":");
+  return [mediaCacheEpoch, mediaPreviewContentSignature(mediaRecord), "original"].join(":");
 }
 
 function rememberOriginalPreviewBlob(
@@ -1037,6 +1061,13 @@ export function mediaFileContentSignature(mediaRecord: MediaRecord): string {
   return [mediaRecord.id, mediaRecord.mtime, mediaRecord.size].join(":");
 }
 
+export function mediaPreviewContentSignature(mediaRecord: MediaRecord): string {
+  // Decoder output may change with capabilities even when source bytes do not.
+  return mediaPreviewKind(mediaRecord) === "static-thumbnail"
+    ? [mediaFileContentSignature(mediaRecord), mediaRecord.presentation?.generation ?? "legacy"].join(":")
+    : mediaFileContentSignature(mediaRecord);
+}
+
 function thumbnailStateRank(state: ThumbnailResponse["state"]): number {
   switch (state) {
     case "ready":
@@ -1044,6 +1075,7 @@ function thumbnailStateRank(state: ThumbnailResponse["state"]): number {
     case "failed":
       return 3;
     case "skipped_small":
+    case "unavailable":
       return 2;
     case "queued":
       return 1;

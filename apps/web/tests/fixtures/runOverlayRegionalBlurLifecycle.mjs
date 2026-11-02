@@ -24,7 +24,7 @@ async function settle() {
 async function setPhase(fixtureWindow, phase) {
   await evaluate(
     fixtureWindow,
-    `window.dispatchEvent(new CustomEvent("megle-regional-blur-phase", { detail: ${JSON.stringify(phase)} })); true`
+    `window.dispatchEvent(new CustomEvent("mangoo-regional-blur-phase", { detail: ${JSON.stringify(phase)} })); true`
   );
 }
 
@@ -357,7 +357,7 @@ async function main() {
     const modalMaskContract = await captureMaskContract(fixtureWindow, '#root');
 
     const modalPoppedByNextFrame = await evaluate(fixtureWindow, `(async () => {
-      window.dispatchEvent(new CustomEvent("megle-regional-blur-phase", { detail: "nested" }));
+      window.dispatchEvent(new CustomEvent("mangoo-regional-blur-phase", { detail: "nested" }));
       await new Promise((resolve) => requestAnimationFrame(resolve));
       const rootFilter = document.querySelector('filter[data-overlay-regional-blur-target="app-root"]');
       return rootFilter?.getAttribute('data-overlay-regional-full-target') === 'false' &&
@@ -370,7 +370,7 @@ async function main() {
     );
 
     const nestedPoppedByNextFrame = await evaluate(fixtureWindow, `(async () => {
-      window.dispatchEvent(new CustomEvent("megle-regional-blur-phase", { detail: "root" }));
+      window.dispatchEvent(new CustomEvent("mangoo-regional-blur-phase", { detail: "root" }));
       await new Promise((resolve) => requestAnimationFrame(resolve));
       const rootFilter = document.querySelector('filter[data-overlay-regional-blur-target="app-root"]');
       return rootFilter?.getAttribute('data-overlay-regional-mask-count') === '1' &&
@@ -383,9 +383,9 @@ async function main() {
     );
 
     const rapidStackMatchesLatestByNextFrame = await evaluate(fixtureWindow, `(async () => {
-      window.dispatchEvent(new CustomEvent("megle-regional-blur-phase", { detail: "nested" }));
+      window.dispatchEvent(new CustomEvent("mangoo-regional-blur-phase", { detail: "nested" }));
       await new Promise((resolve) => setTimeout(resolve, 20));
-      window.dispatchEvent(new CustomEvent("megle-regional-blur-phase", { detail: "modal" }));
+      window.dispatchEvent(new CustomEvent("mangoo-regional-blur-phase", { detail: "modal" }));
       await new Promise((resolve) => requestAnimationFrame(resolve));
       return document.querySelector('filter[data-overlay-regional-blur-target="app-root"]')?.getAttribute('data-overlay-regional-full-target') === 'true';
     })()`);

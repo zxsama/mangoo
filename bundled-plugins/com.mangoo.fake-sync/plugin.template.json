@@ -1,0 +1,139 @@
+{
+  "manifestVersion": 2,
+  "id": "com.mangoo.fake-sync",
+  "name": "Mangoo Bundled Fake Sync Provider",
+  "version": "1.0.0",
+  "engine": "process",
+  "entry": {
+    "windowsX64": "bin/mangoo-fake-provider.exe",
+    "linuxX64": "bin/mangoo-fake-provider"
+  },
+  "rpc": {
+    "wireVersions": [
+      1
+    ],
+    "capabilities": [
+      "sync-provider.v1"
+    ],
+    "methodVersions": {
+      "describe": 1,
+      "health": 1,
+      "diagnostics": 1,
+      "shutdown": 1,
+      "auth.begin": 1,
+      "auth.complete": 1,
+      "auth.poll": 1,
+      "auth.cancel": 1,
+      "auth.status": 1,
+      "auth.sign_out": 1,
+      "delta.list": 1,
+      "object.head": 1,
+      "object.get": 1,
+      "object.get_range": 1,
+      "object.put_immutable": 1,
+      "upload.begin": 1,
+      "upload.write": 1,
+      "upload.commit": 1,
+      "upload.abort": 1
+    }
+  },
+  "activationEvents": [
+    "sync-enabled",
+    "auth-requested",
+    "diagnostics-requested"
+  ],
+  "requestedPermissions": [
+    { "kind": "oauth-loopback", "mode": "ephemeral-only" },
+    {
+      "kind": "secret",
+      "namespace": "fake-sync",
+      "operations": [
+        "read",
+        "write",
+        "delete"
+      ]
+    },
+    {
+      "kind": "temp-storage",
+      "maxBytes": 268435456
+    },
+    {
+      "kind": "network",
+      "schemes": [
+        "https"
+      ],
+      "hosts": [
+        "auth.example.test"
+      ]
+    }
+  ],
+  "integrity": {
+    "sha256": "__SHA256__"
+  },
+  "contributions": {
+    "configuration": [
+      {
+        "id": "workspace",
+        "label": "Storage workspace",
+        "description": "",
+        "format": "text",
+        "required": false,
+        "environment": null,
+        "defaultValue": "fixture",
+        "choices": [],
+        "hidden": false,
+        "debugOnly": false
+      },
+      {
+        "id": "fault",
+        "label": "Fixture behavior",
+        "description": "",
+        "format": "text",
+        "required": false,
+        "environment": "MANGOO_FAKE_PROVIDER_FAULT",
+        "defaultValue": null,
+        "choices": [],
+        "hidden": true,
+        "debugOnly": true
+      }
+    ],
+    "authentication": {
+      "modes": [
+        "loopback",
+        "manual-response-uri",
+        "host-callback"
+      ],
+      "authorizationHosts": [
+        "auth.example.test"
+      ],
+      "manualRedirectUri": "https://auth.example.test/return",
+      "loopbackRedirectPath": "/fixture/callback",
+      "ignoredCallbackFields": [
+        "session_hint"
+      ]
+    },
+    "presentation": {
+      "setupLabel": "配置测试存储",
+      "accountLabel": "Fixture Storage",
+      "icon": "storage",
+      "helpLinks": [
+        {
+          "id": "guide",
+          "label": "存储设置说明",
+          "url": "https://docs.example.test/setup"
+        }
+      ],
+      "setupSteps": [
+        {
+          "title": "选择空间",
+          "body": "输入测试空间名称。",
+          "helpLinkId": "guide"
+        }
+      ]
+    },
+    "primaryCredential": {
+      "namespace": "fake-sync",
+      "purpose": "session-v1"
+    }
+  }
+}

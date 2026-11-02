@@ -1,7 +1,7 @@
 // Real hot-loop stress driver for the disclosure-scan / thumbnail priority flow
 // against a huge real directory (millions of files):
 //
-// 1. Spawn megle-core with a known session token + dynamic data dir.
+// 1. Spawn mangoo-core with a known session token + dynamic data dir.
 // 2. addRoot pointing at a large real directory and wait until the index has
 //    grown past a threshold (or the scan finishes), so the loop below runs
 //    against a realistic, large media set instead of an empty/tiny one.
@@ -37,16 +37,16 @@ import { buildOperationPlan, type Operation } from "./hot-loop/operationPlan.mts
 import { summarize, checkBudgets, type Budgets, type Summary } from "./hot-loop/metrics.mts";
 
 const TOKEN = "real-load-test-token";
-const ADDR = process.env.MEGLE_REAL_LOAD_CORE_ADDR ?? "127.0.0.1:47391";
+const ADDR = process.env.MANGOO_REAL_LOAD_CORE_ADDR ?? "127.0.0.1:47391";
 const BASE = `http://${ADDR}/api`;
-const ROOT_PATH = (process.env.MEGLE_REAL_LOAD_ROOT ?? "Y:/Repository/Billfish/Artists").replace(/\\/g, "/");
-const TOTAL_OPERATIONS = Number(process.env.MEGLE_HOTLOOP_OPS ?? 100);
-const INDEX_THRESHOLD = Number(process.env.MEGLE_HOTLOOP_INDEX_THRESHOLD ?? 20000);
-const INDEX_WAIT_TIMEOUT_MS = Number(process.env.MEGLE_HOTLOOP_INDEX_TIMEOUT_MS ?? 600_000);
-const FOLDER_DISCOVERY_TARGET = Number(process.env.MEGLE_HOTLOOP_FOLDER_TARGET ?? 8);
+const ROOT_PATH = (process.env.MANGOO_REAL_LOAD_ROOT ?? "Y:/Repository/Billfish/Artists").replace(/\\/g, "/");
+const TOTAL_OPERATIONS = Number(process.env.MANGOO_HOTLOOP_OPS ?? 100);
+const INDEX_THRESHOLD = Number(process.env.MANGOO_HOTLOOP_INDEX_THRESHOLD ?? 20000);
+const INDEX_WAIT_TIMEOUT_MS = Number(process.env.MANGOO_HOTLOOP_INDEX_TIMEOUT_MS ?? 600_000);
+const FOLDER_DISCOVERY_TARGET = Number(process.env.MANGOO_HOTLOOP_FOLDER_TARGET ?? 8);
 const FOLDER_DISCOVERY_VISIT_CAP = 250;
-const SETTLE_TIMEOUT_MS = Number(process.env.MEGLE_HOTLOOP_SETTLE_TIMEOUT_MS ?? 60_000);
-const SETTLE_POLL_INTERVAL_MS = Number(process.env.MEGLE_HOTLOOP_SETTLE_POLL_INTERVAL_MS ?? 200);
+const SETTLE_TIMEOUT_MS = Number(process.env.MANGOO_HOTLOOP_SETTLE_TIMEOUT_MS ?? 60_000);
+const SETTLE_POLL_INTERVAL_MS = Number(process.env.MANGOO_HOTLOOP_SETTLE_POLL_INTERVAL_MS ?? 200);
 const WRITE_STORM_OPERATION_INDEX = 20;
 const WINDOW_LIMIT = 96;
 
@@ -156,7 +156,7 @@ async function fetchJson<T>(apiPath: string, init: RequestInit = {}): Promise<T>
 
 async function fetchResponse(apiPath: string, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers);
-  headers.set("x-megle-session", TOKEN);
+  headers.set("x-mangoo-session", TOKEN);
   if (init.body && !headers.has("content-type")) {
     headers.set("content-type", "application/json");
   }
@@ -320,13 +320,13 @@ async function addRoot(contextRevision: number): Promise<AcceptedRoot> {
 // last observed totalCount so the operation plan can be sized against real
 // data instead of guessing.
 //
-// With MEGLE_HOTLOOP_WAIT_SCAN_DONE=1 it instead waits for the root scan to
+// With MANGOO_HOTLOOP_WAIT_SCAN_DONE=1 it instead waits for the root scan to
 // finish, so the 100-op loop measures STEADY-STATE browsing (background
 // thumbnail generation only) rather than browsing during the one-time initial
 // scan. Without it, the loop runs while the scan is still writing — the harsher
 // "browse while indexing" worst case.
 async function waitForIndexThreshold(rootId: number, scanTaskId: number): Promise<number> {
-  const waitScanDone = process.env.MEGLE_HOTLOOP_WAIT_SCAN_DONE === "1";
+  const waitScanDone = process.env.MANGOO_HOTLOOP_WAIT_SCAN_DONE === "1";
   const start = Date.now();
   let lastTotalCount = 0;
   while (Date.now() - start < INDEX_WAIT_TIMEOUT_MS) {
@@ -501,7 +501,7 @@ async function opPreview(fileId: number): Promise<number> {
 async function opThumbnailBlob(fileId: number): Promise<number | null> {
   const t0 = performance.now();
   const response = await fetch(`${BASE}/media/${fileId}/thumbnail/blob?target=grid_320`, {
-    headers: { "x-megle-session": TOKEN }
+    headers: { "x-mangoo-session": TOKEN }
   });
   if (response.status === 404) {
     await response.body?.cancel();
@@ -524,21 +524,21 @@ async function main() {
     throw new Error(`Test directory does not exist: ${ROOT_PATH}`);
   }
 
-  const dataDir = await mkdtemp(path.join(tmpdir(), "megle-hotloop-"));
+  const dataDir = await mkdtemp(path.join(tmpdir(), "mangoo-hotloop-"));
   const managedRoot = path.join(dataDir, "library");
   log(`Source dir: ${ROOT_PATH}`);
   log(`Data dir: ${dataDir}`);
 
   const env = {
     ...process.env,
-    MEGLE_SESSION_TOKEN: TOKEN,
-    MEGLE_CORE_ADDR: ADDR,
+    MANGOO_SESSION_TOKEN: TOKEN,
+    MANGOO_CORE_ADDR: ADDR,
     ...managedLibraryHostEnv(dataDir),
     RUST_LOG: "warn"
   };
 
-  log("Spawning megle-core...");
-  const core = spawnManaged("cargo", ["run", "--release", "-q", "-p", "megle-core"], {
+  log("Spawning mangoo-core...");
+  const core = spawnManaged("cargo", ["run", "--release", "-q", "-p", "mangoo-core"], {
     cwd: process.cwd(),
     env
   });
@@ -826,7 +826,7 @@ async function main() {
     process.off("SIGINT", handleStopSignal);
     process.off("SIGTERM", handleStopSignal);
     await stop();
-    if (process.env.MEGLE_KEEP_DATA !== "1") {
+    if (process.env.MANGOO_KEEP_DATA !== "1") {
       try {
         await rm(dataDir, { recursive: true, force: true });
         log(`Cleaned ${dataDir}`);
@@ -834,7 +834,7 @@ async function main() {
         // ignore
       }
     } else {
-      log(`MEGLE_KEEP_DATA=1, keeping ${dataDir}`);
+      log(`MANGOO_KEEP_DATA=1, keeping ${dataDir}`);
     }
   }
 }

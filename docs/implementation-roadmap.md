@@ -2,9 +2,9 @@
 
 ## 已确认的 UI 基线
 
-当前 UI 基线已确定，详见 `docs/superpowers/specs/2026-05-16-megle-ui-liquid-glass-design.md`。
-基础设施实施计划详见 `docs/superpowers/plans/2026-05-16-megle-ui-foundation.md`。
-完整产品主计划详见 `docs/superpowers/plans/2026-05-16-megle-complete-product-plan.md`。
+当前 UI 基线已确定，详见 `docs/superpowers/specs/2026-05-16-mangoo-ui-liquid-glass-design.md`。
+基础设施实施计划详见 `docs/superpowers/plans/2026-05-16-mangoo-ui-foundation.md`。
+完整产品主计划详见 `docs/superpowers/plans/2026-05-16-mangoo-complete-product-plan.md`。
 
 固定规则：
 
@@ -137,7 +137,7 @@ Phase 1 的 UI 重点：
 
 验收：
 
-- 外部资源管理器修改文件后，Megle 能自动更新。
+- 外部资源管理器修改文件后，Mangoo 能自动更新。
 
 ## Phase 5: 用户元数据
 
@@ -152,7 +152,7 @@ Phase 1 的 UI 重点：
 
 验收：
 
-- 用户元数据只写 Megle 数据库，不修改原文件。
+- 用户元数据只写 Mangoo 数据库，不修改原文件。
 
 ## Phase 6: 真实文件操作
 
@@ -215,7 +215,7 @@ Phase 1 的 UI 重点：
 
 ## Phase 10: 产品硬化和发布准备
 
-状态：Phase 10 功能已进入硬化阶段；2026-05-18 已补入亚克力毛玻璃交互、产品级窗口布局、浮动 Tasks 抽屉、点击预览和设计系统落地检查，详见 `docs/superpowers/plans/2026-05-18-megle-liquid-glass-interaction-completion.md`。
+状态：Phase 10 功能已进入硬化阶段；2026-05-18 已补入亚克力毛玻璃交互、产品级窗口布局、浮动 Tasks 抽屉、点击预览和设计系统落地检查，详见 `docs/superpowers/plans/2026-05-18-mangoo-liquid-glass-interaction-completion.md`。
 
 目标：
 

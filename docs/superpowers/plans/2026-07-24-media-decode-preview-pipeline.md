@@ -20,7 +20,7 @@
 - **The Worker must be a same-origin module Worker.** `apps/web/vite.config.ts` sets a CSP with no `worker-src`, so it falls back to `default-src 'self'`: `new Worker(new URL("./x.ts", import.meta.url), { type: "module" })` is allowed, a `blob:` Worker is **blocked**.
 - **No raw `fetch(` anywhere under `apps/web/src`.** `tools/checks/validate-web-client.mjs:2122` fails the build on `/\bfetch\s*\(/`. The Worker receives `Blob`s over `postMessage`; it never fetches.
 - **Web tests are plain `node --test`, no DOM.** `apps/web/package.json` runs `node --experimental-strip-types --test tests/*.test.mts`. Testable logic must live in pure modules with no React and no unstubbed DOM globals; follow `apps/web/tests/mediaResources.test.mts` for the `register("./resolve-source-imports.mjs", import.meta.url)` + global-stub pattern.
-- **Every diagnostic goes behind the existing single debug switch.** Rust: `crate::debug_log!` / `debug::enabled()` (`MEGLE_DEBUG=1`). Do not add ad-hoc `eprintln!`.
+- **Every diagnostic goes behind the existing single debug switch.** Rust: `crate::debug_log!` / `debug::enabled()` (`MANGOO_DEBUG=1`). Do not add ad-hoc `eprintln!`.
 - **Do not disturb the user's uncommitted working-tree changes.** Every `git add` stages explicit paths only — never `git add -A` / `git add .`.
 - **Full gate before declaring done:** `npm test` (structure, core-api, core-client, notification-contract, desktop, web, ui-design, schema, rust). Rust needs `export PATH="$HOME/.cargo/bin:$PATH"`.
 
@@ -39,7 +39,7 @@
 - `crates/core/src/db/migrations.rs` — declare `PREVIEW_BLOBS_MIGRATION`.
 - `crates/core/src/db/mod.rs` — gate migration 25; `PreviewBlobRecord`, `get_preview_blob`, `upsert_preview_blob`; drop preview blobs alongside thumb blobs on reset/purge.
 - `crates/core/src/thumbnails/mod.rs` — preview-tier profile constants + selection; `generate_image_thumbnail_bytes_with_checkpoint` and `generate_preview_tier_bytes` go through the registry; `classify_thumbnail_failure` gains the chain-failure and decoder-unavailable shapes.
-- `crates/core/src/api/routes.rs` — `get_preview` becomes the source resolver (raw-stream branch preserved verbatim); new `PreviewQuery`; `x-megle-preview-tier` response header.
+- `crates/core/src/api/routes.rs` — `get_preview` becomes the source resolver (raw-stream branch preserved verbatim); new `PreviewQuery`; `x-mangoo-preview-tier` response header.
 - `crates/core/src/scan/mod.rs` + `crates/core/src/watch/mod.rs` — the two duplicated `media_kind` extension lists gain `.heif` (and stay identical to each other).
 - `tools/checks/validate_sqlite_schema.py`, `tools/checks/validate-core-api.mjs`, `packages/core-client/scripts/check-contract.mjs`, `contracts/core-api/openapi.yaml`, `packages/core-client/src/client.ts` — contract + checks.
 
@@ -274,7 +274,7 @@ mod tests {
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo test -p megle-core decode:: 2>&1 | tail -20
+cargo test -p mangoo-core decode:: 2>&1 | tail -20
 ```
 
 Expected: FAIL — `error[E0433]`/`cannot find type DecodedImage`, `cannot find trait MediaDecoder`, and `file not found for module decode` until `mod decode;` is added.
@@ -443,7 +443,7 @@ impl DecoderRegistry {
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo test -p megle-core decode:: 2>&1 | tail -20
+cargo test -p mangoo-core decode:: 2>&1 | tail -20
 cargo fmt --all --check
 ```
 
@@ -486,7 +486,7 @@ mod tests {
     fn unique_temp_dir() -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "megle_decode_image_{}_{}_{}",
+            "mangoo_decode_image_{}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -601,7 +601,7 @@ mod tests {
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo test -p megle-core decode::image_crate 2>&1 | tail -20
+cargo test -p mangoo-core decode::image_crate 2>&1 | tail -20
 ```
 
 Expected: FAIL — `cannot find struct ImageCrateDecoder`, `cannot find function rejects_zero_dimensions`, and `file not found for module image_crate`.
@@ -684,7 +684,7 @@ impl MediaDecoder for ImageCrateDecoder {
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo test -p megle-core decode:: 2>&1 | tail -20
+cargo test -p mangoo-core decode:: 2>&1 | tail -20
 cargo fmt --all --check
 ```
 
@@ -736,7 +736,7 @@ mod tests {
     fn unique_temp_dir() -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "megle_decode_ffmpeg_{}_{}_{}",
+            "mangoo_decode_ffmpeg_{}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -917,7 +917,7 @@ mod tests {
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo test -p megle-core decode::ffmpeg 2>&1 | tail -20
+cargo test -p mangoo-core decode::ffmpeg 2>&1 | tail -20
 ```
 
 Expected: FAIL — `file not found for module ffmpeg`, `cannot find function ffmpeg_scale_filter`, `no method decoder_names`.
@@ -1188,7 +1188,7 @@ fn run_and_read(command: &mut Command, scratch: &std::path::Path) -> anyhow::Res
 fn scratch_path() -> PathBuf {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     std::env::temp_dir().join(format!(
-        "megle-decode-{}-{}-{}.png",
+        "mangoo-decode-{}-{}-{}.png",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1203,8 +1203,8 @@ fn scratch_path() -> PathBuf {
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo test -p megle-core decode:: 2>&1 | tail -25
-cargo test -p megle-core thumbnails:: 2>&1 | tail -10
+cargo test -p mangoo-core decode:: 2>&1 | tail -25
+cargo test -p mangoo-core thumbnails:: 2>&1 | tail -10
 cargo fmt --all --check
 ```
 
@@ -1356,7 +1356,7 @@ Add to `crates/core/src/thumbnails/mod.rs`'s existing `mod tests`:
     #[test]
     fn image_thumbnail_generation_flows_through_the_decoder_registry() {
         let dir = std::env::temp_dir().join(format!(
-            "megle_thumb_registry_{}_{}",
+            "mangoo_thumb_registry_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1388,7 +1388,7 @@ Add to `crates/core/src/thumbnails/mod.rs`'s existing `mod tests`:
     #[test]
     fn an_unclaimed_format_reports_the_no_decoder_marker() {
         let dir = std::env::temp_dir().join(format!(
-            "megle_thumb_nodecoder_{}_{}",
+            "mangoo_thumb_nodecoder_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1413,8 +1413,8 @@ Add to `crates/core/src/thumbnails/mod.rs`'s existing `mod tests`:
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo test -p megle-core decode::formats 2>&1 | tail -15
-cargo test -p megle-core thumbnails::tests 2>&1 | tail -15
+cargo test -p mangoo-core decode::formats 2>&1 | tail -15
+cargo test -p mangoo-core thumbnails::tests 2>&1 | tail -15
 ```
 
 Expected: FAIL — `file not found for module formats`, plus `assertion failed` on the `.raw` marker test (today's error text is `The file extension ... was not recognized`).
@@ -1547,10 +1547,10 @@ Above `classify_thumbnail_failure` in `crates/core/src/thumbnails/mod.rs`, exten
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo test -p megle-core decode:: 2>&1 | tail -15
-cargo test -p megle-core thumbnails:: 2>&1 | tail -15
-cargo test -p megle-core scan:: 2>&1 | tail -8
-cargo test -p megle-core watch:: 2>&1 | tail -8
+cargo test -p mangoo-core decode:: 2>&1 | tail -15
+cargo test -p mangoo-core thumbnails:: 2>&1 | tail -15
+cargo test -p mangoo-core scan:: 2>&1 | tail -8
+cargo test -p mangoo-core watch:: 2>&1 | tail -8
 cargo fmt --all --check
 ```
 
@@ -1801,7 +1801,7 @@ Add to `crates/core/src/db/mod.rs`'s existing `mod tests`:
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo test -p megle-core preview_blob 2>&1 | tail -20
+cargo test -p mangoo-core preview_blob 2>&1 | tail -20
 ```
 
 Expected: FAIL — `cannot find struct PreviewBlobRecord`, `no method get_preview_blob`.
@@ -2056,8 +2056,8 @@ if (!dbMigrationsRs.includes('include_str!("../../migrations/0025_preview_blobs.
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo test -p megle-core preview_blob 2>&1 | tail -20
-cargo test -p megle-core db:: 2>&1 | tail -8
+cargo test -p mangoo-core preview_blob 2>&1 | tail -20
+cargo test -p mangoo-core db:: 2>&1 | tail -8
 npm run check:schema
 npm run check:core-api
 cargo fmt --all --check
@@ -2179,7 +2179,7 @@ Add to `crates/core/src/thumbnails/mod.rs`'s existing `mod tests`:
     #[test]
     fn generates_a_downscaled_webp_tier_from_a_large_original() {
         let dir = std::env::temp_dir().join(format!(
-            "megle_preview_tier_{}_{}",
+            "mangoo_preview_tier_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2211,7 +2211,7 @@ Add to `crates/core/src/thumbnails/mod.rs`'s existing `mod tests`:
     #[test]
     fn a_cap_larger_than_the_source_transcodes_without_upscaling() {
         let dir = std::env::temp_dir().join(format!(
-            "megle_preview_transcode_{}_{}",
+            "mangoo_preview_transcode_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2239,7 +2239,7 @@ Add to `crates/core/src/thumbnails/mod.rs`'s existing `mod tests`:
     #[test]
     fn preview_generation_reports_chain_failures_verbatim() {
         let dir = std::env::temp_dir().join(format!(
-            "megle_preview_fail_{}_{}",
+            "mangoo_preview_fail_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2264,7 +2264,7 @@ Add to `crates/core/src/thumbnails/mod.rs`'s existing `mod tests`:
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo test -p megle-core thumbnails::tests 2>&1 | tail -20
+cargo test -p mangoo-core thumbnails::tests 2>&1 | tail -20
 ```
 
 Expected: FAIL — `cannot find function select_preview_profile`, `cannot find value PREVIEW_2048_PROFILE`, `cannot find function generate_preview_webp`.
@@ -2416,7 +2416,7 @@ pub fn generate_preview_webp(
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo test -p megle-core thumbnails:: 2>&1 | tail -20
+cargo test -p mangoo-core thumbnails:: 2>&1 | tail -20
 cargo fmt --all --check
 ```
 
@@ -2445,8 +2445,8 @@ git commit -m "feat(core): add adaptive preview tier profiles and webp generatio
 - Consumes: Task 4's `decode::formats::{is_browser_renderable_image, lowercase_extension}`; Task 5's `db::PreviewBlobRecord` + `get_preview_blob`/`upsert_preview_blob`; Task 6's `select_preview_profile`, `preview_profile_max_px`, `PREVIEW_NATIVE_PROFILE`, `PREVIEW_NATIVE_MAX_PX`, `generate_preview_webp`.
 - Produces:
   - `routes::PreviewPlan { profile: &'static str, max_px: u32 }` and `routes::resolve_preview_plan(media_kind: Option<&str>, ext: &str, source_max_px: u32, viewport_long_px: u32) -> Option<PreviewPlan>`
-  - HTTP: `GET /api/media/{fileId}/preview?viewportLongPx=<u32>&v=<version>`, response header `x-megle-preview-tier: original | preview_2048 | preview_3072 | preview_native`
-  - `@megle/core-client`: `PreviewResource { blob: Blob; tier: string }` and `getPreviewResource(fileId: number, options: PreviewResourceOptions = {}) => Promise<PreviewResource>`, where `PreviewResourceOptions extends BlobRequestOptions { viewportLongPx?: number }`. Tasks 9–11 consume `getPreviewResource`; the untouched `getPreviewBlob` remains the "give me the original" call used for the background sharpening upgrade.
+  - HTTP: `GET /api/media/{fileId}/preview?viewportLongPx=<u32>&v=<version>`, response header `x-mangoo-preview-tier: original | preview_2048 | preview_3072 | preview_native`
+  - `@mangoo/core-client`: `PreviewResource { blob: Blob; tier: string }` and `getPreviewResource(fileId: number, options: PreviewResourceOptions = {}) => Promise<PreviewResource>`, where `PreviewResourceOptions extends BlobRequestOptions { viewportLongPx?: number }`. Tasks 9–11 consume `getPreviewResource`; the untouched `getPreviewBlob` remains the "give me the original" call used for the background sharpening upgrade.
 
 **Three constraints this task must not break:**
 1. `tools/checks/validate-core-api.mjs` asserts `functionBody("get_preview")` still contains `resolve_file_source_path`, `tokio::fs::File::open`, `Body::from_stream`, `CONTENT_TYPE`, and `preview_content_type`, and must not contain `StatusCode::ACCEPTED`. Keeping the raw-stream branch *inside* `get_preview` (rather than extracting it) satisfies all of that unchanged.
@@ -2514,7 +2514,7 @@ Add to `crates/core/src/api/routes.rs`'s existing `mod tests`:
         assert_eq!(
             response
                 .headers()
-                .get("x-megle-preview-tier")
+                .get("x-mangoo-preview-tier")
                 .and_then(|value| value.to_str().ok()),
             Some("original")
         );
@@ -2533,7 +2533,7 @@ Add to `crates/core/src/api/routes.rs`'s existing `mod tests`:
         assert_eq!(
             first
                 .headers()
-                .get("x-megle-preview-tier")
+                .get("x-mangoo-preview-tier")
                 .and_then(|value| value.to_str().ok()),
             Some(PREVIEW_2048_PROFILE)
         );
@@ -2600,11 +2600,11 @@ Add to `crates/core/src/api/routes.rs`'s existing `mod tests`:
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo test -p megle-core preview_plan 2>&1 | tail -20
-cargo test -p megle-core preview_route 2>&1 | tail -20
+cargo test -p mangoo-core preview_plan 2>&1 | tail -20
+cargo test -p mangoo-core preview_route 2>&1 | tail -20
 ```
 
-Expected: FAIL — `cannot find function resolve_preview_plan`, `no header x-megle-preview-tier`.
+Expected: FAIL — `cannot find function resolve_preview_plan`, `no header x-mangoo-preview-tier`.
 
 - [ ] **Step 3a: Add the query struct and the pure resolver**
 
@@ -2755,7 +2755,7 @@ async fn get_preview(
 
 /// Tells the client WHICH representation it received, so it knows whether a
 /// background full-resolution upgrade is still worth requesting.
-const PREVIEW_TIER_HEADER: &str = "x-megle-preview-tier";
+const PREVIEW_TIER_HEADER: &str = "x-mangoo-preview-tier";
 
 async fn serve_cached_preview_webp(
     state: AppState,
@@ -2855,7 +2855,7 @@ Replace the `/media/{fileId}/preview` block in `contracts/core-api/openapi.yaml`
         images at or below the tier threshold, and every video, stream the
         original indexed bytes unchanged. Larger images return an adaptive
         downscaled WebP tier, and browser-unrenderable images return a
-        transcoded WebP. The x-megle-preview-tier response header names which
+        transcoded WebP. The x-mangoo-preview-tier response header names which
         representation was served.
       parameters:
         - $ref: "#/components/parameters/fileId"
@@ -2873,7 +2873,7 @@ Replace the `/media/{fileId}/preview` block in `contracts/core-api/openapi.yaml`
         "200":
           description: Original indexed media bytes, or a WebP preview representation.
           headers:
-            x-megle-preview-tier:
+            x-mangoo-preview-tier:
               description: original | preview_2048 | preview_3072 | preview_native
               schema:
                 type: string
@@ -2936,7 +2936,7 @@ export interface PreviewResource {
   ): Promise<PreviewResource> {
     const headers = new Headers();
     if (config.sessionToken) {
-      headers.set("x-megle-session", config.sessionToken);
+      headers.set("x-mangoo-session", config.sessionToken);
     }
     const response = await scheduleCoreRequest(
       options.requestPriority ?? "resource",
@@ -2951,7 +2951,7 @@ export interface PreviewResource {
     }
     return {
       blob: await response.blob(),
-      tier: response.headers.get("x-megle-preview-tier") ?? "original"
+      tier: response.headers.get("x-mangoo-preview-tier") ?? "original"
     };
   }
 ```
@@ -2980,8 +2980,8 @@ and the method itself, immediately after `getPreviewBlob` (which stays byte-for-
 if (!/getPreviewResource:\s*\(fileId:\s*number,\s*options:\s*PreviewResourceOptions\s*=\s*\{\}\)\s*=>\s*fetchBlobWithTier\(/.test(client)) {
   fail("client.ts getPreviewResource must request the resolved preview representation");
 }
-if (!/x-megle-preview-tier/.test(client)) {
-  fail("client.ts must read the x-megle-preview-tier response header");
+if (!/x-mangoo-preview-tier/.test(client)) {
+  fail("client.ts must read the x-mangoo-preview-tier response header");
 }
 // The query serialiser is a whitelist; a parameter it does not know is dropped
 // silently and the server never sees a viewport.
@@ -3029,7 +3029,7 @@ if (/run_shared_database[\s\S]{0,400}generate_preview_webp/.test(serveBody)) {
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo test -p megle-core preview 2>&1 | tail -25
+cargo test -p mangoo-core preview 2>&1 | tail -25
 cargo fmt --all --check
 npm run check:core-api
 npm run check:core-client
@@ -3252,7 +3252,7 @@ describe("preview bitmap pool", () => {
 - [ ] **Step 2: Run the test to verify it fails**
 
 ```bash
-npm --workspace @megle/web run test 2>&1 | tail -20
+npm --workspace @mangoo/web run test 2>&1 | tail -20
 ```
 
 Expected: FAIL — `Cannot find module '../src/features/preview/previewBitmapPool.ts'`.
@@ -3415,8 +3415,8 @@ export class PreviewBitmapPool {
 - [ ] **Step 4: Run the test to verify it passes**
 
 ```bash
-npm --workspace @megle/web run test 2>&1 | tail -20
-npm --workspace @megle/web run typecheck
+npm --workspace @mangoo/web run test 2>&1 | tail -20
+npm --workspace @mangoo/web run typecheck
 ```
 
 Expected: 12 new assertions pass alongside the existing web suite; typecheck clean.
@@ -3466,7 +3466,7 @@ import { describe, it } from "node:test";
 
 register("./resolve-source-imports.mjs", import.meta.url);
 (globalThis as typeof globalThis & { window: Record<string, unknown> }).window = {
-  megleDesktop: { coreUrl: "http://127.0.0.1:47321/api" }
+  mangooDesktop: { coreUrl: "http://127.0.0.1:47321/api" }
 };
 
 const { createDecodeDispatcher } = await import(
@@ -3612,7 +3612,7 @@ describe("media cache reset listeners", () => {
 - [ ] **Step 2: Run the tests to verify they fail**
 
 ```bash
-npm --workspace @megle/web run test 2>&1 | tail -20
+npm --workspace @mangoo/web run test 2>&1 | tail -20
 ```
 
 Expected: FAIL — `Cannot find module '../src/features/preview/previewBitmapSource.ts'` and `registerMediaCacheResetListener is not a function`.
@@ -3688,7 +3688,7 @@ and append to the end of `resetMediaCachesForLibrarySwitch`:
 Create `apps/web/src/features/preview/previewBitmapSource.ts`:
 
 ```typescript
-import type { MediaRecord } from "@megle/core-client";
+import type { MediaRecord } from "@mangoo/core-client";
 
 import { createCoreClient } from "../../core/client";
 import {
@@ -3943,8 +3943,8 @@ registerMediaCacheResetListener(releasePreviewBitmaps);
 - [ ] **Step 4: Run the tests to verify they pass**
 
 ```bash
-npm --workspace @megle/web run test 2>&1 | tail -20
-npm --workspace @megle/web run typecheck
+npm --workspace @mangoo/web run test 2>&1 | tail -20
+npm --workspace @mangoo/web run typecheck
 npm run check:web
 ```
 
@@ -4081,7 +4081,7 @@ describe("preview render lane", () => {
 - [ ] **Step 2: Run the test to verify it fails**
 
 ```bash
-npm --workspace @megle/web run test 2>&1 | tail -20
+npm --workspace @mangoo/web run test 2>&1 | tail -20
 ```
 
 Expected: FAIL — `Cannot find module '../src/features/preview/previewRenderLane.ts'`.
@@ -4160,7 +4160,7 @@ Create `apps/web/src/features/preview/PreviewCanvas.tsx`:
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 
-import type { MediaRecord } from "@megle/core-client";
+import type { MediaRecord } from "@mangoo/core-client";
 
 import {
   pinPreviewFrame,
@@ -4395,8 +4395,8 @@ In `apps/web/src/styles.css`, next to the existing `.preview-image` rule:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 ```bash
-npm --workspace @megle/web run test 2>&1 | tail -20
-npm --workspace @megle/web run typecheck
+npm --workspace @mangoo/web run test 2>&1 | tail -20
+npm --workspace @mangoo/web run typecheck
 npm run check:web
 npm run check:ui-design
 ```
@@ -4545,7 +4545,7 @@ describe("prefetch lane split", () => {
 - [ ] **Step 2: Run the tests to verify they fail**
 
 ```bash
-npm --workspace @megle/web run test 2>&1 | tail -20
+npm --workspace @mangoo/web run test 2>&1 | tail -20
 ```
 
 Expected: FAIL — `Cannot find module '../src/app/previewNavigationGate.ts'`.
@@ -4714,8 +4714,8 @@ and drop `previewNavigationLockedRef.current = false;` from `handleClosePreview`
 - [ ] **Step 4: Run the tests to verify they pass**
 
 ```bash
-npm --workspace @megle/web run test 2>&1 | tail -20
-npm --workspace @megle/web run typecheck
+npm --workspace @mangoo/web run test 2>&1 | tail -20
+npm --workspace @mangoo/web run typecheck
 npm run check:web
 ```
 
@@ -4754,7 +4754,7 @@ Expected: every stage prints PASS. Fix anything that does not before continuing 
 - [ ] **Step 2: Launch the real app against the benchmark folder**
 
 ```bash
-MEGLE_AUTO_ADD_ROOT="C:/Users/84460/Pictures/normal" MEGLE_REMOTE_DEBUG=1 npm run dev
+MANGOO_AUTO_ADD_ROOT="C:/Users/84460/Pictures/normal" MANGOO_REMOTE_DEBUG=1 npm run dev
 ```
 
 Wait for the grid to populate and thumbnails to finish (so `media.width/height` are real, which is what the tier selector reads).
@@ -4771,7 +4771,7 @@ node tools/dev/cdp-inspect.mjs "$WS"
 Record in the benchmark doc:
 - median wall-clock for the 31-image walk, before (~8s, from the existing measurement) and after
 - that the preview stage renders `canvas.preview-canvas`, not `img.preview-image`
-- `x-megle-preview-tier` values actually observed in the network log
+- `x-mangoo-preview-tier` values actually observed in the network log
 - `performance.memory.usedJSHeapSize` after 200+ continuous navigation steps, sampled twice five minutes apart, to show the ImageBitmap pool stabilises rather than grows
 
 - [ ] **Step 4: Verify format coverage and memory release**

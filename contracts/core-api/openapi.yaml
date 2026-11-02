@@ -1,7 +1,20 @@
 openapi: 3.1.0
 info:
-  title: Megle Core API
+  title: Mangoo Core API
   version: 0.1.0
+  description: >-
+    Sandbox-delegated UI requests carry both X-Mangoo-Plugin-UI-Id and
+    X-Mangoo-Plugin-UI-Epoch from the verified view document. Core validates the
+    selected installed lifecycle after obtaining UI admission; missing/malformed
+    pairs return 400, unavailable or changed epochs return 409. UI admission
+    spans each handler and serializes API plugin lifecycle mutations, including
+    discovery and auth callbacks. Engine fences remain authoritative for
+    background lifecycle changes. Library mutation context revisions are still required.
+    Mutating Library/sync API requests also take exclusive UI admission. After
+    admission, delegated scoped targets and stored plans must belong to the
+    session plugin and its current account; changes return 409 with code
+    plugin-ui-target-changed. Only explicit setup/enrollment and restore paths
+    accept an unowned local or absent target as appropriate for that operation.
 servers:
   - url: http://127.0.0.1:{port}/api
     variables:
@@ -21,7 +34,7 @@ paths:
       operationId: listLibraries
       responses:
         "200":
-          description: Libraries registered on this device.
+          description: Visible Libraries registered on this device. Forgotten registrations remain reserved internally.
           content:
             application/json:
               schema:
@@ -49,6 +62,67 @@ paths:
                 $ref: "#/components/schemas/LibraryErrorResponse"
         "409":
           description: The root conflicts with an existing library or changed after preflight.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LibraryErrorResponse"
+  /libraries/open:
+    post:
+      operationId: openLibrary
+      parameters:
+        - $ref: "#/components/parameters/contextRevision"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OpenLibraryRequest"
+      responses:
+        "200":
+          description: Existing committed Mangoo Library registered or made visible; activation is reported separately. Same-Host catalog and appearance are retained. Other Hosts rebuild their own catalog without modifying the selected directory.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OpenLibraryResponse"
+        "400":
+          description: Invalid absolute path or invalid Library marker.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LibraryErrorResponse"
+        "404":
+          description: Directory or Library marker not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LibraryErrorResponse"
+        "409":
+          description: Unsupported or changed identity, overlapping root, local-data collision, or stale context revision. User content is preserved.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LibraryErrorResponse"
+  /libraries/{libraryUuid}/registration:
+    delete:
+      operationId: forgetLibrary
+      parameters:
+        - $ref: "#/components/parameters/libraryUuid"
+        - $ref: "#/components/parameters/contextRevision"
+      responses:
+        "200":
+          description: Registration hidden from the list; all media, markers, catalog, cache and retained registration metadata are preserved. An active target is stopped and cleared atomically, incrementing context revision; an inactive target leaves the active context unchanged. Repeating with the current revision is idempotent. Reopen explicitly to restore visibility.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActiveLibraryResponse"
+        "404":
+          description: Registration not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LibraryErrorResponse"
+        "409":
+          description: Stale context revision or lifecycle transition failure.
           content:
             application/json:
               schema:
@@ -787,6 +861,149 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+  /roots/{rootId}/appearance:
+    patch:
+      operationId: updateRootAppearance
+      summary: Update local root appearance independently of scan or storage reachability
+      parameters:
+        - $ref: "#/components/parameters/rootId"
+        - $ref: "#/components/parameters/contextRevision"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateFolderAppearanceRequest" }
+      responses:
+        "200":
+          description: Root metadata with current reachability.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RootRecord" }
+        "400": { description: Invalid appearance pair. }
+        "404": { description: Enabled root not found or pending removal. }
+        "409": { description: Stale Library context. }
+  /roots/{rootId}/sort:
+    get:
+      operationId: getRootSort
+      description: Local direct-subfolder ordering; optional recursive inheritance. Reset restores inherited or default order. Ordinary-folder writes reject root sentinels.
+      parameters:
+        - $ref: "#/components/parameters/rootId"
+      responses:
+        "200":
+          description: Authoritative effective rule and scoped revision.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DirectorySortState" }
+        "400": { description: Invalid rule. }
+        "404": { description: Active directory not found. }
+        "409": { description: Stale Library context. }
+    patch:
+      operationId: updateRootSort
+      description: Local direct-subfolder ordering; optional recursive inheritance. Reset restores inherited or default order. Ordinary-folder writes reject root sentinels.
+      parameters:
+        - $ref: "#/components/parameters/rootId"
+        - $ref: "#/components/parameters/contextRevision"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DirectorySortRule" }
+      responses:
+        "200":
+          description: Authoritative effective rule and scoped revision.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DirectorySortMutationResult" }
+        "400": { description: Invalid rule. }
+        "404": { description: Active directory not found. }
+        "409": { description: Stale Library context. }
+    delete:
+      operationId: resetRootSort
+      description: Local direct-subfolder ordering; optional recursive inheritance. Reset restores inherited or default order. Ordinary-folder writes reject root sentinels.
+      parameters:
+        - $ref: "#/components/parameters/rootId"
+        - $ref: "#/components/parameters/contextRevision"
+      responses:
+        "200":
+          description: Authoritative effective rule and scoped revision.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DirectorySortMutationResult" }
+        "400": { description: Invalid rule. }
+        "404": { description: Active directory not found. }
+        "409": { description: Stale Library context. }
+  /folders/{folderId}/sort:
+    get:
+      operationId: getFolderSort
+      description: Local direct-subfolder ordering; optional recursive inheritance. Reset restores inherited or default order. Ordinary-folder writes reject root sentinels.
+      parameters:
+        - $ref: "#/components/parameters/folderId"
+      responses:
+        "200":
+          description: Authoritative effective rule and scoped revision.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DirectorySortState" }
+        "400": { description: Invalid rule. }
+        "404": { description: Active directory not found. }
+        "409": { description: Stale Library context. }
+    patch:
+      operationId: updateFolderSort
+      description: Local direct-subfolder ordering; optional recursive inheritance. Reset restores inherited or default order. Ordinary-folder writes reject root sentinels.
+      parameters:
+        - $ref: "#/components/parameters/folderId"
+        - $ref: "#/components/parameters/contextRevision"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DirectorySortRule" }
+      responses:
+        "200":
+          description: Authoritative effective rule and scoped revision.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DirectorySortMutationResult" }
+        "400": { description: Invalid rule. }
+        "404": { description: Active directory not found. }
+        "409": { description: Stale Library context. }
+    delete:
+      operationId: resetFolderSort
+      description: Local direct-subfolder ordering; optional recursive inheritance. Reset restores inherited or default order. Ordinary-folder writes reject root sentinels.
+      parameters:
+        - $ref: "#/components/parameters/folderId"
+        - $ref: "#/components/parameters/contextRevision"
+      responses:
+        "200":
+          description: Authoritative effective rule and scoped revision.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DirectorySortMutationResult" }
+        "400": { description: Invalid rule. }
+        "404": { description: Active directory not found. }
+        "409": { description: Stale Library context. }
+  /folders/{folderId}/appearance:
+    patch:
+      operationId: updateFolderAppearance
+      summary: Update the active Library's ordinary folder icon and color
+      description: Catalog metadata only. Root sentinels cannot be edited. Reset explicitly writes folder and white; null is not accepted.
+      parameters:
+        - $ref: "#/components/parameters/folderId"
+        - $ref: "#/components/parameters/contextRevision"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateFolderAppearanceRequest" }
+      responses:
+        "200":
+          description: Authoritative folder with the saved appearance.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FolderRecord" }
+        "400": { description: Invalid appearance. }
+        "404": { description: Ordinary active folder not found. }
+        "409": { description: Active Library context revision changed. }
   /folders/{folderId}/children:
     get:
       operationId: listFolderChildren
@@ -805,7 +1022,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/FolderListResponse"
+                $ref: "#/components/schemas/FolderChildrenPage"
         "400":
           description: Invalid folder children cursor.
           content:
@@ -967,7 +1184,7 @@ paths:
         "200":
           description: Generated thumbnail bytes (WebP).
           headers:
-            x-megle-served-by:
+            x-mangoo-served-by:
               schema:
                 type: string
                 enum: [db_blob]
@@ -1060,6 +1277,115 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ThumbnailCacheCancelBulkResponse"
+  /media/{fileId}/playback-sessions:
+    post:
+      operationId: createPlaybackSession
+      description: >-
+        Creates a single-video grant bound to the active Library/context, source
+        identity and root binding. Normal session and Library mutation headers
+        are required. At most 8 live grants; renewal TTL 60 seconds, absolute
+        lifetime 10 minutes. No video decoding or full-file buffering occurs.
+      parameters:
+        - $ref: "#/components/parameters/fileId"
+      responses:
+        "201":
+          description: Restricted playback grant created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlaybackSession"
+        "401":
+          description: Session authentication required.
+        "404":
+          description: Video source missing.
+        "409":
+          description: Library or source changed, or file is not an original video.
+        "429":
+          description: Live grant limit reached.
+  /playback-sessions/{sessionId}/renew:
+    post:
+      operationId: renewPlaybackSession
+      description: Revalidates the same source and renews for at most 60 seconds without extending the absolute lifetime.
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Grant renewed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlaybackSession"
+        "401":
+          description: Session authentication required.
+        "404":
+          description: Grant expired or revoked.
+        "409":
+          description: Library or source identity changed.
+  /playback-sessions/{sessionId}:
+    delete:
+      operationId: revokePlaybackSession
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204":
+          description: Grant and response-body ownership revoked; also returned if already absent.
+        "401":
+          description: Session authentication required.
+        "409":
+          description: Library mutation context changed.
+  /playback/{capability}:
+    parameters:
+      - name: capability
+        in: path
+        required: true
+        schema: { type: string }
+      - name: Range
+        in: header
+        schema: { type: string }
+    get:
+      operationId: getPlaybackStream
+      security: []
+      description: >-
+        Only this GET/HEAD route accepts the short-lived single-video capability.
+        It never accepts a long-lived session token in the URL. Serves one byte
+        range including suffix/open-ended forms. Malformed, multiple, zero-suffix
+        and unsatisfiable ranges return 416 with Content-Range bytes */length.
+        No Range gives 200; valid Range gives 206 with exact Content-Range and
+        Content-Length. All responses advertise Accept-Ranges bytes and no-store.
+        At most 2 response bodies per grant with 64 KiB read chunks; body drop,
+        revocation, expiry, Library activation, root/source change stop reading.
+      responses:
+        "200":
+          description: Full representation streamed on demand, never buffered in full.
+        "206":
+          description: Requested byte range.
+        "404":
+          description: Missing, expired or revoked grant/source.
+        "409":
+          description: Source or active Library changed.
+        "416":
+          description: Invalid or unsatisfiable byte range.
+          headers:
+            Content-Range:
+              schema: { type: string }
+        "429":
+          description: Concurrent stream limit reached.
+    head:
+      operationId: headPlaybackStream
+      security: []
+      description: Identical status and headers to GET including Range, without reading or returning a body.
+      responses:
+        "200": { description: Representation metadata. }
+        "206": { description: Byte range metadata. }
+        "404": { description: Missing or expired grant/source. }
+        "409": { description: Source or Library changed. }
+        "416": { description: Invalid or unsatisfiable range. }
   /media/{fileId}/preview:
     get:
       operationId: getPreview
@@ -1068,7 +1394,7 @@ paths:
         images at or below the tier threshold, and every video, stream the
         original indexed bytes unchanged. Larger images return an adaptive
         downscaled WebP tier, and browser-unrenderable images return a
-        transcoded WebP. The x-megle-preview-tier response header names which
+        transcoded WebP. The x-mangoo-preview-tier response header names which
         representation was served.
       parameters:
         - $ref: "#/components/parameters/fileId"
@@ -1087,7 +1413,7 @@ paths:
         "200":
           description: Original indexed media bytes, or a WebP preview representation.
           headers:
-            x-megle-preview-tier:
+            x-mangoo-preview-tier:
               description: original | preview_2048 | preview_3072 | preview_native
               schema:
                 type: string
@@ -1117,7 +1443,7 @@ paths:
             Preview generation panicked. A generation FAILURE (no decoder for
             the format, decoder binary missing, unreachable source) is not an
             error here — it degrades to the original bytes with
-            x-megle-preview-tier: original — so only an internal panic, which is
+            x-mangoo-preview-tier: original — so only an internal panic, which is
             a bug, reaches this status.
           content:
             application/json:
@@ -1974,22 +2300,48 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PluginCommandResponse"
-  /plugins/com.megle.onedrive/configuration:
-    get:
-      operationId: getOneDriveConfiguration
-      responses:
-        "200": { description: OneDrive public-client configuration projection., content: { application/json: { schema: { $ref: "#/components/schemas/OneDriveConfiguration" } } } }
-    put:
-      operationId: commitOneDriveConfiguration
-      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/OneDriveConfigurationCommitRequest" } } } }
-      responses:
-        "200": { description: Configuration committed., content: { application/json: { schema: { $ref: "#/components/schemas/OneDriveConfiguration" } } } }
-  /plugins/com.megle.onedrive/configuration/plan:
+  /plugins/{pluginId}/external-link:
+    parameters:
+      - $ref: "#/components/parameters/pluginId"
     post:
-      operationId: planOneDriveConfiguration
-      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/OneDriveConfigurationPlanRequest" } } } }
+      operationId: resolvePluginExternalLink
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/PluginExternalLinkRequest" } } } }
       responses:
-        "200": { description: Configuration impact plan., content: { application/json: { schema: { $ref: "#/components/schemas/OneDriveConfigurationPlan" } } } }
+        "200": { description: Exact current authorization or declared help link., content: { application/json: { schema: { $ref: "#/components/schemas/PluginExternalLink" } } } }
+        "409": { description: The authorization flow is no longer current. }
+  /plugins/{pluginId}/views/{viewId}:
+    parameters:
+      - $ref: "#/components/parameters/pluginId"
+      - name: viewId
+        in: path
+        required: true
+        schema: { type: string, pattern: "^[A-Za-z][A-Za-z0-9-]{0,63}$" }
+    get:
+      operationId: getPluginViewDocument
+      responses:
+        "200": { description: Verified self-contained plugin UI document. Does not launch a Provider or require an account., content: { application/json: { schema: { $ref: "#/components/schemas/HostPluginViewDocument" } } } }
+        "404": { description: Plugin or declared view is missing. }
+        "409": { description: Plugin is disabled, stopping, incompatible, untrusted, changed, or missing grants. }
+  /plugins/{pluginId}/configuration:
+    parameters:
+      - $ref: "#/components/parameters/pluginId"
+    get:
+      operationId: getPluginConfiguration
+      responses:
+        "200": { description: Provider non-secret configuration projection., content: { application/json: { schema: { $ref: "#/components/schemas/PluginConfiguration" } } } }
+    put:
+      operationId: commitPluginConfiguration
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/PluginConfigurationCommitRequest" } } } }
+      responses:
+        "200": { description: Configuration committed., content: { application/json: { schema: { $ref: "#/components/schemas/PluginConfiguration" } } } }
+  /plugins/{pluginId}/configuration/plan:
+    parameters:
+      - $ref: "#/components/parameters/pluginId"
+    post:
+      operationId: planPluginConfiguration
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/PluginConfigurationPlanRequest" } } } }
+      responses:
+        "200": { description: Configuration impact plan., content: { application/json: { schema: { $ref: "#/components/schemas/PluginConfigurationPlan" } } } }
   /plugins/{pluginId}/health:
     get:
       operationId: getPluginHealth
@@ -2034,7 +2386,7 @@ components:
     sessionToken:
       type: apiKey
       in: header
-      name: X-Megle-Session
+      name: X-Mangoo-Session
   parameters:
     rootId:
       name: rootId
@@ -2129,7 +2481,7 @@ components:
         type: integer
         minimum: 0
     contextRevision:
-      name: X-Megle-Context-Revision
+      name: X-Mangoo-Context-Revision
       in: header
       required: true
       schema:
@@ -2193,6 +2545,22 @@ components:
       description: Unexpected persistence or runtime failure.
       content: { application/json: { schema: { $ref: "#/components/schemas/SyncFolderErrorResponse" } } }
   schemas:
+    PlaybackSession:
+      type: object
+      required: [id, src, expiresAt, renewAfterMs]
+      properties:
+        id: { type: string }
+        src:
+          type: string
+          description: API-relative /playback/<capability>; only core-client resolves it against the configured API base.
+        expiresAt:
+          type: integer
+          description: Expiry in Unix epoch milliseconds.
+        renewAfterMs:
+          type: integer
+          minimum: 1
+          maximum: 30000
+          description: Suggested delay before authenticated renewal.
     LibraryLifecycleState:
       type: string
       enum: [creating, ready, removing, error, recovery-required]
@@ -2204,10 +2572,24 @@ components:
       enum: [available, unavailable]
     LibraryPreflightReason:
       type: string
-      enum: [ok, invalid-path, invalid-name, cloud-sync-root, reparse-point, nested-library-root, not-empty, marker-mismatch, not-writable, insufficient-space, path-changed]
+      enum: [ok, invalid-path, invalid-name, cloud-sync-root, reparse-point, nested-library-root, not-empty, marker-mismatch, not-writable, insufficient-space, path-changed, content-roots-required, database-content-overlap, content-roots-overlap]
+    LibraryPreflightPathRole:
+      type: string
+      enum: [database, content-root]
+    LibraryContentRootInput:
+      type: object
+      additionalProperties: false
+      required: [path, createIfMissing]
+      properties:
+        path:
+          type: string
+          minLength: 1
+        createIfMissing:
+          type: boolean
+          description: Permits creation of a missing content folder; does not establish cleanup ownership.
     LibrarySummary:
       type: object
-      required: [libraryUuid, rootUuid, name, managedRoot, active, availability, lifecycleState, bindingState, contextRevision]
+      required: [libraryUuid, rootUuid, name, databasePath, active, availability, lifecycleState, bindingState, contextRevision]
       properties:
         libraryUuid:
           type: string
@@ -2225,8 +2607,9 @@ components:
           anyOf:
             - type: string
             - type: "null"
-        managedRoot:
+        databasePath:
           type: string
+          description: Exact directory containing the Library Catalog and internal storage, separate from content roots.
         active:
           type: boolean
         availability:
@@ -2265,40 +2648,94 @@ components:
           minimum: 0
     LibraryPreflightRequest:
       type: object
-      required: [name, managedRoot]
+      additionalProperties: false
+      required: [name, databasePath, contentRoots]
       properties:
         name:
           type: string
           minLength: 1
-        managedRoot:
+        databasePath:
           type: string
+          minLength: 1
+        contentRoots:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/LibraryContentRootInput"
     LibraryPreflightResponse:
       type: object
-      required: [ok, reason, normalizedRoot, preflightToken]
+      required: [ok, reason, pathRole, rootIndex, normalizedDatabasePath, normalizedContentRoots, preflightToken]
+      description: Normalized paths and token are non-null only on success. Failure preserves the caller's draft; success preserves root order and creation flags.
+      allOf:
+        - if:
+            properties:
+              ok: { const: true }
+          then:
+            properties:
+              reason: { const: ok }
+              pathRole: { type: "null" }
+              rootIndex: { type: "null" }
+              normalizedDatabasePath: { type: string }
+              normalizedContentRoots: { type: array }
+              preflightToken: { type: string, minLength: 1 }
+          else:
+            properties:
+              reason: { not: { const: ok } }
+              normalizedDatabasePath: { type: "null" }
+              normalizedContentRoots: { type: "null" }
+              preflightToken: { type: "null" }
       properties:
         ok:
           type: boolean
         reason:
           $ref: "#/components/schemas/LibraryPreflightReason"
-        normalizedRoot:
-          type: string
+        pathRole:
+          anyOf:
+            - $ref: "#/components/schemas/LibraryPreflightPathRole"
+            - type: "null"
+        rootIndex:
+          description: Zero-based index in the original request, or null for a whole-plan or Database error.
+          anyOf:
+            - type: integer
+              minimum: 0
+            - type: "null"
+        normalizedDatabasePath:
+          anyOf:
+            - type: string
+              minLength: 1
+            - type: "null"
+        normalizedContentRoots:
+          anyOf:
+            - type: array
+              minItems: 1
+              items:
+                $ref: "#/components/schemas/LibraryContentRootInput"
+            - type: "null"
         preflightToken:
           anyOf:
             - type: string
             - type: "null"
         availableBytes:
+          description: Available capacity on the Database destination volume, not aggregate content capacity.
           anyOf:
             - type: integer
             - type: "null"
     CreateLibraryRequest:
       type: object
-      required: [name, managedRoot, initialMode]
+      additionalProperties: false
+      required: [name, databasePath, contentRoots, initialMode]
       properties:
         name:
           type: string
           minLength: 1
-        managedRoot:
+        databasePath:
           type: string
+          minLength: 1
+        contentRoots:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/LibraryContentRootInput"
         icon:
           anyOf:
             - type: string
@@ -2316,6 +2753,26 @@ components:
             - type: "null"
         activate:
           type: boolean
+    OpenLibraryRequest:
+      type: object
+      additionalProperties: false
+      required: [databasePath]
+      properties:
+        databasePath:
+          type: string
+          minLength: 1
+    OpenLibraryResponse:
+      type: object
+      required: [library, activated]
+      properties:
+        library:
+          $ref: "#/components/schemas/LibrarySummary"
+        activated:
+          type: boolean
+        activationError:
+          anyOf:
+            - type: string
+            - type: "null"
     UpdateLibraryRequest:
       type: object
       properties:
@@ -3005,14 +3462,16 @@ components:
         totalCount: { type: integer, minimum: 0 }
     SyncRestoreLegacyItem:
       type: object
-      required: [accountUuid, libraryUuid, name, managedRoot]
+      required: [accountUuid, libraryUuid, name, placementBase]
       additionalProperties: false
       properties:
         restoreMode: { type: string, enum: [legacy-library] }
         accountUuid: { type: string }
         libraryUuid: { type: string, format: uuid }
         name: { type: string }
-        managedRoot: { type: string }
+        placementBase:
+          type: string
+          description: Parent container B; storage uses B/Database and restored content uses B/Files.
     SyncRestoreRootChoice:
       type: object
       required: [rootUuid, expectedLogicalRevision, expectedMaterializationFingerprint, selected]
@@ -3086,14 +3545,19 @@ components:
         ok: { type: boolean }
     SyncRestorePlan:
       type: object
-      required: [restoreUuid, operationUuid, accountUuid, libraryUuid, name, managedRoot, state, phase, catalogReady, mediaItemsDone, mediaBytesDone, updatedAt]
+      required: [restoreUuid, operationUuid, accountUuid, libraryUuid, name, databasePath, placementBase, contentPaths, state, phase, catalogReady, mediaItemsDone, mediaBytesDone, updatedAt]
       properties:
         restoreUuid: { type: string, format: uuid }
         operationUuid: { type: string, format: uuid }
         accountUuid: { type: string }
         libraryUuid: { type: string, format: uuid }
         name: { type: string }
-        managedRoot: { type: string }
+        databasePath: { type: string }
+        placementBase: { type: string }
+        contentPaths:
+          type: array
+          description: Persisted content destinations; empty for a management-only root-aware restore.
+          items: { type: string }
         state: { type: string }
         phase: { type: string }
         catalogReady: { type: boolean }
@@ -3158,9 +3622,12 @@ components:
           type: string
     ScanSummary:
       type: object
-      required: [foldersSeen, mediaFilesSeen, skippedFiles]
+      required: [foldersSeen, mediaFilesSeen, filesSeen, skippedFiles]
       properties:
         foldersSeen:
+          type: integer
+          minimum: 0
+        filesSeen:
           type: integer
           minimum: 0
         mediaFilesSeen:
@@ -3274,6 +3741,7 @@ components:
           itemsTotal,
           foldersSeen,
           mediaFilesSeen,
+          filesSeen,
           skippedFiles,
           error
         ]
@@ -3307,6 +3775,9 @@ components:
           nullable: true
           minimum: 0
         foldersSeen:
+          type: integer
+          minimum: 0
+        filesSeen:
           type: integer
           minimum: 0
         mediaFilesSeen:
@@ -3408,7 +3879,9 @@ components:
           format: uuid
           nullable: true
         managedRootAction:
-          $ref: "#/components/schemas/ManagedRootNotificationAction"
+          anyOf:
+            - $ref: "#/components/schemas/ManagedRootNotificationAction"
+            - type: "null"
         folderId:
           type: integer
           nullable: true
@@ -3491,8 +3964,10 @@ components:
           type: boolean
     RootRecord:
       type: object
-      required: [id, path, displayName, enabled, createdAt, lastScanAt, rootFolderId, mediaCount, reachable]
+      required: [id, path, displayName, enabled, createdAt, lastScanAt, rootFolderId, mediaCount, fileCount, reachable, icon, color]
       properties:
+        icon: { type: string, nullable: true }
+        color: { type: string, nullable: true }
         id:
           type: integer
         path:
@@ -3509,6 +3984,10 @@ components:
         rootFolderId:
           type: integer
           nullable: true
+        fileCount:
+          type: integer
+          minimum: 0
+          description: Total active ordinary files, including descendant folders.
         mediaCount:
           type: integer
           minimum: 0
@@ -3527,9 +4006,55 @@ components:
         nextCursor:
           type: string
           nullable: true
+    DirectorySortOrder:
+      type: string
+      enum: [name_asc, name_desc]
+    DirectorySortRule:
+      type: object
+      additionalProperties: false
+      required: [order, recursive]
+      properties:
+        order: { $ref: "#/components/schemas/DirectorySortOrder" }
+        recursive: { type: boolean }
+    DirectorySortSource:
+      type: object
+      required: [rootId, folderId]
+      properties:
+        rootId: { type: integer }
+        folderId: { type: integer, nullable: true }
+    DirectorySortState:
+      type: object
+      required: [rootId, folderId, explicitRule, effectiveOrder, source, revision]
+      properties:
+        rootId: { type: integer }
+        folderId: { type: integer, nullable: true }
+        explicitRule:
+          nullable: true
+          allOf: [{ $ref: "#/components/schemas/DirectorySortRule" }]
+        effectiveOrder: { $ref: "#/components/schemas/DirectorySortOrder" }
+        source:
+          nullable: true
+          allOf: [{ $ref: "#/components/schemas/DirectorySortSource" }]
+        revision: { type: string, description: Opaque own and ancestry revision fingerprint. }
+    DirectorySortMutationResult:
+      type: object
+      required: [state, invalidateDescendants]
+      properties:
+        state: { $ref: "#/components/schemas/DirectorySortState" }
+        invalidateDescendants: { type: boolean }
+    FolderChildrenPage:
+      type: object
+      required: [items, nextCursor, sortState]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/FolderRecord" }
+        nextCursor: { type: string, nullable: true }
+        totalCount: { type: integer, nullable: true }
+        sortState: { $ref: "#/components/schemas/DirectorySortState" }
     FolderRecord:
       type: object
-      required: [id, rootId, parentId, name, status, hasChildren, mediaCount]
+      required: [id, rootId, parentId, name, status, hasChildren, mediaCount, fileCount, icon, color]
       properties:
         id:
           type: integer
@@ -3542,16 +4067,41 @@ components:
           type: string
         status:
           type: string
+        icon:
+          type: string
+          nullable: true
+          description: Optional stable identity key. Unknown keys are retained and rendered with the default folder fallback.
+        color:
+          type: string
+          nullable: true
+          description: Optional HEX color. Null uses the white default.
         hasChildren:
           type: boolean
           description: >-
             True when the folder has at least one active child folder. Lets the
             UI render an expand affordance up front instead of showing a chevron
             that disappears once an empty child page loads.
+        fileCount:
+          type: integer
+          minimum: 0
+          description: Total active ordinary files, including descendant folders.
         mediaCount:
           type: integer
           minimum: 0
           description: Total active media files in this folder and all descendant folders.
+    UpdateFolderAppearanceRequest:
+      type: object
+      additionalProperties: false
+      required: [icon, color]
+      properties:
+        icon:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: '^[A-Za-z0-9_-]+$'
+        color:
+          type: string
+          pattern: '^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$'
     FolderListResponse:
       type: object
       required: [items, nextCursor]
@@ -3563,6 +4113,21 @@ components:
         nextCursor:
           type: string
           nullable: true
+    FilePresentation:
+      type: object
+      required: [previewKind, thumbnail, generation]
+      properties:
+        previewKind:
+          type: string
+          enum: [original-image, original-video, static-thumbnail]
+        thumbnail:
+          type: string
+          enum: [available, unavailable]
+        generation:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+          description: Local decoder capability snapshot generation; built-ins start at zero.
     MediaRecord:
       type: object
       required: [id, rootId, folderId, name, ext, size, mtime]
@@ -3584,6 +4149,8 @@ components:
         kind:
           type: string
           nullable: true
+        presentation:
+          $ref: "#/components/schemas/FilePresentation"
         width:
           type: integer
           nullable: true
@@ -3655,7 +4222,7 @@ components:
           enum: [grid_320]
         state:
           type: string
-          enum: [pending, queued, ready, failed, skipped_small]
+          enum: [pending, queued, ready, failed, skipped_small, unavailable]
         shortSidePx:
           type: integer
           minimum: 320
@@ -4057,10 +4624,10 @@ components:
           type: boolean
     PluginCapability:
       type: string
-      enum: [sync-provider.v1]
+      enum: [sync-provider.v1, file-decoder.v1]
     PluginRuntimeState:
       type: string
-      enum: [disabled, permission-required, starting, ready, degraded, crashed-backoff, incompatible, configuration-required]
+      enum: [disabled, stopping, permission-required, starting, ready, degraded, crashed-backoff, incompatible, configuration-required]
     PluginAuthState:
       type: string
       enum: [signed-out, authorization-required, authorizing, authenticated, expired, error]
@@ -4110,10 +4677,54 @@ components:
           properties:
             kind: { const: temp-storage }
             maxBytes: { type: integer, minimum: 1, maximum: 1073741824 }
+        - type: object
+          required: [kind, operations]
+          additionalProperties: false
+          properties:
+            kind: { const: host-ui }
+            operations:
+              type: array
+              minItems: 1
+              maxItems: 5
+              uniqueItems: true
+              items: { enum: [core-api, pick-folder, reveal-path, clipboard-write, external-link] }
+    HostPluginViewDocument:
+      type: object
+      additionalProperties: false
+      required: [pluginId, lifecycleEpoch, version, viewId, title, document]
+      properties:
+        pluginId: { type: string }
+        lifecycleEpoch: { type: integer, minimum: 1, maximum: 9007199254740991 }
+        version: { type: string }
+        viewId: { type: string }
+        title: { type: string }
+        document: { type: string, maxLength: 8388608 }
+    PluginUiSlot:
+      type: string
+      enum: [library-menu, library-settings, plugin-detail, root-menu, notification-center]
+    PluginUiView:
+      type: object
+      additionalProperties: false
+      required: [id, title, slot]
+      properties:
+        id: { type: string, pattern: "^[A-Za-z][A-Za-z0-9-]{0,63}$" }
+        title: { type: string, minLength: 1, maxLength: 128 }
+        slot: { $ref: "#/components/schemas/PluginUiSlot" }
+    PluginUiContribution:
+      type: object
+      additionalProperties: false
+      required: [apiVersion, entry, sha256, views]
+      properties:
+        apiVersion: { type: integer, const: 1 }
+        entry: { type: string, maxLength: 512 }
+        sha256: { type: string, pattern: "^[0-9a-f]{64}$" }
+        views: { type: array, minItems: 1, maxItems: 16, items: { $ref: "#/components/schemas/PluginUiView" } }
     HostPluginProjection:
       type: object
-      required: [pluginId, name, selectedVersion, knownGoodVersion, enabledIntent, runtimeState, authState, capabilities, requestedPermissions, grantedPermissions, permissionRequired, accountUuid, accountDisplayName, accountKind, compatibilityReason, backoffUntil, lastHealthyAt, lastErrorCode, lastErrorDetail]
+      required: [contributions, lifecycleEpoch, pluginId, name, selectedVersion, knownGoodVersion, enabledIntent, runtimeState, authState, capabilities, requestedPermissions, grantedPermissions, permissionRequired, accountUuid, accountDisplayName, accountKind, compatibilityReason, backoffUntil, lastHealthyAt, lastErrorCode, lastErrorDetail]
       properties:
+        contributions: { anyOf: [{ $ref: "#/components/schemas/PluginContributions" }, { type: "null" }], nullable: true }
+        lifecycleEpoch: { type: integer, minimum: 1, maximum: 9007199254740991 }
         pluginId: { type: string }
         name: { type: string, minLength: 1, maxLength: 128 }
         selectedVersion: { type: string }
@@ -4198,7 +4809,7 @@ components:
         authorizationUrl: { type: string }
         flowId: { type: string }
         expiresAt: { type: integer }
-        completionMode: { type: string, enum: [loopback, manual-response-uri] }
+        completionMode: { type: string, enum: [loopback, manual-response-uri, host-callback] }
         redirectUri: { type: string, nullable: true }
     PluginAuthCompleteRequest:
       type: object
@@ -4213,40 +4824,25 @@ components:
       additionalProperties: false
       properties:
         flowId: { type: string, minLength: 1, maxLength: 160 }
-    OneDriveConfiguration:
+    PluginContributions:
       type: object
-      required: [source, configured, readOnly, revision, errorCode]
-      properties:
-        source: { type: string, enum: [environment, host-override, missing] }
-        configured: { type: boolean }
-        readOnly: { type: boolean }
-        revision: { type: integer, minimum: 1 }
-        errorCode: { type: string, nullable: true }
-    OneDriveConfigurationPlanRequest:
-      type: object
-      required: [clientId, expectedRevision]
       additionalProperties: false
+      required: [configuration, authentication, presentation, primaryCredential]
       properties:
-        clientId: { type: string, nullable: true, maxLength: 64 }
-        expectedRevision: { type: integer, minimum: 1 }
-    OneDriveConfigurationPlan:
-      type: object
-      required: [planUuid, expectedRevision, effectiveChanged, affectedLibraries, requiresConfirmation, expiresAt]
-      properties:
-        planUuid: { type: string }
-        expectedRevision: { type: integer, minimum: 1 }
-        effectiveChanged: { type: boolean }
-        affectedLibraries: { type: integer, minimum: 0 }
-        requiresConfirmation: { type: boolean }
-        expiresAt: { type: integer }
-    OneDriveConfigurationCommitRequest:
-      type: object
-      required: [planUuid, expectedRevision, confirmed]
-      additionalProperties: false
-      properties:
-        planUuid: { type: string }
-        expectedRevision: { type: integer, minimum: 1 }
-        confirmed: { type: boolean }
+        configuration: { type: array, maxItems: 8, items: { $ref: "#/components/schemas/PluginConfigurationField" } }
+        authentication: { anyOf: [{ type: "null" }, { $ref: "#/components/schemas/PluginAuthenticationContribution" }] }
+        presentation: { anyOf: [{ type: "null" }, { $ref: "#/components/schemas/PluginPresentationContribution" }] }
+        primaryCredential: { anyOf: [{ type: "null" }, { type: object, additionalProperties: false, required: [namespace, purpose], properties: { namespace: { type: string, pattern: "^[a-z0-9][a-z0-9-]{0,63}$" }, purpose: { type: string, pattern: "^[a-z0-9][a-z0-9-]{0,63}$" } } }] }
+        ui: { $ref: "#/components/schemas/PluginUiContribution" }
+    PluginConfigurationField: {"type": "object", "additionalProperties": false, "required": ["id", "label", "description", "format", "required", "environment", "defaultValue", "choices", "hidden", "debugOnly"], "properties": {"id": {"type": "string", "pattern": "^[a-zA-Z][a-zA-Z0-9]{0,63}$"}, "label": {"type": "string", "minLength": 1, "maxLength": 128}, "description": {"type": "string", "maxLength": 2048}, "format": {"enum": ["uuid", "text", "choice", "https-url", "loopback-url"]}, "required": {"type": "boolean"}, "environment": {"type": "string", "pattern": "^MANGOO_[A-Z0-9_]{1,100}$", "nullable": true}, "defaultValue": {"type": "string", "maxLength": 2048, "nullable": true}, "choices": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 128}}, "hidden": {"type": "boolean"}, "debugOnly": {"type": "boolean"}}}
+    PluginAuthenticationContribution: {"type": "object", "additionalProperties": false, "required": ["modes", "authorizationHosts", "manualRedirectUri", "loopbackRedirectPath", "ignoredCallbackFields"], "properties": {"modes": {"type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": true, "items": {"enum": ["loopback", "manual-response-uri", "host-callback"]}}, "authorizationHosts": {"type": "array", "minItems": 1, "maxItems": 8, "uniqueItems": true, "items": {"type": "string", "maxLength": 253}}, "manualRedirectUri": {"type": "string", "maxLength": 2048, "nullable": true}, "loopbackRedirectPath": {"type": "string", "maxLength": 256, "nullable": true}, "ignoredCallbackFields": {"type": "array", "maxItems": 4, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 64}}}}
+    PluginPresentationContribution: {"type": "object", "additionalProperties": false, "required": ["setupLabel", "accountLabel", "icon", "helpLinks", "setupSteps"], "properties": {"setupLabel": {"type": "string", "minLength": 1, "maxLength": 128}, "accountLabel": {"type": "string", "minLength": 1, "maxLength": 128}, "icon": {"enum": ["cloud", "storage"]}, "helpLinks": {"type": "array", "maxItems": 4, "items": {"type": "object", "additionalProperties": false, "required": ["id", "label", "url"], "properties": {"id": {"type": "string", "pattern": "^[a-zA-Z][a-zA-Z0-9]{0,63}$"}, "label": {"type": "string", "minLength": 1, "maxLength": 128}, "url": {"type": "string", "maxLength": 2048}}}}, "setupSteps": {"type": "array", "maxItems": 8, "items": {"type": "object", "additionalProperties": false, "required": ["title", "body", "helpLinkId"], "properties": {"title": {"type": "string", "minLength": 1, "maxLength": 128}, "body": {"type": "string", "maxLength": 2048}, "helpLinkId": {"type": "string", "maxLength": 64, "nullable": true}}}}}}
+    PluginConfiguration: {"type": "object", "required": ["source", "configured", "readOnly", "revision", "errorCode", "values", "fields", "lockedFields"], "additionalProperties": false, "properties": {"source": {"type": "string", "enum": ["environment", "host-override", "missing", "default"]}, "configured": {"type": "boolean"}, "readOnly": {"type": "boolean"}, "revision": {"type": "integer", "minimum": 1}, "errorCode": {"type": "string", "nullable": true}, "values": {"type": "object", "additionalProperties": {"type": "string"}, "maxProperties": 8}, "fields": {"type": "array", "maxItems": 8, "items": {"$ref": "#/components/schemas/PluginConfigurationField"}}, "lockedFields": {"type": "array", "maxItems": 8, "items": {"type": "string"}}}}
+    PluginConfigurationPlanRequest: {"type": "object", "required": ["values", "expectedRevision"], "additionalProperties": false, "properties": {"values": {"type": "object", "maxProperties": 8, "additionalProperties": {"type": "string", "nullable": true, "maxLength": 2048}}, "expectedRevision": {"type": "integer", "minimum": 1}}}
+    PluginConfigurationPlan: {"type": "object", "required": ["planUuid", "expectedRevision", "effectiveChanged", "affectedLibraries", "requiresConfirmation", "expiresAt"], "additionalProperties": false, "properties": {"planUuid": {"type": "string"}, "expectedRevision": {"type": "integer", "minimum": 1}, "effectiveChanged": {"type": "boolean"}, "affectedLibraries": {"type": "integer", "minimum": 0}, "requiresConfirmation": {"type": "boolean"}, "expiresAt": {"type": "integer"}}}
+    PluginConfigurationCommitRequest: {"type": "object", "required": ["planUuid", "expectedRevision", "confirmed"], "additionalProperties": false, "properties": {"planUuid": {"type": "string"}, "expectedRevision": {"type": "integer", "minimum": 1}, "confirmed": {"type": "boolean"}}}
+    PluginExternalLinkRequest: {"type": "object", "required": ["kind", "id"], "additionalProperties": false, "properties": {"kind": {"type": "string", "enum": ["authorization", "help"]}, "id": {"type": "string", "minLength": 1, "maxLength": 160}}}
+    PluginExternalLink: {"type": "object", "required": ["kind", "id", "url", "expiresAt"], "additionalProperties": false, "properties": {"kind": {"type": "string", "enum": ["authorization", "help"]}, "id": {"type": "string"}, "url": {"type": "string", "maxLength": 8192}, "expiresAt": {"type": "integer", "nullable": true}}}
     PluginHealthResponse:
       type: object
       required: [state, lastHealthyAt, lastErrorCode]

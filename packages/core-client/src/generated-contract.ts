@@ -1,6 +1,13 @@
 // Generated-client boundary placeholder.
 // Keep this file mechanically aligned with contracts/core-api/openapi.yaml until generator output replaces it.
 
+export interface PlaybackSession {
+  id: string;
+  src: string;
+  expiresAt: number;
+  renewAfterMs: number;
+}
+
 export interface Page<T> {
   items: T[];
   nextCursor: string | null;
@@ -10,6 +17,7 @@ export interface Page<T> {
 export interface ScanSummary {
   foldersSeen: number;
   mediaFilesSeen: number;
+  filesSeen: number;
   skippedFiles: number;
 }
 
@@ -27,7 +35,17 @@ export type LibraryPreflightReason =
   | "marker-mismatch"
   | "not-writable"
   | "insufficient-space"
-  | "path-changed";
+  | "path-changed"
+  | "content-roots-required"
+  | "database-content-overlap"
+  | "content-roots-overlap";
+
+export type LibraryPreflightPathRole = "database" | "content-root";
+
+export interface LibraryContentRootInput {
+  path: string;
+  createIfMissing: boolean;
+}
 
 export interface LibrarySummary {
   libraryUuid: string;
@@ -35,7 +53,7 @@ export interface LibrarySummary {
   name: string;
   icon?: string | null;
   color?: string | null;
-  managedRoot: string;
+  databasePath: string;
   active: boolean;
   availability: LibraryAvailability;
   lifecycleState: LibraryLifecycleState;
@@ -56,20 +74,25 @@ export interface ActiveLibraryResponse {
 
 export interface LibraryPreflightRequest {
   name: string;
-  managedRoot: string;
+  databasePath: string;
+  contentRoots: LibraryContentRootInput[];
 }
 
 export interface LibraryPreflightResponse {
   ok: boolean;
   reason: LibraryPreflightReason;
-  normalizedRoot: string;
+  pathRole: LibraryPreflightPathRole | null;
+  rootIndex: number | null;
+  normalizedDatabasePath: string | null;
+  normalizedContentRoots: LibraryContentRootInput[] | null;
   preflightToken: string | null;
   availableBytes?: number | null;
 }
 
 export interface CreateLibraryRequest {
   name: string;
-  managedRoot: string;
+  databasePath: string;
+  contentRoots: LibraryContentRootInput[];
   icon?: string | null;
   color?: string | null;
   initialMode: "local-only";
@@ -87,6 +110,16 @@ export interface UpdateLibraryRequest {
   name?: string;
   icon?: string | null;
   color?: string | null;
+}
+
+export interface OpenLibraryRequest {
+  databasePath: string;
+}
+
+export interface OpenLibraryResponse {
+  library: LibrarySummary;
+  activated: boolean;
+  activationError?: string | null;
 }
 
 export interface EnableLibrarySyncRequest {
@@ -169,7 +202,7 @@ export interface SyncReconnectPlan { planUuid: string; libraryUuid: string; remo
 export interface SyncReconnectCommitRequest { operationUuid: string; planUuid: string; choice: "merge-local-fork" | "publish-new-remote"; }
 export interface RemoteLibrarySummary { accountUuid: string; libraryUuid: string; name: string; icon: string | null; mediaCount: number | null; logicalBytes: number | null; lastSyncedAt: number | null; descriptorSize: number; updatedAt: number; compatible: boolean; boundLocally: boolean; errorCode: string | null; }
 export interface RemoteLibraryListResponse { items: RemoteLibrarySummary[]; nextCursor: string | null; totalCount?: number; }
-export interface SyncRestoreLegacyItem { restoreMode?: "legacy-library"; accountUuid: string; libraryUuid: string; name: string; managedRoot: string; }
+export interface SyncRestoreLegacyItem { restoreMode?: "legacy-library"; accountUuid: string; libraryUuid: string; name: string; placementBase: string; }
 export interface SyncRestoreRootChoice { rootUuid: string; expectedLogicalRevision: number; expectedMaterializationFingerprint: string; selected: boolean; targetPath?: string; }
 export interface SyncRestoreRootAwareItem { restoreMode: "root-aware"; accountUuid: string; libraryUuid: string; placementBase: string; inventoryFence: string; roots: SyncRestoreRootChoice[]; }
 export type SyncRestoreStartItem = SyncRestoreLegacyItem | SyncRestoreRootAwareItem;
@@ -178,7 +211,7 @@ export interface SyncRestoreRootResult { libraryUuid: string; rootUuid: string; 
 export interface SyncRestoreVolumeResult { volumeKey: string; requiredBytes: number; availableBytes: number | null; ok: boolean; }
 export interface SyncRestorePreflight { preflightToken: string | null; expiresAt: number; totalItems: number; totalBytes: number; ok: boolean; rootResults: SyncRestoreRootResult[]; volumeResults: SyncRestoreVolumeResult[]; }
 export interface SyncRestoreStartRequest { operationUuid: string; preflightToken: string; items: SyncRestoreStartItem[]; }
-export interface SyncRestorePlan { restoreUuid: string; operationUuid: string; accountUuid: string; libraryUuid: string; name: string; managedRoot: string; state: string; phase: string; catalogReady: boolean; mediaItemsDone: number; mediaItemsTotal?: number | null; mediaBytesDone: number; mediaBytesTotal?: number | null; errorCode?: string | null; updatedAt: number; }
+export interface SyncRestorePlan { restoreUuid: string; operationUuid: string; accountUuid: string; libraryUuid: string; name: string; databasePath: string; placementBase: string; contentPaths: string[]; state: string; phase: string; catalogReady: boolean; mediaItemsDone: number; mediaItemsTotal?: number | null; mediaBytesDone: number; mediaBytesTotal?: number | null; errorCode?: string | null; updatedAt: number; }
 export interface SyncRestoreListResponse { items: SyncRestorePlan[]; }
 export interface SyncConflictRecord { conflictUuid: string; entityUuid?: string | null; conflictKind: string; state: string; details?: unknown | null; createdAt: number; resolvedAt?: number | null; }
 export interface SyncConflictListResponse { items: SyncConflictRecord[]; nextCursor: string | null; }
@@ -284,6 +317,8 @@ export interface ThumbnailCacheCancelBulkResponse {
 
 export type ThumbnailPriority = "background" | "ahead" | "visible" | "selected";
 export interface RootRecord {
+  icon: string | null;
+  color: string | null;
   id: number;
   path: string;
   displayName: string;
@@ -292,6 +327,7 @@ export interface RootRecord {
   lastScanAt: number | null;
   rootFolderId: number | null;
   mediaCount: number;
+  fileCount: number;
   reachable: boolean;
 }
 
@@ -312,6 +348,7 @@ export interface TaskRecord {
   itemsTotal: number | null;
   foldersSeen: number;
   mediaFilesSeen: number;
+  filesSeen: number;
   skippedFiles: number;
   error: string | null;
 }
@@ -340,7 +377,7 @@ export interface NotificationOperationSnapshot {
   rootId: number | null;
   libraryUuid?: string | null;
   rootUuid?: string | null;
-  managedRootAction?: ManagedRootNotificationAction;
+  managedRootAction?: ManagedRootNotificationAction | null;
   folderId: number | null;
   fileId: number | null;
   currentValue: number;
@@ -392,7 +429,36 @@ export interface ListNotificationOutboxParams {
   waitMs?: number;
 }
 
+export interface UpdateFolderAppearanceRequest {
+  icon: string;
+  color: string;
+}
+
+/** Root and ordinary folder appearance share the same paired validation. */
+export type UpdateRootAppearanceRequest = UpdateFolderAppearanceRequest;
+
+export type DirectorySortOrder = "name_asc" | "name_desc";
+export interface DirectorySortRule { order: DirectorySortOrder; recursive: boolean; }
+export interface DirectorySortSource { rootId: number; folderId: number | null; }
+export interface DirectorySortState {
+  rootId: number;
+  folderId: number | null;
+  explicitRule: DirectorySortRule | null;
+  effectiveOrder: DirectorySortOrder;
+  source: DirectorySortSource | null;
+  revision: string;
+}
+export interface DirectorySortMutationResult {
+  state: DirectorySortState;
+  invalidateDescendants: boolean;
+}
+export interface FolderChildrenPage extends Page<FolderRecord> {
+  sortState: DirectorySortState;
+}
+
 export interface FolderRecord {
+  icon: string | null;
+  color: string | null;
   id: number;
   rootId: number;
   parentId: number | null;
@@ -400,6 +466,13 @@ export interface FolderRecord {
   status: string;
   hasChildren: boolean;
   mediaCount: number;
+  fileCount: number;
+}
+
+export interface FilePresentation {
+  previewKind: "original-image" | "original-video" | "static-thumbnail";
+  thumbnail: "available" | "unavailable";
+  generation: number;
 }
 
 export interface MediaRecord {
@@ -411,6 +484,7 @@ export interface MediaRecord {
   size: number;
   mtime: number;
   kind?: string | null;
+  presentation?: FilePresentation;
   width?: number | null;
   height?: number | null;
   durationMs?: number | null;
@@ -485,7 +559,7 @@ export interface ThumbnailAsset {
 export interface ThumbnailResponse {
   fileId: number;
   target: "grid_320";
-  state: "pending" | "queued" | "ready" | "failed" | "skipped_small";
+  state: "pending" | "queued" | "ready" | "failed" | "skipped_small" | "unavailable";
   shortSidePx: number;
   outputFormat: "image/webp";
   width: number | null;
@@ -586,9 +660,10 @@ export interface ListFileOperationsParams {
   cursor?: string;
 }
 
-export type PluginCapability = "sync-provider.v1";
+export type PluginCapability = "sync-provider.v1" | "file-decoder.v1";
 export type PluginRuntimeState =
   | "disabled"
+  | "stopping"
   | "permission-required"
   | "starting"
   | "ready"
@@ -607,9 +682,34 @@ export type PluginPermission =
   | { kind: "network"; schemes: "https"[]; hosts: string[] }
   | { kind: "oauth-loopback"; mode: "ephemeral-only" }
   | { kind: "secret"; namespace: string; operations: ("read" | "write" | "delete")[] }
-  | { kind: "temp-storage"; maxBytes: number };
+  | { kind: "temp-storage"; maxBytes: number }
+  | { kind: "host-ui"; operations: ("core-api" | "pick-folder" | "reveal-path" | "clipboard-write" | "external-link")[] };
+
+export interface HostPluginViewDocument {
+  pluginId: string;
+  lifecycleEpoch: number;
+  version: string;
+  viewId: string;
+  title: string;
+  document: string;
+}
+
+export type PluginUiSlot = "library-menu" | "library-settings" | "plugin-detail" | "root-menu" | "notification-center";
+export interface PluginUiView {
+  id: string;
+  title: string;
+  slot: PluginUiSlot;
+}
+export interface PluginUiContribution {
+  apiVersion: 1;
+  entry: string;
+  sha256: string;
+  views: PluginUiView[];
+}
 
 export interface HostPluginProjection {
+  contributions: PluginContributions | null;
+  lifecycleEpoch: number;
   pluginId: string;
   name: string;
   selectedVersion: string;
@@ -658,7 +758,7 @@ export interface PluginAuthBeginResponse {
   authorizationUrl: string;
   flowId: string;
   expiresAt: number;
-  completionMode: "loopback" | "manual-response-uri";
+  completionMode: "loopback" | "manual-response-uri" | "host-callback";
   redirectUri: string | null;
 }
 export interface PluginAuthCompleteRequest {
@@ -668,16 +768,56 @@ export interface PluginAuthCompleteRequest {
 export interface PluginAuthCancelRequest {
   flowId: string;
 }
-export interface OneDriveConfiguration {
-  source: "environment" | "host-override" | "missing";
+export interface PluginConfigurationField {
+  id: string;
+  label: string;
+  description: string;
+  format: "uuid" | "text" | "choice" | "https-url" | "loopback-url";
+  required: boolean;
+  environment: string | null;
+  defaultValue: string | null;
+  choices: string[];
+  hidden: boolean;
+  debugOnly: boolean;
+}
+export interface PluginAuthenticationContribution {
+  modes: ("loopback" | "manual-response-uri" | "host-callback")[];
+  authorizationHosts: string[];
+  manualRedirectUri: string | null;
+  loopbackRedirectPath: string | null;
+  ignoredCallbackFields: string[];
+}
+export interface PluginPresentationContribution {
+  setupLabel: string;
+  accountLabel: string;
+  icon: "cloud" | "storage";
+  helpLinks: { id: string; label: string; url: string }[];
+  setupSteps: { title: string; body: string; helpLinkId: string | null }[];
+}
+export interface PluginContributions {
+  ui?: PluginUiContribution;
+  configuration: PluginConfigurationField[];
+  authentication: PluginAuthenticationContribution | null;
+  presentation: PluginPresentationContribution | null;
+  primaryCredential: { namespace: string; purpose: string } | null;
+}
+export interface PluginConfiguration {
+  /** Aggregate precedence across visible fields: missing, environment, host-override, default. */
+  source: "environment" | "host-override" | "missing" | "default";
   configured: boolean;
+  /** True only when every visible field is environment-locked; use lockedFields per field. */
   readOnly: boolean;
   revision: number;
   errorCode: string | null;
+  values: Record<string, string>;
+  fields: PluginConfigurationField[];
+  lockedFields: string[];
 }
-export interface OneDriveConfigurationPlanRequest { clientId: string | null; expectedRevision: number; }
-export interface OneDriveConfigurationPlan { planUuid: string; expectedRevision: number; effectiveChanged: boolean; affectedLibraries: number; requiresConfirmation: boolean; expiresAt: number; }
-export interface OneDriveConfigurationCommitRequest { planUuid: string; expectedRevision: number; confirmed: boolean; }
+export interface PluginConfigurationPlanRequest { values: Record<string, string | null>; expectedRevision: number; }
+export interface PluginConfigurationPlan { planUuid: string; expectedRevision: number; effectiveChanged: boolean; affectedLibraries: number; requiresConfirmation: boolean; expiresAt: number; }
+export interface PluginConfigurationCommitRequest { planUuid: string; expectedRevision: number; confirmed: boolean; }
+export interface PluginExternalLinkRequest { kind: "authorization" | "help"; id: string; }
+export interface PluginExternalLink { kind: "authorization" | "help"; id: string; url: string; expiresAt: number | null; }
 export interface PluginHealthResponse {
   state: PluginRuntimeState;
   lastHealthyAt: number | null;

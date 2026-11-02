@@ -1,5 +1,5 @@
 import { useCallback, useState } from "react";
-import type { FolderRecord, MediaRecord } from "@megle/core-client";
+import type { FolderRecord, MediaRecord } from "@mangoo/core-client";
 import type { FileOpResult, LibraryState } from "../../core/useLibraryData";
 
 export type FileOpsTarget =

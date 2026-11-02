@@ -9,7 +9,7 @@ it("replays a persisted recovery error to a newly loaded renderer", async () => 
   };
   let listener: ((phase: LibraryLoadPhase) => void) | null = null;
   (globalThis as typeof globalThis & { window: unknown }).window = {
-    megleDesktop: {
+    mangooDesktop: {
       onLibraryPhase: (next: (phase: LibraryLoadPhase) => void) => {
         listener = next;
         return () => {
@@ -37,7 +37,7 @@ it("does not overwrite a live phase with an older reload snapshot", async () => 
   });
   let listener: ((phase: LibraryLoadPhase) => void) | null = null;
   (globalThis as typeof globalThis & { window: unknown }).window = {
-    megleDesktop: {
+    mangooDesktop: {
       onLibraryPhase: (next: (phase: LibraryLoadPhase) => void) => {
         listener = next;
         return () => undefined;
@@ -59,7 +59,7 @@ it("does not overwrite a live phase with an older reload snapshot", async () => 
 it("replays loading-media when Core became ready before the renderer subscribed", async () => {
   const phaseBeforeSubscribe: LibraryLoadPhase = "loading-media";
   (globalThis as typeof globalThis & { window: unknown }).window = {
-    megleDesktop: {
+    mangooDesktop: {
       onLibraryPhase: () => () => undefined,
       getLibraryPhase: async () => phaseBeforeSubscribe
     }
@@ -76,7 +76,7 @@ it("replays loading-media when Core became ready before the renderer subscribed"
 it("replays the current loading phase again after a renderer reload", async () => {
   let snapshotReads = 0;
   (globalThis as typeof globalThis & { window: unknown }).window = {
-    megleDesktop: {
+    mangooDesktop: {
       onLibraryPhase: () => () => undefined,
       getLibraryPhase: async () => {
         snapshotReads += 1;
@@ -102,7 +102,7 @@ it("replays the current loading phase again after a renderer reload", async () =
 it("keeps the live subscription usable when the reload snapshot request fails", async () => {
   let listener: ((phase: LibraryLoadPhase) => void) | null = null;
   (globalThis as typeof globalThis & { window: unknown }).window = {
-    megleDesktop: {
+    mangooDesktop: {
       onLibraryPhase: (next: (phase: LibraryLoadPhase) => void) => {
         listener = next;
         return () => undefined;
@@ -126,7 +126,7 @@ it("keeps the live subscription usable when the reload snapshot request fails", 
 it("routes retry through Desktop recovery instead of only reloading the renderer", async () => {
   let retryCalls = 0;
   (globalThis as typeof globalThis & { window: unknown }).window = {
-    megleDesktop: {
+    mangooDesktop: {
       retryLibraryLoad: async () => {
         retryCalls += 1;
         return { ok: true };

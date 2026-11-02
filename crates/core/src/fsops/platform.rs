@@ -568,7 +568,7 @@ mod tests {
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "megle-platform-{label}-{}-{}",
+            "mangoo-platform-{label}-{}-{}",
             std::process::id(),
             uuid::Uuid::now_v7()
         ))
@@ -694,7 +694,7 @@ mod tests {
         fs::create_dir_all(&dir).expect("create temp dir");
         let source = dir.join("source.txt");
         let displaced = dir.join("displaced.txt");
-        let staging = dir.join(".megle-recycle-stage");
+        let staging = dir.join(".mangoo-recycle-stage");
         fs::write(&source, b"original").expect("write source");
         let verified = VerifiedSource::open(&source).expect("open protected source");
         let target_parent = VerifiedTargetParent::open(&dir).expect("open target parent");

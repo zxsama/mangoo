@@ -5,7 +5,7 @@ import {
   legacyRendererErrorOperationId,
   rendererErrorOperationId,
   type RendererErrorIdentity
-} from "@megle/notification-contract";
+} from "@mangoo/notification-contract";
 
 import type {
   DesktopNotificationOperation,
@@ -175,7 +175,7 @@ function validateOperation(operation: NotificationOperationInput): void {
   if (operation.rootUuid !== undefined && operation.rootUuid !== null) {
     assertString(operation.rootUuid, "operation.rootUuid");
   }
-  if (operation.managedRootAction !== undefined) {
+  if (operation.managedRootAction !== undefined && operation.managedRootAction !== null) {
     assertObject(operation.managedRootAction, "operation.managedRootAction");
     if (operation.managedRootAction.kind !== "review-placement") {
       throw new TypeError("operation.managedRootAction.kind is invalid");

@@ -40,7 +40,7 @@ try {
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   await page.goto(url);
-  await page.waitForFunction(() => window.__megleReady === true);
+  await page.waitForFunction(() => window.__mangooReady === true);
   const result = await page.evaluate(() => window.runVirtualGridBenchmark());
   await browser.close();
 
