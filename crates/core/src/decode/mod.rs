@@ -8,6 +8,7 @@
 //! next claiming decoder runs. That is what lets `image` lose on an exotic
 //! TIFF variant and ffmpeg still produce a picture.
 
+pub mod exif;
 pub mod ffmpeg;
 pub mod formats;
 pub mod image_crate;

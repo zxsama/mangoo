@@ -1,5 +1,8 @@
 import type {
   AcceptedRootResponse,
+  ImageViewerFolder,
+  ImageViewerFormats,
+  ImageViewerMetadata,
   PlaybackSession,
   AddFileTagRequest,
   ActiveLibraryResponse,
@@ -116,6 +119,19 @@ export interface PreviewResource {
   blob: Blob;
   /** original | preview_2048 | preview_3072 | preview_native */
   tier: string;
+}
+
+export interface ImageViewerImageOptions extends BlobRequestOptions {
+  /** Longest side of the viewer viewport in device pixels. */
+  viewportLongPx?: number;
+  /** Request the original bytes (zoomed past fit) when Chromium can paint them. */
+  full?: boolean;
+}
+
+export interface ImageViewerImageResource extends PreviewResource {
+  /** Display dimensions of the source (orientation applied), when known. */
+  sourceWidth: number | null;
+  sourceHeight: number | null;
 }
 
 export interface CoreRequestOptions {
@@ -324,6 +340,45 @@ export function createCoreClient(config: CoreClientConfig) {
               throw new CoreApiError(response.status, body);
             }
             return response.blob();
+          }
+        ),
+      path
+    );
+  }
+
+  async function fetchImageViewerResource(
+    path: string,
+    options: BlobRequestOptions = {}
+  ): Promise<ImageViewerImageResource> {
+    const signal = requestSignal(options.signal);
+    const headers = new Headers();
+    applyPluginUiHeaders(headers);
+    if (config.sessionToken) {
+      headers.set("x-mangoo-session", config.sessionToken);
+    }
+    const dimension = (value: string | null) => {
+      const parsed = value === null ? Number.NaN : Number(value);
+      return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+    };
+    return scheduleCoreRequest(
+      options.requestPriority ?? "interactive",
+      signal,
+      () =>
+        fetchWithTimeout(
+          resolveUrl(config.baseUrl, path),
+          { headers },
+          signal,
+          async (response) => {
+            if (!response.ok) {
+              const body = await readResponseBody(response);
+              throw new CoreApiError(response.status, body);
+            }
+            return {
+              blob: await response.blob(),
+              tier: response.headers.get("x-mangoo-preview-tier") ?? "original",
+              sourceWidth: dimension(response.headers.get("x-mangoo-source-width")),
+              sourceHeight: dimension(response.headers.get("x-mangoo-source-height"))
+            };
           }
         ),
       path
@@ -799,6 +854,35 @@ export function createCoreClient(config: CoreClientConfig) {
         method: "POST",
         requestPriority: "metadata",
         body: JSON.stringify(body)
+      }),
+    getImageViewerFormats: (options: CoreRequestOptions = {}) =>
+      request<ImageViewerFormats>("/image-viewer/formats", {
+        requestPriority: options.requestPriority ?? "metadata",
+        signal: options.signal
+      }),
+    getImageViewerFolder: (path: string, options: CoreRequestOptions = {}) =>
+      request<ImageViewerFolder>(`/image-viewer/folder?${new URLSearchParams({ path })}`, {
+        requestPriority: options.requestPriority ?? "navigation",
+        signal: options.signal
+      }),
+    getImageViewerImage: (path: string, options: ImageViewerImageOptions = {}) => {
+      const search = new URLSearchParams({ path });
+      if (options.viewportLongPx && options.viewportLongPx > 0) search.set("viewportLongPx", String(Math.round(options.viewportLongPx)));
+      if (options.full) search.set("full", "true");
+      return fetchImageViewerResource(`/image-viewer/image?${search}`, options);
+    },
+    getImageViewerThumbnail: (path: string, options: BlobRequestOptions & { size?: number } = {}) => {
+      const search = new URLSearchParams({ path });
+      if (options.size) search.set("size", String(Math.round(options.size)));
+      return fetchBlob(`/image-viewer/thumbnail?${search}`, {
+        ...options,
+        requestPriority: options.requestPriority ?? "resource"
+      });
+    },
+    getImageViewerMetadata: (path: string, options: CoreRequestOptions = {}) =>
+      request<ImageViewerMetadata>(`/image-viewer/metadata?${new URLSearchParams({ path })}`, {
+        requestPriority: options.requestPriority ?? "metadata",
+        signal: options.signal
       }),
     listPlugins: (options: CoreRequestOptions = {}) => request<HostPluginListResponse>("/plugins", {
       requestPriority: options.requestPriority ?? "metadata",

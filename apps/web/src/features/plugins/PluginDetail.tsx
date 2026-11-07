@@ -5,6 +5,7 @@ import { StatusPill } from "./StatusPill";
 import { PluginAccountSetup } from "./PluginAccountSetup";
 import { pluginPanelId, pluginTabId } from "./PluginCard";
 import { PluginContributionsSlot } from "./PluginContributionsSlot";
+import { HostPluginPanel, permissionLabel } from "./hostPlugins";
 
 interface PluginDetailProps {
   plugin: HostPluginProjection;
@@ -18,7 +19,8 @@ interface PluginDetailProps {
 
 const CAPABILITY_LABEL: Record<PluginCapability, string> = {
   "sync-provider.v1": "Sync provider v1",
-  "file-decoder.v1": "文件解析"
+  "file-decoder.v1": "文件解析",
+  "image-viewer.v1": "看图"
 };
 
 export function PluginDetail({
@@ -81,6 +83,7 @@ export function PluginDetail({
         </div>
       ) : null}
       <PluginContributionsSlot slot="plugin-detail" pluginId={plugin.pluginId} />
+      <HostPluginPanel plugin={plugin} />
 
       {(plugin.permissionRequired || plugin.runtimeState === "crashed-backoff" || plugin.runtimeState === "degraded") ? (
         <div className="plugin-primary-actions">
@@ -126,7 +129,7 @@ export function PluginDetail({
             ) : (
               <ul className="plugin-permission-list">
                 {plugin.requestedPermissions.map((permission, index) => (
-                  <li key={`${permission.kind}-${index}`}>{permission.kind}</li>
+                  <li key={`${permission.kind}-${index}`}>{permissionLabel(permission)}</li>
                 ))}
               </ul>
             )}

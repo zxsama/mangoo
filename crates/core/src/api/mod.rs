@@ -22,6 +22,7 @@ use crate::host_registry::HostRegistry;
 use crate::library_manager::{ActiveSnapshot, LibraryManager, LibraryRuntimeResources};
 use crate::roots::reachability::{refresh_root_reachability, RootReachability};
 
+mod image_viewer;
 mod playback;
 mod plugin_ui_admission;
 pub mod routes;
@@ -471,6 +472,7 @@ pub fn router_with_state(state: AppState, config: ApiConfig) -> Router {
     start_runtime_background_tasks(&state);
     let api_router = routes::router(state.clone())
         .merge(playback::authenticated_router(state.clone()))
+        .merge(image_viewer::router(state.clone()))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             attach_library_context,
@@ -1405,6 +1407,8 @@ fn cors_layer(origin: HeaderValue) -> CorsLayer {
         // image would stay at tier resolution no matter how far you zoomed.
         .expose_headers([
             HeaderName::from_static("x-mangoo-preview-tier"),
+            HeaderName::from_static("x-mangoo-source-width"),
+            HeaderName::from_static("x-mangoo-source-height"),
             HeaderName::from_static("x-mangoo-library-id"),
             HeaderName::from_static("x-mangoo-context-revision"),
         ])
@@ -1422,6 +1426,9 @@ async fn attach_library_context(
     let is_library_control = request.uri().path().starts_with("/api/libraries")
         || request.uri().path().starts_with("/api/sync")
         || request.uri().path().starts_with("/api/plugins")
+        // The standalone viewer opens OS files outside any Library and is
+        // gated by its Host-engine plugin capability instead.
+        || request.uri().path().starts_with("/api/image-viewer/")
         || request
             .uri()
             .path()

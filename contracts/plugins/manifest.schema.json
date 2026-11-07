@@ -3,22 +3,23 @@
   "$id": "https://mangoo.local/contracts/plugins/manifest.schema.json",
   "title": "Mangoo Plugin Manifest v2",
   "type": "object",
-  "required": ["manifestVersion", "id", "name", "version", "engine", "entry", "rpc", "activationEvents", "requestedPermissions", "integrity"],
+  "required": ["manifestVersion", "id", "name", "version", "engine", "activationEvents", "requestedPermissions"],
   "additionalProperties": false,
   "properties": {
     "manifestVersion": { "const": 2 },
     "id": { "type": "string", "pattern": "^[a-z0-9]+(\\.[a-z0-9][a-z0-9-]*)+$", "maxLength": 255 },
     "name": { "type": "string", "minLength": 1, "maxLength": 128 },
     "version": { "type": "string", "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$", "maxLength": 128 },
-    "engine": { "const": "process" },
+    "engine": { "enum": ["process", "host"] },
+    "host": { "$ref": "#/$defs/hostDeclaration" },
     "entry": { "$ref": "#/$defs/processEntry" },
     "rpc": { "$ref": "#/$defs/rpc" },
-    "activationEvents": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["sync-enabled", "auth-requested", "diagnostics-requested", "file-decode-requested"] } },
+    "activationEvents": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["sync-enabled", "auth-requested", "diagnostics-requested", "file-decode-requested", "file-open-requested"] } },
     "requestedPermissions": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/permission" } },
     "integrity": { "type": "object", "required": ["sha256"], "additionalProperties": false, "properties": { "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" } } },
     "contributions": { "$ref": "#/$defs/contributions" }
   },
-  "allOf": [{"if":{"properties":{"rpc":{"properties":{"capabilities":{"const":["file-decoder.v1"]}}}}},"then":{"not":{"required":["contributions"]},"properties":{"activationEvents":{"items":{"enum":["file-decode-requested","diagnostics-requested"]}},"requestedPermissions":{"items":{"type":"object","required":["kind","maxBytes"],"additionalProperties":false,"properties":{"kind":{"const":"temp-storage"},"maxBytes":{"type":"integer","minimum":1,"maximum":268435456}}}}}},"else":{"properties":{"activationEvents":{"items":{"enum":["sync-enabled","auth-requested","diagnostics-requested"]}}}}}, { "if": { "required": ["contributions"], "properties": { "contributions": { "required": ["ui"] } } }, "then": { "properties": { "requestedPermissions": { "contains": { "required": ["kind", "operations"], "properties": { "kind": { "const": "host-ui" }, "operations": { "contains": { "const": "core-api" } } } } } } } }],
+  "allOf": [{"if":{"properties":{"engine":{"const":"host"}}},"then":{"required":["host"],"not":{"anyOf":[{"required":["entry"]},{"required":["rpc"]},{"required":["integrity"]},{"required":["contributions"]}]},"properties":{"activationEvents":{"items":{"enum":["file-open-requested","diagnostics-requested"]}},"requestedPermissions":{"items":{"$ref":"#/$defs/hostEnginePermission"}}}},"else":{"required":["entry","rpc","integrity"],"not":{"required":["host"]},"properties":{"activationEvents":{"items":{"not":{"const":"file-open-requested"}}},"requestedPermissions":{"items":{"not":{"$ref":"#/$defs/hostEnginePermission"}}}}}},{"if":{"properties":{"engine":{"const":"process"}}},"then":{"if":{"properties":{"rpc":{"properties":{"capabilities":{"const":["file-decoder.v1"]}}}}},"then":{"not":{"required":["contributions"]},"properties":{"activationEvents":{"items":{"enum":["file-decode-requested","diagnostics-requested"]}},"requestedPermissions":{"items":{"type":"object","required":["kind","maxBytes"],"additionalProperties":false,"properties":{"kind":{"const":"temp-storage"},"maxBytes":{"type":"integer","minimum":1,"maximum":268435456}}}}}},"else":{"properties":{"activationEvents":{"items":{"enum":["sync-enabled","auth-requested","diagnostics-requested"]}}}}}},{"if":{"properties":{"engine":{"const":"process"}}},"then":{"if":{"required":["contributions"],"properties":{"contributions":{"required":["ui"]}}},"then":{"properties":{"requestedPermissions":{"contains":{"required":["kind","operations"],"properties":{"kind":{"const":"host-ui"},"operations":{"contains":{"const":"core-api"}}}}}}}}}],
   "$defs": {
     "contributions": { "type": "object", "additionalProperties": false, "required": ["configuration", "authentication", "presentation", "primaryCredential"], "properties": {
       "configuration": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/configurationField" } },
@@ -59,6 +60,10 @@
     "oauthLoopbackPermission": { "type": "object", "required": ["kind", "mode"], "additionalProperties": false, "properties": { "kind": { "const": "oauth-loopback" }, "mode": { "const": "ephemeral-only" } } },
     "secretPermission": { "type": "object", "required": ["kind", "namespace", "operations"], "additionalProperties": false, "properties": { "kind": { "const": "secret" }, "namespace": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$" }, "operations": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["read", "write", "delete"] } } } },
     "tempStoragePermission": { "type": "object", "required": ["kind", "maxBytes"], "additionalProperties": false, "properties": { "kind": { "const": "temp-storage" }, "maxBytes": { "type": "integer", "minimum": 1, "maximum": 1073741824 } } },
-    "permission": { "oneOf": [{ "$ref": "#/$defs/networkPermission" }, { "$ref": "#/$defs/oauthLoopbackPermission" }, { "$ref": "#/$defs/secretPermission" }, { "$ref": "#/$defs/tempStoragePermission" }, { "$ref": "#/$defs/hostUiPermission" }] }
+    "hostDeclaration": { "type": "object", "additionalProperties": false, "required": ["capabilities"], "properties": { "capabilities": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["image-viewer.v1"] } } } },
+    "localFilesPermission": { "type": "object", "required": ["kind", "access"], "additionalProperties": false, "properties": { "kind": { "const": "local-files" }, "access": { "const": "opened-folders" } } },
+    "fileAssociationPermission": { "type": "object", "required": ["kind", "scope"], "additionalProperties": false, "properties": { "kind": { "const": "file-association" }, "scope": { "const": "current-user" } } },
+    "hostEnginePermission": { "oneOf": [{ "$ref": "#/$defs/localFilesPermission" }, { "$ref": "#/$defs/fileAssociationPermission" }] },
+    "permission": { "oneOf": [{ "$ref": "#/$defs/localFilesPermission" }, { "$ref": "#/$defs/fileAssociationPermission" }, { "$ref": "#/$defs/networkPermission" }, { "$ref": "#/$defs/oauthLoopbackPermission" }, { "$ref": "#/$defs/secretPermission" }, { "$ref": "#/$defs/tempStoragePermission" }, { "$ref": "#/$defs/hostUiPermission" }] }
   }
 }

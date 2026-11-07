@@ -511,6 +511,9 @@ assertInterfaceMatchesSchema("HostPluginViewDocument");
 assertInterfaceMatchesSchema("PluginUiView");
 assertInterfaceMatchesSchema("PluginUiContribution");
 assertEnumMatchesGeneratedType("PluginUiSlot");
+for (const name of ["ImageViewerFormats", "ImageViewerFolderEntry", "ImageViewerFolder", "ImageViewerExif", "ImageViewerMetadata"]) {
+  assertInterfaceMatchesSchema(name);
+}
 assertOperationRoute("getPluginViewDocument", "get", "/plugins/{pluginId}/views/{viewId}");
 assertInterfaceMatchesSchema("PluginDiscoveryError");
 assertInterfaceMatchesSchema("PluginDiscoveryResponse");
@@ -710,6 +713,11 @@ for (const method of [
   "listThumbnailCacheFailures",
   "getPreviewBlob",
   "getPreviewResource",
+  "getImageViewerFormats",
+  "getImageViewerFolder",
+  "getImageViewerImage",
+  "getImageViewerThumbnail",
+  "getImageViewerMetadata",
   "listTasks",
   "cancelTask",
   "retryTask",

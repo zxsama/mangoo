@@ -3,7 +3,7 @@
 // root sets type: module). We ship this hand-maintained .cjs alongside the
 // tsc output so the renderer reliably gets the bridge.
 
-const { contextBridge, ipcRenderer } = require("electron");
+const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 function readArg(prefix) {
   const arg = process.argv.find((item) => item.startsWith(prefix));
@@ -131,7 +131,7 @@ function snapshotAndSubscribeLogs(query, cb) {
 
 const visualHarnessEnabled = readArg("--mangoo-visual-harness=") === "1";
 const requestedWindowRole = readArg("--mangoo-window=");
-const windowRole = ["main", "settings", "plugins", "notifications"].includes(requestedWindowRole)
+const windowRole = ["main", "settings", "plugins", "notifications", "image-viewer"].includes(requestedWindowRole)
   ? requestedWindowRole
   : "unknown";
 const windowControls = {
@@ -174,8 +174,49 @@ const commonWindowBridge = {
     ipcRenderer.invoke("mangoo:secondary-window-ready", role),
   windowControls
 };
+// Built-in image viewer plugin (com.mangoo.image-viewer). Channel names mirror
+// bundled-plugins/com.mangoo.image-viewer/src/shared/ipc.ts (guarded by a test).
+const imageViewerHostBridge = {
+  associationStatus: () => ipcRenderer.invoke("mangoo:image-viewer:association-status"),
+  setAssociation: (enabled) => ipcRenderer.invoke("mangoo:image-viewer:set-association", enabled === true),
+  openDefaultAppsSettings: () => ipcRenderer.invoke("mangoo:image-viewer:open-default-apps-settings"),
+  openFiles: (paths) => ipcRenderer.invoke("mangoo:image-viewer:open-files", paths)
+};
+const imageViewerBridge = {
+  ...imageViewerHostBridge,
+  ready: () => ipcRenderer.invoke("mangoo:image-viewer:ready"),
+  onOpenRequest: (cb) => subscribe("mangoo:image-viewer:open-request", cb),
+  pickFiles: () => ipcRenderer.invoke("mangoo:image-viewer:pick-files"),
+  pickFolder: () => ipcRenderer.invoke("mangoo:image-viewer:pick-folder"),
+  admitPaths: (paths) => ipcRenderer.invoke("mangoo:image-viewer:admit-paths", paths),
+  pathForFile: (file) => {
+    try {
+      return webUtils.getPathForFile(file) || null;
+    } catch {
+      return null;
+    }
+  },
+  trash: (path) => ipcRenderer.invoke("mangoo:image-viewer:trash", path),
+  rename: (path, newName) => ipcRenderer.invoke("mangoo:image-viewer:rename", path, newName),
+  reveal: (path) => ipcRenderer.invoke("mangoo:image-viewer:reveal", path),
+  openExternally: (path) => ipcRenderer.invoke("mangoo:image-viewer:open-externally", path),
+  copyImage: (png) => ipcRenderer.invoke("mangoo:image-viewer:copy-image", png),
+  copyText: (text) => ipcRenderer.invoke("mangoo:image-viewer:copy-text", text),
+  toggleFullscreen: () => ipcRenderer.invoke("mangoo:image-viewer:toggle-fullscreen"),
+  onFullscreenChanged: (cb) => subscribe("mangoo:image-viewer:fullscreen-changed", cb),
+  setAlwaysOnTop: (value) => ipcRenderer.invoke("mangoo:image-viewer:set-always-on-top", value === true),
+  openMainWindow: () => ipcRenderer.invoke("mangoo:image-viewer:open-main-window")
+};
+const imageViewerWindowBridge = {
+  ...commonWindowBridge,
+  coreUrl: readArg("--mangoo-core-url="),
+  sessionToken: readArg("--mangoo-session-token="),
+  imageViewer: imageViewerBridge
+};
 const fullBridge = {
   ...commonWindowBridge,
+  notifyPluginsChanged: () => ipcRenderer.invoke("mangoo:plugins-changed"),
+  imageViewerHost: imageViewerHostBridge,
   coreUrl: readArg("--mangoo-core-url="),
   sessionToken: readArg("--mangoo-session-token="),
   notifyShellReady: () => ipcRenderer.invoke("mangoo:shell-ready"),
@@ -225,6 +266,8 @@ const notificationWindowBridge = {
 };
 const roleBridge = windowRole === "notifications"
   ? notificationWindowBridge
+  : windowRole === "image-viewer"
+    ? imageViewerWindowBridge
   : ["main", "settings", "plugins"].includes(windowRole)
     ? fullBridge
     : { windowRole };

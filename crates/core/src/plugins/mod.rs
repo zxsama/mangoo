@@ -8,6 +8,11 @@ pub mod ui;
 
 pub const SYNC_PROVIDER_V1_CAPABILITY: &str = "sync-provider.v1";
 pub const FILE_DECODER_V1_CAPABILITY: &str = "file-decoder.v1";
+/// Host-engine capability: the standalone image viewer feature.
+pub const IMAGE_VIEWER_V1_CAPABILITY: &str = "image-viewer.v1";
+/// Entry path recorded for a Host-engine plugin version. It has no executable;
+/// the verified artifact is exactly its manifest.
+pub const HOST_ENGINE_ENTRY: &str = "plugin.json";
 
 #[allow(unused_imports)]
 pub use manifest::{parse_manifest, ManifestError, ManifestRecord};
@@ -87,6 +92,34 @@ pub fn reconcile_bundled(
     let (records, mut errors) = discover(bundled_root);
     let mut registered = 0;
     for record in records {
+        let plugin_root = record.manifest_path.parent().unwrap_or(bundled_root);
+        if record.engine == manifest::Engine::Host {
+            match runtime::trust::verify_bundled_host_plugin(
+                &record,
+                plugin_root,
+                platform,
+                runtime::trust::embedded_trust_registry(),
+            ) {
+                Ok(()) => match register_verified(
+                    registry,
+                    &record,
+                    plugin_root,
+                    HOST_ENGINE_ENTRY,
+                    &[0; 32],
+                ) {
+                    Ok(()) => registered += 1,
+                    Err(message) => errors.push(DiscoveryErrorEntry {
+                        manifest_path: record.manifest_path.clone(),
+                        message,
+                    }),
+                },
+                Err(error) => errors.push(DiscoveryErrorEntry {
+                    manifest_path: record.manifest_path.clone(),
+                    message: format!("bundled trust verification failed: {error:?}"),
+                }),
+            }
+            continue;
+        }
         let Some(relative) = record.entry_for(platform) else {
             errors.push(DiscoveryErrorEntry {
                 manifest_path: record.manifest_path.clone(),
@@ -94,7 +127,6 @@ pub fn reconcile_bundled(
             });
             continue;
         };
-        let plugin_root = record.manifest_path.parent().unwrap_or(bundled_root);
         match runtime::trust::verify_bundled_entry(
             &record,
             plugin_root,
@@ -140,4 +172,28 @@ pub fn reconcile_bundled(
         }
     }
     (registered, errors)
+}
+
+fn register_verified(
+    registry: &crate::host_registry::HostRegistry,
+    record: &ManifestRecord,
+    plugin_root: &Path,
+    entry_relative_path: &str,
+    entry_sha256: &[u8; 32],
+) -> Result<(), String> {
+    let manifest_json = serde_json::to_string(record).map_err(|error| error.to_string())?;
+    let permissions =
+        serde_json::to_string(&record.requested_permissions).unwrap_or_else(|_| "[]".into());
+    registry
+        .register_bundled_plugin(crate::host_registry::RegisterBundledPlugin {
+            plugin_id: &record.id,
+            version: &record.version,
+            manifest_json: &manifest_json,
+            entry_relative_path,
+            entry_sha256,
+            install_root: plugin_root,
+            trust_policy_id: "embedded-v1",
+            requested_permissions_json: &permissions,
+        })
+        .map_err(|error| error.to_string())
 }

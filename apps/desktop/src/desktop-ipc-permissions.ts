@@ -1,10 +1,13 @@
-export type DesktopIpcWindowRole = "main" | "settings" | "plugins" | "notifications";
+export type DesktopIpcWindowRole = "main" | "settings" | "plugins" | "notifications" | "image-viewer";
 
 const ALL_WINDOW_ROLES = new Set<DesktopIpcWindowRole>([
   "main",
   "settings",
   "plugins",
-  "notifications"
+  "notifications",
+  // The Host-engine image viewer window owns frameless chrome too. Its own
+  // feature channels are authorized by the plugin host, not this table.
+  "image-viewer"
 ]);
 const PRIVILEGED_WINDOW_ROLES = new Set<DesktopIpcWindowRole>([
   "main",
@@ -41,7 +44,14 @@ const PRIVILEGED_CHANNELS = new Set([
   "mangoo:close-plugins-window",
   "mangoo:get-library-load-phase",
   "mangoo:retry-library-load",
-  "mangoo:pick-new-library-path"
+  "mangoo:pick-new-library-path",
+  // Generic Host-engine plugin reconcile after a plugin lifecycle mutation.
+  "mangoo:plugins-changed",
+  // Image viewer plugin: association management and Library "open in viewer".
+  "mangoo:image-viewer:association-status",
+  "mangoo:image-viewer:set-association",
+  "mangoo:image-viewer:open-default-apps-settings",
+  "mangoo:image-viewer:open-files"
 ]);
 
 export function canAccessDesktopIpc(

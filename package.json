@@ -9,7 +9,8 @@
     "apps/web",
     "packages/core-client",
     "packages/notification-contract",
-    "packages/plugin-sdk"
+    "packages/plugin-sdk",
+    "bundled-plugins/com.mangoo.image-viewer"
   ],
   "scripts": {
     "dev": "node tools/dev/run-dev.mjs",
@@ -37,7 +38,8 @@
     "bench:sync-integration": "node tools/bench/sync-integration-bench.mjs",
     "bench:renderer-sync": "node tools/bench/renderer-sync-performance.mjs",
     "check:sync-release": "node tools/checks/sync-release.mjs",
-    "test": "npm run check:structure && npm run check:plugin-artifacts && npm run check:plugin-sdk && npm run check:core-api && npm run check:core-client && npm run check:notification-contract && npm run check:desktop && npm run check:web && npm run check:ui-design && npm run check:schema && npm run check:rust"
+    "test": "npm run check:structure && npm run check:plugin-artifacts && npm run check:plugin-sdk && npm run check:plugin-image-viewer && npm run check:core-api && npm run check:core-client && npm run check:notification-contract && npm run check:desktop && npm run check:web && npm run check:ui-design && npm run check:schema && npm run check:rust",
+    "check:plugin-image-viewer": "npm --workspace @mangoo/plugin-image-viewer run typecheck && npm --workspace @mangoo/plugin-image-viewer run test"
   },
   "engines": {
     "node": ">=22.0.0",

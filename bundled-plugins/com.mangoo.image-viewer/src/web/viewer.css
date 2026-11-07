@@ -1,0 +1,737 @@
+/* Mangoo 看图 (com.mangoo.image-viewer).
+ * Follows the Host design contract: acrylic / frosted materials on chrome and
+ * controls only (titlebar, toolbar, filmstrip, info panel, menus); the image
+ * stage is a dark, stable content surface. Every color, radius, blur and
+ * boundary comes from the shared interface-style tokens so the viewer tracks
+ * Settings > Appearance exactly like the Library window. */
+
+.iv-window {
+  --iv-titlebar-height: 40px;
+  --iv-filmstrip-height: 92px;
+  display: flex;
+  flex-direction: column;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  border-radius: var(--radius-window);
+  color: var(--text-soft);
+  background: transparent;
+  user-select: none;
+}
+
+.iv-window[data-fullscreen="true"] {
+  border-radius: 0;
+}
+
+/* ------------------------------------------------------------- titlebar */
+
+.liquid-glass.iv-titlebar {
+  --glass-fill: var(--glass-side-fill);
+  --glass-blur-current: var(--glass-side-blur);
+  --glass-border-current: var(--glass-side-stroke);
+}
+
+.iv-titlebar {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  flex: 0 0 var(--iv-titlebar-height);
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  height: var(--iv-titlebar-height);
+  padding: 0 6px 0 12px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  -webkit-app-region: drag;
+  transition: opacity 180ms ease, transform 180ms ease;
+}
+
+.iv-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.iv-title-icon {
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+
+.iv-title-name {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.iv-title-meta,
+.iv-title-folder {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.iv-title-folder {
+  overflow: hidden;
+  max-width: 220px;
+  text-overflow: ellipsis;
+}
+
+.iv-title-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+  -webkit-app-region: no-drag;
+}
+
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+.iv-icon-button {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 28px;
+  padding: 0;
+  color: var(--text-soft);
+  border-radius: var(--radius-control);
+}
+
+.iv-icon-button[disabled] {
+  opacity: 0.38;
+}
+
+.iv-icon-button[aria-pressed="true"] {
+  color: var(--accent);
+  background: var(--interactive-active);
+}
+
+/* ----------------------------------------------------------------- body */
+
+.iv-body {
+  position: relative;
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.iv-main {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* Dark stable content stage (never a blur layer). */
+.iv-stage {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  background: var(--glass-center-fill-strong, rgba(8, 12, 16, 0.5));
+  cursor: grab;
+  touch-action: none;
+}
+
+.iv-stage:active {
+  cursor: grabbing;
+}
+
+.iv-stage[data-has-image="false"] {
+  cursor: default;
+}
+
+.iv-stage[data-background="black"] {
+  background: #000;
+}
+
+.iv-stage[data-background="dark"] {
+  background: #15181b;
+}
+
+.iv-stage[data-background="light"] {
+  background: #e9ecef;
+}
+
+.iv-stage[data-background="checker"] {
+  background-color: #2a2d31;
+  background-image:
+    linear-gradient(45deg, #3a3e43 25%, transparent 25%),
+    linear-gradient(-45deg, #3a3e43 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #3a3e43 75%),
+    linear-gradient(-45deg, transparent 75%, #3a3e43 75%);
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+  background-size: 16px 16px;
+}
+
+.iv-stage[data-drop-active="true"]::after {
+  position: absolute;
+  inset: 10px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-panel);
+  background: var(--interactive-hover);
+  content: "";
+  pointer-events: none;
+}
+
+.iv-image-layer {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform-origin: 50% 50%;
+  will-change: transform;
+  pointer-events: none;
+}
+
+.iv-image-layer[data-animate="true"] {
+  transition: transform 180ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+.iv-canvas,
+.iv-animated {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.iv-image-layer[data-pixelated="true"] .iv-canvas,
+.iv-image-layer[data-pixelated="true"] .iv-animated {
+  image-rendering: pixelated;
+}
+
+.iv-stage-status {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  pointer-events: none;
+  animation: iv-fade-in 160ms ease 180ms both;
+}
+
+.iv-stage-message,
+.iv-empty {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  width: min(440px, calc(100% - 48px));
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+  transform: translate(-50%, -50%);
+}
+
+.iv-stage-message strong,
+.iv-empty strong {
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.iv-empty {
+  gap: 10px;
+}
+
+.iv-empty > svg {
+  color: var(--text-muted);
+}
+
+.iv-empty-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.iv-empty-actions > * {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 14px;
+}
+
+.iv-slideshow-badge {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  padding: 4px 10px;
+  color: var(--text-soft);
+  font-size: 12px;
+  border-radius: var(--radius-pill);
+  background: var(--glass-readable-surface-strong);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+/* Edge navigation zones: visible on hover only. */
+.iv-nav-zone {
+  position: absolute;
+  top: 50%;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 88px;
+  padding: 0;
+  color: var(--text-primary);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  background: var(--glass-readable-surface-strong);
+  opacity: 0;
+  transform: translateY(-50%);
+  transition: opacity 160ms ease;
+  cursor: pointer;
+}
+
+.iv-nav-prev {
+  left: 12px;
+}
+
+.iv-nav-next {
+  right: 12px;
+}
+
+.iv-main:hover .iv-nav-zone {
+  opacity: 0.72;
+}
+
+.iv-nav-zone:hover,
+.iv-nav-zone:focus-visible {
+  opacity: 1 !important;
+  border-color: var(--interactive-focus);
+  outline: none;
+}
+
+/* Floating toolbar */
+.liquid-glass.iv-toolbar {
+  /* Floats over the picture: denser than the side material so it stays
+     readable on bright images, still frosted and still interface-driven. */
+  --glass-fill: color-mix(in srgb, var(--glass-side-fill-strong) 45%, rgba(8, 12, 16, 0.8));
+  --glass-blur-current: var(--glass-side-blur);
+  --glass-border-current: var(--glass-side-stroke);
+}
+
+.iv-toolbar {
+  position: absolute;
+  bottom: 14px;
+  left: 50%;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px;
+  border-radius: var(--radius-panel);
+  box-shadow: var(--glass-shadow-tight);
+  backdrop-filter: blur(var(--glass-control-blur, 18px)) saturate(var(--glass-side-saturation, 1.4));
+  transform: translateX(-50%);
+  transition: opacity 180ms ease, transform 180ms ease;
+}
+
+.iv-toolbar-divider {
+  width: 1px;
+  height: 18px;
+  margin: 0 4px;
+  background: var(--line);
+}
+
+.iv-zoom-button {
+  min-width: 62px;
+  height: 28px;
+  padding: 0 8px;
+  color: var(--text-soft);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  border-radius: var(--radius-control);
+}
+
+.iv-one-to-one {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.iv-toast {
+  position: absolute;
+  bottom: 64px;
+  left: 50%;
+  z-index: 3;
+  padding: 6px 14px;
+  color: var(--text-primary);
+  font-size: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  background: var(--glass-readable-surface-strong);
+  transform: translateX(-50%);
+  animation: iv-fade-in 140ms ease both;
+  pointer-events: none;
+}
+
+/* ------------------------------------------------------------- info pane */
+
+.liquid-glass.iv-info-pane {
+  --glass-fill: var(--glass-side-fill);
+  --glass-blur-current: var(--glass-side-blur);
+  --glass-border-current: var(--glass-side-stroke);
+}
+
+.iv-info-pane {
+  flex: 0 0 280px;
+  min-height: 0;
+  border: 0;
+  border-left: 1px solid var(--line);
+  border-radius: 0;
+}
+
+.iv-info {
+  display: grid;
+  gap: 14px;
+  padding: 14px 14px 18px;
+  font-size: 12px;
+  user-select: text;
+}
+
+.iv-info-title {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.iv-info-empty,
+.iv-info-error {
+  color: var(--text-muted);
+}
+
+.iv-info-section {
+  display: grid;
+  gap: 6px;
+}
+
+.iv-info-section-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+}
+
+.iv-info-section dl,
+.iv-shortcuts dl {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+}
+
+.iv-info-row {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.iv-info-row dt {
+  color: var(--text-muted);
+}
+
+.iv-info-row dd {
+  margin: 0;
+  color: var(--text-soft);
+  overflow-wrap: anywhere;
+}
+
+.iv-info-path {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+
+.iv-info-exposure {
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.iv-histogram {
+  height: 72px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: rgba(0, 0, 0, 0.22);
+}
+
+.iv-histogram canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  transition: opacity 160ms ease;
+}
+
+.iv-histogram[data-ready="true"] canvas {
+  opacity: 1;
+}
+
+/* ------------------------------------------------------------- filmstrip */
+
+.liquid-glass.iv-filmstrip-pane {
+  --glass-fill: var(--glass-side-fill);
+  --glass-blur-current: var(--glass-side-blur);
+  --glass-border-current: var(--glass-side-stroke);
+}
+
+.iv-filmstrip-pane {
+  flex: 0 0 var(--iv-filmstrip-height);
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  transition: opacity 180ms ease;
+}
+
+.iv-filmstrip {
+  height: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+}
+
+.iv-filmstrip-track {
+  position: relative;
+  height: 100%;
+}
+
+.iv-film-item {
+  position: absolute;
+  top: 10px;
+  bottom: 10px;
+  left: 6px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  background: rgba(0, 0, 0, 0.26);
+  cursor: pointer;
+  opacity: 0.72;
+}
+
+.iv-film-item:hover {
+  opacity: 1;
+}
+
+.iv-film-item[data-selected="true"] {
+  border-color: var(--interactive-focus);
+  opacity: 1;
+}
+
+.iv-film-item:focus-visible {
+  border-color: var(--interactive-focus);
+  outline: none;
+}
+
+.iv-film-image {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.iv-film-placeholder {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+/* ------------------------------------------------------- fullscreen chrome */
+
+.iv-window[data-fullscreen="true"] .iv-titlebar {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+}
+
+.iv-window[data-fullscreen="true"] .iv-filmstrip-pane {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 3;
+}
+
+.iv-window[data-chrome-visible="false"] {
+  cursor: none;
+}
+
+.iv-window[data-chrome-visible="false"] .iv-titlebar {
+  opacity: 0;
+  transform: translateY(-100%);
+  pointer-events: none;
+}
+
+.iv-window[data-chrome-visible="false"] .iv-toolbar,
+.iv-window[data-chrome-visible="false"] .iv-filmstrip-pane,
+.iv-window[data-chrome-visible="false"] .iv-nav-zone {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* ------------------------------------------------------------ settings UI */
+
+.iv-settings .preview-render-group + .preview-render-group {
+  margin-top: 4px;
+}
+
+.iv-segmented {
+  display: flex;
+  gap: 2px;
+  padding: 2px 6px 6px;
+}
+
+.iv-segment {
+  flex: 1 1 0;
+  height: 26px;
+  color: var(--text-soft);
+  font-size: 12px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  background: transparent;
+  cursor: pointer;
+}
+
+.iv-segment[data-selected="true"] {
+  color: var(--text-primary);
+  border-color: var(--line-strong);
+  background: var(--interactive-active);
+}
+
+.iv-segment:focus-visible {
+  border-color: var(--interactive-focus);
+  outline: none;
+}
+
+.iv-assoc {
+  display: grid;
+  gap: 8px;
+  padding: 2px 6px 6px;
+}
+
+.iv-assoc-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text-soft);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.iv-assoc-row[data-disabled="true"] {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.iv-assoc-label {
+  display: grid;
+  gap: 2px;
+}
+
+.iv-assoc-label small {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.iv-assoc-detail,
+.iv-assoc-formats {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.iv-assoc-button {
+  display: inline-flex;
+  align-items: center;
+  justify-self: start;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.iv-plugin-panel {
+  display: grid;
+  gap: 10px;
+}
+
+.iv-plugin-description {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.6;
+}
+
+.iv-plugin-panel .iv-assoc {
+  padding: 0;
+}
+
+.iv-shortcuts summary {
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.iv-shortcuts dl {
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+.iv-shortcuts .iv-info-row {
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+}
+
+.iv-rename-input {
+  width: 100%;
+  height: 32px;
+  padding: 0 10px;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--glass-readable-surface);
+  outline: none;
+}
+
+.iv-rename-input:focus {
+  border-color: var(--interactive-focus);
+}
+
+@keyframes iv-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .iv-image-layer[data-animate="true"],
+  .iv-titlebar,
+  .iv-toolbar,
+  .iv-nav-zone {
+    transition: none;
+  }
+}

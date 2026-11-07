@@ -31,8 +31,19 @@ const isPluginsWindow =
   window.location.hash.startsWith("#/plugins") || windowRole === "plugins";
 const isNotificationsWindow =
   window.location.hash.startsWith("#/notifications") || windowRole === "notifications";
+// Host-engine plugin window: the built-in image viewer (com.mangoo.image-viewer).
+const isImageViewerWindow =
+  window.location.hash.startsWith("#/image-viewer") || windowRole === "image-viewer";
 
-if (isNotificationsWindow) {
+if (isImageViewerWindow) {
+  void import("@mangoo/plugin-image-viewer/web").then(({ ImageViewerWindow }) => {
+    ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+      <React.StrictMode>
+        <ApplicationProviders><ImageViewerWindow /></ApplicationProviders>
+      </React.StrictMode>
+    );
+  });
+} else if (isNotificationsWindow) {
   void import("./features/notifications/NotificationWindow").then(({ NotificationWindow }) => {
     ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
       <React.StrictMode>

@@ -73,6 +73,13 @@ The desktop shell (`apps/desktop/src/main.ts`, `core-process.ts`, `core-session.
 
 When adding an API path, plugin capability, table, or index, update the contract and the corresponding check before wiring code.
 
+### Host-Engine Plugins and the Built-in Image Viewer
+
+- Manifest v2 has two engines. `process` = trusted native executable + framed RPC (sync providers, decoders). `host` = a trusted bundled feature implemented BY the Host from its plugin directory: manifest declares `host.capabilities` (only `image-viewer.v1` today), omits `entry`/`rpc`/`integrity`/`contributions`, and may request only `local-files` / `file-association`. The artifact is exactly `plugin.json`; compiled trust pins it with a zero executable digest (`verify_bundled_host_plugin`). Host plugins never get accounts or enter launch enumeration; enabled + granted settles to `ready` (`settle_host_engine_runtime`).
+- Gate every Host service on `HostRegistry::host_capability_enabled(...)` so disabling the plugin turns the feature off. Desktop-side Host plugins reconcile through the generic `mangoo:plugins-changed` IPC fired by `broadcastPluginChange()` — no polling.
+- `bundled-plugins/com.mangoo.image-viewer/` is an npm workspace (`@mangoo/plugin-image-viewer`): `src/desktop` (emitted to `dist/desktop`, imported by `main.ts`; rebuilt by the desktop `prebuild`/`pretypecheck`), `src/web` (TSX compiled into the web bundle, mounted for `#/image-viewer` / role `image-viewer`), `src/shared` (IPC contract, pure math). Plugin web code imports Host primitives ONLY via `apps/web/src/plugin-host` (`@mangoo/web/plugin-host`). Core services are `crates/core/src/api/image_viewer.rs` (path-scoped `/api/image-viewer/*`, exempt from the active-Library requirement, writes nothing) and `decode/exif.rs`.
+- Viewer file actions (trash / rename / reveal) are limited to images directly inside folders the user opened in that viewer session (`ViewerAccessPolicy`). OS registration is per-user only (Windows HKCU via one `reg import`, Linux XDG); dev builds skip it unless `MANGOO_IMAGE_VIEWER_DEV_ASSOCIATION=1`. Preload channel names must match `src/shared/ipc.ts` (a plugin test enforces it). See `docs/superpowers/specs/2026-11-08-image-viewer-plugin.md`.
+
 ### Rust Core Layout (Phase 1)
 
 `crates/core/src` keeps `api`, `db`, `decode`, `roots`, `scan`, `thumbnails`, `fsops`, `plugins`, `watch`, and `tasks` as **modules inside one crate**. Do not pre-split them into separate workspace crates — `validate-structure.mjs` actively rejects `crates/indexer` and `crates/thumbnails`. Crate-splitting comes only after module boundaries stabilize.

@@ -660,7 +660,7 @@ export interface ListFileOperationsParams {
   cursor?: string;
 }
 
-export type PluginCapability = "sync-provider.v1" | "file-decoder.v1";
+export type PluginCapability = "sync-provider.v1" | "file-decoder.v1" | "image-viewer.v1";
 export type PluginRuntimeState =
   | "disabled"
   | "stopping"
@@ -683,7 +683,71 @@ export type PluginPermission =
   | { kind: "oauth-loopback"; mode: "ephemeral-only" }
   | { kind: "secret"; namespace: string; operations: ("read" | "write" | "delete")[] }
   | { kind: "temp-storage"; maxBytes: number }
-  | { kind: "host-ui"; operations: ("core-api" | "pick-folder" | "reveal-path" | "clipboard-write" | "external-link")[] };
+  | { kind: "host-ui"; operations: ("core-api" | "pick-folder" | "reveal-path" | "clipboard-write" | "external-link")[] }
+  | { kind: "local-files"; access: "opened-folders" }
+  | { kind: "file-association"; scope: "current-user" };
+
+/** Image formats the standalone viewer opens (lowercase dotted extensions). */
+export interface ImageViewerFormats {
+  imageExtensions: string[];
+  browserRenderableExtensions: string[];
+  animatedExtensions: string[];
+  pluginExtensions: string[];
+}
+
+export interface ImageViewerFolderEntry {
+  path: string;
+  name: string;
+  ext: string;
+  sizeBytes: number;
+  modifiedAtMs: number;
+}
+
+export interface ImageViewerFolder {
+  directory: string;
+  entries: ImageViewerFolderEntry[];
+  truncated: boolean;
+}
+
+export interface ImageViewerExif {
+  make: string | null;
+  model: string | null;
+  lensModel: string | null;
+  software: string | null;
+  artist: string | null;
+  copyright: string | null;
+  dateTimeOriginal: string | null;
+  exposureTime: string | null;
+  fNumber: number | null;
+  iso: number | null;
+  focalLengthMm: number | null;
+  focalLength35mm: number | null;
+  exposureBiasEv: number | null;
+  exposureProgram: string | null;
+  meteringMode: string | null;
+  flash: string | null;
+  whiteBalance: string | null;
+  colorSpace: string | null;
+  orientation: number | null;
+  pixelWidth: number | null;
+  pixelHeight: number | null;
+  gpsLatitude: number | null;
+  gpsLongitude: number | null;
+  gpsAltitudeM: number | null;
+}
+
+export interface ImageViewerMetadata {
+  path: string;
+  name: string;
+  directory: string;
+  ext: string;
+  sizeBytes: number;
+  modifiedAtMs: number;
+  createdAtMs: number | null;
+  width: number | null;
+  height: number | null;
+  exif: ImageViewerExif | null;
+}
 
 export interface HostPluginViewDocument {
   pluginId: string;

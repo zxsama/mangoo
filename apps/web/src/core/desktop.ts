@@ -107,7 +107,9 @@ export interface MangooDesktopBridge {
   onPluginViewIntent?: (callback: (intent: PluginViewWindowIntent) => void) => () => void;
   coreUrl?: string;
   sessionToken?: string;
-  windowRole?: "main" | DesktopSecondaryWindowRole;
+  windowRole?: "main" | DesktopSecondaryWindowRole | "image-viewer";
+  /** Generic Host-engine plugin hook: a plugin lifecycle mutation finished. */
+  notifyPluginsChanged?: () => Promise<boolean>;
   notifyShellReady?: () => Promise<boolean>;
   notifySecondaryWindowReady?: (
     role: DesktopSecondaryWindowRole
@@ -263,6 +265,17 @@ export async function openPluginExternalLink(
 
 export async function requestOAuthReturnFocus(): Promise<boolean> {
   return (await getDesktopShellActions()?.requestOAuthReturnFocus?.()) ?? false;
+}
+
+/** Opens files in the image viewer plugin window (false when it is disabled). */
+export async function openInImageViewer(paths: string[]): Promise<boolean> {
+  const host = (getDesktopBridge() as { imageViewerHost?: { openFiles(paths: string[]): Promise<boolean> } } | null)?.imageViewerHost;
+  return (await host?.openFiles(paths)) ?? false;
+}
+
+/** Lets Desktop-side Host-engine plugins (e.g. the image viewer) reconcile. */
+export async function notifyDesktopPluginsChanged(): Promise<boolean> {
+  return (await getDesktopBridge()?.notifyPluginsChanged?.()) ?? false;
 }
 
 export async function copyText(text: string): Promise<boolean> {

@@ -1,0 +1,25 @@
+{
+  "manifestVersion": 2,
+  "id": "com.mangoo.image-viewer",
+  "name": "Mangoo 看图",
+  "version": "1.0.0",
+  "engine": "host",
+  "host": {
+    "capabilities": [
+      "image-viewer.v1"
+    ]
+  },
+  "activationEvents": [
+    "file-open-requested"
+  ],
+  "requestedPermissions": [
+    {
+      "kind": "local-files",
+      "access": "opened-folders"
+    },
+    {
+      "kind": "file-association",
+      "scope": "current-user"
+    }
+  ]
+}

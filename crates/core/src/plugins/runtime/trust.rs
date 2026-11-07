@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use super::super::manifest::{ManifestRecord, Platform};
+use super::super::manifest::{Engine, ManifestRecord, Platform};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustEntry {
@@ -23,7 +23,10 @@ pub fn embedded_trust_registry() -> &'static [TrustEntry] {
     REGISTRY.get_or_init(|| {
         super::generated_trust::GENERATED_PLUGIN_TRUST
             .iter()
-            .filter(|(_, _, _, hash, manifest_hash)| *hash != [0; 32] && *manifest_hash != [0; 32])
+            // A zero binary digest is the Host-engine marker (no executable);
+            // it can never match a real executable, and the exact manifest
+            // digest still pins every Host plugin.
+            .filter(|(_, _, _, _, manifest_hash)| *manifest_hash != [0; 32])
             .map(
                 |(plugin_id, version, platform, binary_sha256, manifest_sha256)| TrustEntry {
                     plugin_id: (*plugin_id).into(),
@@ -137,6 +140,9 @@ pub fn verify_bundled_entry(
     platform: Platform,
     allowlist: &[TrustEntry],
 ) -> Result<VerifiedExecutable, TrustError> {
+    if manifest.engine != Engine::Process {
+        return Err(TrustError::MissingEntry);
+    }
     verify_manifest(manifest, bundled_root, platform, allowlist)?;
     if let Some(ui) = manifest.contributions.as_ref().and_then(|c| c.ui.as_ref()) {
         read_ui_document(bundled_root, ui)?;
@@ -171,6 +177,32 @@ pub fn verify_bundled_entry(
 }
 
 pub const MAX_UI_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Trust for a Host-engine plugin: the artifact is exactly its manifest, which
+/// must match the compiled digest, and the compiled row must carry the
+/// no-executable marker so a process row can never vouch for it (or vice versa).
+pub fn verify_bundled_host_plugin(
+    manifest: &ManifestRecord,
+    bundled_root: &Path,
+    platform: Platform,
+    allowlist: &[TrustEntry],
+) -> Result<(), TrustError> {
+    if manifest.engine != Engine::Host {
+        return Err(TrustError::IdentityMismatch);
+    }
+    let expected = allowlist
+        .iter()
+        .find(|entry| {
+            entry.plugin_id == manifest.id
+                && entry.version == manifest.version
+                && entry.platform == platform
+        })
+        .ok_or(TrustError::MissingEntry)?;
+    if expected.binary_sha256 != [0; 32] {
+        return Err(TrustError::IdentityMismatch);
+    }
+    verify_manifest(manifest, bundled_root, platform, allowlist)
+}
 
 /// Read from a pinned no-follow handle. On Windows the complete parent chain
 /// also stays pinned against replacement; Unix packages require safe ownership.
@@ -351,6 +383,83 @@ fn validate_unix_components(path: &Path) -> Result<(), TrustError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_engine_trust_pins_the_manifest_and_requires_the_no_executable_marker() {
+        let root = std::env::temp_dir().join(format!(
+            "mangoo_host_trust_{}_{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let manifest_path = root.join("plugin.json");
+        std::fs::write(
+            &manifest_path,
+            include_str!(
+                "../../../../../contracts/plugins/fixtures/valid-host-image-viewer-v2.json"
+            ),
+        )
+        .unwrap();
+        let manifest = crate::plugins::manifest::parse_manifest(&manifest_path).unwrap();
+        let manifest_sha256: [u8; 32] =
+            Sha256::digest(std::fs::read(&manifest_path).unwrap()).into();
+        let row = |binary_sha256: [u8; 32], manifest_sha256: [u8; 32]| TrustEntry {
+            plugin_id: manifest.id.clone(),
+            version: manifest.version.clone(),
+            platform: Platform::WindowsX64,
+            binary_sha256,
+            manifest_sha256,
+        };
+        verify_bundled_host_plugin(
+            &manifest,
+            &root,
+            Platform::WindowsX64,
+            &[row([0; 32], manifest_sha256)],
+        )
+        .expect("exact manifest digest with the host marker");
+        assert!(verify_bundled_host_plugin(&manifest, &root, Platform::WindowsX64, &[]).is_err());
+        // A process row (non-zero executable digest) never vouches for a host plugin.
+        assert!(verify_bundled_host_plugin(
+            &manifest,
+            &root,
+            Platform::WindowsX64,
+            &[row([7; 32], manifest_sha256)]
+        )
+        .is_err());
+        assert!(verify_bundled_host_plugin(
+            &manifest,
+            &root,
+            Platform::WindowsX64,
+            &[row([0; 32], [9; 32])]
+        )
+        .is_err());
+        // The process verifier never accepts a host manifest.
+        assert!(matches!(
+            verify_bundled_entry(
+                &manifest,
+                &root,
+                Platform::WindowsX64,
+                &[row([0; 32], manifest_sha256)]
+            ),
+            Err(TrustError::MissingEntry)
+        ));
+        // Tampering with the manifest bytes breaks the pin.
+        std::fs::write(
+            &manifest_path,
+            std::fs::read_to_string(&manifest_path)
+                .unwrap()
+                .replace("Mangoo", "Other"),
+        )
+        .unwrap();
+        assert!(verify_bundled_host_plugin(
+            &manifest,
+            &root,
+            Platform::WindowsX64,
+            &[row([0; 32], manifest_sha256)]
+        )
+        .is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn exact_allowlist_hash_is_required() {

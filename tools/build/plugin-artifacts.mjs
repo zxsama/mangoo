@@ -6,6 +6,11 @@ import Ajv2020 from "ajv/dist/2020.js";
 export const INVENTORY_FILE = ".inventory.json";
 export const FAKE_PLUGIN_ID = "com.mangoo.fake-sync";
 export const PPM_PLUGIN_ID = "com.mangoo.ppm-decoder";
+export const IMAGE_VIEWER_PLUGIN_ID = "com.mangoo.image-viewer";
+/** Built-in defaults staged by build-bundled-plugins.mjs, in id order. */
+export const DEFAULT_PLUGIN_IDS = [FAKE_PLUGIN_ID, IMAGE_VIEWER_PLUGIN_ID, PPM_PLUGIN_ID];
+/** Compiled-trust marker for a Host-engine plugin, which has no executable. */
+export const HOST_ENGINE_SHA256 = "0".repeat(64);
 const ID = /^[a-z0-9]+(\.[a-z0-9][a-z0-9-]*)+$/;
 const VERSION = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -130,6 +135,7 @@ export function validateArtifact(pluginRoot, platform = currentPlatform()) {
   assertNoLinks(manifestPath);
   const manifestBytes = readBounded(manifestPath, 256 * 1024, "plugin manifest");
   const manifest = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(manifestBytes));
+  if (manifest.manifestVersion === 2 && manifest.engine === "host") return validateHostArtifact(root, manifest, manifestBytes, platform);
   if (manifest.manifestVersion !== 2 || manifest.engine !== "process") throw new Error("plugin artifact must use process manifest v2");
   if (typeof manifest.id !== "string" || manifest.id.length > 255 || !ID.test(manifest.id)) throw new Error("invalid plugin id");
   if (typeof manifest.version !== "string" || manifest.version.length > 128 || !VERSION.test(manifest.version)
@@ -152,6 +158,21 @@ export function validateArtifact(pluginRoot, platform = currentPlatform()) {
   return artifact;
 }
 
+// A Host-engine plugin is implemented by the Host itself: its artifact is
+// exactly plugin.json, Core pins that manifest in compiled trust, and the
+// inventory row carries no executable entry.
+function validateHostArtifact(root, manifest, manifestBytes, platform) {
+  if (typeof manifest.id !== "string" || manifest.id.length > 255 || !ID.test(manifest.id)) throw new Error("invalid plugin id");
+  if (typeof manifest.version !== "string" || manifest.version.length > 128 || !VERSION.test(manifest.version)) throw new Error("invalid plugin version");
+  for (const field of ["entry", "rpc", "integrity", "contributions"]) {
+    if (Object.hasOwn(manifest, field)) throw new Error(`host engine plugin must not declare ${field}`);
+  }
+  if (!validateManifestSchema(manifest)) throw new Error("invalid plugin manifest schema");
+  const artifact = { root, manifestBytes, row: { id: manifest.id, version: manifest.version, platform, engine: "host", manifestSha256: sha256(manifestBytes) } };
+  assertArtifactContents(artifact);
+  return artifact;
+}
+
 export function validateSelection(artifacts) {
   const ids = new Set();
   for (const artifact of artifacts) {
@@ -166,9 +187,11 @@ export function renderTrust(rows) {
   const indent = single ? "" : "    ";
   const declarations = rows.map((row) => {
     const platform = { windowsX64: "WindowsX64", linuxX64: "LinuxX64" }[row.platform];
-    if (!platform || !SHA256.test(row.sha256) || !SHA256.test(row.manifestSha256)) throw new Error("invalid plugin trust row");
+    const executableSha256 = row.engine === "host" ? HOST_ENGINE_SHA256 : row.sha256;
+    if (!platform || !SHA256.test(executableSha256) || !SHA256.test(row.manifestSha256)
+        || (row.engine !== "host" && executableSha256 === HOST_ENGINE_SHA256)) throw new Error("invalid plugin trust row");
     const width = single ? 15 : 14;
-    const arrays = [row.sha256, row.manifestSha256].map((hash) => {
+    const arrays = [executableSha256, row.manifestSha256].map((hash) => {
       const bytes = hash.match(/../g).map((value) => `0x${value}`);
       const lines = [];
       for (let index = 0; index < bytes.length; index += width) lines.push(`${indent}        ${bytes.slice(index, index + width).join(", ")},`);
@@ -200,10 +223,13 @@ export function stageArtifacts({ targetRoot, profile, artifacts }) {
   try {
     for (const artifact of selected) {
       const pluginRoot = path.join(staging, artifact.row.id);
-      const binary = entryPath(pluginRoot, artifact.row.entry).absolute;
-      fs.mkdirSync(path.dirname(binary), { recursive: true });
+      fs.mkdirSync(pluginRoot, { recursive: true });
       fs.writeFileSync(path.join(pluginRoot, "plugin.json"), artifact.manifestBytes);
-      fs.writeFileSync(binary, artifact.executableBytes, { mode: 0o755 });
+      if (artifact.row.engine !== "host") {
+        const binary = entryPath(pluginRoot, artifact.row.entry).absolute;
+        fs.mkdirSync(path.dirname(binary), { recursive: true });
+        fs.writeFileSync(binary, artifact.executableBytes, { mode: 0o755 });
+      }
       if (artifact.row.ui) {
         const uiPath = entryPath(pluginRoot, artifact.row.ui.entry).absolute;
         fs.mkdirSync(path.dirname(uiPath), { recursive: true });
@@ -239,7 +265,7 @@ export function stageArtifacts({ targetRoot, profile, artifacts }) {
 }
 
 function assertArtifactContents(artifact) {
-  const entries = [artifact.row.entry, ...(artifact.row.ui ? [artifact.row.ui.entry] : [])];
+  const entries = [...(artifact.row.entry ? [artifact.row.entry] : []), ...(artifact.row.ui ? [artifact.row.ui.entry] : [])];
   const allowed = new Set(["plugin.json", ...entries]);
   for (const item of entries) {
     const components = item.split("/");
@@ -276,8 +302,8 @@ export function readInventory(bundledRoot, platform = currentPlatform()) {
 
 export function assertSelectedInventory(inventory, externalArtifacts) {
   const selected = validateSelection(externalArtifacts);
-  if (selected.some((artifact) => [FAKE_PLUGIN_ID, PPM_PLUGIN_ID].includes(artifact.row.id))) throw new Error("duplicate plugin id in default selection");
-  const expected = [FAKE_PLUGIN_ID, PPM_PLUGIN_ID, ...selected.map((artifact) => artifact.row.id)].sort();
+  if (selected.some((artifact) => DEFAULT_PLUGIN_IDS.includes(artifact.row.id))) throw new Error("duplicate plugin id in default selection");
+  const expected = [...DEFAULT_PLUGIN_IDS, ...selected.map((artifact) => artifact.row.id)].sort();
   if (JSON.stringify(inventory.plugins.map((row) => row.id).sort()) !== JSON.stringify(expected)) throw new Error("bundled inventory does not match explicitly selected plugins");
   for (const artifact of selected) {
     if (JSON.stringify(inventory.plugins.find((row) => row.id === artifact.row.id)) !== JSON.stringify(artifact.row)) throw new Error(`selected artifact changed: ${artifact.row.id}`);

@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import type { QueryClient } from "@tanstack/react-query";
 import type { HostPluginProjection } from "@mangoo/core-client";
 import { createCoreClient } from "../../core/client";
-import { subscribeLibraryPhase } from "../../core/desktop";
+import { notifyDesktopPluginsChanged, subscribeLibraryPhase } from "../../core/desktop";
 
 const CHANNEL_NAME = "mangoo-plugin-state";
 const SOURCE_ID = `${Date.now()}-${Math.random()}`;
@@ -102,6 +102,9 @@ export async function invalidatePluginQueries(queryClient: QueryClient): Promise
 
 export function broadcastPluginChange(): void {
   for (const listener of localChangeListeners) listener();
+  // Desktop-side Host-engine plugins (image viewer windows, OS associations)
+  // reconcile against the new lifecycle; no polling is involved.
+  void notifyDesktopPluginsChanged();
   if (typeof BroadcastChannel === "undefined") return;
   const channel = new BroadcastChannel(CHANNEL_NAME);
   channel.postMessage({ kind: "changed", source: SOURCE_ID });

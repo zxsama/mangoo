@@ -5574,7 +5574,7 @@ impl HostRegistry {
     pub fn plugin_runtime_launches(&self) -> anyhow::Result<Vec<PluginRuntimeLaunch>> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let mut statement = connection.prepare(
-            "SELECT i.plugin_id,i.selected_version,v.manifest_json,i.install_root,v.entry_sha256,a.account_uuid,a.generation,i.requested_permissions_json,i.granted_permissions_json,i.lifecycle_epoch FROM plugin_installations i JOIN plugin_versions v ON v.plugin_id=i.plugin_id AND v.version=i.selected_version JOIN plugin_accounts a ON a.plugin_id=i.plugin_id JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id WHERE i.enabled_intent=1 AND r.stop_pending=0 AND r.state <> 'configuration-required' AND NOT EXISTS(SELECT 1 FROM plugin_credential_retirements q WHERE q.plugin_id=i.plugin_id) ORDER BY i.plugin_id",
+            "SELECT i.plugin_id,i.selected_version,v.manifest_json,i.install_root,v.entry_sha256,a.account_uuid,a.generation,i.requested_permissions_json,i.granted_permissions_json,i.lifecycle_epoch FROM plugin_installations i JOIN plugin_versions v ON v.plugin_id=i.plugin_id AND v.version=i.selected_version JOIN plugin_accounts a ON a.plugin_id=i.plugin_id JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id WHERE i.enabled_intent=1 AND r.stop_pending=0 AND r.state <> 'configuration-required' AND COALESCE(json_extract(v.manifest_json,'$.engine'),'process')<>'host' AND NOT EXISTS(SELECT 1 FROM plugin_credential_retirements q WHERE q.plugin_id=i.plugin_id) ORDER BY i.plugin_id",
         )?;
         let rows = statement.query_map([], |row| {
             let hash: Vec<u8> = row.get(4)?;
@@ -5746,6 +5746,7 @@ impl HostRegistry {
                     params![now, plugin.plugin_id],
                 )?;
             }
+            Self::settle_host_engine_runtime(&transaction, plugin.plugin_id)?;
         }
         transaction.commit()?;
         Ok(())
@@ -5813,6 +5814,7 @@ impl HostRegistry {
             params![state, now, plugin_id],
         )?;
         let fences = pause_plugin_bindings_in_transaction(&transaction, plugin_id)?;
+        Self::settle_host_engine_runtime(&transaction, plugin_id)?;
         transaction.commit()?;
         Ok(fences)
     }
@@ -5902,8 +5904,9 @@ impl HostRegistry {
         if changed != 1 {
             anyhow::bail!("plugin-not-found");
         }
+        // Decoders and Host-engine plugins are account-free local features.
         let decoder_only: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM plugin_installations i JOIN plugin_versions v ON v.plugin_id=i.plugin_id AND v.version=i.selected_version WHERE i.plugin_id=?1 AND json_extract(v.manifest_json,'$.rpc.capabilities[0]')='file-decoder.v1')",
+            "SELECT EXISTS(SELECT 1 FROM plugin_installations i JOIN plugin_versions v ON v.plugin_id=i.plugin_id AND v.version=i.selected_version WHERE i.plugin_id=?1 AND (json_extract(v.manifest_json,'$.rpc.capabilities[0]')='file-decoder.v1' OR json_extract(v.manifest_json,'$.engine')='host'))",
             [plugin_id], |row| row.get(0),
         )?;
         if enabled && !decoder_only {
@@ -5952,9 +5955,52 @@ impl HostRegistry {
                 params![unix_timestamp_millis(),plugin_id],
             )?;
         }
+        Self::settle_host_engine_runtime(&transaction, plugin_id)?;
         Self::bump_sync_status_revision(&transaction)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Host-engine plugins have no process to launch or stop: the Host's own
+    /// code is the runtime. A launchable (`starting`) intent therefore settles
+    /// to `ready` immediately with its declared Host capabilities; any other
+    /// state publishes no capability and has no pending stop to join.
+    fn settle_host_engine_runtime(
+        transaction: &rusqlite::Transaction<'_>,
+        plugin_id: &str,
+    ) -> anyhow::Result<()> {
+        let host_capabilities: Option<String> = transaction
+            .query_row(
+                "SELECT json_extract(v.manifest_json,'$.host.capabilities') FROM plugin_installations i JOIN plugin_versions v ON v.plugin_id=i.plugin_id AND v.version=i.selected_version WHERE i.plugin_id=?1 AND json_extract(v.manifest_json,'$.engine')='host'",
+                [plugin_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(host_capabilities) = host_capabilities else {
+            return Ok(());
+        };
+        let now = unix_timestamp_millis();
+        transaction.execute(
+            "UPDATE plugin_runtime_state SET state=CASE WHEN state='starting' THEN 'ready' ELSE state END,capabilities_json=CASE WHEN state IN ('starting','ready') THEN ?1 ELSE '[]' END,stop_pending=0,pid=NULL,session_id=NULL,crash_count=0,backoff_until=NULL,last_healthy_at=CASE WHEN state IN ('starting','ready') THEN ?2 ELSE last_healthy_at END,updated_at=?2 WHERE plugin_id=?3",
+            params![host_capabilities, now, plugin_id],
+        )?;
+        Ok(())
+    }
+
+    /// Whether an enabled, granted and trusted Host-engine plugin currently
+    /// provides `capability`. Core consults this before serving any Host
+    /// service that the capability gates.
+    pub fn host_capability_enabled(&self, capability: &str) -> anyhow::Result<bool> {
+        Ok(self
+            .connection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM plugin_installations i JOIN plugin_versions v ON v.plugin_id=i.plugin_id AND v.version=i.selected_version JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id WHERE i.enabled_intent=1 AND i.trust_policy_id='embedded-v1' AND r.state='ready' AND r.stop_pending=0 AND json_extract(v.manifest_json,'$.engine')='host' AND EXISTS(SELECT 1 FROM json_each(r.capabilities_json) WHERE value=?1))",
+                [capability],
+                |row| row.get(0),
+            )?)
     }
 
     pub fn plugin_binding_fences(&self, plugin_id: &str) -> anyhow::Result<Vec<BindingFence>> {
@@ -5996,6 +6042,7 @@ impl HostRegistry {
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
         transaction.execute("UPDATE plugin_runtime_state SET stop_pending=0 WHERE plugin_id=?1 AND EXISTS(SELECT 1 FROM plugin_installations i WHERE i.plugin_id=?1 AND i.enabled_intent=0)", [plugin_id])?;
+        Self::settle_host_engine_runtime(&transaction, plugin_id)?;
         Self::bump_sync_status_revision(&transaction)?;
         transaction.commit()?;
         Ok(())
@@ -6026,6 +6073,7 @@ impl HostRegistry {
             "UPDATE plugin_runtime_state SET stop_pending=0 WHERE plugin_id=?1",
             [plugin_id],
         )?;
+        Self::settle_host_engine_runtime(&transaction, plugin_id)?;
         Self::bump_sync_status_revision(&transaction)?;
         transaction.commit()?;
         Ok(())
@@ -6047,6 +6095,7 @@ impl HostRegistry {
                 "UPDATE plugin_runtime_state SET stop_pending=0 WHERE plugin_id=?1",
                 [plugin_id],
             )?;
+            Self::settle_host_engine_runtime(&transaction, plugin_id)?;
             Self::bump_sync_status_revision(&transaction)?;
         }
         transaction.commit()?;
@@ -6254,6 +6303,7 @@ impl HostRegistry {
             "UPDATE plugin_installations SET lifecycle_epoch=lifecycle_epoch+1 WHERE plugin_id=?1",
             [plugin_id],
         )?;
+        Self::settle_host_engine_runtime(&transaction, plugin_id)?;
         Self::bump_sync_status_revision(&transaction)?;
         transaction.commit()?;
         Ok(())
@@ -9789,6 +9839,83 @@ mod tests {
         registry
             .record_plugin_runtime_ready(plugin_id, "test-session", &["sync-provider.v1".into()])
             .unwrap();
+    }
+
+    #[test]
+    fn host_engine_plugin_lifecycle_gates_its_capability_without_a_process() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../contracts/plugins/fixtures/valid-host-image-viewer-v2.json"
+        ))
+        .unwrap();
+        let requested = serde_json::to_string(&manifest["requestedPermissions"]).unwrap();
+        registry
+            .register_bundled_plugin(RegisterBundledPlugin {
+                plugin_id: "com.mangoo.image-viewer",
+                version: "1.0.0",
+                manifest_json: &serde_json::to_string(&manifest).unwrap(),
+                entry_relative_path: crate::plugins::HOST_ENGINE_ENTRY,
+                entry_sha256: &[0; 32],
+                install_root: Path::new("bundled"),
+                trust_policy_id: "embedded-v1",
+                requested_permissions_json: &requested,
+            })
+            .unwrap();
+        let capability = crate::plugins::IMAGE_VIEWER_V1_CAPABILITY;
+        let state = |registry: &HostRegistry| {
+            registry
+                .host_plugin("com.mangoo.image-viewer")
+                .unwrap()
+                .unwrap()
+        };
+        assert!(!registry.host_capability_enabled(capability).unwrap());
+        assert_eq!(state(&registry).runtime_state, "disabled");
+
+        // Enabling without grants waits for permission approval.
+        registry
+            .set_plugin_intent("com.mangoo.image-viewer", true, false)
+            .unwrap();
+        assert_eq!(state(&registry).runtime_state, "permission-required");
+        assert!(!registry.host_capability_enabled(capability).unwrap());
+
+        // Approving the requested permissions settles straight to ready: there
+        // is no process to start, and no account row is ever created.
+        registry
+            .set_plugin_grants("com.mangoo.image-viewer", &requested, false)
+            .unwrap();
+        registry
+            .mark_plugin_stop_pending("com.mangoo.image-viewer")
+            .unwrap();
+        registry
+            .finish_plugin_runtime_restart("com.mangoo.image-viewer")
+            .unwrap();
+        let ready = state(&registry);
+        assert_eq!(ready.runtime_state, "ready");
+        assert_eq!(ready.capabilities, serde_json::json!([capability]));
+        assert!(ready.account_uuid.is_none());
+        assert!(registry.host_capability_enabled(capability).unwrap());
+        assert!(registry.plugin_runtime_launches().unwrap().is_empty());
+        assert!(registry.decoder_runtime_launches().unwrap().is_empty());
+
+        // Disabling closes the capability and leaves no pending stop behind.
+        registry
+            .set_plugin_intent("com.mangoo.image-viewer", false, false)
+            .unwrap();
+        registry
+            .finish_plugin_stop("com.mangoo.image-viewer")
+            .unwrap();
+        let disabled = state(&registry);
+        assert_eq!(disabled.runtime_state, "disabled");
+        assert_eq!(disabled.capabilities, serde_json::json!([]));
+        assert!(!registry.host_capability_enabled(capability).unwrap());
+
+        // Re-enabling keeps the accepted grants and is immediately ready.
+        registry
+            .set_plugin_intent("com.mangoo.image-viewer", true, false)
+            .unwrap();
+        assert_eq!(state(&registry).runtime_state, "ready");
+        assert!(registry.host_capability_enabled(capability).unwrap());
     }
 
     #[test]

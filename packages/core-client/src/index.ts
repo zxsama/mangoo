@@ -2,6 +2,8 @@ export { CoreApiError, createCoreClient } from "./client.ts";
 export type {
   CoreClientConfig,
   CoreRequestPriority,
+  ImageViewerImageOptions,
+  ImageViewerImageResource,
   PreviewResource,
   PreviewResourceOptions
 } from "./client.ts";
@@ -17,6 +19,11 @@ export type {
   CreateLibraryResponse,
   CreateTagRequest,
   HostPluginListResponse,
+  ImageViewerExif,
+  ImageViewerFolder,
+  ImageViewerFolderEntry,
+  ImageViewerFormats,
+  ImageViewerMetadata,
   HostPluginProjection,
   HostPluginViewDocument,
   PluginUiSlot,

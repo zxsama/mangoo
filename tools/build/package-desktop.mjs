@@ -107,7 +107,7 @@ await buildElectron({
       },
       ...inventory.plugins.flatMap((plugin) => [
         { from: path.join(bundledRoot, plugin.id, "plugin.json"), to: `core/bundled-plugins/${plugin.id}/plugin.json` },
-        { from: path.join(bundledRoot, plugin.id, plugin.entry), to: `core/bundled-plugins/${plugin.id}/${plugin.entry}` },
+        ...(plugin.entry ? [{ from: path.join(bundledRoot, plugin.id, plugin.entry), to: `core/bundled-plugins/${plugin.id}/${plugin.entry}` }] : []),
         ...(plugin.ui ? [{ from: path.join(bundledRoot, plugin.id, plugin.ui.entry), to: `core/bundled-plugins/${plugin.id}/${plugin.ui.entry}` }] : [])
       ]),
       {

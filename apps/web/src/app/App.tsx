@@ -9,6 +9,7 @@ import {
   RefreshCw,
   Trash2
 } from "../design/icons";
+import { Image as ImageIcon } from "../design/icons";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FolderRecord, MediaRecord, RootRecord } from "@mangoo/core-client";
 import type { MediaFocusCommand, NotificationWindowIntent } from "@mangoo/notification-contract";
@@ -61,6 +62,8 @@ import {
 } from "../features/library/LibrarySidebar";
 import { LibrarySwitcher } from "../features/library/LibrarySwitcher";
 import { usePluginContributionViews, usePluginViewLauncher } from "../features/plugins/PluginContributionsSlot";
+import { useHostCapability } from "../features/plugins/hostPlugins";
+import { openInImageViewer } from "../core/desktop";
 import {
   LibraryCenterPane,
   LibraryInspectorPane
@@ -127,6 +130,8 @@ const LIBRARY_LAYOUT_STORAGE_KEY = "mangoo.library.layout-mode";
 export function App() {
   useOverlayScrollbars();
   const rootContributions = usePluginContributionViews("root-menu");
+  // Host-engine image viewer: Library images can open in its standalone window.
+  const imageViewerAvailable = useHostCapability("image-viewer.v1");
   const pluginView = usePluginViewLauncher();
   const overlays = useOverlayStack();
   useEffect(() => {
@@ -817,10 +822,11 @@ export function App() {
           onPreview: handleOpenPreview,
           beginFileOperation,
           closeMenu: closeContextMenu,
+          imageViewerAvailable,
         })
       });
     },
-    [beginFileOperation, closeContextMenu, fileOps, handleOpenPreview, library, openContextMenu]
+    [beginFileOperation, closeContextMenu, fileOps, handleOpenPreview, imageViewerAvailable, library, openContextMenu]
   );
 
   const handleFolderContextMenu = useCallback(
@@ -1171,6 +1177,8 @@ interface BuildFileItemsArgs {
   onPreview: (mediaId: number) => void;
   beginFileOperation: (openOperation: () => void) => void;
   closeMenu: () => void;
+  /** The image viewer plugin is enabled (Host-engine capability image-viewer.v1). */
+  imageViewerAvailable?: boolean;
 }
 
 interface BuildFolderItemsArgs {
@@ -1204,10 +1212,22 @@ function buildFileItems({
   fileOps,
   onPreview,
   beginFileOperation,
-  closeMenu
+  closeMenu,
+  imageViewerAvailable = false
 }: BuildFileItemsArgs): ContextMenuItem[] {
   const filePath = resolveMediaPath(library, file);
   const canReveal = Boolean(filePath && getDesktopShellActions());
+  const viewerItems: ContextMenuItem[] = imageViewerAvailable && file.kind === "image" && filePath
+    ? [{
+        id: "open-image-viewer",
+        label: "Open in Mangoo 看图",
+        icon: <ImageIcon size={14} />,
+        onSelect: () => {
+          closeMenu();
+          void openInImageViewer([filePath]);
+        }
+      }]
+    : [];
   return [
     {
       id: "preview",
@@ -1228,6 +1248,7 @@ function buildFileItems({
         if (filePath) void openPath(filePath);
       }
     },
+    ...viewerItems,
     { id: "file-primary-separator", separator: true },
     {
       id: "rename",

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { assertNoLinks, currentPlatform, FAKE_PLUGIN_ID, PPM_PLUGIN_ID, parsePluginArgs, renderTrust, sha256, stageArtifacts, validateArtifact, validateSelection } from "./plugin-artifacts.mjs";
+import { assertNoLinks, currentPlatform, DEFAULT_PLUGIN_IDS, FAKE_PLUGIN_ID, IMAGE_VIEWER_PLUGIN_ID, PPM_PLUGIN_ID, parsePluginArgs, renderTrust, sha256, stageArtifacts, validateArtifact, validateSelection } from "./plugin-artifacts.mjs";
 
 const root = process.cwd();
 const options = parsePluginArgs(process.argv.slice(2));
@@ -13,7 +13,7 @@ const targetRoot = path.resolve(root, process.env.CARGO_TARGET_DIR ?? "target");
 const dataRelative = path.relative(path.join(root, ".data"), targetRoot);
 if (!dataRelative.startsWith(`..${path.sep}`) && dataRelative !== ".." && !path.isAbsolute(dataRelative)) throw new Error("bundled build output must not use the production data directory");
 const external = validateSelection(options.externalPlugins.map((artifact) => validateArtifact(artifact, platform)));
-if (external.some((artifact) => [FAKE_PLUGIN_ID, PPM_PLUGIN_ID].includes(artifact.row.id))) throw new Error("duplicate built-in plugin id");
+if (external.some((artifact) => DEFAULT_PLUGIN_IDS.includes(artifact.row.id))) throw new Error("duplicate built-in plugin id");
 execFileSync("cargo", ["build", ...(options.releaseProfile ? ["--release"] : []), "-p", "mangoo-fake-provider", "-p", "mangoo-ppm-decoder"], {
   cwd: root, stdio: "inherit", shell: false, windowsHide: true,
 });
@@ -33,6 +33,14 @@ try {
     fs.writeFileSync(path.join(directory, "plugin.json"), manifestTemplate.replaceAll("__SHA256__", sha256(bytes)));
     defaults.push(validateArtifact(directory, platform));
   }
+  // Host-engine built-ins ship only their manifest; their feature code is
+  // compiled into Core, Desktop and Web from the plugin directory.
+  for (const id of [IMAGE_VIEWER_PLUGIN_ID]) {
+    const directory = path.join(scratch, id);
+    fs.mkdirSync(directory, { recursive: true });
+    fs.copyFileSync(path.join(root, "bundled-plugins", id, "plugin.template.json"), path.join(directory, "plugin.json"));
+    defaults.push(validateArtifact(directory, platform));
+  }
   inventory = stageArtifacts({ targetRoot, profile, artifacts: [...defaults, ...external] });
 } finally {
   assertNoLinks(scratch);
@@ -41,7 +49,7 @@ try {
 const generatedTrustPath = path.join(root, "crates", "core", "src", "plugins", "runtime", "generated_trust.rs");
 const generatedTrust = renderTrust(inventory.plugins);
 if (!fs.existsSync(generatedTrustPath) || fs.readFileSync(generatedTrustPath, "utf8") !== generatedTrust) fs.writeFileSync(generatedTrustPath, generatedTrust);
-for (const plugin of inventory.plugins) console.log(`[bundled-plugin] ${plugin.id} ${plugin.version} ${plugin.platform} ${plugin.sha256}`);
+for (const plugin of inventory.plugins) console.log(`[bundled-plugin] ${plugin.id} ${plugin.version} ${plugin.platform} ${plugin.engine === "host" ? "host-engine" : plugin.sha256}`);
 if (options.release) {
   execFileSync("cargo", ["build", "--release", "-p", "mangoo-core"], { cwd: root, stdio: "inherit", shell: false, windowsHide: true });
 }

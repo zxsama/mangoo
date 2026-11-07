@@ -102,3 +102,20 @@ suspended by that plugin transition, preserving explicit user pauses.
 
 See [the all-file sync scope and ownership contract](../../docs/superpowers/specs/2026-09-16-all-file-plugin-sync.md)
 for the corresponding local capture, compatibility and acceptance boundaries.
+
+## Host engine
+
+`engine: "host"` declares a trusted bundled feature implemented by the Host itself
+(Core, Desktop and Web) from the plugin directory, e.g. the built-in image viewer
+`com.mangoo.image-viewer`. A Host manifest declares `host: { capabilities: ["image-viewer.v1"] }`
+and omits `entry`, `rpc`, `integrity` and `contributions`. Its only activation events are
+`file-open-requested` / `diagnostics-requested`, and its only permissions are
+`{ kind: "local-files", access: "opened-folders" }` and `{ kind: "file-association", scope: "current-user" }`.
+Process manifests cannot declare Host capabilities, permissions or activation.
+
+The artifact is exactly `plugin.json`. Compiled trust pins its digest with a zero executable digest,
+and the inventory row is `{ id, version, platform, engine: "host", manifestSha256 }`.
+Enable, grants and disable use the ordinary lifecycle; an enabled and granted Host plugin is `ready`
+with its capabilities published, and Core gates each Host service on
+`HostRegistry::host_capability_enabled`. `fixtures/valid-host-image-viewer-v2.json` is the canonical fixture.
+See [the image viewer design](../../docs/superpowers/specs/2026-11-08-image-viewer-plugin.md).

@@ -2381,6 +2381,184 @@ paths:
           content:
             text/html:
               schema: { type: string }
+  /image-viewer/formats:
+    get:
+      operationId: getImageViewerFormats
+      description: >-
+        Image formats the standalone viewer opens, exactly the project decode
+        support (built-in registry plus running decoder plugins). Available only
+        while an enabled and granted Host-engine plugin provides image-viewer.v1.
+      responses:
+        "200":
+          description: Supported lowercase dotted extensions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImageViewerFormats"
+        "403":
+          description: The image viewer plugin is not enabled (code image_viewer_disabled).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /image-viewer/folder:
+    get:
+      operationId: getImageViewerFolder
+      description: >-
+        Non-recursive listing of the supported images in the folder of an
+        absolute file or folder path. Ordering is a client preference.
+      parameters:
+        - $ref: "#/components/parameters/imageViewerPath"
+      responses:
+        "200":
+          description: Supported images in the folder.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImageViewerFolder"
+        "400":
+          description: Path is not a bounded absolute normalized path (code invalid_image_path).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: The image viewer plugin is not enabled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Folder is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /image-viewer/image:
+    get:
+      operationId: getImageViewerImage
+      description: >-
+        Paintable source for one image path. Browser-renderable images at or
+        below the tier threshold stream verbatim; larger images return the same
+        adaptive WebP tier as the Library preview, and full=true returns the
+        original for zooming past fit. Browser-unrenderable and decoder-plugin
+        formats always return WebP. x-mangoo-preview-tier names the representation;
+        x-mangoo-source-width/height carry display dimensions when known.
+      parameters:
+        - $ref: "#/components/parameters/imageViewerPath"
+        - name: viewportLongPx
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 16384 }
+        - name: full
+          in: query
+          required: false
+          schema: { type: boolean }
+      responses:
+        "200":
+          description: Original image bytes or a WebP representation.
+          headers:
+            x-mangoo-preview-tier:
+              description: original | preview_2048 | preview_3072 | preview_native | decoder
+              schema: { type: string }
+            x-mangoo-source-width:
+              schema: { type: integer }
+            x-mangoo-source-height:
+              schema: { type: integer }
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+            image/webp:
+              schema: { type: string, format: binary }
+        "400":
+          description: Invalid path or query.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: The image viewer plugin is not enabled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Image file is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "415":
+          description: Extension is not a supported image format (code unsupported_image_format).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: The image could not be decoded (code image_decode_failed).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /image-viewer/thumbnail:
+    get:
+      operationId: getImageViewerThumbnail
+      description: Small WebP thumbnail of one image path for the viewer filmstrip.
+      parameters:
+        - $ref: "#/components/parameters/imageViewerPath"
+        - name: size
+          in: query
+          required: false
+          schema: { type: integer, minimum: 48, maximum: 512 }
+      responses:
+        "200":
+          description: WebP thumbnail bounded to size on its longest side.
+          content:
+            image/webp:
+              schema: { type: string, format: binary }
+        "403":
+          description: The image viewer plugin is not enabled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Image file is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          description: The image could not be decoded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /image-viewer/metadata:
+    get:
+      operationId: getImageViewerMetadata
+      description: File facts, display dimensions and an EXIF summary for one image path.
+      parameters:
+        - $ref: "#/components/parameters/imageViewerPath"
+      responses:
+        "200":
+          description: Image metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImageViewerMetadata"
+        "403":
+          description: The image viewer plugin is not enabled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Image file is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 components:
   securitySchemes:
     sessionToken:
@@ -2423,6 +2601,15 @@ components:
       schema:
         type: integer
         minimum: 1
+    imageViewerPath:
+      name: path
+      in: query
+      required: true
+      description: Absolute, normalized path to a local image file (or, for folder, a folder).
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 4096
     pluginId:
       name: pluginId
       in: path
@@ -2545,6 +2732,77 @@ components:
       description: Unexpected persistence or runtime failure.
       content: { application/json: { schema: { $ref: "#/components/schemas/SyncFolderErrorResponse" } } }
   schemas:
+    ImageViewerFormats:
+      type: object
+      additionalProperties: false
+      required: [imageExtensions, browserRenderableExtensions, animatedExtensions, pluginExtensions]
+      properties:
+        imageExtensions: { type: array, items: { type: string } }
+        browserRenderableExtensions: { type: array, items: { type: string } }
+        animatedExtensions: { type: array, items: { type: string } }
+        pluginExtensions: { type: array, items: { type: string } }
+    ImageViewerFolderEntry:
+      type: object
+      additionalProperties: false
+      required: [path, name, ext, sizeBytes, modifiedAtMs]
+      properties:
+        path: { type: string }
+        name: { type: string }
+        ext: { type: string }
+        sizeBytes: { type: integer, minimum: 0 }
+        modifiedAtMs: { type: integer }
+    ImageViewerFolder:
+      type: object
+      additionalProperties: false
+      required: [directory, entries, truncated]
+      properties:
+        directory: { type: string }
+        entries: { type: array, items: { $ref: "#/components/schemas/ImageViewerFolderEntry" } }
+        truncated: { type: boolean }
+    ImageViewerExif:
+      type: object
+      additionalProperties: false
+      required: [make, model, lensModel, software, artist, copyright, dateTimeOriginal, exposureTime, fNumber, iso, focalLengthMm, focalLength35mm, exposureBiasEv, exposureProgram, meteringMode, flash, whiteBalance, colorSpace, orientation, pixelWidth, pixelHeight, gpsLatitude, gpsLongitude, gpsAltitudeM]
+      properties:
+        make: { type: string, nullable: true }
+        model: { type: string, nullable: true }
+        lensModel: { type: string, nullable: true }
+        software: { type: string, nullable: true }
+        artist: { type: string, nullable: true }
+        copyright: { type: string, nullable: true }
+        dateTimeOriginal: { type: string, nullable: true }
+        exposureTime: { type: string, nullable: true }
+        fNumber: { type: number, nullable: true }
+        iso: { type: integer, nullable: true }
+        focalLengthMm: { type: number, nullable: true }
+        focalLength35mm: { type: integer, nullable: true }
+        exposureBiasEv: { type: number, nullable: true }
+        exposureProgram: { type: string, nullable: true }
+        meteringMode: { type: string, nullable: true }
+        flash: { type: string, nullable: true }
+        whiteBalance: { type: string, nullable: true }
+        colorSpace: { type: string, nullable: true }
+        orientation: { type: integer, nullable: true }
+        pixelWidth: { type: integer, nullable: true }
+        pixelHeight: { type: integer, nullable: true }
+        gpsLatitude: { type: number, nullable: true }
+        gpsLongitude: { type: number, nullable: true }
+        gpsAltitudeM: { type: number, nullable: true }
+    ImageViewerMetadata:
+      type: object
+      additionalProperties: false
+      required: [path, name, directory, ext, sizeBytes, modifiedAtMs, createdAtMs, width, height, exif]
+      properties:
+        path: { type: string }
+        name: { type: string }
+        directory: { type: string }
+        ext: { type: string }
+        sizeBytes: { type: integer, minimum: 0 }
+        modifiedAtMs: { type: integer }
+        createdAtMs: { type: integer, nullable: true }
+        width: { type: integer, nullable: true }
+        height: { type: integer, nullable: true }
+        exif: { anyOf: [{ $ref: "#/components/schemas/ImageViewerExif" }, { type: "null" }], nullable: true }
     PlaybackSession:
       type: object
       required: [id, src, expiresAt, renewAfterMs]
@@ -4624,7 +4882,7 @@ components:
           type: boolean
     PluginCapability:
       type: string
-      enum: [sync-provider.v1, file-decoder.v1]
+      enum: [sync-provider.v1, file-decoder.v1, image-viewer.v1]
     PluginRuntimeState:
       type: string
       enum: [disabled, stopping, permission-required, starting, ready, degraded, crashed-backoff, incompatible, configuration-required]
@@ -4688,6 +4946,18 @@ components:
               maxItems: 5
               uniqueItems: true
               items: { enum: [core-api, pick-folder, reveal-path, clipboard-write, external-link] }
+        - type: object
+          required: [kind, access]
+          additionalProperties: false
+          properties:
+            kind: { const: local-files }
+            access: { const: opened-folders }
+        - type: object
+          required: [kind, scope]
+          additionalProperties: false
+          properties:
+            kind: { const: file-association }
+            scope: { const: current-user }
     HostPluginViewDocument:
       type: object
       additionalProperties: false

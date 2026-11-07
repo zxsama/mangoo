@@ -28,11 +28,14 @@ import {
 import { createCoreSession, type CoreSession } from "./core-session.js";
 import {
   assertDesktopIpcAccess,
+  canAccessDesktopIpc,
   type DesktopIpcWindowRole
 } from "./desktop-ipc-permissions.js";
 import { desktopLogger, processLogBuffer } from "./desktop-logger.js";
 import { parseFolderPickerRequest, showFolderPicker } from "./folder-picker.js";
 import { createCoreClient } from "@mangoo/core-client/node";
+import * as electronModule from "electron";
+import { createImageViewerHost, type ImageViewerHost } from "@mangoo/plugin-image-viewer/desktop";
 import { notificationPluginEntries, resolveNotificationPluginIntent } from "./plugin-notification-views.js";
 import { openPluginExternalLink, parsePluginExternalLinkInput } from "./plugin-external-link.js";
 import {
@@ -289,6 +292,7 @@ function roleForWebContents(sender: WebContents): DesktopIpcWindowRole | null {
   const window = BrowserWindow.fromWebContents(sender);
   if (!window || window.isDestroyed()) return null;
   if (window === mainWindow) return "main";
+  if (imageViewerHost?.ownsWindow(window)) return "image-viewer";
   for (const role of Object.keys(secondaryWindows) as SecondaryWindowRole[]) {
     if (secondaryWindows[role] === window) return role;
   }
@@ -308,7 +312,9 @@ function requireNotificationIpcAccess(
   event: IpcMainInvokeEvent | IpcMainEvent,
   channel: string
 ): NotificationIpcWindowRole {
-  const role = roleForWebContents(event.sender);
+  const windowRole = roleForWebContents(event.sender);
+  // The image viewer window has no notification access.
+  const role = windowRole === "image-viewer" ? null : windowRole;
   assertNotificationIpcAccess(role, channel);
   return role;
 }
@@ -2245,15 +2251,63 @@ if (!hasSingleInstanceLock) {
   app.quit();
 }
 
-if (app.isPackaged) {
-  app.on("second-instance", () => {
-    const window = mainWindow;
-    if (!window || window.isDestroyed()) return;
+// Built-in Host-engine plugin com.mangoo.image-viewer: a standalone viewer
+// window for files the OS opens with Mangoo. Enabled/disabled through the
+// ordinary plugin lifecycle; while disabled every viewer surface is off.
+const imageViewerHost: ImageViewerHost | null = hasSingleInstanceLock
+  ? createImageViewerHost(electronModule, {
+      userDataDir: app.getPath("userData"),
+      preloadPath: fileURLToPath(new URL("./preload.cjs", import.meta.url)),
+      windowIconPath: windowIconPath(app.isPackaged, process.resourcesPath) ?? null,
+      associationIconPath: app.isPackaged
+        ? path.join(process.resourcesPath, "icon.png")
+        : fileURLToPath(new URL("../build/icon.png", import.meta.url)),
+      ensureCoreSession: () => ensureCoreReady(),
+      rendererUrl: (session, route) =>
+        process.env.MANGOO_WEB_URL
+          ? `${process.env.MANGOO_WEB_URL}${route}`
+          : rendererUrlForSession(session, route),
+      applyWindowMaterial,
+      openMainWindow: showOrCreateMainWindow,
+      authorizeHostWindow: (event, channel) => canAccessDesktopIpc(roleForWebContents(event.sender), channel),
+      extraRendererArguments: () => (isVisualHarnessEnabled() ? ["--mangoo-visual-harness=1"] : []),
+      log: (level, message, data) => desktopLogger[level]("main", `[mangoo] ${message}`, data ?? "")
+    })
+  : null;
+
+// macOS delivers Finder "Open with" through open-file (queued until ready).
+app.on("open-file", (event, filePath) => {
+  if (!imageViewerHost) return;
+  event.preventDefault();
+  imageViewerHost.handleOpenFile(filePath);
+});
+
+async function showOrCreateMainWindow(): Promise<void> {
+  const window = mainWindow;
+  if (window && !window.isDestroyed()) {
     if (window.isMinimized()) window.restore();
     window.show();
     window.focus();
+    return;
+  }
+  await createWindow();
+}
+
+if (app.isPackaged) {
+  app.on("second-instance", (_event, argv, workingDirectory) => {
+    void (async () => {
+      // Files opened from the OS go to the viewer when its plugin is enabled.
+      if (imageViewerHost && (await imageViewerHost.handleSecondInstance(argv, workingDirectory))) return;
+      await showOrCreateMainWindow();
+    })().catch((error) => desktopLogger.warn("main", "[mangoo] second instance handling failed:", error));
   });
 }
+
+ipcMain.handle("mangoo:plugins-changed", async (event) => {
+  requireDesktopIpcAccess(event, "mangoo:plugins-changed");
+  await imageViewerHost?.refresh();
+  return true;
+});
 
 if (hasSingleInstanceLock) app
   .whenReady()
@@ -2266,7 +2320,10 @@ if (hasSingleInstanceLock) app
       prepareLibrary: maybeAutoAddRoot,
       publishPhase: pushLibraryPhase
     });
-    await createWindow();
+    // A launch that only opens image files shows just the viewer window, like
+    // any standalone image viewer; every other launch opens the Library.
+    const viewerLaunch = imageViewerHost ? await imageViewerHost.start() : { openedViewer: false };
+    if (!viewerLaunch.openedViewer) await createWindow();
     app.on("browser-window-focus", () => { void wakeCoreSync("foreground"); });
     powerMonitor.on("resume", () => { void wakeCoreSync("foreground"); });
     powerMonitor.on("unlock-screen", () => { void wakeCoreSync("foreground"); });
@@ -2520,6 +2577,7 @@ app.on("activate", () => {
 
 app.on("before-quit", (event) => {
   oauthReturnFocusEntitlements.clear();
+  imageViewerHost?.dispose();
   // Persist window state synchronously before tearing Core down. The
   // `persisted` guard prevents the second `before-quit` (after `app.exit`)
   // from re-entering this branch — Node would otherwise double-stop Core

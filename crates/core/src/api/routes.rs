@@ -211,6 +211,11 @@ pub const PHASE1_API_PATHS: &[&str] = &[
     "/api/plugins/{pluginId}/health",
     "/api/plugins/{pluginId}/diagnostics",
     "/api/plugin-auth/callback/{flowId}",
+    "/api/image-viewer/formats",
+    "/api/image-viewer/folder",
+    "/api/image-viewer/image",
+    "/api/image-viewer/thumbnail",
+    "/api/image-viewer/metadata",
 ];
 
 #[derive(Debug, Serialize)]
@@ -407,15 +412,15 @@ struct PreviewQuery {
 
 /// What `get_preview` decided to serve instead of the raw original.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PreviewPlan {
-    profile: &'static str,
-    max_px: u32,
+pub(crate) struct PreviewPlan {
+    pub(crate) profile: &'static str,
+    pub(crate) max_px: u32,
 }
 
 /// Pure preview-source resolution. `None` means "stream the original file
 /// bytes", which is the zero-cost majority path and the exact behaviour that
 /// shipped before this pipeline existed.
-fn resolve_preview_plan(
+pub(crate) fn resolve_preview_plan(
     media_kind: Option<&str>,
     ext: &str,
     source_max_px: u32,

@@ -18,10 +18,20 @@ pub struct ManifestRecord {
     pub name: String,
     pub version: String,
     pub engine: Engine,
+    /// Process engine only. A Host-engine plugin has no executable, so the
+    /// field is absent on the wire and empty here.
+    #[serde(default, skip_serializing_if = "PlatformEntries::is_empty")]
     pub entry: PlatformEntries,
+    /// Process engine only: the executable's framed RPC contract.
+    #[serde(default, skip_serializing_if = "RpcDeclaration::is_empty")]
     pub rpc: RpcDeclaration,
+    /// Host engine only: the Host-implemented capabilities the plugin turns on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostDeclaration>,
     pub activation_events: Vec<ActivationEvent>,
     pub requested_permissions: Vec<Permission>,
+    /// Process engine only: the descriptive executable digest.
+    #[serde(default, skip_serializing_if = "Integrity::is_empty")]
     pub integrity: Integrity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contributions: Option<super::contributions::PluginContributions>,
@@ -32,17 +42,43 @@ pub struct ManifestRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Engine {
+    /// A trusted bundled native executable spoken to over framed RPC.
     Process,
+    /// A trusted bundled feature implemented by the Host itself (Core, Desktop
+    /// and Web). The artifact is only its manifest: Core pins that manifest in
+    /// compiled trust, and the ordinary plugin lifecycle (enable, grants,
+    /// disable) gates the Host services its declared capabilities name.
+    Host,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PlatformEntries {
     pub windows_x64: Option<String>,
     pub linux_x64: Option<String>,
 }
 
+impl PlatformEntries {
+    pub fn is_empty(&self) -> bool {
+        self.windows_x64.is_none() && self.linux_x64.is_none()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostDeclaration {
+    pub capabilities: Vec<HostCapability>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum HostCapability {
+    /// Standalone image viewer: path-scoped image services in Core, a separate
+    /// Desktop viewer window and optional OS file-association registration.
+    #[serde(rename = "image-viewer.v1")]
+    ImageViewerV1,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RpcDeclaration {
     pub wire_versions: Vec<u16>,
@@ -50,6 +86,15 @@ pub struct RpcDeclaration {
     pub method_versions: BTreeMap<String, u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoder: Option<DecoderDeclaration>,
+}
+
+impl RpcDeclaration {
+    pub fn is_empty(&self) -> bool {
+        self.wire_versions.is_empty()
+            && self.capabilities.is_empty()
+            && self.method_versions.is_empty()
+            && self.decoder.is_none()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +127,8 @@ pub enum ActivationEvent {
     AuthRequested,
     DiagnosticsRequested,
     FileDecodeRequested,
+    /// Host engine: the user opened a file that the plugin's capability handles.
+    FileOpenRequested,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +152,28 @@ pub enum Permission {
     HostUi {
         operations: Vec<HostUiOperation>,
     },
+    /// Host engine: read the image files the user explicitly opens, and the
+    /// sibling images of their folder, by absolute path.
+    LocalFiles {
+        access: LocalFileAccess,
+    },
+    /// Host engine: register the application with the operating system as a
+    /// handler for the capability's file types (current user only).
+    FileAssociation {
+        scope: FileAssociationScope,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocalFileAccess {
+    OpenedFolders,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FileAssociationScope {
+    CurrentUser,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -134,10 +203,16 @@ pub enum SecretOperation {
     Write,
     Delete,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Integrity {
     pub sha256: String,
+}
+
+impl Integrity {
+    pub fn is_empty(&self) -> bool {
+        self.sha256.is_empty()
+    }
 }
 
 #[derive(Debug)]
@@ -191,17 +266,91 @@ pub(crate) fn parse_manifest_bytes(
         return Err(ManifestError::Invalid("plugin manifest is too large"));
     }
     let raw: serde_json::Value = serde_json::from_slice(bytes)?;
-    let entries = raw
-        .get("entry")
-        .and_then(|value| value.as_object())
-        .ok_or(ManifestError::Invalid("entry must be an object"))?;
-    if entries.is_empty() || entries.values().any(serde_json::Value::is_null) {
-        return Err(ManifestError::Invalid("platform entries cannot be null"));
+    if raw.get("engine").and_then(|value| value.as_str()) == Some("host") {
+        // Serde defaults must never stand in for a present-but-empty process
+        // declaration: a Host plugin omits every process-only field.
+        if ["entry", "rpc", "integrity"]
+            .iter()
+            .any(|field| raw.get(*field).is_some())
+        {
+            return Err(ManifestError::Invalid(
+                "host engine manifests cannot declare process fields",
+            ));
+        }
+    } else {
+        let entries = raw
+            .get("entry")
+            .and_then(|value| value.as_object())
+            .ok_or(ManifestError::Invalid("entry must be an object"))?;
+        if entries.is_empty() || entries.values().any(serde_json::Value::is_null) {
+            return Err(ManifestError::Invalid("platform entries cannot be null"));
+        }
+        if raw.get("rpc").is_none() || raw.get("integrity").is_none() {
+            return Err(ManifestError::Invalid(
+                "process manifests require rpc and integrity",
+            ));
+        }
     }
     let mut manifest: ManifestRecord = serde_json::from_value(raw)?;
     validate(&manifest)?;
     manifest.manifest_path = path.to_path_buf();
     Ok(manifest)
+}
+
+fn is_host_engine_permission(permission: &Permission) -> bool {
+    matches!(
+        permission,
+        Permission::LocalFiles { .. } | Permission::FileAssociation { .. }
+    )
+}
+
+/// A Host-engine plugin owns no executable, RPC contract or contributions: its
+/// feature is compiled into the Host, which the trusted manifest turns on.
+fn validate_host_engine(m: &ManifestRecord) -> Result<(), ManifestError> {
+    if !m.entry.is_empty() || !m.rpc.is_empty() || !m.integrity.is_empty() {
+        return Err(ManifestError::Invalid(
+            "host engine manifests cannot declare process fields",
+        ));
+    }
+    if m.contributions.is_some() {
+        return Err(ManifestError::Invalid(
+            "host engine manifests cannot declare contributions",
+        ));
+    }
+    let Some(host) = &m.host else {
+        return Err(ManifestError::Invalid(
+            "host engine manifests require host capabilities",
+        ));
+    };
+    if host.capabilities.is_empty() || !unique(&host.capabilities) {
+        return Err(ManifestError::Invalid(
+            "host capabilities must be unique and non-empty",
+        ));
+    }
+    if m.activation_events.is_empty()
+        || !unique(&m.activation_events)
+        || m.activation_events.iter().any(|event| {
+            !matches!(
+                event,
+                ActivationEvent::FileOpenRequested | ActivationEvent::DiagnosticsRequested
+            )
+        })
+    {
+        return Err(ManifestError::Invalid(
+            "invalid host engine activation events",
+        ));
+    }
+    if m.requested_permissions
+        .iter()
+        .any(|permission| !is_host_engine_permission(permission))
+        || m.requested_permissions
+            .iter()
+            .enumerate()
+            .any(|(index, permission)| m.requested_permissions[..index].contains(permission))
+    {
+        return Err(ManifestError::Invalid("invalid host engine permission"));
+    }
+    Ok(())
 }
 
 fn validate(m: &ManifestRecord) -> Result<(), ManifestError> {
@@ -221,6 +370,20 @@ fn validate(m: &ManifestRecord) -> Result<(), ManifestError> {
     }
     if !valid_semver(&m.version) {
         return Err(ManifestError::Invalid("version must be semantic version"));
+    }
+    if m.engine == Engine::Host {
+        return validate_host_engine(m);
+    }
+    if m.host.is_some()
+        || m.requested_permissions
+            .iter()
+            .any(is_host_engine_permission)
+        || m.activation_events
+            .contains(&ActivationEvent::FileOpenRequested)
+    {
+        return Err(ManifestError::Invalid(
+            "host capabilities, permissions and activation require the host engine",
+        ));
     }
     if m.entry.windows_x64.is_none() && m.entry.linux_x64.is_none() {
         return Err(ManifestError::Invalid(
@@ -544,6 +707,67 @@ mod tests {
             .unwrap();
         let manifest = parse_manifest(&fixture).expect("shared v2 fixture");
         assert_eq!(manifest.id, "com.mangoo.fake-sync");
+    }
+
+    #[test]
+    fn host_engine_manifest_is_strict_and_process_free() {
+        let fixture =
+            include_str!("../../../../contracts/plugins/fixtures/valid-host-image-viewer-v2.json");
+        let parse = |text: &str| parse_manifest_bytes(text.as_bytes(), Path::new("plugin.json"));
+        let manifest = parse(fixture).expect("host engine fixture");
+        assert_eq!(manifest.engine, Engine::Host);
+        assert_eq!(
+            manifest.host.as_ref().unwrap().capabilities,
+            [HostCapability::ImageViewerV1]
+        );
+        assert!(manifest.entry.is_empty() && manifest.rpc.is_empty());
+        // Round-trips without growing process-only fields.
+        let serialized = serde_json::to_value(&manifest).unwrap();
+        for field in ["entry", "rpc", "integrity"] {
+            assert!(serialized.get(field).is_none(), "{field} must stay absent");
+        }
+        let value: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        let with = |key: &str, extra: serde_json::Value| {
+            let mut copy = value.clone();
+            copy[key] = extra;
+            serde_json::to_string(&copy).unwrap()
+        };
+        // Process-only declarations are rejected even when empty.
+        assert!(parse(&with("entry", serde_json::json!({}))).is_err());
+        assert!(parse(&with("integrity", serde_json::json!({"sha256": ""}))).is_err());
+        // Host plugins cannot request process permissions or activation.
+        assert!(parse(&with(
+            "requestedPermissions",
+            serde_json::json!([{"kind": "temp-storage", "maxBytes": 1}])
+        ))
+        .is_err());
+        assert!(parse(&with(
+            "activationEvents",
+            serde_json::json!(["sync-enabled"])
+        ))
+        .is_err());
+        assert!(parse(&with("host", serde_json::json!({"capabilities": []}))).is_err());
+        assert!(parse(&with(
+            "host",
+            serde_json::json!({"capabilities": ["unknown.v1"]})
+        ))
+        .is_err());
+        assert!(parse(&with(
+            "contributions",
+            serde_json::json!({"configuration": [], "authentication": null, "presentation": null, "primaryCredential": null})
+        ))
+        .is_err());
+        // A process manifest cannot borrow Host capabilities or permissions.
+        let mut process: serde_json::Value = serde_json::from_str(valid()).unwrap();
+        process["host"] = serde_json::json!({"capabilities": ["image-viewer.v1"]});
+        assert!(parse(&serde_json::to_string(&process).unwrap()).is_err());
+        let mut process: serde_json::Value = serde_json::from_str(valid()).unwrap();
+        process["requestedPermissions"] =
+            serde_json::json!([{"kind": "local-files", "access": "opened-folders"}]);
+        assert!(parse(&serde_json::to_string(&process).unwrap()).is_err());
+        let mut process: serde_json::Value = serde_json::from_str(valid()).unwrap();
+        process.as_object_mut().unwrap().remove("rpc");
+        assert!(parse(&serde_json::to_string(&process).unwrap()).is_err());
     }
 
     #[test]
