@@ -28,6 +28,7 @@ export {
   OverlayDialogActions,
   OverlayDialogBody,
   OverlayDialogHeader,
+  OverlayField,
   OverlayInlineStatus,
   OverlayMenuItem,
   OverlayMenuList,

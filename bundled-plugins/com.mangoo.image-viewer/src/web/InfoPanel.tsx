@@ -121,7 +121,7 @@ export function InfoPanel({ entry, image }: { entry: ImageEntry | null; image: L
   return (
     <aside aria-label="图片信息" className="iv-info">
       <div className="iv-info-title" title={entry.name}>{entry.name}</div>
-      <HistogramView image={image} />
+      {image ? <HistogramView image={image} /> : null}
       <section className="iv-info-section">
         <div className="iv-info-section-title">
           <icons.File aria-hidden="true" size={13} />

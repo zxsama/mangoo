@@ -330,9 +330,9 @@ export function createImageViewerHost(electron: ElectronModule, options: ImageVi
         ? "macOS 的默认应用由安装包声明的文档类型决定：请在访达中对图片选择“显示简介 → 打开方式 → 全部更改”。"
         : "当前系统不支持注册默认看图应用。";
     } else if (developmentBlocked) {
-      detail = "开发模式下不写入系统关联；打包版本可注册（或设置 MANGOO_IMAGE_VIEWER_DEV_ASSOCIATION=1）。";
+      detail = "开发版不会修改系统设置，安装正式版后即可开启。";
     } else if (!enabled) {
-      detail = "启用看图插件后可注册为系统图片查看器。";
+      detail = "启用看图插件后即可设置。";
     } else if (registered) {
       detail = process.platform === "win32"
         ? "已注册到“打开方式”。可在 Windows 设置的“默认应用”中将 Mangoo 看图设为默认。"

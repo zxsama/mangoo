@@ -39,11 +39,17 @@ export function describeError(error: unknown): string {
   if (error instanceof CoreApiError) {
     const body = error.body as { error?: string; code?: string } | undefined;
     if (body?.code === "image_viewer_disabled") return "看图插件未启用。请在插件管理中启用 Mangoo 看图。";
-    if (body?.code === "unsupported_image_format") return "不支持此图片格式。";
-    if (error.status === 404) return "文件不存在或无法访问。";
-    return body?.error ?? `请求失败（${error.status}）`;
+    if (body?.code === "unsupported_image_format") return "Mangoo 暂不支持这种图片格式。";
+    if (body?.code === "image_decode_failed") return "这张图片无法显示，文件可能已损坏，或使用了不支持的编码。";
+    if (body?.code === "invalid_image_path") return "无法识别这个文件路径。";
+    if (error.status === 404) return "找不到这个文件，它可能已被移动或删除。";
+    return `读取图片失败（错误 ${error.status}）。`;
   }
-  return error instanceof Error ? error.message : String(error);
+  // Decode failures surface from the browser (createImageBitmap / <img>) in
+  // English and without detail the user can act on.
+  const message = error instanceof Error ? error.message : String(error);
+  if (/decod|image|bitmap|显示/i.test(message)) return "这张图片无法显示，文件可能已损坏，或使用了不支持的编码。";
+  return message;
 }
 
 function toEntry(entry: ImageViewerFolderEntry): ImageEntry {

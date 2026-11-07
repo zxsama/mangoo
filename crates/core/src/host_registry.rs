@@ -5494,6 +5494,9 @@ impl HostRegistry {
                 "UPDATE plugin_runtime_state SET state=?1,pid=NULL,session_id=NULL,started_at=NULL,crash_count=0,backoff_until=NULL,last_error_code=?2,last_error_detail=?3,updated_at=?4 WHERE plugin_id=?5",
                 params![state, error_code, error_detail, now, plugin_id],
             )?;
+            // Host-engine plugins have no process supervisor to advance them
+            // out of starting, so settle them here or they stay unusable.
+            Self::settle_host_engine_runtime(&transaction, &plugin_id)?;
         }
         transaction.commit()?;
         Ok(changed)
@@ -9913,6 +9916,14 @@ mod tests {
         // Re-enabling keeps the accepted grants and is immediately ready.
         registry
             .set_plugin_intent("com.mangoo.image-viewer", true, false)
+            .unwrap();
+        assert_eq!(state(&registry).runtime_state, "ready");
+        assert!(registry.host_capability_enabled(capability).unwrap());
+
+        // A Host restart resets every enabled plugin to starting; a Host
+        // plugin must come back ready without any process supervisor.
+        registry
+            .reset_plugin_runtime_states_for_startup(false)
             .unwrap();
         assert_eq!(state(&registry).runtime_state, "ready");
         assert!(registry.host_capability_enabled(capability).unwrap());

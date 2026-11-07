@@ -1,118 +1,101 @@
-import { useCallback, useEffect, useState } from "react";
-import { LiquidGlassButton, icons } from "@mangoo/web/plugin-host";
+import { icons } from "@mangoo/web/plugin-host";
 
-import type { ImageViewerAssociationStatus } from "../shared/ipc.ts";
-import { viewerHostBridge } from "./bridge.ts";
+import { AssociationControls } from "./AssociationControls.tsx";
+import { useViewerPreferences } from "./preferences.ts";
+import { ViewerSettingsForm } from "./ViewerSettings.tsx";
 import "./viewer.css";
 
-/** Register / unregister Mangoo as the OS image viewer. */
-export function AssociationControls({ compact = false, refreshKey }: { compact?: boolean; refreshKey?: unknown }) {
-  const bridge = viewerHostBridge();
-  const [status, setStatus] = useState<ImageViewerAssociationStatus | null>(null);
-  const [busy, setBusy] = useState(false);
+export { AssociationControls } from "./AssociationControls.tsx";
 
-  const load = useCallback(async () => {
-    if (!bridge) return;
-    try {
-      setStatus(await bridge.associationStatus());
-    } catch {
-      setStatus(null);
-    }
-  }, [bridge]);
-
-  useEffect(() => {
-    void load();
-  }, [load, refreshKey]);
-
-  if (!bridge) {
-    return <p className="iv-assoc-detail">系统关联仅在桌面版中可用。</p>;
+export const SHORTCUT_GROUPS: Array<{ title: string; items: Array<[string, string]> }> = [
+  {
+    title: "浏览",
+    items: [
+      ["← →  /  PageUp PageDown", "上一张 / 下一张"],
+      ["Home / End", "第一张 / 最后一张"],
+      ["鼠标侧键", "上一张 / 下一张"],
+      ["S 或 F5", "开始 / 停止幻灯片"]
+    ]
+  },
+  {
+    title: "缩放与旋转",
+    items: [
+      ["滚轮、Ctrl + 滚轮、双指捏合", "以光标为中心缩放"],
+      ["+ / −", "放大 / 缩小"],
+      ["0 / 1、双击图片", "适应窗口 / 原始大小"],
+      ["R / Shift + R", "向右 / 向左旋转"],
+      ["H / V", "水平 / 垂直翻转"]
+    ]
+  },
+  {
+    title: "窗口与文件",
+    items: [
+      ["F11 或 F、Esc", "全屏 / 退出"],
+      ["I、T", "显示信息、缩略图条"],
+      ["Ctrl + O", "打开图片"],
+      ["Ctrl + C、Ctrl + Shift + C", "复制图片、复制路径"],
+      ["F2、Delete", "重命名、删除到回收站"]
+    ]
   }
-  if (!status) {
-    return <p className="iv-assoc-detail">正在读取系统关联状态…</p>;
-  }
+];
 
-  async function toggle() {
-    if (!bridge || !status) return;
-    setBusy(true);
-    try {
-      setStatus(await bridge.setAssociation(!status.registered));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  const actionable = status.supported && status.pluginEnabled;
+export function ShortcutList() {
   return (
-    <div className="iv-assoc" data-compact={compact ? "true" : "false"}>
-      <label className="iv-assoc-row" data-disabled={!actionable || busy ? "true" : "false"}>
-        <span className="iv-assoc-label">
-          <span>设为系统图片查看器</span>
-          <small>{status.registered ? "已注册" : status.wanted && actionable ? "等待注册" : "未注册"}</small>
-        </span>
-        <span className={`plugin-toggle${status.registered ? " on" : ""}${!actionable || busy ? " disabled" : ""}`}>
-          <input
-            aria-label="设为系统图片查看器"
-            checked={status.registered}
-            disabled={!actionable || busy}
-            onChange={() => void toggle()}
-            type="checkbox"
-          />
-          <span aria-hidden="true" className="plugin-toggle-track">
-            <span className="plugin-toggle-thumb" />
-          </span>
-        </span>
-      </label>
-      <p className="iv-assoc-detail">{status.detail}</p>
-      {status.registered && status.canOpenSystemSettings ? (
-        <LiquidGlassButton className="iv-assoc-button" onClick={() => void bridge.openDefaultAppsSettings()} tone="control" type="button">
-          <icons.ExternalLink aria-hidden="true" size={13} />
-          <span>打开系统“默认应用”设置</span>
-        </LiquidGlassButton>
-      ) : null}
-      {!compact && status.extensions.length ? (
-        <p className="iv-assoc-formats">
-          支持格式：{status.extensions.map((ext) => ext.replace(".", "").toUpperCase()).join("、")}
-        </p>
-      ) : null}
+    <div className="iv-shortcut-groups">
+      {SHORTCUT_GROUPS.map((group) => (
+        <div className="iv-shortcut-group" key={group.title}>
+          <div className="iv-shortcut-group-title">{group.title}</div>
+          <dl>
+            {group.items.map(([keys, action]) => (
+              <div className="iv-shortcut-row" key={keys}>
+                <dt>{keys.split("、").map((part) => <kbd key={part}>{part}</kbd>)}</dt>
+                <dd>{action}</dd>
+              </div>
+            ))}
+          </dl>
+        </div>
+      ))}
     </div>
   );
 }
 
-const SHORTCUTS: Array<[string, string]> = [
-  ["← / →、PageUp / PageDown、滚轮（可设置）", "上一张 / 下一张"],
-  ["Home / End", "第一张 / 最后一张"],
-  ["+ / −、Ctrl + 滚轮", "放大 / 缩小（以光标为中心）"],
-  ["0 / 1、双击", "适应窗口 / 实际大小"],
-  ["R / Shift+R、H / V", "旋转、水平 / 垂直翻转"],
-  ["F11 / F、Esc", "全屏 / 退出"],
-  ["S / F5", "幻灯片放映"],
-  ["I、T", "信息面板、缩略图条"],
-  ["Delete、F2", "删除到回收站、重命名"],
-  ["Ctrl+C / Ctrl+Shift+C", "复制图片 / 复制路径"],
-  ["Ctrl+O", "打开图片"]
-];
-
 /** Rendered in the plugin manager detail pane for com.mangoo.image-viewer. */
-export function ImageViewerPluginPanel({ enabled, refreshKey }: { enabled: boolean; refreshKey?: unknown }) {
+export function ImageViewerPluginPanel({ enabled }: { enabled: boolean; refreshKey?: unknown }) {
+  const [preferences, setPreferences] = useViewerPreferences();
+  if (!enabled) {
+    return (
+      <div className="plugin-detail-section iv-plugin-panel">
+        <div className="iv-plugin-intro">
+          <icons.Images aria-hidden="true" size={28} weight="light" />
+          <div>
+            <strong>独立的看图窗口</strong>
+            <p className="iv-plugin-description">
+              启用后，可以在资源管理器中双击图片直接用 Mangoo 查看：浏览整个文件夹、缩放旋转、幻灯片、EXIF 信息与直方图，支持的格式与资料库一致。
+            </p>
+            <p className="iv-plugin-description">停用插件会关闭看图窗口，并撤销 Mangoo 在系统中的图片关联。</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="plugin-detail-section iv-plugin-panel">
-      <div className="plugin-detail-section-title">看图</div>
-      <p className="iv-plugin-description">
-        {enabled
-          ? "在系统中双击图片即可用独立的 Mangoo 看图窗口打开，支持文件夹浏览、缩放、旋转、幻灯片、EXIF 信息与直方图。格式支持与 Mangoo 一致。"
-          : "启用后，Mangoo 可作为独立的看图应用打开系统中的图片。停用插件会关闭看图窗口并移除系统关联。"}
-      </p>
-      <AssociationControls refreshKey={`${String(enabled)}:${String(refreshKey ?? "")}`} />
+      <section className="iv-settings-section">
+        <h3 className="iv-settings-section-title">
+          <icons.Settings aria-hidden="true" size={14} />
+          <span>系统</span>
+        </h3>
+        <div className="iv-settings-rows">
+          <AssociationControls />
+        </div>
+      </section>
+      <ViewerSettingsForm onChange={setPreferences} preferences={preferences} showSystem={false} />
       <details className="iv-shortcuts">
-        <summary data-pointer-glow="off">快捷键</summary>
-        <dl>
-          {SHORTCUTS.map(([keys, action]) => (
-            <div className="iv-info-row" key={keys}>
-              <dt>{keys}</dt>
-              <dd>{action}</dd>
-            </div>
-          ))}
-        </dl>
+        <summary data-pointer-glow="off">
+          <icons.Keyboard aria-hidden="true" size={14} />
+          <span>键盘快捷键</span>
+        </summary>
+        <ShortcutList />
       </details>
     </div>
   );
