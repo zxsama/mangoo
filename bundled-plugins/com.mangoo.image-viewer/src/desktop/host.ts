@@ -425,10 +425,16 @@ export function createImageViewerHost(electron: ElectronModule, options: ImageVi
   }
 
   function requireAdmitted(file: unknown): string {
-    if (typeof file !== "string" || !access.allows(file, supportedSet())) {
+    if (typeof file !== "string") throw new Error("image path is outside the folders opened in this viewer");
+    // Reject traversal before normalising, which would otherwise fold it away.
+    if (file.split(/[\\/]/).some((part) => part === ".." || part === ".")) {
       throw new Error("image path is outside the folders opened in this viewer");
     }
-    return file;
+    const normalized = path.normalize(file);
+    if (!access.allows(normalized, supportedSet())) {
+      throw new Error("image path is outside the folders opened in this viewer");
+    }
+    return normalized;
   }
 
   async function guarded(action: () => Promise<void> | void, extra: Partial<ImageViewerActionResult> = {}): Promise<ImageViewerActionResult> {

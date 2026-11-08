@@ -1409,6 +1409,7 @@ fn cors_layer(origin: HeaderValue) -> CorsLayer {
             HeaderName::from_static("x-mangoo-preview-tier"),
             HeaderName::from_static("x-mangoo-source-width"),
             HeaderName::from_static("x-mangoo-source-height"),
+            HeaderName::from_static("x-mangoo-animated"),
             HeaderName::from_static("x-mangoo-library-id"),
             HeaderName::from_static("x-mangoo-context-revision"),
         ])

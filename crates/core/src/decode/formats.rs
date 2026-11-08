@@ -10,8 +10,8 @@ use std::path::Path;
 /// Extensions indexed as `media.kind = "image"`. The decode registry mirrors
 /// this set across browser-native, PSD, camera RAW, and ffmpeg-backed decoders.
 pub const IMAGE_EXTENSIONS: &[&str] = &[
-    ".arw", ".avif", ".bmp", ".cr2", ".dng", ".gif", ".heic", ".heif", ".jpeg", ".jpg", ".nef",
-    ".orf", ".png", ".psd", ".raw", ".rw2", ".tif", ".tiff", ".webp",
+    ".apng", ".arw", ".avif", ".bmp", ".cr2", ".dng", ".gif", ".heic", ".heif", ".jpeg", ".jpg",
+    ".nef", ".orf", ".png", ".psd", ".raw", ".rw2", ".tif", ".tiff", ".webp",
 ];
 
 /// Extensions indexed as `media.kind = "video"`.
@@ -20,12 +20,16 @@ pub const VIDEO_EXTENSIONS: &[&str] = &[".avi", ".m4v", ".mkv", ".mov", ".mp4", 
 /// What Chromium paints from raw bytes in an `<img>`/`createImageBitmap`.
 /// Anything outside this set must be transcoded to WebP by Core before the
 /// frontend can show it.
-const BROWSER_RENDERABLE_IMAGE_EXTENSIONS: &[&str] =
-    &[".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"];
+const BROWSER_RENDERABLE_IMAGE_EXTENSIONS: &[&str] = &[
+    ".apng", ".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp",
+];
 
 /// Formats that can carry more than one frame. The preview surface keeps these
 /// on `<img>` for native animation — a canvas would freeze them on frame one.
-const ANIMATION_CAPABLE_IMAGE_EXTENSIONS: &[&str] = &[".avif", ".gif", ".webp"];
+/// `.png` is deliberately absent (most PNGs are still images and the Library
+/// preview must keep its canvas lane for them); the image viewer sniffs APNG
+/// headers itself for files that kept the `.png` extension.
+const ANIMATION_CAPABLE_IMAGE_EXTENSIONS: &[&str] = &[".apng", ".avif", ".gif", ".webp"];
 
 /// Lowercase extension INCLUDING the leading dot, or `""` when the file has
 /// none. This exact shape is what `files.ext` stores and what
@@ -79,9 +83,9 @@ mod tests {
     #[test]
     fn classifies_indexed_image_and_video_extensions() {
         for name in [
-            "a.avif", "a.bmp", "a.gif", "a.heic", "a.heif", "a.jpeg", "a.jpg", "a.png", "a.psd",
-            "a.raw", "a.cr2", "a.nef", "a.arw", "a.dng", "a.orf", "a.rw2", "a.tif", "a.tiff",
-            "a.webp",
+            "a.apng", "a.avif", "a.bmp", "a.gif", "a.heic", "a.heif", "a.jpeg", "a.jpg", "a.png",
+            "a.psd", "a.raw", "a.cr2", "a.nef", "a.arw", "a.dng", "a.orf", "a.rw2", "a.tif",
+            "a.tiff", "a.webp",
         ] {
             assert_eq!(
                 media_kind_for_path(Path::new(name)),
@@ -134,7 +138,7 @@ mod tests {
     fn animation_capable_set_is_the_canvas_opt_out() {
         // These may hold multiple frames, so the preview must keep using <img>
         // (a canvas would freeze on frame one).
-        for ext in [".gif", ".webp", ".avif"] {
+        for ext in [".gif", ".webp", ".avif", ".apng"] {
             assert!(is_animated_capable_image(ext), "{ext}");
         }
         for ext in [".jpg", ".png", ".bmp", ".heic"] {

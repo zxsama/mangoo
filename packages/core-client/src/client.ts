@@ -132,6 +132,8 @@ export interface ImageViewerImageResource extends PreviewResource {
   /** Display dimensions of the source (orientation applied), when known. */
   sourceWidth: number | null;
   sourceHeight: number | null;
+  /** Core confirmed a multi-frame animation (served as the original bytes). */
+  animated: boolean;
 }
 
 export interface CoreRequestOptions {
@@ -377,7 +379,8 @@ export function createCoreClient(config: CoreClientConfig) {
               blob: await response.blob(),
               tier: response.headers.get("x-mangoo-preview-tier") ?? "original",
               sourceWidth: dimension(response.headers.get("x-mangoo-source-width")),
-              sourceHeight: dimension(response.headers.get("x-mangoo-source-height"))
+              sourceHeight: dimension(response.headers.get("x-mangoo-source-height")),
+              animated: response.headers.get("x-mangoo-animated") === "true"
             };
           }
         ),

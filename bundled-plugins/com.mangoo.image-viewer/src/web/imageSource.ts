@@ -138,14 +138,14 @@ export class ViewerImageCache {
     options: { viewportLongPx: number; full: boolean; animatedExtensions: readonly string[]; priority?: "interactive" | "resource" }
   ): Promise<LoadedImage> {
     const client = createCoreClient();
-    const animatedCandidate = options.animatedExtensions.includes(entry.ext);
-    // Animated candidates always need the original bytes to keep their frames.
+    // Core sniffs animation itself and then always serves the original bytes
+    // (x-mangoo-animated), so a large still PNG still gets an adaptive tier.
     const resource = await client.getImageViewerImage(entry.path, {
       viewportLongPx: options.viewportLongPx,
-      full: options.full || animatedCandidate,
+      full: options.full,
       requestPriority: options.priority ?? "interactive"
     });
-    if (animatedCandidate && resource.tier === "original") {
+    if (resource.animated || (options.animatedExtensions.includes(entry.ext) && resource.tier === "original")) {
       const header = new Uint8Array(await resource.blob.slice(0, 64).arrayBuffer());
       if (isAnimatedImageHeader(header, entry.ext)) {
         const url = URL.createObjectURL(resource.blob);

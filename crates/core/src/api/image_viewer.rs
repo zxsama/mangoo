@@ -47,6 +47,9 @@ const MAX_FOLDER_ENTRIES: usize = 50_000;
 const TIER_HEADER: &str = "x-mangoo-preview-tier";
 const SOURCE_WIDTH_HEADER: &str = "x-mangoo-source-width";
 const SOURCE_HEIGHT_HEADER: &str = "x-mangoo-source-height";
+/// `true` when the served bytes are a multi-frame animation (GIF, APNG,
+/// animated WebP / AVIF), so the client keeps every frame.
+const ANIMATED_HEADER: &str = "x-mangoo-animated";
 const DEFAULT_THUMBNAIL_PX: u32 = 192;
 const MIN_THUMBNAIL_PX: u32 = 48;
 const MAX_THUMBNAIL_PX: u32 = 512;
@@ -323,6 +326,71 @@ fn decode_failed(error: impl std::fmt::Display) -> CoreError {
         "image_decode_failed",
         error.to_string(),
     )
+}
+
+/// Whether the file header declares an animation. Bounded read (64 KiB);
+/// never decodes pixels. GIF counts image descriptors beyond the first.
+fn sniff_animated(path: &Path, ext: &str) -> bool {
+    use std::io::Read;
+    if !formats::is_animated_capable_image(ext) && ext != ".png" {
+        return false;
+    }
+    let mut head = Vec::new();
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if file.take(64 * 1024).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    match ext {
+        ".png" | ".apng" => png_has_actl(&head),
+        ".webp" => {
+            head.len() > 20
+                && &head[0..4] == b"RIFF"
+                && &head[8..12] == b"WEBP"
+                && &head[12..16] == b"VP8X"
+                && head[20] & 0x02 != 0
+        }
+        ".avif" => {
+            let size = head
+                .get(0..4)
+                .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize)
+                .unwrap_or(0);
+            head.get(4..8) == Some(b"ftyp")
+                && head
+                    .get(8..size.min(head.len()))
+                    .is_some_and(|brands| brands.chunks(4).any(|brand| brand == b"avis"))
+        }
+        ".gif" => head.starts_with(b"GIF"),
+        _ => false,
+    }
+}
+
+fn png_has_actl(head: &[u8]) -> bool {
+    if head.get(1..4) != Some(b"PNG") {
+        return false;
+    }
+    let mut offset = 8usize;
+    while offset + 8 <= head.len() {
+        let length = u32::from_be_bytes([
+            head[offset],
+            head[offset + 1],
+            head[offset + 2],
+            head[offset + 3],
+        ]) as usize;
+        let kind = &head[offset + 4..offset + 8];
+        if kind == b"acTL" {
+            return true;
+        }
+        if kind == b"IDAT" {
+            return false;
+        }
+        offset = match offset.checked_add(12 + length) {
+            Some(next) => next,
+            None => return false,
+        };
+    }
+    false
 }
 
 /// Display dimensions (EXIF orientation applied) without decoding pixels.
@@ -671,6 +739,20 @@ async fn get_image(
     }
     let renderable = formats::is_browser_renderable_image(&image.ext);
     let full = query.full.unwrap_or(false);
+    let sniff_path = image.path.clone();
+    let sniff_ext = image.ext.clone();
+    let animated = renderable
+        && tokio::task::spawn_blocking(move || sniff_animated(&sniff_path, &sniff_ext))
+            .await
+            .unwrap_or(false);
+    if animated {
+        // A tier would flatten the animation to its first frame.
+        let mut response = stream_original(&image).await?;
+        response
+            .headers_mut()
+            .insert(ANIMATED_HEADER, HeaderValue::from_static("true"));
+        return Ok(response);
+    }
     if renderable && full {
         return stream_original(&image).await;
     }
@@ -802,6 +884,32 @@ async fn get_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn png_animation_sniff_requires_actl_before_idat() {
+        let chunk = |kind: &[u8], data: &[u8]| {
+            let mut out = (data.len() as u32).to_be_bytes().to_vec();
+            out.extend_from_slice(kind);
+            out.extend_from_slice(data);
+            out.extend_from_slice(&[0, 0, 0, 0]);
+            out
+        };
+        const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        let mut still = SIGNATURE.to_vec();
+        still.extend(chunk(b"IHDR", &[0; 13]));
+        still.extend(chunk(b"IDAT", &[0; 4]));
+        assert!(!png_has_actl(&still));
+        let mut animated = SIGNATURE.to_vec();
+        animated.extend(chunk(b"IHDR", &[0; 13]));
+        animated.extend(chunk(b"acTL", &[0; 8]));
+        animated.extend(chunk(b"IDAT", &[0; 4]));
+        assert!(png_has_actl(&animated));
+        assert!(!png_has_actl(b"GIF89a"));
+        // A corrupt length never panics.
+        let mut corrupt = SIGNATURE.to_vec();
+        corrupt.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, b'I', b'H', b'D', b'R']);
+        assert!(!png_has_actl(&corrupt));
+    }
 
     #[test]
     fn path_policy_rejects_relative_traversal_and_nul() {

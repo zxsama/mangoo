@@ -14,7 +14,8 @@ use super::{ensure_decode_pixel_budget, DecodePurpose, DecodeRequest, DecodedIma
 /// dependency requiring cmake+nasm that this project explicitly avoids), so
 /// claiming them would only add a guaranteed-failing link ahead of ffmpeg.
 const SUPPORTED_EXTENSIONS: &[&str] = &[
-    ".bmp", ".gif", ".ico", ".jpeg", ".jpg", ".png", ".qoi", ".tga", ".tif", ".tiff", ".webp",
+    ".apng", ".bmp", ".gif", ".ico", ".jpeg", ".jpg", ".png", ".qoi", ".tga", ".tif", ".tiff",
+    ".webp",
 ];
 
 pub struct ImageCrateDecoder;

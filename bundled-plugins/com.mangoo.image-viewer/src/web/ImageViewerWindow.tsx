@@ -22,6 +22,7 @@ import {
 
 import { extensionOf, splitPath } from "../shared/formats.ts";
 import { formatBytes, prefetchOrder, validateFileName } from "../shared/navigation.ts";
+import { formatChord, matchAction, resolveBindings, type ShortcutActionId } from "../shared/shortcuts.ts";
 import {
   clampPan,
   fitScale,
@@ -35,7 +36,10 @@ import {
   type Size,
   type ViewTransform
 } from "../shared/viewTransform.ts";
-import { ShortcutList } from "./ImageViewerPluginPanel.tsx";
+import { FloatingPanel } from "./FloatingPanel.tsx";
+import { FrameInspector } from "./FrameInspector.tsx";
+import { ShortcutEditor } from "./ShortcutEditor.tsx";
+import { useAnimationFrames } from "./useAnimationFrames.ts";
 import { ViewerSettingsForm } from "./ViewerSettings.tsx";
 import { Filmstrip } from "./Filmstrip.tsx";
 import { InfoPanel } from "./InfoPanel.tsx";
@@ -47,14 +51,30 @@ import { ViewerStage } from "./ViewerStage.tsx";
 import "./viewer.css";
 
 type ZoomState = FitMode | "custom";
+type SettingsTab = "general" | "shortcuts";
 type Dialog =
   | { kind: "delete"; dontAskAgain: boolean }
   | { kind: "rename"; value: string; error: string | null; busy: boolean }
-  | { kind: "settings" }
-  | { kind: "shortcuts" }
+  | { kind: "settings"; tab: SettingsTab }
   | null;
 
+/** Height reserved by the titlebar when it is pinned (px). */
+const TITLEBAR_HEIGHT = 40;
+const FILMSTRIP_HEIGHT = 92;
+const TOOLBAR_CLEARANCE = 64;
+
 const ZOOM_PRESETS = [0.25, 0.5, 1, 2, 4];
+
+/** Desktop host errors can be English OS / Node messages; say it in Chinese. */
+function friendlyActionError(error: string | undefined, action: string): string {
+  if (!error) return `${action}，请重试。`;
+  if (/[\u4e00-\u9fa5]/.test(error)) return error;
+  if (/outside the folders|path/i.test(error)) return `${action}：文件路径无效或不在当前文件夹中。`;
+  if (/EPERM|EACCES|denied|permission/i.test(error)) return `${action}：没有权限。`;
+  if (/ENOENT|not found|no such/i.test(error)) return `${action}：文件已不存在。`;
+  if (/EBUSY|in use|locked/i.test(error)) return `${action}：文件正被其他程序使用。`;
+  return `${action}。`;
+}
 
 function isEditableTarget(target: EventTarget | null): boolean {
   const element = target as HTMLElement | null;
@@ -90,6 +110,7 @@ function IconButton({
       onClick={onClick}
       ref={buttonRef}
       title={shortcut ? `${label}（${shortcut}）` : label}
+      data-pointer-glow="off"
       tone={danger ? "danger" : "control"}
       type="button"
     >
@@ -104,6 +125,29 @@ export function ImageViewerWindow() {
   const [preferences, setPreferences] = useViewerPreferences();
   const session = useViewerSession(preferences.sortKey, preferences.sortDirection, preferences.loop);
   const { state, current } = session;
+  const bindings = useMemo(() => resolveBindings(preferences.shortcuts), [preferences.shortcuts]);
+  /** First chord of an action, formatted for tooltips and menus. */
+  const keyOf = useCallback((action: ShortcutActionId) => {
+    const chord = bindings[action][0];
+    return chord ? formatChord(chord) : undefined;
+  }, [bindings]);
+  const [titlebarHover, setTitlebarHover] = useState(false);
+  // Reaching the top 24px reveals an auto-hidden titlebar. Measured from the
+  // pointer position, so no invisible element sits over the picture.
+  useEffect(() => {
+    const onMove = (event: PointerEvent) => {
+      if (event.clientY <= 24) setTitlebarHover(true);
+      else if (event.clientY > 56) setTitlebarHover(false);
+    };
+    const onLeave = () => setTitlebarHover(false);
+    window.addEventListener("pointermove", onMove, { passive: true });
+    document.documentElement.addEventListener("pointerleave", onLeave);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      document.documentElement.removeEventListener("pointerleave", onLeave);
+    };
+  }, []);
+  const [framesOpen, setFramesOpen] = useState(false);
   const cache = useMemo(() => new ViewerImageCache(), []);
 
   const [animatedExtensions, setAnimatedExtensions] = useState<string[]>([".gif", ".webp", ".avif"]);
@@ -120,7 +164,7 @@ export function ImageViewerWindow() {
   const [slideshow, setSlideshow] = useState(false);
   const [chromeVisible, setChromeVisible] = useState(true);
   const [zoomMenuOpen, setZoomMenuOpen] = useState(false);
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; byKeyboard?: boolean } | null>(null);
   const [dialog, setDialog] = useState<Dialog>(null);
   const [toast, setToast] = useState<{ message: string; action?: { label: string; run(): void } } | null>(null);
   /** Brief centred readout for zoom / rotation changes (like most viewers). */
@@ -136,6 +180,23 @@ export function ImageViewerWindow() {
   const animateTimer = useRef<number | null>(null);
   const toastTimer = useRef<number | null>(null);
   const lastRefresh = useRef(0);
+
+  const animation = useAnimationFrames(image, current?.ext ?? null, framesOpen);
+  const isAnimated = Boolean(animation.state);
+  // The user's choice to inspect frames sticks for the session: it hides on
+  // still pictures and comes back on the next animated one.
+  const [framesWanted, setFramesWanted] = useState(false);
+  useEffect(() => {
+    if (isAnimated) setFramesOpen(framesWanted || preferences.showFrames);
+    else setFramesOpen(false);
+  }, [isAnimated, framesWanted, preferences.showFrames]);
+  const toggleFrames = useCallback((next?: boolean) => {
+    setFramesOpen((value) => {
+      const open = next ?? !value;
+      setFramesWanted(open);
+      return open;
+    });
+  }, []);
 
   const imageSize = useMemo<Size | null>(
     () => (image ? { width: image.width / dpr, height: image.height / dpr } : null),
@@ -160,7 +221,8 @@ export function ImageViewerWindow() {
     createCoreClient()
       .getImageViewerFormats()
       .then((formats) => {
-        setAnimatedExtensions(formats.animatedExtensions);
+        // APNGs often keep the .png extension: sniff those too (header check in imageSource).
+        setAnimatedExtensions([...new Set([...formats.animatedExtensions, ".png"])]);
         setGlobalError(null);
       }, (error) => setGlobalError(describeError(error)));
   }, []);
@@ -203,7 +265,15 @@ export function ImageViewerWindow() {
       void session.refresh();
     };
     window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
+    // Files copied into the folder while the viewer stays in front show up
+    // too: a cheap non-recursive re-list every few seconds while visible.
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void session.refresh();
+    }, 4000);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      window.clearInterval(timer);
+    };
   }, [session.refresh]);
 
   // ---------------------------------------------------------- image loading
@@ -400,13 +470,13 @@ export function ImageViewerWindow() {
   const reveal = useCallback(async () => {
     if (!bridge || !current) return;
     const result = await bridge.reveal(current.path);
-    if (!result.ok) showToast(result.error ?? "无法显示文件");
+    if (!result.ok) showToast(friendlyActionError(result.error, "无法在文件夹中显示"));
   }, [bridge, current, showToast]);
 
   const openExternally = useCallback(async () => {
     if (!bridge || !current) return;
     const result = await bridge.openExternally(current.path);
-    if (!result.ok) showToast(result.error ?? "无法打开");
+    if (!result.ok) showToast(friendlyActionError(result.error, "无法用其他应用打开"));
   }, [bridge, current, showToast]);
 
   const performDelete = useCallback(async (dontAskAgain = false) => {
@@ -416,7 +486,7 @@ export function ImageViewerWindow() {
     setDialog(null);
     if (dontAskAgain) setPreferences({ confirmDelete: false });
     if (!result.ok) {
-      showToast(result.error ?? "删除失败");
+      showToast(friendlyActionError(result.error, "无法删除"));
       return;
     }
     cache.forget(target.path);
@@ -461,14 +531,19 @@ export function ImageViewerWindow() {
     showToast("已重命名");
   }, [bridge, cache, current, dialog, session, showToast]);
 
+  const renameOpen = dialog?.kind === "rename";
   useEffect(() => {
-    if (dialog?.kind !== "rename") return;
-    const input = renameInputRef.current;
-    if (!input || document.activeElement === input) return;
-    input.focus();
-    const dot = input.value.lastIndexOf(".");
-    input.setSelectionRange(0, dot > 0 ? dot : input.value.length);
-  }, [dialog]);
+    if (!renameOpen) return;
+    // The modal's focus trap focuses the field after mount; select afterwards.
+    const timer = window.setTimeout(() => {
+      const input = renameInputRef.current;
+      if (!input) return;
+      input.focus();
+      const dot = input.value.lastIndexOf(".");
+      input.setSelectionRange(0, dot > 0 ? dot : input.value.length);
+    }, 60);
+    return () => window.clearTimeout(timer);
+  }, [renameOpen]);
 
   const toggleAlwaysOnTop = useCallback(async () => {
     if (bridge) setAlwaysOnTop(await bridge.setAlwaysOnTop(!alwaysOnTop));
@@ -514,47 +589,63 @@ export function ImageViewerWindow() {
       if (overlaysOpen || isEditableTarget(event.target)) return;
       // A focused button activates on Space/Enter; do not also navigate.
       if ((event.key === " " || event.key === "Enter") && (event.target as HTMLElement | null)?.closest?.("button")) return;
-      const ctrl = event.ctrlKey || event.metaKey;
       // Up/Down pan a zoomed-in picture and otherwise navigate, like most viewers.
       const zoomedIn = Boolean(imageSize) && transform.scale > fitScale(imageSize ?? { width: 1, height: 1 }, viewport, transform.rotation, "fit", preferences.upscaleSmall) + 1e-3;
       const key = event.key;
       let handled = true;
-      if (ctrl && key.toLowerCase() === "o") void openFiles();
-      else if (ctrl && event.shiftKey && key.toLowerCase() === "c") void copyPath();
-      else if (ctrl && key.toLowerCase() === "c") void copyImage();
-      else if (ctrl && key.toLowerCase() === "w") window.close();
-      else if (ctrl && (key === "0")) setFit("fit");
-      else if (ctrl && (key === "1")) zoomTo(1);
-      else if (ctrl && (key === "=" || key === "+")) zoomStep(1);
-      else if (ctrl && key === "-") zoomStep(-1);
-      else if (ctrl) handled = false;
-      else if (key === "ArrowRight" || key === "PageDown" || key === " " || (key === "ArrowDown" && !zoomedIn)) session.go(1);
-      else if (key === "ArrowLeft" || key === "PageUp" || key === "Backspace" || (key === "ArrowUp" && !zoomedIn)) session.go(-1);
-      else if (key === "ArrowDown") pan(0, -60);
-      else if (key === "ArrowUp") pan(0, 60);
-      else if (key === "Home") session.goTo(0);
-      else if (key === "End") session.goTo(state.entries.length - 1);
-      else if (key === "+" || key === "=") zoomStep(1);
-      else if (key === "-" || key === "_") zoomStep(-1);
-      else if (key === "0") setFit("fit");
-      else if (key === "1") zoomTo(1);
-      else if (key === "r") rotateBy(1);
-      else if (key === "R" || (key === "l" || key === "L")) rotateBy(-1);
-      else if (key === "h" || key === "H") flip("x");
-      else if (key === "v" || key === "V") flip("y");
-      else if (key === "F11" || key === "f" || key === "F") void toggleFullscreen();
-      else if (key === "F5" || key === "s" || key === "S") setSlideshow((value) => !value);
-      else if (key === "i" || key === "I") setPreferences({ showInfo: !preferences.showInfo });
-      else if (key === "t" || key === "T") setPreferences({ showFilmstrip: !preferences.showFilmstrip });
-      else if (key === "Delete") requestDelete();
-      else if (key === "?" || (key === "/" && event.shiftKey)) setDialog({ kind: "shortcuts" });
-      else if (key === "F2") requestRename();
-      else if (key === "Escape") {
-        if (slideshow) setSlideshow(false);
+      if (key === "Escape") {
+        if (framesOpen) toggleFrames(false);
+        else if (slideshow) setSlideshow(false);
         else if (fullscreen) void toggleFullscreen();
         else if (preferences.escapeCloses) window.close();
         else handled = false;
-      } else handled = false;
+      } else if (key === "ArrowDown" && zoomedIn) pan(0, -60);
+      else if (key === "ArrowUp" && zoomedIn) pan(0, 60);
+      else if (key === "ArrowDown" && !event.ctrlKey && !event.shiftKey && !event.altKey) session.go(1);
+      else if (key === "ArrowUp" && !event.ctrlKey && !event.shiftKey && !event.altKey) session.go(-1);
+      else {
+        const action = matchAction(bindings, event);
+        // Space plays/pauses an animation; elsewhere it advances like most viewers.
+        const resolved: ShortcutActionId | "advance" | null = action === "playPause" && !isAnimated ? "advance" : action;
+        switch (resolved) {
+          case "next": case "advance": session.go(1); break;
+          case "previous": session.go(-1); break;
+          case "first": session.goTo(0); break;
+          case "last": session.goTo(state.entries.length - 1); break;
+          case "zoomIn": zoomStep(1); break;
+          case "zoomOut": zoomStep(-1); break;
+          case "fit": setFit("fit"); break;
+          case "actualSize": zoomTo(1); break;
+          case "rotateRight": rotateBy(1); break;
+          case "rotateLeft": rotateBy(-1); break;
+          case "flipHorizontal": flip("x"); break;
+          case "flipVertical": flip("y"); break;
+          case "fullscreen": void toggleFullscreen(); break;
+          case "slideshow": setSlideshow((value) => !value); break;
+          case "toggleInfo": setPreferences({ showInfo: !preferences.showInfo }); break;
+          case "toggleFilmstrip": setPreferences({ showFilmstrip: !preferences.showFilmstrip }); break;
+          case "toggleTitlebarPin": setPreferences({ titlebarPinned: !preferences.titlebarPinned }); break;
+          case "playPause":
+            // First press freezes native playback on the frame being shown.
+            if (!framesOpen) toggleFrames(true);
+            else animation.playPause();
+            break;
+          case "nextFrame":
+            if (isAnimated) { if (!framesOpen) toggleFrames(true); animation.step(1); } else handled = false;
+            break;
+          case "previousFrame":
+            if (isAnimated) { if (!framesOpen) toggleFrames(true); animation.step(-1); } else handled = false;
+            break;
+          case "open": void openFiles(); break;
+          case "copyImage": void copyImage(); break;
+          case "copyPath": void copyPath(); break;
+          case "rename": requestRename(); break;
+          case "delete": requestDelete(); break;
+          case "showShortcuts": setDialog({ kind: "settings", tab: "shortcuts" }); break;
+          case "closeWindow": window.close(); break;
+          default: handled = false;
+        }
+      }
       if (handled) {
         event.preventDefault();
         noteActivity();
@@ -563,6 +654,7 @@ export function ImageViewerWindow() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [
+    animation, bindings, framesOpen, isAnimated, toggleFrames,
     copyImage, copyPath, flip, fullscreen, imageSize, noteActivity, openFiles, overlaysOpen, pan, preferences,
     requestDelete, requestRename, rotateBy, session, setFit, setPreferences, slideshow, state.entries.length,
     toggleFullscreen, transform.rotation, transform.scale, viewport, zoomStep, zoomTo
@@ -642,35 +734,54 @@ export function ImageViewerWindow() {
   );
 
   const menuItems: Array<{ id: string; label?: string; icon?: ReactNode; shortcut?: string; disabled?: boolean; danger?: boolean; checked?: boolean; onSelect?: () => void; separator?: boolean }> = [
-    { id: "copy", label: "复制图片", icon: <icons.Copy size={14} />, shortcut: "Ctrl+C", disabled: !image, onSelect: () => void copyImage() },
-    { id: "copy-path", label: "复制文件路径", icon: <icons.Clipboard size={14} />, shortcut: "Ctrl+Shift+C", disabled: !hasImage, onSelect: () => void copyPath() },
+    { id: "copy", label: "复制图片", icon: <icons.Copy size={14} />, shortcut: keyOf("copyImage"), disabled: !image, onSelect: () => void copyImage() },
+    { id: "copy-path", label: "复制文件路径", icon: <icons.Clipboard size={14} />, shortcut: keyOf("copyPath"), disabled: !hasImage, onSelect: () => void copyPath() },
     { id: "s1", separator: true },
-    { id: "rotate-right", label: "向右旋转", icon: <icons.RotateCw size={14} />, shortcut: "R", disabled: !hasImage, onSelect: () => rotateBy(1) },
-    { id: "rotate-left", label: "向左旋转", icon: <icons.RotateCcw size={14} />, shortcut: "Shift+R", disabled: !hasImage, onSelect: () => rotateBy(-1) },
-    { id: "flip-x", label: "水平翻转", icon: <icons.FlipHorizontal size={14} />, shortcut: "H", disabled: !hasImage, checked: transform.flipX, onSelect: () => flip("x") },
-    { id: "flip-y", label: "垂直翻转", icon: <icons.FlipVertical size={14} />, shortcut: "V", disabled: !hasImage, checked: transform.flipY, onSelect: () => flip("y") },
+    { id: "rotate-right", label: "向右旋转", icon: <icons.RotateCw size={14} />, shortcut: keyOf("rotateRight"), disabled: !hasImage, onSelect: () => rotateBy(1) },
+    { id: "rotate-left", label: "向左旋转", icon: <icons.RotateCcw size={14} />, shortcut: keyOf("rotateLeft"), disabled: !hasImage, onSelect: () => rotateBy(-1) },
+    { id: "flip-x", label: "水平翻转", icon: <icons.FlipHorizontal size={14} />, shortcut: keyOf("flipHorizontal"), disabled: !hasImage, checked: transform.flipX, onSelect: () => flip("x") },
+    { id: "flip-y", label: "垂直翻转", icon: <icons.FlipVertical size={14} />, shortcut: keyOf("flipVertical"), disabled: !hasImage, checked: transform.flipY, onSelect: () => flip("y") },
+    ...(isAnimated ? [{ id: "frames", label: "逐帧查看动图", icon: <icons.FilmReel size={14} />, shortcut: keyOf("nextFrame"), checked: framesOpen, onSelect: () => toggleFrames() }] : []),
+    { id: "info", label: "图片信息", icon: <icons.Info size={14} />, shortcut: keyOf("toggleInfo"), checked: preferences.showInfo, onSelect: () => setPreferences({ showInfo: !preferences.showInfo }) },
     { id: "s2", separator: true },
     { id: "reveal", label: "在文件夹中显示", icon: <icons.FolderOpen size={14} />, disabled: !hasImage, onSelect: () => void reveal() },
     { id: "open-external", label: "用其他应用打开", icon: <icons.ExternalLink size={14} />, disabled: !hasImage, onSelect: () => void openExternally() },
-    { id: "rename", label: "重命名…", icon: <icons.Pencil size={14} />, shortcut: "F2", disabled: !hasImage, onSelect: requestRename },
-    { id: "delete", label: "删除到回收站", icon: <icons.Trash2 size={14} />, shortcut: "Delete", danger: true, disabled: !hasImage, onSelect: requestDelete },
+    { id: "rename", label: "重命名…", icon: <icons.Pencil size={14} />, shortcut: keyOf("rename"), disabled: !hasImage, onSelect: requestRename },
+    { id: "delete", label: "删除到回收站", icon: <icons.Trash2 size={14} />, shortcut: keyOf("delete"), danger: true, disabled: !hasImage, onSelect: requestDelete },
     { id: "s3", separator: true },
-    { id: "slideshow", label: slideshow ? "停止幻灯片" : "幻灯片放映", icon: slideshow ? <icons.Pause size={14} /> : <icons.Play size={14} />, shortcut: "S", disabled: state.entries.length < 2, onSelect: () => setSlideshow((value) => !value) },
-    { id: "fullscreen", label: fullscreen ? "退出全屏" : "全屏", icon: fullscreen ? <icons.ExitFullscreen size={14} /> : <icons.Fullscreen size={14} />, shortcut: "F11", onSelect: () => void toggleFullscreen() }
+    { id: "slideshow", label: slideshow ? "停止幻灯片" : "幻灯片放映", icon: slideshow ? <icons.Pause size={14} /> : <icons.Slideshow size={14} />, shortcut: keyOf("slideshow"), disabled: state.entries.length < 2, onSelect: () => setSlideshow((value) => !value) },
+    { id: "fullscreen", label: fullscreen ? "退出全屏" : "全屏", icon: fullscreen ? <icons.ExitFullscreen size={14} /> : <icons.Fullscreen size={14} />, shortcut: keyOf("fullscreen"), onSelect: () => void toggleFullscreen() }
   ];
 
   /** Titlebar "more" menu: window-level things that are not about the picture. */
   const moreItems: typeof menuItems = [
-    { id: "open", label: "打开图片…", icon: <icons.FolderOpen size={14} />, shortcut: "Ctrl+O", onSelect: () => void openFiles() },
+    { id: "open", label: "打开图片…", icon: <icons.FolderOpen size={14} />, shortcut: keyOf("open"), onSelect: () => void openFiles() },
     { id: "open-folder", label: "打开文件夹…", icon: <icons.Folder size={14} />, onSelect: () => void openFolder() },
     { id: "s1", separator: true },
-    { id: "on-top", label: "窗口置顶", icon: <icons.Pin size={14} />, checked: alwaysOnTop, onSelect: () => void toggleAlwaysOnTop() },
+    { id: "on-top", label: "窗口置顶", icon: <icons.StackTop size={14} />, checked: alwaysOnTop, onSelect: () => void toggleAlwaysOnTop() },
     { id: "main", label: "打开 Mangoo 资料库", icon: <icons.Library size={14} />, disabled: !bridge, onSelect: () => void bridge?.openMainWindow() },
     { id: "s2", separator: true },
-    { id: "settings", label: "看图设置…", icon: <icons.Settings size={14} />, onSelect: () => openDialog({ kind: "settings" }) },
-    { id: "shortcuts", label: "键盘快捷键", icon: <icons.Keyboard size={14} />, shortcut: "?", onSelect: () => openDialog({ kind: "shortcuts" }) }
+    { id: "settings", label: "看图设置…", icon: <icons.Settings size={14} />, onSelect: () => openDialog({ kind: "settings", tab: "general" }) },
+    { id: "shortcuts", label: "快捷键…", icon: <icons.Keyboard size={14} />, shortcut: keyOf("showShortcuts"), onSelect: () => openDialog({ kind: "settings", tab: "shortcuts" }) }
   ];
   const [menuSource, setMenuSource] = useState<"stage" | "more">("stage");
+  const filmstripShown = preferences.showFilmstrip && state.entries.length > 1 && !slideshow;
+  // Panels float over the whole window but never under the pinned titlebar
+  // or the filmstrip, so their headers stay reachable.
+  // An unpinned titlebar overlays the top edge: keep panels below it so its
+  // controls are never covered when it slides in.
+  const panelInsets = useMemo(() => ({
+    top: immersive ? 0 : TITLEBAR_HEIGHT,
+    // Filmstrip plus the floating toolbar (bottom 14px + 40px tall + gap).
+    bottom: (filmstripShown ? FILMSTRIP_HEIGHT : 0) + (hasImage ? TOOLBAR_CLEARANCE : 0)
+  }), [immersive, filmstripShown, hasImage]);
+  const [dockedSides, setDockedSides] = useState<Record<string, "left" | "right" | null>>({});
+  const reportDock = useCallback((panel: string, side: "left" | "right" | null) => {
+    setDockedSides((current) => (current[panel] === side ? current : { ...current, [panel]: side }));
+  }, []);
+  const panelsOpen = { info: preferences.showInfo && !slideshow, frames: framesOpen && Boolean(animation.state) && !slideshow };
+  const leftDocked = (panelsOpen.info && dockedSides.info === "left") || (panelsOpen.frames && dockedSides.frames === "left");
+  const rightDocked = (panelsOpen.info && dockedSides.info === "right") || (panelsOpen.frames && dockedSides.frames === "right");
   const activeMenuItems = menuSource === "more" ? moreItems : menuItems;
 
   return (
@@ -681,24 +792,42 @@ export function ImageViewerWindow() {
         data-controls-idle={controlsIdle && !overlaysOpen ? "true" : "false"}
         data-fullscreen={fullscreen ? "true" : "false"}
         data-immersive={immersive ? "true" : "false"}
+        data-panel-left={leftDocked ? "true" : "false"}
+        data-panel-right={rightDocked ? "true" : "false"}
+        data-titlebar={preferences.titlebarPinned && !immersive ? "pinned" : titlebarHover || overlaysOpen ? "revealed" : "hidden"}
         onPointerMove={noteActivity}
       >
-        <LiquidGlassSurface as="header" className="iv-titlebar" tone="chrome">
+        <LiquidGlassSurface
+          as="header"
+          className="iv-titlebar"
+          tone="chrome"
+        >
           <div className="iv-title">
             <icons.Image aria-hidden="true" className="iv-title-icon" size={15} />
             <span className="iv-title-name" title={current?.path}>{current?.name ?? "Mangoo 看图"}</span>
             {current ? (
               <span className="iv-title-meta" title={state.directory ?? undefined}>
-                {[counter, dims, fileSize].filter(Boolean).join("  ·  ")}
+                {[dims, fileSize].filter(Boolean).join("  ·  ")}
               </span>
             ) : null}
           </div>
           <div className="iv-title-actions no-drag" data-no-drag="true">
-            <IconButton active={preferences.showFilmstrip} disabled={state.entries.length < 2} label="缩略图条" onClick={() => setPreferences({ showFilmstrip: !preferences.showFilmstrip })} shortcut="T">
+            <IconButton active={preferences.showFilmstrip} disabled={state.entries.length < 2} label="缩略图条" onClick={() => setPreferences({ showFilmstrip: !preferences.showFilmstrip })} shortcut={keyOf("toggleFilmstrip")}>
               <icons.FilmStrip aria-hidden="true" size={15} />
             </IconButton>
-            <IconButton active={preferences.showInfo} label="图片信息" onClick={() => setPreferences({ showInfo: !preferences.showInfo })} shortcut="I">
+            <IconButton active={preferences.showInfo} label="图片信息" onClick={() => setPreferences({ showInfo: !preferences.showInfo })} shortcut={keyOf("toggleInfo")}>
               <icons.Info aria-hidden="true" size={15} />
+            </IconButton>
+            <IconButton
+              active={preferences.titlebarPinned}
+              label={preferences.titlebarPinned ? "取消固定标题栏（自动隐藏）" : "固定标题栏"}
+              onClick={() => {
+                setPreferences({ titlebarPinned: !preferences.titlebarPinned });
+                flashHud(preferences.titlebarPinned ? "标题栏将自动隐藏" : "标题栏已固定");
+              }}
+              shortcut={keyOf("toggleTitlebarPin")}
+            >
+              {preferences.titlebarPinned ? <icons.Pin aria-hidden="true" size={15} weight="fill" /> : <icons.Pin aria-hidden="true" size={15} />}
             </IconButton>
             <IconButton
               active={contextMenu !== null && menuSource === "more"}
@@ -742,6 +871,8 @@ export function ImageViewerWindow() {
               renderLevel={canvasLevel}
               transform={transform}
               wheelNavigates={preferences.wheelAction === "navigate"}
+              frameBitmap={animation.bitmap}
+              zoomedIn={Boolean(imageSize) && zoomState === "custom" && transform.scale > fitScale(imageSize ?? { width: 1, height: 1 }, viewport, transform.rotation, "fit", preferences.upscaleSmall) + 1e-3}
             />
 
             {state.entries.length > 1 ? (
@@ -757,15 +888,15 @@ export function ImageViewerWindow() {
 
             {hasImage ? (
             <LiquidGlassSurface aria-label="看图工具栏" as="div" className="iv-toolbar" onPointerEnter={noteActivity} role="toolbar" tone="chrome">
-              <IconButton disabled={state.entries.length < 2} label="上一张" onClick={() => session.go(-1)} shortcut="←">
+              <IconButton disabled={state.entries.length < 2} label="上一张" onClick={() => session.go(-1)} shortcut={keyOf("previous")}>
                 <icons.ArrowLeft aria-hidden="true" size={15} />
               </IconButton>
               <span className="iv-toolbar-counter" aria-live="polite">{counter}</span>
-              <IconButton disabled={state.entries.length < 2} label="下一张" onClick={() => session.go(1)} shortcut="→">
+              <IconButton disabled={state.entries.length < 2} label="下一张" onClick={() => session.go(1)} shortcut={keyOf("next")}>
                 <icons.ArrowRight aria-hidden="true" size={15} />
               </IconButton>
               <span className="iv-toolbar-divider" />
-              <IconButton disabled={!image} label="缩小" onClick={() => zoomStep(-1)} shortcut="−">
+              <IconButton disabled={!image} label="缩小" onClick={() => zoomStep(-1)} shortcut={keyOf("zoomOut")}>
                 <icons.ZoomOut aria-hidden="true" size={15} />
               </IconButton>
               <LiquidGlassButton
@@ -783,29 +914,34 @@ export function ImageViewerWindow() {
                 <span>{zoomLabel}</span>
                 <icons.ChevronUp aria-hidden="true" size={11} />
               </LiquidGlassButton>
-              <IconButton disabled={!image} label="放大" onClick={() => zoomStep(1)} shortcut="+">
+              <IconButton disabled={!image} label="放大" onClick={() => zoomStep(1)} shortcut={keyOf("zoomIn")}>
                 <icons.ZoomIn aria-hidden="true" size={15} />
               </IconButton>
               <IconButton
                 disabled={!image}
                 label={zoomState === "fit" ? "原始大小" : "适应窗口"}
                 onClick={() => (zoomState === "fit" ? zoomTo(1) : setFit("fit"))}
-                shortcut={zoomState === "fit" ? "1" : "0"}
+                shortcut={zoomState === "fit" ? keyOf("actualSize") : keyOf("fit")}
               >
                 {zoomState === "fit" ? <span className="iv-one-to-one" aria-hidden="true">1:1</span> : <icons.Minimize2 aria-hidden="true" size={14} />}
               </IconButton>
               <span className="iv-toolbar-divider" />
-              <IconButton disabled={!image} label="向右旋转" onClick={() => rotateBy(1)} shortcut="R">
+              <IconButton disabled={!image} label="向右旋转" onClick={() => rotateBy(1)} shortcut={keyOf("rotateRight")}>
                 <icons.RotateCw aria-hidden="true" size={15} />
               </IconButton>
-              <IconButton active={slideshow} disabled={state.entries.length < 2} label={slideshow ? "停止幻灯片" : "幻灯片放映"} onClick={() => setSlideshow((value) => !value)} shortcut="S">
-                {slideshow ? <icons.Pause aria-hidden="true" size={15} /> : <icons.Play aria-hidden="true" size={15} />}
+              {isAnimated ? (
+                <IconButton active={framesOpen} label="逐帧查看动图" onClick={() => toggleFrames()} shortcut={keyOf("nextFrame")}>
+                  <icons.FilmReel aria-hidden="true" size={15} />
+                </IconButton>
+              ) : null}
+              <IconButton active={slideshow} disabled={state.entries.length < 2} label={slideshow ? "停止幻灯片" : "幻灯片放映"} onClick={() => setSlideshow((value) => !value)} shortcut={keyOf("slideshow")}>
+                {slideshow ? <icons.Pause aria-hidden="true" size={15} /> : <icons.Slideshow aria-hidden="true" size={15} />}
               </IconButton>
-              <IconButton active={fullscreen} label={fullscreen ? "退出全屏" : "全屏"} onClick={() => void toggleFullscreen()} shortcut="F11">
+              <IconButton active={fullscreen} label={fullscreen ? "退出全屏" : "全屏"} onClick={() => void toggleFullscreen()} shortcut={keyOf("fullscreen")}>
                 {fullscreen ? <icons.ExitFullscreen aria-hidden="true" size={15} /> : <icons.Fullscreen aria-hidden="true" size={15} />}
               </IconButton>
               <span className="iv-toolbar-divider" />
-              <IconButton danger disabled={!hasImage} label="删除到回收站" onClick={requestDelete} shortcut="Delete">
+              <IconButton danger disabled={!hasImage} label="删除到回收站" onClick={requestDelete} shortcut={keyOf("delete")}>
                 <icons.Trash2 aria-hidden="true" size={15} />
               </IconButton>
             </LiquidGlassSurface>
@@ -821,17 +957,47 @@ export function ImageViewerWindow() {
             ) : null}
           </div>
 
-          {preferences.showInfo && !immersive ? (
-            <LiquidGlassSurface as="div" className="iv-info-pane" scrollable tone="panel">
-              <InfoPanel entry={current} image={image} />
-            </LiquidGlassSurface>
-          ) : null}
         </div>
 
         {preferences.showFilmstrip && state.entries.length > 1 && !slideshow ? (
           <LiquidGlassSurface as="div" className="iv-filmstrip-pane" tone="chrome">
             <Filmstrip entries={state.entries} index={state.index} onSelect={session.goTo} />
           </LiquidGlassSurface>
+        ) : null}
+        {preferences.showInfo && !slideshow ? (
+          <FloatingPanel
+            defaultSize={{ width: 300, height: 460 }}
+            icon={<icons.Info aria-hidden="true" size={14} />}
+            id="info"
+            onDockChange={(side) => reportDock("info", side)}
+            insets={panelInsets}
+            onClose={() => setPreferences({ showInfo: false })}
+            title="图片信息"
+          >
+            <InfoPanel animation={animation.state} entry={current} image={image} />
+          </FloatingPanel>
+        ) : null}
+        {framesOpen && animation.state && !slideshow ? (
+          <FloatingPanel
+            className="iv-frames-panel"
+            defaultSize={{ width: 300, height: 300 }}
+            icon={<icons.FilmReel aria-hidden="true" size={14} />}
+            id="frames"
+            onDockChange={(side) => reportDock("frames", side)}
+            insets={panelInsets}
+            onClose={() => toggleFrames(false)}
+            resizable={false}
+            title="动图帧"
+          >
+            <FrameInspector
+              onLoop={animation.setLoop}
+              onPlayPause={animation.playPause}
+              onSeek={animation.seek}
+              onSpeed={animation.setSpeed}
+              onStep={animation.step}
+              state={animation.state}
+            />
+          </FloatingPanel>
         ) : null}
       </div>
 
@@ -872,39 +1038,43 @@ export function ImageViewerWindow() {
 
       <ModalSurface
         ariaLabelledBy="image-viewer-settings-title"
-        className="file-operation-dialog overlay-dialog-wide iv-settings-dialog"
+        className="file-operation-dialog overlay-dialog-wide iv-settings-dialog iv-dialog"
         id="image-viewer-settings-dialog"
         onDismiss={() => setDialog(null)}
         open={dialog?.kind === "settings"}
         rootId="file-operation"
       >
-        <OverlayDialogHeader
-          description="更改会立即生效，并在下次打开时保留。"
-          title="看图设置"
-          titleId="image-viewer-settings-title"
-        />
+        <header className="overlay-dialog-header iv-settings-header">
+          <h2 id="image-viewer-settings-title">看图设置</h2>
+          <div aria-label="设置分类" className="iv-tabs" role="tablist">
+            {([["general", "常规"], ["shortcuts", "快捷键"]] as const).map(([tab, label]) => (
+              <button
+                aria-selected={dialog?.kind === "settings" && dialog.tab === tab}
+                className="iv-tab"
+                data-pointer-glow="off"
+                key={tab}
+                onClick={() => {
+                  setDialog({ kind: "settings", tab });
+                  document.querySelector("#image-viewer-settings-dialog .iv-settings-body")?.scrollTo({ top: 0 });
+                }}
+                role="tab"
+                type="button"
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </header>
         <OverlayDialogBody className="iv-settings-body">
-          <ViewerSettingsForm onChange={setPreferences} preferences={preferences} />
+          {dialog?.kind === "settings" && dialog.tab === "shortcuts" ? (
+            <ShortcutEditor onChange={(shortcuts) => setPreferences({ shortcuts })} overrides={preferences.shortcuts} />
+          ) : (
+            <ViewerSettingsForm onChange={setPreferences} preferences={preferences} />
+          )}
         </OverlayDialogBody>
         <OverlayDialogActions>
+          <span className="iv-settings-footnote">更改会立即生效，并在下次打开时保留。</span>
           <LiquidGlassButton className="overlay-dialog-button overlay-dialog-button-primary" onClick={() => setDialog(null)} tone="primary" type="button">完成</LiquidGlassButton>
-        </OverlayDialogActions>
-      </ModalSurface>
-
-      <ModalSurface
-        ariaLabelledBy="image-viewer-shortcuts-title"
-        className="file-operation-dialog overlay-dialog-wide iv-settings-dialog"
-        id="image-viewer-shortcuts-dialog"
-        onDismiss={() => setDialog(null)}
-        open={dialog?.kind === "shortcuts"}
-        rootId="file-operation"
-      >
-        <OverlayDialogHeader title="键盘快捷键" titleId="image-viewer-shortcuts-title" />
-        <OverlayDialogBody className="iv-settings-body">
-          <ShortcutList />
-        </OverlayDialogBody>
-        <OverlayDialogActions>
-          <LiquidGlassButton className="overlay-dialog-button overlay-dialog-button-primary" onClick={() => setDialog(null)} tone="primary" type="button">知道了</LiquidGlassButton>
         </OverlayDialogActions>
       </ModalSurface>
 
@@ -912,7 +1082,7 @@ export function ImageViewerWindow() {
         <AnchoredOverlay
           anchor={pointOverlayAnchor(contextMenu.x, contextMenu.y)}
           ariaLabel={menuSource === "more" ? "更多" : "图片操作"}
-          className="context-menu"
+          className={`context-menu iv-menu${contextMenu.byKeyboard ? "" : " iv-menu-pointer"}`}
           id="image-viewer-context-menu"
           onDismiss={() => setContextMenu(null)}
           open
@@ -950,7 +1120,7 @@ export function ImageViewerWindow() {
       <ModalSurface
         ariaDescribedBy="image-viewer-delete-description"
         ariaLabelledBy="image-viewer-delete-title"
-        className="file-operation-dialog"
+        className="file-operation-dialog iv-dialog"
         id="image-viewer-delete-dialog"
         onDismiss={() => setDialog(null)}
         open={dialog?.kind === "delete"}
@@ -991,7 +1161,7 @@ export function ImageViewerWindow() {
       <ModalSurface
         ariaLabelledBy="image-viewer-rename-title"
         busy={dialog?.kind === "rename" && dialog.busy}
-        className="file-operation-dialog"
+        className="file-operation-dialog iv-dialog"
         id="image-viewer-rename-dialog"
         initialFocusRef={renameInputRef}
         onDismiss={() => setDialog(null)}
@@ -999,7 +1169,7 @@ export function ImageViewerWindow() {
         rootId="file-operation"
       >
         <OverlayDialogHeader
-          description={current ? `扩展名 ${current.ext} 会自动保留。` : undefined}
+          description={current ? `只需修改名称部分，不输入扩展名时会自动保留 ${current.ext}。` : undefined}
           title="重命名图片"
           titleId="image-viewer-rename-title"
         />

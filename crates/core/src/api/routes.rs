@@ -10412,6 +10412,7 @@ pub(super) fn preview_content_type(path: &FilePath, media_kind: Option<&str>) ->
     match extension.as_deref() {
         Some("jpg" | "jpeg") => "image/jpeg",
         Some("png") => "image/png",
+        Some("apng") => "image/apng",
         Some("gif") => "image/gif",
         Some("webp") => "image/webp",
         Some("bmp") => "image/bmp",

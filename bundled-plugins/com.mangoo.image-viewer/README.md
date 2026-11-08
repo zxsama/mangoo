@@ -36,15 +36,13 @@ pipeline, so it is implemented *by the Host*, from this directory:
 
 ## Features
 
-Folder browsing with natural / date / size / type sort and wrap-around, prev/next
-neighbour prefetch, fit / fill / 1:1 / zoom stops / wheel and pinch zoom at the
-cursor, drag pan, rotate and flip, fullscreen with auto-hiding chrome, slideshow,
-virtualized filmstrip, info panel with EXIF summary and RGB histogram, background
-choices (follow interface, dark, black, checkerboard, light), pixel view above 200%,
-animated GIF / WebP / AVIF playback, copy image / path, reveal in folder, open with
-the system default app, rename (F2), move to recycle bin (Delete), drag and drop,
-always-on-top, window state persistence. Formats are whatever Core decodes
-(`crates/core/src/decode/formats.rs` plus running decoder plugins).
+- **Browse**: whole folder, natural / date / size / type sort, wrap-around, neighbour prefetch, virtualized filmstrip, auto-refresh when files appear.
+- **View**: fit / fill / 1:1, zoom stops, wheel switches pictures by default (Ctrl+wheel zooms; wheel pans when zoomed in), pinch, drag pan, rotate / flip, pixel view above 200%, five backgrounds, fullscreen, slideshow with progress line.
+- **Animated images**: GIF, APNG (`.apng` or `.png`), animated WebP / AVIF play natively; the floating 动图帧 panel (film-reel button, `.` `,` Space) takes over playback with WebCodecs `ImageDecoder` for pause, frame stepping, scrubbing, speed and loop. Core sniffs animation (`x-mangoo-animated`) and never tiers an animated file.
+- **Floating panels**: image info (file facts, EXIF, histogram, frame count) and frames float over the picture, drag by the header, snap magnetically to window edges / corners, stay docked through resizes, remember their place (double-click the header to reset).
+- **Titlebar**: auto-hides by default and slides in at the top edge; the pin button (or P) keeps it visible.
+- **Shortcuts**: every action is remappable in 设置 → 快捷键 (record a chord, conflicts move with an undo, per-action and global reset).
+- **Files**: copy image / path, reveal, open with another app, rename (keeps the extension), recycle bin with optional confirmation, drag and drop, always-on-top. Formats are whatever Core decodes.
 
 ## OS registration
 

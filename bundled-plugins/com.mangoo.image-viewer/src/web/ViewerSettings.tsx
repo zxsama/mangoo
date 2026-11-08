@@ -155,13 +155,13 @@ export function ViewerSettingsForm({ preferences, onChange, showSystem = true }:
       </Section>
 
       <Section icon={<icons.Images aria-hidden="true" size={14} />} title="浏览">
-        <SettingRow description="按住 Ctrl 滚动总是缩放；拖动图片可以平移。" title="鼠标滚轮">
+        <SettingRow description="按住 Ctrl 滚动总是缩放。图片放大后，滚轮会先平移图片。" title="鼠标滚轮">
           <Segmented
             label="鼠标滚轮"
             onChange={(wheelAction) => onChange({ wheelAction })}
             options={[
-              { value: "zoom", label: "缩放图片" },
-              { value: "navigate", label: "切换图片" }
+              { value: "navigate", label: "切换图片" },
+              { value: "zoom", label: "缩放图片" }
             ]}
             value={preferences.wheelAction}
           />
@@ -195,6 +195,15 @@ export function ViewerSettingsForm({ preferences, onChange, showSystem = true }:
             options={SLIDESHOW_INTERVALS.map((seconds) => ({ value: seconds, label: `${seconds} 秒` }))}
             value={preferences.slideshowSeconds}
           />
+        </SettingRow>
+      </Section>
+
+      <Section icon={<icons.LayoutPanelTop aria-hidden="true" size={14} />} title="窗口">
+        <SettingRow description="关闭后标题栏会自动隐藏，把鼠标移到窗口顶部即可显示。也可以用标题栏上的图钉按钮切换。" title="固定标题栏">
+          <Switch checked={preferences.titlebarPinned} label="固定标题栏" onChange={(titlebarPinned) => onChange({ titlebarPinned })} />
+        </SettingRow>
+        <SettingRow description="打开 GIF、APNG、WebP 动图时自动显示帧控制面板，可暂停、逐帧查看和调整速度。" title="动图自动显示帧面板">
+          <Switch checked={preferences.showFrames} label="动图自动显示帧面板" onChange={(showFrames) => onChange({ showFrames })} />
         </SettingRow>
       </Section>
 

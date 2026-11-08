@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 
 import type { ImageSortDirection, ImageSortKey } from "../shared/navigation.ts";
 import type { FitMode } from "../shared/viewTransform.ts";
+import { normalizeOverrides, type ShortcutOverrides } from "../shared/shortcuts.ts";
 
 export type ViewerBackground = "interface" | "black" | "dark" | "checker" | "light";
 export type WheelAction = "zoom" | "navigate";
@@ -22,13 +23,18 @@ export interface ViewerPreferences {
   showInfo: boolean;
   /** Keep the rotation/zoom when moving to the next picture. */
   keepTransform: boolean;
+  /** Titlebar stays visible (true) or auto-hides and reveals on hover (false). */
+  titlebarPinned: boolean;
+  /** Show the frame inspector automatically for animated images. */
+  showFrames: boolean;
+  shortcuts: ShortcutOverrides;
 }
 
 export const DEFAULT_VIEWER_PREFERENCES: ViewerPreferences = {
   background: "interface",
   fitMode: "fit",
   upscaleSmall: false,
-  wheelAction: "zoom",
+  wheelAction: "navigate",
   loop: true,
   sortKey: "name",
   sortDirection: "asc",
@@ -38,12 +44,17 @@ export const DEFAULT_VIEWER_PREFERENCES: ViewerPreferences = {
   escapeCloses: true,
   showFilmstrip: true,
   showInfo: false,
-  keepTransform: false
+  keepTransform: false,
+  titlebarPinned: false,
+  showFrames: false,
+  shortcuts: {}
 };
 
 export const SLIDESHOW_INTERVALS = [2, 3, 4, 6, 10, 20];
 
-const STORAGE_KEY = "mangoo.imageViewer.preferences.v1";
+// v2: wheel default changed to navigate; v1 values migrate below.
+const STORAGE_KEY = "mangoo.imageViewer.preferences.v2";
+const LEGACY_STORAGE_KEY = "mangoo.imageViewer.preferences.v1";
 
 function oneOf<T extends string>(value: unknown, options: readonly T[], fallback: T): T {
   return typeof value === "string" && (options as readonly string[]).includes(value) ? (value as T) : fallback;
@@ -68,13 +79,23 @@ export function normalizeViewerPreferences(value: unknown): ViewerPreferences {
     escapeCloses: bool("escapeCloses"),
     showFilmstrip: bool("showFilmstrip"),
     showInfo: bool("showInfo"),
-    keepTransform: bool("keepTransform")
+    keepTransform: bool("keepTransform"),
+    titlebarPinned: bool("titlebarPinned"),
+    showFrames: bool("showFrames"),
+    shortcuts: normalizeOverrides(raw.shortcuts)
   };
 }
 
 function readPreferences(): ViewerPreferences {
   try {
-    return normalizeViewerPreferences(JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? "{}"));
+    const stored = window.localStorage.getItem(STORAGE_KEY);
+    if (stored === null) {
+      // Carry v1 choices over, except the wheel, whose default changed.
+      const legacy = JSON.parse(window.localStorage.getItem(LEGACY_STORAGE_KEY) ?? "{}") as Record<string, unknown>;
+      delete legacy.wheelAction;
+      return normalizeViewerPreferences(legacy);
+    }
+    return normalizeViewerPreferences(JSON.parse(stored));
   } catch {
     return DEFAULT_VIEWER_PREFERENCES;
   }

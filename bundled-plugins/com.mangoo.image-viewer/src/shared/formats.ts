@@ -10,6 +10,7 @@ const MIME_BY_EXTENSION: Record<string, string> = {
   ".jpg": "image/jpeg",
   ".jpeg": "image/jpeg",
   ".png": "image/png",
+  ".apng": "image/apng",
   ".gif": "image/gif",
   ".webp": "image/webp",
   ".bmp": "image/bmp",
@@ -66,6 +67,19 @@ export function isAnimatedImageHeader(bytes: Uint8Array, extension: string): boo
   const ascii = (start: number, length: number) =>
     String.fromCharCode(...bytes.subarray(start, Math.min(bytes.length, start + length)));
   if (extension === ".gif") return ascii(0, 3) === "GIF";
+  if (extension === ".png" || extension === ".apng") {
+    // APNG: an acTL chunk before the first IDAT.
+    if (ascii(1, 3) !== "PNG") return false;
+    let offset = 8;
+    while (offset + 8 <= bytes.length) {
+      const length = ((bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3]) >>> 0;
+      const type = ascii(offset + 4, 4);
+      if (type === "acTL") return true;
+      if (type === "IDAT") return false;
+      offset += 12 + length;
+    }
+    return false;
+  }
   if (extension === ".webp") {
     return ascii(0, 4) === "RIFF" && ascii(8, 4) === "WEBP" && ascii(12, 4) === "VP8X" && bytes.length > 20 && (bytes[20] & 0x02) !== 0;
   }

@@ -2465,6 +2465,9 @@ paths:
               schema: { type: integer }
             x-mangoo-source-height:
               schema: { type: integer }
+            x-mangoo-animated:
+              description: true when the original bytes are a multi-frame animation
+              schema: { type: string, enum: ["true"] }
           content:
             application/octet-stream:
               schema: { type: string, format: binary }

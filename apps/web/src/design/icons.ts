@@ -9,6 +9,10 @@ import { CornersOutIcon as CornersOutGlyph } from "@phosphor-icons/react/dist/cs
 import { CornersInIcon as CornersInGlyph } from "@phosphor-icons/react/dist/csr/CornersIn";
 import { InfoIcon as InfoGlyph } from "@phosphor-icons/react/dist/csr/Info";
 import { CheckerboardIcon as CheckerboardGlyph } from "@phosphor-icons/react/dist/csr/Checkerboard";
+import { PlusIcon as PlusGlyph } from "@phosphor-icons/react/dist/csr/Plus";
+import { PushPinSlashIcon as PushPinSlashGlyph } from "@phosphor-icons/react/dist/csr/PushPinSlash";
+import { FilmReelIcon as FilmReelGlyph } from "@phosphor-icons/react/dist/csr/FilmReel";
+import { SlideshowIcon as SlideshowGlyph } from "@phosphor-icons/react/dist/csr/Slideshow";
 import { ArchiveIcon as ArchiveGlyph } from "@phosphor-icons/react/dist/csr/Archive";
 import { ArrowBendUpRightIcon as ArrowBendUpRightGlyph } from "@phosphor-icons/react/dist/csr/ArrowBendUpRight";
 import { ArrowCounterClockwiseIcon as ArrowCounterClockwiseGlyph } from "@phosphor-icons/react/dist/csr/ArrowCounterClockwise";
@@ -224,3 +228,8 @@ export const ExitFullscreen = /* @__PURE__ */ appIcon(CornersInGlyph, "ExitFulls
 export const Info = /* @__PURE__ */ appIcon(InfoGlyph, "Info");
 export const FilmStrip = /* @__PURE__ */ appIcon(FilmStripGlyph, "FilmStrip");
 export const Checkerboard = /* @__PURE__ */ appIcon(CheckerboardGlyph, "Checkerboard");
+export const Plus = /* @__PURE__ */ appIcon(PlusGlyph, "Plus");
+export const PinOff = /* @__PURE__ */ appIcon(PushPinSlashGlyph, "PinOff");
+export const FilmReel = /* @__PURE__ */ appIcon(FilmReelGlyph, "FilmReel");
+export const Slideshow = /* @__PURE__ */ appIcon(SlideshowGlyph, "Slideshow");
+export const StackTop = /* @__PURE__ */ appIcon(StackSimpleGlyph, "StackTop");

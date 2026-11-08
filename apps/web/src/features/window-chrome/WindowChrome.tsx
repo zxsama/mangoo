@@ -46,36 +46,36 @@ export function WindowChrome() {
       className="window-chrome no-drag"
       data-no-drag="true"
       role="group"
-      aria-label="Window controls"
+      aria-label="窗口控制"
     >
       <LiquidGlassButton
-        aria-label="Minimize window"
+        aria-label="最小化"
         className="window-chrome-button"
         data-titlebar-control="window-minimize"
         onClick={() => void controls.minimize()}
-        title="Minimize window"
+        title="最小化"
         tone="control"
         type="button"
       >
         <Minus size={14} />
       </LiquidGlassButton>
       <LiquidGlassButton
-        aria-label={isMaximized ? "Restore window" : "Maximize window"}
+        aria-label={isMaximized ? "还原" : "最大化"}
         className="window-chrome-button"
         data-titlebar-control="window-maximize"
         onClick={() => void handleMaximize()}
-        title={isMaximized ? "Restore window" : "Maximize window"}
+        title={isMaximized ? "还原" : "最大化"}
         tone="control"
         type="button"
       >
         {isMaximized ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
       </LiquidGlassButton>
       <LiquidGlassButton
-        aria-label="Close window"
+        aria-label="关闭"
         className="window-chrome-button window-chrome-button-close"
         data-titlebar-control="window-close"
         onClick={() => void controls.close()}
-        title="Close window"
+        title="关闭"
         tone="danger"
         type="button"
       >

@@ -4,6 +4,8 @@ import type { ImageViewerMetadata } from "@mangoo/core-client";
 
 import { formatBytes, type ImageEntry } from "../shared/navigation.ts";
 import { computeHistogram, type Histogram, type LoadedImage } from "./imageSource.ts";
+import { formatFrameTime } from "../shared/frames.ts";
+import type { FramePlaybackState } from "./FrameInspector.tsx";
 import { describeError } from "./useViewerSession.ts";
 
 function formatDate(ms: number | null | undefined): string | null {
@@ -77,7 +79,7 @@ function HistogramView({ image }: { image: LoadedImage | null }) {
   );
 }
 
-export function InfoPanel({ entry, image }: { entry: ImageEntry | null; image: LoadedImage | null }) {
+export function InfoPanel({ entry, image, animation }: { entry: ImageEntry | null; image: LoadedImage | null; animation?: FramePlaybackState | null }) {
   const [metadata, setMetadata] = useState<ImageViewerMetadata | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -104,7 +106,11 @@ export function InfoPanel({ entry, image }: { entry: ImageEntry | null; image: L
   const exif = metadata?.exif ?? null;
   const width = metadata?.width ?? image?.width ?? null;
   const height = metadata?.height ?? image?.height ?? null;
-  const megapixels = width && height ? `${((width * height) / 1_000_000).toFixed(1)} MP` : null;
+  const pixels = width && height ? width * height : 0;
+  const megapixels = !pixels ? null : pixels >= 1_000_000 ? `${(pixels / 1_000_000).toFixed(1)} MP` : `${(pixels / 10_000).toFixed(1)} 万像素`;
+  const format = image?.kind === "animated"
+    ? ({ ".png": "APNG（动态 PNG）", ".apng": "APNG", ".gif": "GIF 动图", ".webp": "WebP 动图", ".avif": "AVIF 动图" } as Record<string, string>)[entry.ext] ?? entry.ext.replace(".", "").toUpperCase()
+    : entry.ext.replace(".", "").toUpperCase();
   const camera = [exif?.make, exif?.model && exif?.make && exif.model.startsWith(exif.make) ? exif.model.slice(exif.make.length).trim() : exif?.model]
     .filter(Boolean)
     .join(" ");
@@ -128,10 +134,13 @@ export function InfoPanel({ entry, image }: { entry: ImageEntry | null; image: L
           <span>文件</span>
         </div>
         <dl>
+          <Row label="名称" value={<span className="iv-info-name">{entry.name}</span>} />
           <Row label="尺寸" value={width && height ? `${width} × ${height}` : null} />
           <Row label="像素" value={megapixels} />
           <Row label="大小" value={formatBytes(metadata?.sizeBytes ?? entry.sizeBytes)} />
-          <Row label="格式" value={entry.ext.replace(".", "").toUpperCase()} />
+          <Row label="格式" value={format} />
+          <Row label="帧数" value={animation ? `${animation.frameCount} 帧` : null} />
+          <Row label="时长" value={animation ? formatFrameTime(animation.totalMs) : null} />
           <Row label="修改时间" value={formatDate(metadata?.modifiedAtMs ?? entry.modifiedAtMs)} />
           <Row label="创建时间" value={formatDate(metadata?.createdAtMs)} />
           <Row label="显示" value={image ? (image.tier === "original" ? "原图" : image.tier === "decoder" ? "插件解码" : "自适应预览") : null} />

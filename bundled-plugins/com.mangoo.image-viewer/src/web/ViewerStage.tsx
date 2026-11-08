@@ -14,11 +14,15 @@ export interface ViewerStageProps {
   pixelated: boolean;
   /** Backing-store scale for the canvas (see renderLevel). */
   renderLevel: number;
+  /** Animation frame to paint instead of the image (frame inspector). */
+  frameBitmap?: ImageBitmap | null;
   overlay?: ReactNode;
   onViewportChange(size: Size): void;
   onWheelZoom(factor: number, anchor: { x: number; y: number }): void;
   onWheelNavigate(direction: 1 | -1): void;
   wheelNavigates: boolean;
+  /** Picture larger than the window: plain wheel pans instead of navigating. */
+  zoomedIn?: boolean;
   onPan(deltaX: number, deltaY: number): void;
   onPinch(factor: number, anchor: { x: number; y: number }): void;
   onToggleActualSize(anchor: { x: number; y: number }): void;
@@ -57,10 +61,13 @@ export function ViewerStage(props: ViewerStageProps) {
   useLayoutEffect(() => {
     const canvas = canvasRef.current;
     const image = props.image;
-    if (!canvas || !image || image.kind !== "bitmap") return;
-    const { bitmap } = image;
-    const width = Math.max(1, Math.round(bitmap.width * props.renderLevel));
-    const height = Math.max(1, Math.round(bitmap.height * props.renderLevel));
+    const frame = props.frameBitmap ?? null;
+    if (!canvas || !image || (image.kind !== "bitmap" && !frame)) return;
+    const bitmap = frame ?? (image.kind === "bitmap" ? image.bitmap : null);
+    if (!bitmap) return;
+    const level = frame ? 1 : props.renderLevel;
+    const width = Math.max(1, Math.round(bitmap.width * level));
+    const height = Math.max(1, Math.round(bitmap.height * level));
     if (canvas.width !== width || canvas.height !== height) {
       canvas.width = width;
       canvas.height = height;
@@ -76,7 +83,7 @@ export function ViewerStage(props: ViewerStageProps) {
       // A bitmap closed by eviction between render and paint: the next
       // load repaints, so leaving the previous frame is the right fallback.
     }
-  }, [props.image, props.renderLevel]);
+  }, [props.image, props.renderLevel, props.frameBitmap]);
 
   // Non-passive wheel so the page never scrolls.
   useEffect(() => {
@@ -88,6 +95,10 @@ export function ViewerStage(props: ViewerStageProps) {
       const current = propsRef.current;
       current.onActivity();
       const zoomGesture = event.ctrlKey || !current.wheelNavigates;
+      if (!zoomGesture && current.zoomedIn) {
+        current.onPan(-event.deltaX, -event.deltaY);
+        return;
+      }
       if (!zoomGesture) {
         const now = performance.now();
         if (now < navigateCooldown || Math.abs(event.deltaY) < 4) return;
@@ -96,9 +107,11 @@ export function ViewerStage(props: ViewerStageProps) {
         return;
       }
       const pixels = event.deltaMode === 1 ? event.deltaY * 16 : event.deltaMode === 2 ? event.deltaY * 400 : event.deltaY;
-      // Trackpad pinches arrive as ctrl+wheel with small deltas: be gentler.
+      // A mouse notch (|delta| >= 50) zooms ~1.2x; trackpad pinches arrive as
+      // ctrl+wheel with small deltas and get a finer, proportional response.
       const clamped = Math.max(-240, Math.min(240, pixels));
-      const factor = Math.exp(-clamped * (event.ctrlKey ? 0.01 : 0.0018));
+      const pinch = event.ctrlKey && event.deltaMode === 0 && Math.abs(pixels) < 50;
+      const factor = Math.exp(-clamped * (pinch ? 0.01 : 0.0015));
       current.onWheelZoom(factor, pointIn(stage, event.clientX, event.clientY));
     };
     stage.addEventListener("wheel", onWheel, { passive: false });
@@ -215,8 +228,8 @@ export function ViewerStage(props: ViewerStageProps) {
         hidden={!props.image}
         style={layerStyle}
       >
-        <canvas className="iv-canvas" hidden={props.image?.kind !== "bitmap"} ref={canvasRef} />
-        {props.image?.kind === "animated" ? (
+        <canvas className="iv-canvas" hidden={props.image?.kind !== "bitmap" && !props.frameBitmap} ref={canvasRef} />
+        {props.image?.kind === "animated" && !props.frameBitmap ? (
           <img alt="" className="iv-animated" draggable={false} src={props.image.url} />
         ) : null}
       </div>
