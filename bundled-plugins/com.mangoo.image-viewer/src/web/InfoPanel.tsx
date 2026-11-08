@@ -8,6 +8,10 @@ import { formatFrameTime } from "../shared/frames.ts";
 import type { FramePlaybackState } from "./FrameInspector.tsx";
 import { describeError } from "./useViewerSession.ts";
 
+function orientationLabel(value: number): string {
+  return ({ 2: "水平翻转", 3: "旋转 180°", 4: "垂直翻转", 5: "转置", 6: "顺时针 90°", 7: "反转置", 8: "逆时针 90°" } as Record<number, string>)[value] ?? String(value);
+}
+
 function formatDate(ms: number | null | undefined): string | null {
   if (!ms) return null;
   return new Date(ms).toLocaleString();
@@ -74,7 +78,7 @@ function HistogramView({ image }: { image: LoadedImage | null }) {
   }, [histogram]);
   return (
     <div className="iv-histogram" data-ready={histogram ? "true" : "false"}>
-      <canvas height={72} ref={canvasRef} width={256} />
+      <canvas height={112} ref={canvasRef} width={280} />
     </div>
   );
 }
@@ -147,17 +151,28 @@ export function InfoPanel({ entry, image, animation }: { entry: ImageEntry | nul
           <Row label="位置" value={<span className="iv-info-path">{metadata?.directory ?? null}</span>} />
         </dl>
       </section>
+      <section className="iv-info-section">
+        <div className="iv-info-section-title">
+          <icons.Camera aria-hidden="true" size={13} />
+          <span>EXIF</span>
+        </div>
+        {!metadata ? (
+          <p className="iv-exif-empty">正在读取…</p>
+        ) : !exif ? (
+          <p className="iv-exif-empty">这张图片没有 EXIF 信息。</p>
+        ) : null}
+      </section>
       {exif ? (
-        <section className="iv-info-section">
-          <div className="iv-info-section-title">
-            <icons.Camera aria-hidden="true" size={13} />
-            <span>拍摄</span>
-          </div>
+        <section className="iv-info-section iv-info-section-continued">
           {exposure ? <div className="iv-info-exposure">{exposure}</div> : null}
           <dl>
             <Row label="相机" value={camera || null} />
             <Row label="镜头" value={exif.lensModel} />
             <Row label="拍摄时间" value={exifDate(exif.dateTimeOriginal)} />
+            <Row label="快门" value={exif.exposureTime ? `${exif.exposureTime} s` : null} />
+            <Row label="光圈" value={exif.fNumber ? `f/${exif.fNumber.toFixed(1).replace(/\.0$/, "")}` : null} />
+            <Row label="ISO" value={exif.iso ? String(exif.iso) : null} />
+            <Row label="焦距" value={exif.focalLengthMm ? `${Math.round(exif.focalLengthMm)} mm` : null} />
             <Row label="等效焦距" value={exif.focalLength35mm ? `${exif.focalLength35mm}mm` : null} />
             <Row label="曝光补偿" value={exif.exposureBiasEv !== null ? `${exif.exposureBiasEv > 0 ? "+" : ""}${exif.exposureBiasEv.toFixed(1)} EV` : null} />
             <Row label="曝光程序" value={exif.exposureProgram} />
@@ -165,6 +180,8 @@ export function InfoPanel({ entry, image, animation }: { entry: ImageEntry | nul
             <Row label="闪光灯" value={exif.flash} />
             <Row label="白平衡" value={exif.whiteBalance} />
             <Row label="色彩空间" value={exif.colorSpace} />
+            <Row label="方向" value={exif.orientation && exif.orientation !== 1 ? orientationLabel(exif.orientation) : null} />
+            <Row label="原始尺寸" value={exif.pixelWidth && exif.pixelHeight ? `${exif.pixelWidth} × ${exif.pixelHeight}` : null} />
             <Row label="GPS" value={gps} />
             <Row label="海拔" value={exif.gpsAltitudeM !== null ? `${Math.round(exif.gpsAltitudeM)} m` : null} />
             <Row label="软件" value={exif.software} />

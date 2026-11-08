@@ -20,12 +20,12 @@ export function Switch({ checked, label, onChange, disabled = false }: {
   disabled?: boolean;
 }) {
   return (
-    <span className={`plugin-toggle iv-switch${checked ? " on" : ""}${disabled ? " disabled" : ""}`}>
+    <label className={`plugin-toggle iv-switch${checked ? " on" : ""}${disabled ? " disabled" : ""}`}>
       <input aria-label={label} checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} role="switch" type="checkbox" />
       <span aria-hidden="true" className="plugin-toggle-track">
         <span className="plugin-toggle-thumb" />
       </span>
-    </span>
+    </label>
   );
 }
 
@@ -68,7 +68,15 @@ export function SettingRow({ title, description, children, htmlFor, stacked = fa
 }) {
   return (
     <div className="iv-setting-row" data-layout={stacked ? "stacked" : "inline"}>
-      <div className="iv-setting-text">
+      <div
+        className="iv-setting-text"
+        onClick={(event) => {
+          // Clicking a row's text toggles its switch, like system settings.
+          const row = (event.currentTarget as HTMLElement).parentElement;
+          const input = row?.querySelector<HTMLInputElement>('.iv-setting-control input[type="checkbox"]');
+          if (input && !input.disabled) input.click();
+        }}
+      >
         <label className="iv-setting-title" htmlFor={htmlFor}>{title}</label>
         {description ? <p className="iv-setting-description">{description}</p> : null}
       </div>
@@ -203,7 +211,7 @@ export function ViewerSettingsForm({ preferences, onChange, showSystem = true }:
           <Switch checked={preferences.titlebarPinned} label="固定标题栏" onChange={(titlebarPinned) => onChange({ titlebarPinned })} />
         </SettingRow>
         <SettingRow description="打开 GIF、APNG、WebP 动图时自动显示帧控制面板，可暂停、逐帧查看和调整速度。" title="动图自动显示帧面板">
-          <Switch checked={preferences.showFrames} label="动图自动显示帧面板" onChange={(showFrames) => onChange({ showFrames })} />
+          <Switch checked={preferences.framesAutoOpen} label="动图自动显示帧面板" onChange={(framesAutoOpen) => onChange({ framesAutoOpen })} />
         </SettingRow>
       </Section>
 

@@ -79,7 +79,7 @@ export function AssociationControls() {
           <span className="iv-assoc-state" data-on={status.registered ? "true" : "false"}>
             {busy ? "正在应用…" : status.registered ? "已开启" : "未开启"}
           </span>
-          <span className={`plugin-toggle iv-switch${status.registered ? " on" : ""}${!actionable || busy ? " disabled" : ""}`}>
+          <label className={`plugin-toggle iv-switch${status.registered ? " on" : ""}${!actionable || busy ? " disabled" : ""}`}>
             <input
               aria-label="用 Mangoo 打开图片"
               checked={status.registered}
@@ -91,7 +91,7 @@ export function AssociationControls() {
             <span aria-hidden="true" className="plugin-toggle-track">
               <span className="plugin-toggle-thumb" />
             </span>
-          </span>
+          </label>
         </div>
       </div>
 

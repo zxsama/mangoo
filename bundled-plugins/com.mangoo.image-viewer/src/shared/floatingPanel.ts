@@ -30,11 +30,15 @@ export interface PanelPlacement {
 
 /** Distance (px) at which a dragged panel snaps to an edge. */
 export const SNAP_DISTANCE = 18;
-/** Gap kept between a snapped panel and the window edge. */
-export const EDGE_GAP = 12;
+/** Gap kept between a snapped panel and the window edge (flush). */
+export const EDGE_GAP = 0;
+
+/** Smallest panel size; also the CSS min-width, so stored == rendered. */
+export const MIN_PANEL_WIDTH = 260;
+export const MIN_PANEL_HEIGHT = 120;
 
 export function clampRect(rect: PanelRect, bounds: Bounds, insets: { top: number; bottom: number }): PanelRect {
-  const width = Math.min(rect.width, Math.max(160, bounds.width - EDGE_GAP * 2));
+  const width = Math.min(Math.max(MIN_PANEL_WIDTH, rect.width), Math.max(MIN_PANEL_WIDTH, bounds.width - EDGE_GAP * 2));
   const maxHeight = Math.max(120, bounds.height - insets.top - insets.bottom - EDGE_GAP * 2);
   const height = Math.min(rect.height, maxHeight);
   return {
@@ -75,6 +79,25 @@ export function snapRect(rect: PanelRect, bounds: Bounds, insets: { top: number;
   return { rect: { ...clamped, x, y }, dock };
 }
 
+/**
+ * A horizontal band near the bottom edge that panels must not cover (the
+ * centred floating toolbar). Panels whose span overlaps it are lifted above
+ * it; panels in the corners stay flush with the bottom edge.
+ */
+export interface BottomObstacle {
+  left: number;
+  right: number;
+  height: number;
+}
+
+export function avoidObstacle(rect: PanelRect, bounds: Bounds, insets: { top: number; bottom: number }, obstacle: BottomObstacle | null): PanelRect {
+  if (!obstacle) return rect;
+  const overlapsHorizontally = rect.x < obstacle.right && rect.x + rect.width > obstacle.left;
+  const limit = bounds.height - insets.bottom - obstacle.height;
+  if (!overlapsHorizontally || rect.y + rect.height <= limit) return rect;
+  return { ...rect, y: Math.max(insets.top, limit - rect.height) };
+}
+
 /** Re-apply a docked placement after the window resized. */
 export function relayout(placement: PanelPlacement, bounds: Bounds, insets: { top: number; bottom: number }): PanelRect {
   const rect = clampRect(placement.rect, bounds, insets);
@@ -85,9 +108,16 @@ export function relayout(placement: PanelPlacement, bounds: Bounds, insets: { to
   return clampRect(rect, bounds, insets);
 }
 
-/** Default: snapped to the top-right corner below the titlebar. */
-export function defaultPlacement(size: { width: number; height: number }, bounds: Bounds, insets: { top: number; bottom: number }): PanelPlacement {
-  return snapRect({ x: bounds.width, y: 0, width: size.width, height: size.height }, bounds, insets);
+/** Default: snapped to a corner (top-right below the titlebar, or bottom-left). */
+export function defaultPlacement(
+  size: { width: number; height: number },
+  corner: "top-right" | "bottom-left",
+  bounds: Bounds,
+  insets: { top: number; bottom: number }
+): PanelPlacement {
+  const x = corner === "top-right" ? bounds.width : 0;
+  const y = corner === "top-right" ? 0 : bounds.height;
+  return snapRect({ x, y, width: size.width, height: size.height }, bounds, insets);
 }
 
 export function parsePlacement(value: unknown): PanelPlacement | null {

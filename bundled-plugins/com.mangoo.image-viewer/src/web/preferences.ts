@@ -25,8 +25,8 @@ export interface ViewerPreferences {
   keepTransform: boolean;
   /** Titlebar stays visible (true) or auto-hides and reveals on hover (false). */
   titlebarPinned: boolean;
-  /** Show the frame inspector automatically for animated images. */
-  showFrames: boolean;
+  /** Show the frame panel automatically for animated images. */
+  framesAutoOpen: boolean;
   shortcuts: ShortcutOverrides;
 }
 
@@ -46,7 +46,7 @@ export const DEFAULT_VIEWER_PREFERENCES: ViewerPreferences = {
   showInfo: false,
   keepTransform: false,
   titlebarPinned: false,
-  showFrames: false,
+  framesAutoOpen: true,
   shortcuts: {}
 };
 
@@ -81,7 +81,7 @@ export function normalizeViewerPreferences(value: unknown): ViewerPreferences {
     showInfo: bool("showInfo"),
     keepTransform: bool("keepTransform"),
     titlebarPinned: bool("titlebarPinned"),
-    showFrames: bool("showFrames"),
+    framesAutoOpen: bool("framesAutoOpen"),
     shortcuts: normalizeOverrides(raw.shortcuts)
   };
 }

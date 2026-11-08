@@ -278,21 +278,37 @@
 /* Edge navigation zones: visible on hover only. */
 .iv-nav-zone {
   position: absolute;
-  top: 50%;
+  top: calc(50% - 32px);
   z-index: 2;
   display: grid;
   place-items: center;
-  width: 44px;
-  height: 88px;
+  width: 64px;
+  height: 64px;
   padding: 0;
-  color: var(--text-primary);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-panel);
-  background: var(--glass-readable-surface-strong);
+  color: rgba(255, 255, 255, 0.86);
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
   opacity: 0;
-  transform: translateY(-50%);
-  transition: opacity 160ms ease;
+  pointer-events: none;
+  /* The global button hover lifts by 1px; arrows must never move. */
+  transform: none !important;
+  transition: opacity 180ms ease, color 120ms ease;
   cursor: pointer;
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.7)) drop-shadow(0 0 12px rgba(0, 0, 0, 0.45));
+}
+
+.iv-nav-zone:hover {
+  color: #fff;
+  transform: none !important;
+}
+
+.iv-nav-zone:hover > svg {
+  scale: 1.08;
+}
+
+.iv-nav-zone > svg {
+  transition: scale 120ms ease;
 }
 
 .iv-nav-prev {
@@ -303,14 +319,9 @@
   right: 12px;
 }
 
-.iv-main:hover .iv-nav-zone {
-  opacity: 0.72;
-}
-
-.iv-nav-zone:hover,
 .iv-nav-zone:focus-visible {
-  opacity: 1 !important;
-  border-color: var(--interactive-focus);
+  opacity: 1;
+  pointer-events: auto;
   outline: none;
 }
 
@@ -1126,14 +1137,17 @@
 
 /* In a normal window the toolbar and edge arrows step back after a few idle
  * seconds so the picture is unobstructed; any pointer movement brings them back. */
-.iv-window[data-controls-idle="true"] .iv-toolbar,
-.iv-window[data-controls-idle="true"] .iv-nav-zone {
+/* Toolbar and edge arrows follow the same proximity reveal as the titlebar. */
+.iv-window[data-toolbar="hidden"] .iv-toolbar {
   opacity: 0;
   pointer-events: none;
+  transform: translate(-50%, 8px);
 }
 
-.iv-window[data-controls-idle="true"] .iv-main:hover .iv-nav-zone {
-  opacity: 0;
+.iv-window[data-nav-left="shown"] .iv-nav-prev,
+.iv-window[data-nav-right="shown"] .iv-nav-next {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 
@@ -1148,12 +1162,13 @@
   right: 0;
   left: 0;
   z-index: 8;
-  transition: opacity 220ms ease, transform 220ms ease;
+  /* Fade only: sliding moved the bar under a stationary cursor, which then
+     left and re-entered the reveal zone (the flicker). */
+  transition: opacity 200ms ease;
 }
 
 .iv-window[data-titlebar="hidden"] .iv-titlebar {
   opacity: 0;
-  transform: translateY(-100%);
   pointer-events: none;
   -webkit-app-region: no-drag;
 }
@@ -1170,7 +1185,7 @@
   position: absolute;
   z-index: 6;
   display: flex;
-  min-width: 220px;
+  min-width: 260px; /* = MIN_PANEL_WIDTH */
   min-height: 120px;
 }
 
@@ -1798,4 +1813,203 @@
 .iv-menu-pointer .overlay-menu-item:focus-visible {
   outline: none;
   box-shadow: none;
+}
+
+/* ------------------------------------------------ real frosted overlays */
+/* The viewer's floating chrome sits directly over the picture, so it must
+ * blur what is behind it. In this window Chromium drops backdrop-filter when
+ * a sibling layer is an SVG-filtered element (the invisible lens) or a
+ * blended layer (the 5% dither texture) — measured: either alone leaves the
+ * backdrop sharp. Those two decorative layers are therefore disabled on the
+ * viewer's overlay surfaces only; Host surfaces are untouched. */
+.iv-titlebar > .liquid-glass-lens,
+.iv-titlebar > .liquid-glass-dither,
+.iv-toolbar > .liquid-glass-lens,
+.iv-toolbar > .liquid-glass-dither,
+.iv-float-surface > .liquid-glass-lens,
+.iv-float-surface > .liquid-glass-dither,
+.iv-filmstrip-pane > .liquid-glass-lens,
+.iv-filmstrip-pane > .liquid-glass-dither {
+  display: none;
+}
+
+.liquid-glass.iv-titlebar,
+.liquid-glass.iv-toolbar,
+.liquid-glass.iv-float-surface,
+.liquid-glass.iv-filmstrip-pane {
+  --glass-saturation: 1.35;
+}
+
+.liquid-glass.iv-titlebar {
+  --glass-fill: rgba(10, 14, 18, 0.46);
+  --glass-blur-current: 24px;
+}
+
+.liquid-glass.iv-toolbar {
+  --glass-fill: rgba(10, 14, 18, 0.52);
+  --glass-blur-current: 20px;
+}
+
+.liquid-glass.iv-float-surface {
+  --glass-fill: rgba(12, 16, 20, 0.58);
+  --glass-blur-current: 28px;
+}
+
+/* Round 3 ---------------------------------------------------------------- */
+
+/* Dragging a panel near an edge could autoscroll an overflow:hidden ancestor
+ * and shift the whole window up by a titlebar height (black band under the
+ * filmstrip). clip cannot be scrolled at all. */
+html:has(.iv-window),
+html:has(.iv-window) body,
+html:has(.iv-window) #root,
+.iv-window {
+  overflow: clip;
+}
+
+.iv-float[data-dragging="true"],
+.iv-window:has(.iv-float[data-dragging="true"]) {
+  user-select: none;
+}
+
+/* 5.6: the Host's glass rule makes every child position:relative; the grip
+ * must sit in the bottom-right corner, drawn as two diagonal ticks there. */
+.iv-float > .iv-float-resize {
+  position: absolute;
+  left: auto;
+  top: auto;
+  right: 2px;
+  bottom: 2px;
+  z-index: 3;
+  width: 12px;
+  height: 12px;
+  background:
+    linear-gradient(135deg, transparent 0 58%, rgba(255, 255, 255, 0.34) 58% 66%, transparent 66% 76%, rgba(255, 255, 255, 0.34) 76% 84%, transparent 84%);
+}
+
+/* 5.6: histogram at a 5:2 ratio (readable shape, not a flat strip). */
+.iv-histogram {
+  height: auto;
+  aspect-ratio: 5 / 2;
+}
+
+.iv-histogram canvas {
+  width: 100%;
+  height: 100%;
+}
+
+.iv-exif-empty {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--iv-text-body);
+}
+
+/* 6: compact frames panel. */
+.iv-frames {
+  gap: 8px;
+  padding: 8px 10px 10px;
+}
+
+.iv-frames-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.iv-frames-top strong {
+  color: var(--text-primary);
+  font-size: var(--iv-text-label);
+  font-weight: 650;
+}
+
+.iv-frames-top span {
+  color: var(--text-muted);
+  font-size: var(--iv-text-caption);
+}
+
+.iv-frames-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.iv-frames-row .iv-frames-button {
+  width: 28px;
+  height: 26px;
+}
+
+.iv-frames-row .iv-frames-primary {
+  width: 34px;
+}
+
+.iv-frames-row .iv-frames-spacer {
+  flex: 1 1 auto;
+}
+
+.iv-frames-row .iv-frames-select {
+  height: 26px;
+  padding: 0 4px;
+}
+
+.iv-frames-loop[aria-pressed="true"] {
+  color: var(--accent);
+  border-color: var(--line-strong);
+  background: rgba(142, 199, 208, 0.12);
+}
+
+.iv-info-section-continued {
+  margin-top: -6px;
+  padding-top: 0;
+  border-top: 0;
+}
+
+/* Toasts and the HUD always sit above floating panels. */
+.iv-toast,
+.iv-hud {
+  z-index: 9;
+}
+
+/* Review round 3 ------------------------------------------------------- */
+
+/* Panels sit above an auto-hidden titlebar's area; the revealed titlebar
+ * (z 8) still overlays them while the pointer is at the top edge. */
+
+.iv-float,
+.iv-float * {
+  user-select: none;
+}
+
+.iv-float .iv-info-path,
+.iv-float .iv-info-name {
+  user-select: text;
+}
+
+.iv-setting-text {
+  cursor: pointer;
+}
+
+.iv-chord .iv-keycap + .iv-keycap::before {
+  margin: 0 5px 0 1px;
+}
+
+.liquid-glass.iv-settings-dialog {
+  --glass-fill: rgba(14, 18, 22, 0.86);
+}
+
+.iv-menu .overlay-menu-item:focus,
+.iv-menu .overlay-menu-item:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+.iv-menu .overlay-menu-item:focus-visible[data-keyboard-focus="true"] {
+  outline: 1px solid var(--interactive-focus);
+}
+
+/* Panels move out of the titlebar's way while it is revealed (see
+ * panelInsets), so window controls and panel headers never overlap. */
+.iv-float:not([data-dragging="true"]) {
+  transition: top 200ms ease;
 }

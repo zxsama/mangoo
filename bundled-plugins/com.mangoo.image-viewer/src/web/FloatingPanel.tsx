@@ -2,11 +2,15 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState, type Pointer
 import { LiquidGlassSurface, icons } from "@mangoo/web/plugin-host";
 
 import {
+  MIN_PANEL_HEIGHT,
+  MIN_PANEL_WIDTH,
+  avoidObstacle,
   clampRect,
   defaultPlacement,
   parsePlacement,
   relayout,
   snapRect,
+  type BottomObstacle,
   type PanelPlacement,
   type PanelRect
 } from "../shared/floatingPanel.ts";
@@ -29,6 +33,8 @@ export function FloatingPanel({
   resizable = true,
   autoHeight = true,
   onDockChange,
+  defaultCorner = "top-right",
+  bottomObstacle = null,
   className
 }: {
   id: string;
@@ -43,6 +49,10 @@ export function FloatingPanel({
   resizable?: boolean;
   /** Grow with the content up to the stored height instead of a fixed box. */
   autoHeight?: boolean;
+  /** Band at the bottom (the toolbar) that the panel must not cover. */
+  bottomObstacle?: BottomObstacle | null;
+  /** Where the panel first appears. */
+  defaultCorner?: "top-right" | "bottom-left";
   /** Which side edge the panel hugs, so the window can move its edge arrows. */
   onDockChange?(side: "left" | "right" | null): void;
   className?: string;
@@ -53,13 +63,24 @@ export function FloatingPanel({
   const [placement, setPlacement] = useState<PanelPlacement>(() => {
     try {
       const stored = parsePlacement(JSON.parse(window.localStorage.getItem(storageKey) ?? "null"));
-      if (stored) return stored;
+      if (stored) {
+        const viewport = { width: window.innerWidth, height: window.innerHeight };
+        return { rect: clampRect(stored.rect, viewport, insets), dock: stored.dock };
+      }
     } catch {
       // ignore
     }
-    return defaultPlacement(defaultSize, { width: window.innerWidth, height: window.innerHeight }, insets);
+    return defaultPlacement(defaultSize, defaultCorner, { width: window.innerWidth, height: window.innerHeight }, insets);
   });
   const [dragging, setDragging] = useState(false);
+  // A panel never moves under the pointer: while the pointer is inside it,
+  // inset changes (e.g. the titlebar hiding) are deferred until it leaves.
+  const [hovered, setHovered] = useState(false);
+  const [frozenInsets, setFrozenInsets] = useState<{ top: number; bottom: number } | null>(null);
+  const liveInsets = insets;
+  useEffect(() => {
+    if (!hovered) setFrozenInsets(null);
+  }, [hovered]);
   /** Rendered height of an auto-height panel, so bottom docking hugs its real edge. */
   const [measuredHeight, setMeasuredHeight] = useState<number | null>(null);
   useLayoutEffect(() => {
@@ -88,11 +109,13 @@ export function FloatingPanel({
     }
   }, [storageKey]);
 
+  const layoutInsets = frozenInsets ?? liveInsets;
   const effective: PanelPlacement = autoHeight && measuredHeight
     ? { ...placement, rect: { ...placement.rect, height: Math.min(placement.rect.height, measuredHeight) } }
     : placement;
-  const laidOut = dragging ? clampRect(effective.rect, bounds, insets) : relayout(effective, bounds, insets);
-  const rect = autoHeight ? { ...laidOut, height: placement.rect.height } : laidOut;
+  const laidOut = dragging ? clampRect(effective.rect, bounds, liveInsets) : avoidObstacle(relayout(effective, bounds, layoutInsets), bounds, layoutInsets, bottomObstacle);
+  const sized = autoHeight ? { ...laidOut, height: placement.rect.height } : laidOut;
+  const rect = { x: Math.round(sized.x), y: Math.round(sized.y), width: Math.round(sized.width), height: Math.round(sized.height) };
 
   function begin(event: ReactPointerEvent<HTMLElement>, mode: "move" | "resize") {
     if (event.button !== 0) return;
@@ -111,9 +134,10 @@ export function FloatingPanel({
     const dy = event.clientY - state.startY;
     const next: PanelRect = state.mode === "move"
       ? { ...state.origin, x: state.origin.x + dx, y: state.origin.y + dy }
-      : { ...state.origin, width: Math.max(220, state.origin.width + dx), height: Math.max(160, state.origin.height + dy) };
+      : { ...state.origin, width: Math.max(MIN_PANEL_WIDTH, state.origin.width + dx), height: Math.max(MIN_PANEL_HEIGHT, state.origin.height + dy) };
     // Live magnetic preview while moving; resizing keeps the current dock.
-    setPlacement(state.mode === "move" ? snapRect(next, bounds, insets) : { ...placement, rect: next });
+    // Resizing drops the dock so the top-left stays put and the grip follows.
+    setPlacement(state.mode === "move" ? snapRect(next, bounds, insets) : { rect: next, dock: { horizontal: null, vertical: null } });
   }
 
   function end(event: ReactPointerEvent<HTMLElement>) {
@@ -121,7 +145,7 @@ export function FloatingPanel({
     (event.currentTarget as HTMLElement).releasePointerCapture?.(event.pointerId);
     const finalPlacement = drag.current.mode === "move"
       ? snapRect(placement.rect, bounds, insets)
-      : { ...placement, rect: clampRect(placement.rect, bounds, insets) };
+      : { rect: clampRect(placement.rect, bounds, insets), dock: { horizontal: null, vertical: null } };
     drag.current = null;
     setDragging(false);
     setPlacement(finalPlacement);
@@ -129,7 +153,7 @@ export function FloatingPanel({
   }
 
   function resetPosition() {
-    const next = defaultPlacement(defaultSize, bounds, insets);
+    const next = defaultPlacement(defaultSize, defaultCorner, bounds, insets);
     setPlacement(next);
     persist(next);
   }
@@ -159,6 +183,11 @@ export function FloatingPanel({
       className={`iv-float${className ? ` ${className}` : ""}`}
       data-docked={docked ? "true" : "false"}
       data-dragging={dragging ? "true" : "false"}
+      onPointerEnter={() => {
+        setHovered(true);
+        setFrozenInsets(liveInsets);
+      }}
+      onPointerLeave={() => setHovered(false)}
       ref={hostRef}
       role="dialog"
       aria-label={title}
@@ -185,17 +214,17 @@ export function FloatingPanel({
           </button>
         </header>
         <div className="iv-float-body">{children}</div>
-        {resizable ? (
-          <span
-            aria-hidden="true"
-            className="iv-float-resize"
-            onPointerCancel={end}
-            onPointerDown={(event) => begin(event, "resize")}
-            onPointerMove={move}
-            onPointerUp={end}
-          />
-        ) : null}
       </LiquidGlassSurface>
+      {resizable ? (
+        <span
+          aria-hidden="true"
+          className="iv-float-resize"
+          onPointerCancel={end}
+          onPointerDown={(event) => begin(event, "resize")}
+          onPointerMove={move}
+          onPointerUp={end}
+        />
+      ) : null}
     </div>
   );
 }

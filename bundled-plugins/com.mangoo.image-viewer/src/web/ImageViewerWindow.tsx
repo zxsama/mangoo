@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   AnchoredOverlay,
   LiquidGlassButton,
@@ -40,6 +40,7 @@ import { FloatingPanel } from "./FloatingPanel.tsx";
 import { FrameInspector } from "./FrameInspector.tsx";
 import { ShortcutEditor } from "./ShortcutEditor.tsx";
 import { useAnimationFrames } from "./useAnimationFrames.ts";
+import { useProximityChrome } from "./useProximityChrome.ts";
 import { ViewerSettingsForm } from "./ViewerSettings.tsx";
 import { Filmstrip } from "./Filmstrip.tsx";
 import { InfoPanel } from "./InfoPanel.tsx";
@@ -131,22 +132,6 @@ export function ImageViewerWindow() {
     const chord = bindings[action][0];
     return chord ? formatChord(chord) : undefined;
   }, [bindings]);
-  const [titlebarHover, setTitlebarHover] = useState(false);
-  // Reaching the top 24px reveals an auto-hidden titlebar. Measured from the
-  // pointer position, so no invisible element sits over the picture.
-  useEffect(() => {
-    const onMove = (event: PointerEvent) => {
-      if (event.clientY <= 24) setTitlebarHover(true);
-      else if (event.clientY > 56) setTitlebarHover(false);
-    };
-    const onLeave = () => setTitlebarHover(false);
-    window.addEventListener("pointermove", onMove, { passive: true });
-    document.documentElement.addEventListener("pointerleave", onLeave);
-    return () => {
-      window.removeEventListener("pointermove", onMove);
-      document.documentElement.removeEventListener("pointerleave", onLeave);
-    };
-  }, []);
   const [framesOpen, setFramesOpen] = useState(false);
   const cache = useMemo(() => new ViewerImageCache(), []);
 
@@ -185,11 +170,11 @@ export function ImageViewerWindow() {
   const isAnimated = Boolean(animation.state);
   // The user's choice to inspect frames sticks for the session: it hides on
   // still pictures and comes back on the next animated one.
-  const [framesWanted, setFramesWanted] = useState(false);
+  const [framesWanted, setFramesWanted] = useState<boolean | null>(null);
   useEffect(() => {
-    if (isAnimated) setFramesOpen(framesWanted || preferences.showFrames);
+    if (isAnimated) setFramesOpen(framesWanted ?? preferences.framesAutoOpen);
     else setFramesOpen(false);
-  }, [isAnimated, framesWanted, preferences.showFrames]);
+  }, [isAnimated, framesWanted, preferences.framesAutoOpen]);
   const toggleFrames = useCallback((next?: boolean) => {
     setFramesOpen((value) => {
       const open = next ?? !value;
@@ -208,6 +193,19 @@ export function ImageViewerWindow() {
     if (toastTimer.current) window.clearTimeout(toastTimer.current);
     toastTimer.current = window.setTimeout(() => setToast(null), action ? 6000 : 2400);
   }, []);
+
+  /** Step through the folder, telling the user when it wraps around. */
+  const navigate = useCallback((delta: number) => {
+    const count = state.entries.length;
+    if (count < 2) return;
+    const atEnd = state.index === count - 1 && delta > 0;
+    const atStart = state.index === 0 && delta < 0;
+    if (atEnd || atStart) {
+      if (preferences.loop) showToast(atEnd ? "已回到第一张" : "已跳到最后一张");
+      else showToast(atEnd ? "已是最后一张" : "已是第一张");
+    }
+    session.go(delta);
+  }, [preferences.loop, session, showToast, state.entries.length, state.index]);
 
   const flashHud = useCallback((message: string) => {
     setHud(message);
@@ -448,7 +446,11 @@ export function ImageViewerWindow() {
   }, [bridge, session, showToast]);
 
   const toggleFullscreen = useCallback(async () => {
-    if (bridge) setFullscreen(await bridge.toggleFullscreen());
+    if (!bridge) return;
+    const result = await bridge.toggleFullscreen();
+    // The leave/enter-full-screen event is authoritative; this only covers a
+    // missed event (e.g. the window was not yet ready).
+    window.setTimeout(() => setFullscreen((current) => (current === result ? current : result)), 400);
   }, [bridge]);
 
   const copyImage = useCallback(async () => {
@@ -560,21 +562,18 @@ export function ImageViewerWindow() {
         setSlideshow(false);
         return;
       }
-      session.go(1);
+      navigate(1);
     }, preferences.slideshowSeconds * 1000);
     return () => window.clearInterval(timer);
   }, [slideshow, preferences.slideshowSeconds, preferences.loop, session, state.index, state.entries.length]);
 
   const immersive = fullscreen || slideshow;
-  const [controlsIdle, setControlsIdle] = useState(false);
+  // Cursor auto-hide in fullscreen / slideshow only.
   const noteActivity = useCallback(() => {
     setChromeVisible(true);
-    setControlsIdle(false);
     if (hideChromeTimer.current) window.clearTimeout(hideChromeTimer.current);
-    hideChromeTimer.current = window.setTimeout(() => {
-      setControlsIdle(true);
-      if (immersive) setChromeVisible(false);
-    }, immersive ? 2200 : 2800);
+    if (!immersive) return;
+    hideChromeTimer.current = window.setTimeout(() => setChromeVisible(false), 2200);
   }, [immersive]);
 
   useEffect(() => {
@@ -584,6 +583,22 @@ export function ImageViewerWindow() {
   // ------------------------------------------------------------- keyboard
 
   const overlaysOpen = Boolean(dialog || zoomMenuOpen || contextMenu);
+  // Titlebar, toolbar and edge arrows share one reveal model: shown while the
+  // pointer is near them, hidden after a short grace delay once it leaves.
+  const chrome = useProximityChrome({
+    reach: { top: 28, bottom: 72, left: 96, right: 96 },
+    anchors: {
+      top: () => document.querySelector(".iv-titlebar"),
+      bottom: () => document.querySelector(".iv-toolbar"),
+      left: () => document.querySelector(".iv-nav-prev"),
+      right: () => document.querySelector(".iv-nav-next")
+    },
+    hysteresis: 28,
+    hideDelay: 450,
+    pinned: { top: preferences.titlebarPinned && !immersive },
+    hold: overlaysOpen,
+    blockers: { top: ".iv-float", bottom: ".iv-float" }
+  });
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (overlaysOpen || isEditableTarget(event.target)) return;
@@ -594,22 +609,22 @@ export function ImageViewerWindow() {
       const key = event.key;
       let handled = true;
       if (key === "Escape") {
-        if (framesOpen) toggleFrames(false);
-        else if (slideshow) setSlideshow(false);
+        if (slideshow) setSlideshow(false);
         else if (fullscreen) void toggleFullscreen();
+        else if (framesOpen) toggleFrames(false);
         else if (preferences.escapeCloses) window.close();
         else handled = false;
       } else if (key === "ArrowDown" && zoomedIn) pan(0, -60);
       else if (key === "ArrowUp" && zoomedIn) pan(0, 60);
-      else if (key === "ArrowDown" && !event.ctrlKey && !event.shiftKey && !event.altKey) session.go(1);
-      else if (key === "ArrowUp" && !event.ctrlKey && !event.shiftKey && !event.altKey) session.go(-1);
+      else if (key === "ArrowDown" && !event.ctrlKey && !event.shiftKey && !event.altKey) navigate(1);
+      else if (key === "ArrowUp" && !event.ctrlKey && !event.shiftKey && !event.altKey) navigate(-1);
       else {
         const action = matchAction(bindings, event);
         // Space plays/pauses an animation; elsewhere it advances like most viewers.
         const resolved: ShortcutActionId | "advance" | null = action === "playPause" && !isAnimated ? "advance" : action;
         switch (resolved) {
-          case "next": case "advance": session.go(1); break;
-          case "previous": session.go(-1); break;
+          case "next": case "advance": navigate(1); break;
+          case "previous": navigate(-1); break;
           case "first": session.goTo(0); break;
           case "last": session.goTo(state.entries.length - 1); break;
           case "zoomIn": zoomStep(1); break;
@@ -765,16 +780,43 @@ export function ImageViewerWindow() {
     { id: "shortcuts", label: "快捷键…", icon: <icons.Keyboard size={14} />, shortcut: keyOf("showShortcuts"), onSelect: () => openDialog({ kind: "settings", tab: "shortcuts" }) }
   ];
   const [menuSource, setMenuSource] = useState<"stage" | "more">("stage");
-  const filmstripShown = preferences.showFilmstrip && state.entries.length > 1 && !slideshow;
+  const filmstripShown = preferences.showFilmstrip && state.entries.length > 1 && !slideshow && !(fullscreen && !chromeVisible);
+  const chromeTopShown = chrome.shown("top");
   // Panels float over the whole window but never under the pinned titlebar
   // or the filmstrip, so their headers stay reachable.
   // An unpinned titlebar overlays the top edge: keep panels below it so its
   // controls are never covered when it slides in.
   const panelInsets = useMemo(() => ({
-    top: immersive ? 0 : TITLEBAR_HEIGHT,
-    // Filmstrip plus the floating toolbar (bottom 14px + 40px tall + gap).
-    bottom: (filmstripShown ? FILMSTRIP_HEIGHT : 0) + (hasImage ? TOOLBAR_CLEARANCE : 0)
-  }), [immersive, filmstripShown, hasImage]);
+    // Hidden titlebar: panels may hug the top edge. Pinned or revealed: they
+    // sit below it, so its controls are never covered.
+    top: !immersive && (preferences.titlebarPinned || chrome.shown("top")) ? TITLEBAR_HEIGHT : 0,
+    bottom: filmstripShown ? FILMSTRIP_HEIGHT : 0
+  }), [immersive, filmstripShown, preferences.titlebarPinned, chromeTopShown]);
+  // The centred toolbar is the only thing panels avoid at the bottom edge.
+  const [toolbarSpan, setToolbarSpan] = useState<{ left: number; right: number } | null>(null);
+  useLayoutEffect(() => {
+    const toolbar = document.querySelector(".iv-toolbar");
+    if (!toolbar) {
+      setToolbarSpan(null);
+      return;
+    }
+    const measure = () => {
+      const rect = toolbar.getBoundingClientRect();
+      setToolbarSpan((current) => (current && current.left === Math.round(rect.left) && current.right === Math.round(rect.right) ? current : { left: Math.round(rect.left), right: Math.round(rect.right) }));
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(toolbar);
+    window.addEventListener("resize", measure);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", measure);
+    };
+  }, [hasImage, isAnimated]);
+  const bottomObstacle = useMemo(
+    () => (hasImage && toolbarSpan ? { ...toolbarSpan, height: TOOLBAR_CLEARANCE } : null),
+    [hasImage, toolbarSpan]
+  );
   const [dockedSides, setDockedSides] = useState<Record<string, "left" | "right" | null>>({});
   const reportDock = useCallback((panel: string, side: "left" | "right" | null) => {
     setDockedSides((current) => (current[panel] === side ? current : { ...current, [panel]: side }));
@@ -789,12 +831,14 @@ export function ImageViewerWindow() {
       <div
         className="iv-window"
         data-chrome-visible={chromeVisible ? "true" : "false"}
-        data-controls-idle={controlsIdle && !overlaysOpen ? "true" : "false"}
+        data-toolbar={chrome.shown("bottom") ? "shown" : "hidden"}
+        data-nav-left={chrome.shown("left") ? "shown" : "hidden"}
+        data-nav-right={chrome.shown("right") ? "shown" : "hidden"}
         data-fullscreen={fullscreen ? "true" : "false"}
         data-immersive={immersive ? "true" : "false"}
         data-panel-left={leftDocked ? "true" : "false"}
         data-panel-right={rightDocked ? "true" : "false"}
-        data-titlebar={preferences.titlebarPinned && !immersive ? "pinned" : titlebarHover || overlaysOpen ? "revealed" : "hidden"}
+        data-titlebar={preferences.titlebarPinned && !immersive ? "pinned" : chrome.shown("top") ? "revealed" : "hidden"}
         onPointerMove={noteActivity}
       >
         <LiquidGlassSurface
@@ -859,12 +903,12 @@ export function ImageViewerWindow() {
                 setContextMenu({ x, y });
               }}
               onDropFiles={(files) => void dropFiles(files)}
-              onNavigate={(direction) => session.go(direction)}
+              onNavigate={navigate}
               onPan={pan}
               onPinch={zoomBy}
               onToggleActualSize={toggleActualSize}
               onViewportChange={setViewport}
-              onWheelNavigate={(direction) => session.go(direction)}
+              onWheelNavigate={navigate}
               onWheelZoom={zoomBy}
               overlay={stageOverlay}
               pixelated={pixelated}
@@ -877,22 +921,22 @@ export function ImageViewerWindow() {
 
             {state.entries.length > 1 ? (
               <>
-                <button aria-label="上一张" className="iv-nav-zone iv-nav-prev no-drag" data-pointer-glow="off" onClick={() => session.go(-1)} title="上一张（←）" type="button">
-                  <icons.ChevronLeft aria-hidden="true" size={22} />
+                <button aria-label="上一张" className="iv-nav-zone iv-nav-prev no-drag" data-pointer-glow="off" onClick={() => navigate(-1)} title="上一张（←）" type="button">
+                  <icons.ChevronLeft aria-hidden="true" size={40} weight="light" />
                 </button>
-                <button aria-label="下一张" className="iv-nav-zone iv-nav-next no-drag" data-pointer-glow="off" onClick={() => session.go(1)} title="下一张（→）" type="button">
-                  <icons.ChevronRight aria-hidden="true" size={22} />
+                <button aria-label="下一张" className="iv-nav-zone iv-nav-next no-drag" data-pointer-glow="off" onClick={() => navigate(1)} title="下一张（→）" type="button">
+                  <icons.ChevronRight aria-hidden="true" size={40} weight="light" />
                 </button>
               </>
             ) : null}
 
             {hasImage ? (
             <LiquidGlassSurface aria-label="看图工具栏" as="div" className="iv-toolbar" onPointerEnter={noteActivity} role="toolbar" tone="chrome">
-              <IconButton disabled={state.entries.length < 2} label="上一张" onClick={() => session.go(-1)} shortcut={keyOf("previous")}>
+              <IconButton disabled={state.entries.length < 2} label="上一张" onClick={() => navigate(-1)} shortcut={keyOf("previous")}>
                 <icons.ArrowLeft aria-hidden="true" size={15} />
               </IconButton>
               <span className="iv-toolbar-counter" aria-live="polite">{counter}</span>
-              <IconButton disabled={state.entries.length < 2} label="下一张" onClick={() => session.go(1)} shortcut={keyOf("next")}>
+              <IconButton disabled={state.entries.length < 2} label="下一张" onClick={() => navigate(1)} shortcut={keyOf("next")}>
                 <icons.ArrowRight aria-hidden="true" size={15} />
               </IconButton>
               <span className="iv-toolbar-divider" />
@@ -968,6 +1012,7 @@ export function ImageViewerWindow() {
           <FloatingPanel
             defaultSize={{ width: 300, height: 460 }}
             icon={<icons.Info aria-hidden="true" size={14} />}
+            bottomObstacle={bottomObstacle}
             id="info"
             onDockChange={(side) => reportDock("info", side)}
             insets={panelInsets}
@@ -980,9 +1025,11 @@ export function ImageViewerWindow() {
         {framesOpen && animation.state && !slideshow ? (
           <FloatingPanel
             className="iv-frames-panel"
-            defaultSize={{ width: 300, height: 300 }}
+            defaultSize={{ width: 260, height: 132 }}
             icon={<icons.FilmReel aria-hidden="true" size={14} />}
-            id="frames"
+            defaultCorner="bottom-left"
+            bottomObstacle={bottomObstacle}
+            id="frames-v2"
             onDockChange={(side) => reportDock("frames", side)}
             insets={panelInsets}
             onClose={() => toggleFrames(false)}
