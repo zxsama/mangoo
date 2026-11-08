@@ -26,7 +26,8 @@ export interface ViewerStageProps {
   wheelNavigates: boolean;
   /** Picture larger than the window: plain wheel pans instead of navigating. */
   zoomedIn?: boolean;
-  onPan(deltaX: number, deltaY: number): void;
+  /** `bounded`: wheel panning stops at the picture's edge; dragging is free. */
+  onPan(deltaX: number, deltaY: number, bounded?: boolean): void;
   onPinch(factor: number, anchor: { x: number; y: number }): void;
   onToggleActualSize(anchor: { x: number; y: number }): void;
   onNavigate(direction: 1 | -1): void;
@@ -48,6 +49,8 @@ export function ViewerStage(props: ViewerStageProps) {
   const pointers = useRef(new Map<number, { x: number; y: number }>());
   const pinchDistance = useRef<number | null>(null);
   const dragged = useRef(false);
+  /** Where the press started: a click (or double-click) never nudges the picture. */
+  const pressOrigin = useRef<{ x: number; y: number } | null>(null);
 
   // Measure the viewport.
   useLayoutEffect(() => {
@@ -99,7 +102,7 @@ export function ViewerStage(props: ViewerStageProps) {
       current.onActivity();
       const zoomGesture = event.ctrlKey || !current.wheelNavigates;
       if (!zoomGesture && current.zoomedIn) {
-        current.onPan(-event.deltaX, -event.deltaY);
+        current.onPan(-event.deltaX, -event.deltaY, true);
         return;
       }
       if (!zoomGesture) {
@@ -134,6 +137,7 @@ export function ViewerStage(props: ViewerStageProps) {
     event.currentTarget.setPointerCapture(event.pointerId);
     pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
     dragged.current = false;
+    pressOrigin.current = { x: event.clientX, y: event.clientY };
     if (pointers.current.size === 2) {
       const [a, b] = [...pointers.current.values()];
       pinchDistance.current = Math.hypot(a.x - b.x, a.y - b.y);
@@ -157,12 +161,17 @@ export function ViewerStage(props: ViewerStageProps) {
       dragged.current = true;
       return;
     }
+    if (!dragged.current) {
+      // Past a 3px threshold the drag starts, catching up the distance so far.
+      const origin = pressOrigin.current ?? previous;
+      if (Math.hypot(next.x - origin.x, next.y - origin.y) < 3) return;
+      dragged.current = true;
+      props.onPan(next.x - origin.x, next.y - origin.y);
+      return;
+    }
     const deltaX = next.x - previous.x;
     const deltaY = next.y - previous.y;
-    if (Math.abs(deltaX) + Math.abs(deltaY) > 0) {
-      if (Math.abs(deltaX) + Math.abs(deltaY) > 2) dragged.current = true;
-      props.onPan(deltaX, deltaY);
-    }
+    if (deltaX !== 0 || deltaY !== 0) props.onPan(deltaX, deltaY);
   }
 
   function handlePointerUp(event: ReactPointerEvent<HTMLDivElement>) {

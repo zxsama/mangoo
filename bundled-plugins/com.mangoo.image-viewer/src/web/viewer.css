@@ -355,7 +355,6 @@
   padding: 4px;
   border-radius: var(--radius-panel);
   box-shadow: var(--glass-shadow-tight);
-  backdrop-filter: blur(var(--glass-control-blur, 18px)) saturate(var(--glass-side-saturation, 1.4));
   transform: translateX(-50%);
   transition: opacity 260ms ease, transform 180ms ease;
 }
@@ -1869,29 +1868,6 @@ html:has(.iv-window) #root,
   -webkit-app-region: no-drag;
 }
 
-/* Edge-quality blur: the blur layer reaches 40px past each overlay and is
- * clipped by it, so pixels just outside an edge blur in naturally instead of
- * the blur stopping hard at the boundary (dark/bright fringes over the
- * picture's edge). */
-.iv-titlebar > .liquid-glass-backdrop,
-.iv-toolbar > .liquid-glass-backdrop,
-.iv-float-surface > .liquid-glass-backdrop,
-.iv-filmstrip-pane > .liquid-glass-backdrop {
-  inset: -40px;
-  border-radius: 0;
-}
-
-/* Full-width bars extend only along the picture, never into the area where
- * other overlays sit: the filmstrip's blur stops at its top edge (it used to
- * pick up the toolbar / a panel just above it — the dark band), and the
- * titlebar's at its bottom edge (panels below it). */
-.iv-filmstrip-pane > .liquid-glass-backdrop {
-  top: 0;
-}
-
-.iv-titlebar > .liquid-glass-backdrop {
-  bottom: 0;
-}
 
 /* Thin, stable surfaces: no shadow may land on the filmstrip. The toolbar's
  * and the panels' soft shadows used to paint (and be re-blurred) across its
@@ -2212,4 +2188,122 @@ html:has(.iv-settings-window) #root {
 
 .iv-settings-scroll .iv-settings-section-title > svg {
   color: var(--accent);
+}
+
+/* Round 5 ---------------------------------------------------------------- */
+
+/* Overlay glass over the picture (titlebar, toolbar, panels, notices).
+ *
+ * The stage is translucent (it lets the window's acrylic through), so what an
+ * overlay's backdrop-filter samples is half transparent next to the picture
+ * and opaque on it. Blurring that mix both darkened every overlay (measured
+ * on screen: a panel over the stage read 24 vs 55 for the filmstrip) and left
+ * a hard step where the picture's edge meets the background, because the
+ * blur averaged alpha, not colour.
+ *
+ * The fix fills the transparent part of the backdrop with an acrylic-like
+ * neutral BEFORE blurring (stacked zero-offset drop-shadows saturate alpha),
+ * so the blur sees continuous colour — a smooth ramp across the picture's
+ * edge — and the global side fill/blur (Settings > Appearance, the same
+ * tokens as the filmstrip) then tints it exactly like the filmstrip. */
+.iv-window,
+.iv-settings-window {
+  --iv-acrylic-base: rgb(118, 119, 120);
+  --iv-glass-prefill:
+    drop-shadow(0 0 0 var(--iv-acrylic-base)) drop-shadow(0 0 0 var(--iv-acrylic-base))
+    drop-shadow(0 0 0 var(--iv-acrylic-base)) drop-shadow(0 0 0 var(--iv-acrylic-base))
+    drop-shadow(0 0 0 var(--iv-acrylic-base)) drop-shadow(0 0 0 var(--iv-acrylic-base))
+    drop-shadow(0 0 0 var(--iv-acrylic-base)) drop-shadow(0 0 0 var(--iv-acrylic-base));
+}
+
+.iv-titlebar > .liquid-glass-backdrop,
+.iv-toolbar > .liquid-glass-backdrop,
+.iv-float-surface > .liquid-glass-backdrop {
+  -webkit-backdrop-filter: var(--iv-glass-prefill) blur(var(--glass-blur-current)) saturate(var(--glass-saturation));
+  backdrop-filter: var(--iv-glass-prefill) blur(var(--glass-blur-current)) saturate(var(--glass-saturation));
+}
+
+.iv-toast {
+  -webkit-backdrop-filter: var(--iv-glass-prefill) blur(var(--glass-side-blur)) saturate(1.35);
+  backdrop-filter: var(--iv-glass-prefill) blur(var(--glass-side-blur)) saturate(1.35);
+}
+
+/* Fading frosted glass. An ancestor with opacity < 1 becomes the backdrop
+ * root, so a bar fading via its own opacity showed its fill unblurred first
+ * and only "snapped" into blur at opacity 1 (the flash). The bars stay fully
+ * opaque themselves; their layers (blur layer included) fade together. */
+.iv-window:not([data-titlebar="pinned"]) .iv-titlebar,
+.iv-window[data-titlebar="hidden"] .iv-titlebar,
+.iv-window[data-titlebar="revealed"] .iv-titlebar,
+.iv-toolbar,
+.iv-window[data-toolbar="hidden"] .iv-toolbar {
+  opacity: 1;
+}
+
+.iv-titlebar > *,
+.iv-toolbar > * {
+  transition: opacity 200ms ease;
+}
+
+.iv-titlebar {
+  transition: border-color 200ms ease, box-shadow 200ms ease, transform 200ms ease;
+}
+
+.iv-toolbar {
+  transition: border-color 200ms ease, box-shadow 200ms ease, transform 180ms ease;
+}
+
+.iv-window[data-titlebar="hidden"] .iv-titlebar,
+.iv-window[data-toolbar="hidden"] .iv-toolbar {
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.iv-window[data-titlebar="hidden"] .iv-titlebar > *,
+.iv-window[data-toolbar="hidden"] .iv-toolbar > * {
+  opacity: 0;
+}
+
+.iv-window[data-chrome-visible="false"] .iv-titlebar,
+.iv-window[data-chrome-visible="false"] .iv-toolbar {
+  opacity: 1;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.iv-window[data-chrome-visible="false"] .iv-titlebar > *,
+.iv-window[data-chrome-visible="false"] .iv-toolbar > * {
+  opacity: 0;
+}
+
+.iv-filmstrip-pane > * {
+  transition: opacity 200ms ease;
+}
+
+.iv-window[data-chrome-visible="false"] .iv-filmstrip-pane {
+  opacity: 1;
+  border-color: transparent;
+}
+
+.iv-window[data-chrome-visible="false"] .iv-filmstrip-pane > * {
+  opacity: 0;
+}
+
+/* Notices fade in by moving, not by opacity on the blurred element. */
+.iv-toast {
+  animation: iv-toast-in 160ms ease both;
+}
+
+@keyframes iv-toast-in {
+  from {
+    transform: translate(-50%, -6px);
+  }
+  to {
+    transform: translate(-50%, 0);
+  }
+}
+
+/* Free panning: the grab cursor applies to any picture. */
+.iv-stage[data-has-image="true"] {
+  cursor: grab;
 }

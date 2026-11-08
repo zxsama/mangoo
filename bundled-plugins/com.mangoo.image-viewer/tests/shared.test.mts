@@ -15,6 +15,7 @@ import {
 } from "../src/shared/navigation.ts";
 import {
   clampPan,
+  softClampPan,
   cssTransform,
   fitScale,
   identityTransform,
@@ -121,4 +122,19 @@ test("animated headers are detected for GIF, animated WebP and AVIF sequences", 
   avif.set(bytes("avif"), 8);
   assert.equal(isAnimatedImageHeader(avif, ".avif"), false);
   assert.equal(isAnimatedImageHeader(bytes("GIF89a"), ".png"), false);
+});
+
+test("panning is free by hand; keyboard and wheel panning stop at the edge", () => {
+  const image = { width: 4000, height: 2000 };
+  const viewport = { width: 1000, height: 1000 };
+  const start = { ...identityTransform(), scale: 1, panX: 1400, panY: 0 };
+  // Zoom at a point does not clamp (a dragged-out picture stays where it is).
+  const zoomed = zoomAt({ ...identityTransform(), scale: 1, panX: 5000, panY: 0 }, 1, { x: 500, y: 500 }, image, viewport);
+  assert.equal(zoomed.panX, 5000);
+  // Soft limit: stop at the edge (1500) ...
+  assert.equal(softClampPan(start, { ...start, panX: 1700 }, image, viewport).panX, 1500);
+  // ... but never pull back a picture already beyond it, and allow moving inwards.
+  const outside = { ...start, panX: 3000 };
+  assert.equal(softClampPan(outside, { ...outside, panX: 3100 }, image, viewport).panX, 3000);
+  assert.equal(softClampPan(outside, { ...outside, panX: 2900 }, image, viewport).panX, 2900);
 });

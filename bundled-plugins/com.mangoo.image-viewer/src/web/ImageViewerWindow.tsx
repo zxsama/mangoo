@@ -26,11 +26,11 @@ import { extensionOf, splitPath } from "../shared/formats.ts";
 import { formatBytes, prefetchOrder, validateFileName } from "../shared/navigation.ts";
 import { formatChord, matchAction, resolveBindings, type ShortcutActionId } from "../shared/shortcuts.ts";
 import {
-  clampPan,
   fitScale,
   formatZoom,
   identityTransform,
   nextZoomStop,
+  softClampPan,
   renderLevel,
   rotate,
   zoomAt,
@@ -196,10 +196,25 @@ export function ImageViewerWindow() {
     toastTimer.current = window.setTimeout(() => setToast(null), duration ?? (action ? 6000 : 2400));
   }, []);
 
+  // The next picture is shown only once the current one has appeared, so fast
+  // key repeat / wheel can never skip pictures that never loaded. A press made
+  // while loading is remembered (one step) and runs as soon as the picture is
+  // up; a load that hangs (offline NAS) stops gating after a short grace.
+  const imageLoadingRef = useRef(false);
+  imageLoadingRef.current = imageLoading;
+  const loadStartedAt = useRef(0);
+  const pendingStep = useRef<number | null>(null);
+  const navigationBlocked = () => imageLoadingRef.current && performance.now() - loadStartedAt.current < 1500;
+
   /** Step through the folder, telling the user when it wraps around. */
   const navigate = useCallback((delta: number) => {
     const count = state.entries.length;
     if (count < 2) return;
+    if (navigationBlocked()) {
+      pendingStep.current = delta;
+      return;
+    }
+    pendingStep.current = null;
     const atEnd = state.index === count - 1 && delta > 0;
     const atStart = state.index === 0 && delta < 0;
     if (atEnd || atStart) {
@@ -208,6 +223,25 @@ export function ImageViewerWindow() {
     }
     session.go(delta);
   }, [preferences.loop, session, showToast, state.entries.length, state.index]);
+
+  // Run the remembered step once the picture has appeared.
+  useEffect(() => {
+    if (imageLoading || pendingStep.current === null) return;
+    const delta = pendingStep.current;
+    pendingStep.current = null;
+    navigate(delta);
+  }, [imageLoading, navigate]);
+  // ... or once a hung load stops gating.
+  useEffect(() => {
+    if (!imageLoading) return;
+    const timer = window.setTimeout(() => {
+      if (pendingStep.current === null) return;
+      const delta = pendingStep.current;
+      pendingStep.current = null;
+      navigate(delta);
+    }, 1550);
+    return () => window.clearTimeout(timer);
+  }, [imageLoading, navigate]);
 
   /** Short readouts (zoom level, rotation) use the same notice, briefly. */
   const flashHud = useCallback((message: string) => showToast(message, undefined, 1100), [showToast]);
@@ -289,6 +323,8 @@ export function ImageViewerWindow() {
       setImage(cached);
       setImageLoading(false);
     } else {
+      // Stamped per picture: a hung picture's grace never carries over.
+      loadStartedAt.current = performance.now();
       setImageLoading(true);
     }
     const viewportLongPx = viewerViewportLongPx();
@@ -324,12 +360,15 @@ export function ImageViewerWindow() {
 
   // Reset the view for a new picture (unless the user asked to keep it).
   const imageKey = image?.key.split("\u0000")[0] ?? null;
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!imageKey) return;
     setAnimate("none");
     if (!preferences.keepTransform) {
       setZoomState(preferences.fitMode);
       setTransform((value) => ({ ...identityTransform(), scale: value.scale }));
+    } else {
+      // Keep zoom, rotation and flips; recentre so the next picture is in view.
+      setTransform((value) => ({ ...value, panX: 0, panY: 0 }));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [imageKey]);
@@ -432,10 +471,15 @@ export function ImageViewerWindow() {
     setTransform((value) => (axis === "x" ? { ...value, flipX: !value.flipX } : { ...value, flipY: !value.flipY }));
   }, [withAnimation]);
 
-  const pan = useCallback((deltaX: number, deltaY: number) => {
+  const pan = useCallback((deltaX: number, deltaY: number, bounded = false) => {
     if (!imageSize) return;
     stopAnimation();
-    const next = clampPan({ ...transformRef.current, panX: transformRef.current.panX + deltaX, panY: transformRef.current.panY + deltaY }, imageSize, viewport);
+    const current = transformRef.current;
+    const moved = { ...current, panX: current.panX + deltaX, panY: current.panY + deltaY };
+    const next = bounded ? softClampPan(current, moved, imageSize, viewport) : moved;
+    if (next.panX === current.panX && next.panY === current.panY) return;
+    // A hand-placed picture keeps its place: window resizes no longer refit it.
+    if (!bounded) setZoomState("custom");
     transformRef.current = next;
     setTransform(next);
   }, [imageSize, stopAnimation, viewport]);
@@ -575,19 +619,22 @@ export function ImageViewerWindow() {
 
   // -------------------------------------------------------- slideshow, chrome
 
+  // Each picture stays up for the full interval counted from when it appeared
+  // (a slow picture never eats into its own time).
   useEffect(() => {
-    if (!slideshow) return;
+    if (!slideshow || imageLoading) return;
     setSlideshowTick((value) => value + 1);
-    const timer = window.setInterval(() => {
-      setSlideshowTick((value) => value + 1);
+    const timer = window.setTimeout(() => {
       if (!preferences.loop && state.index >= state.entries.length - 1) {
         setSlideshow(false);
         return;
       }
       navigate(1);
     }, preferences.slideshowSeconds * 1000);
-    return () => window.clearInterval(timer);
-  }, [slideshow, preferences.slideshowSeconds, preferences.loop, session, state.index, state.entries.length]);
+    return () => window.clearTimeout(timer);
+    // navigate is re-created per index; the picture (state.index) drives this.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slideshow, imageLoading, preferences.slideshowSeconds, preferences.loop, state.index, state.entries.length]);
 
   const immersive = fullscreen || slideshow;
   // Cursor auto-hide in fullscreen / slideshow only.
@@ -636,8 +683,8 @@ export function ImageViewerWindow() {
         else if (framesOpen) toggleFrames(false);
         else if (preferences.escapeCloses) window.close();
         else handled = false;
-      } else if (key === "ArrowDown" && zoomedIn) pan(0, -60);
-      else if (key === "ArrowUp" && zoomedIn) pan(0, 60);
+      } else if (key === "ArrowDown" && zoomedIn) pan(0, -60, true);
+      else if (key === "ArrowUp" && zoomedIn) pan(0, 60, true);
       else if (key === "ArrowDown" && !event.ctrlKey && !event.shiftKey && !event.altKey) navigate(1);
       else if (key === "ArrowUp" && !event.ctrlKey && !event.shiftKey && !event.altKey) navigate(-1);
       else {
@@ -797,8 +844,7 @@ export function ImageViewerWindow() {
     { id: "on-top", label: "窗口置顶", icon: <icons.StackTop size={14} />, checked: alwaysOnTop, onSelect: () => void toggleAlwaysOnTop() },
     { id: "main", label: "打开 Mangoo 资料库", icon: <icons.Library size={14} />, disabled: !bridge, onSelect: () => void bridge?.openMainWindow() },
     { id: "s2", separator: true },
-    { id: "settings", label: "看图设置…", icon: <icons.Settings size={14} />, disabled: !bridge, onSelect: () => openSettings("display") },
-    { id: "shortcuts", label: "快捷键…", icon: <icons.Keyboard size={14} />, shortcut: keyOf("showShortcuts"), disabled: !bridge, onSelect: () => openSettings("shortcuts") }
+    { id: "settings", label: "看图设置…", icon: <icons.Settings size={14} />, disabled: !bridge, onSelect: () => openSettings("display") }
   ];
   const [menuSource, setMenuSource] = useState<"stage" | "more">("stage");
   const windowControls = getWindowControls();
@@ -835,13 +881,14 @@ export function ImageViewerWindow() {
     if (drag.started) void windowControls?.endDrag();
   };
   const filmstripShown = preferences.showFilmstrip && state.entries.length > 1 && !slideshow && !(fullscreen && !chromeVisible);
-  // Panels float over the window but always below the titlebar's row (pinned
-  // or auto-hiding alike), so they never jump as it reveals and never cover
-  // its controls; and never over the filmstrip.
+  // Panels float over the window and step down below the titlebar while it is
+  // shown (pinned or revealed), so its controls are never covered; a panel
+  // under the pointer stays put until the pointer leaves it (FloatingPanel).
+  const chromeTopShown = chrome.shown("top");
   const panelInsets = useMemo(() => ({
-    top: immersive ? 0 : TITLEBAR_HEIGHT,
+    top: !immersive && (preferences.titlebarPinned || chromeTopShown) ? TITLEBAR_HEIGHT : 0,
     bottom: filmstripShown ? FILMSTRIP_HEIGHT : 0
-  }), [immersive, filmstripShown]);
+  }), [immersive, filmstripShown, preferences.titlebarPinned, chromeTopShown]);
   // The centred toolbar is the only thing panels avoid at the bottom edge.
   const [toolbarSpan, setToolbarSpan] = useState<{ left: number; right: number } | null>(null);
   useLayoutEffect(() => {
@@ -962,7 +1009,7 @@ export function ImageViewerWindow() {
               }}
               onDropFiles={(files) => void dropFiles(files)}
               onNavigate={navigate}
-              onPan={pan}
+              onPan={(dx, dy, bounded) => pan(dx, dy, bounded)}
               onPinch={(factor, anchor) => zoomBy(factor, anchor, "touch")}
               onToggleActualSize={toggleActualSize}
               onViewportChange={setViewport}

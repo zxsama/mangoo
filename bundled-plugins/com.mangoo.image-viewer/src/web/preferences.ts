@@ -44,7 +44,7 @@ export const DEFAULT_VIEWER_PREFERENCES: ViewerPreferences = {
   escapeCloses: true,
   showFilmstrip: true,
   showInfo: false,
-  keepTransform: false,
+  keepTransform: true,
   titlebarPinned: false,
   framesAutoOpen: true,
   shortcuts: {}
@@ -52,9 +52,13 @@ export const DEFAULT_VIEWER_PREFERENCES: ViewerPreferences = {
 
 export const SLIDESHOW_INTERVALS = [2, 3, 4, 6, 10, 20];
 
-// v2: wheel default changed to navigate; v1 values migrate below.
-const STORAGE_KEY = "mangoo.imageViewer.preferences.v2";
-const LEGACY_STORAGE_KEY = "mangoo.imageViewer.preferences.v1";
+// v3: keep zoom/rotation by default. v2: wheel default changed to navigate.
+// Older values migrate below, minus the settings whose default changed.
+const STORAGE_KEY = "mangoo.imageViewer.preferences.v3";
+const LEGACY_STORAGE_KEYS: Array<[key: string, dropped: string[]]> = [
+  ["mangoo.imageViewer.preferences.v2", ["keepTransform"]],
+  ["mangoo.imageViewer.preferences.v1", ["keepTransform", "wheelAction"]]
+];
 
 function oneOf<T extends string>(value: unknown, options: readonly T[], fallback: T): T {
   return typeof value === "string" && (options as readonly string[]).includes(value) ? (value as T) : fallback;
@@ -90,10 +94,14 @@ function readPreferences(): ViewerPreferences {
   try {
     const stored = window.localStorage.getItem(STORAGE_KEY);
     if (stored === null) {
-      // Carry v1 choices over, except the wheel, whose default changed.
-      const legacy = JSON.parse(window.localStorage.getItem(LEGACY_STORAGE_KEY) ?? "{}") as Record<string, unknown>;
-      delete legacy.wheelAction;
-      return normalizeViewerPreferences(legacy);
+      for (const [key, dropped] of LEGACY_STORAGE_KEYS) {
+        const raw = window.localStorage.getItem(key);
+        if (raw === null) continue;
+        const legacy = JSON.parse(raw) as Record<string, unknown>;
+        for (const name of dropped) delete legacy[name];
+        return normalizeViewerPreferences(legacy);
+      }
+      return DEFAULT_VIEWER_PREFERENCES;
     }
     return normalizeViewerPreferences(JSON.parse(stored));
   } catch {

@@ -98,6 +98,20 @@ export function clampPan(transform: ViewTransform, image: Size, viewport: Size):
 }
 
 /**
+ * Keyboard / wheel panning stops at the picture's edge, but never pulls back
+ * a picture the user dragged further out by hand: each axis may move freely
+ * toward the centre and only up to the edge limit away from it.
+ */
+export function softClampPan(current: ViewTransform, next: ViewTransform, image: Size, viewport: Size): ViewTransform {
+  const box = rotatedSize(image, next.rotation);
+  const limitX = Math.max(0, (box.width * next.scale - viewport.width) / 2);
+  const limitY = Math.max(0, (box.height * next.scale - viewport.height) / 2);
+  const axis = (value: number, previous: number, limit: number) =>
+    Math.min(Math.max(limit, previous), Math.max(Math.min(-limit, previous), value));
+  return { ...next, panX: axis(next.panX, current.panX, limitX), panY: axis(next.panY, current.panY, limitY) };
+}
+
+/**
  * Zoom to `nextScale` keeping the image point under `anchor` (viewport CSS
  * px, origin top-left) fixed on screen — zoom-at-cursor.
  */
@@ -118,7 +132,11 @@ export function zoomAt(
     panX: offsetX - (offsetX - transform.panX) * ratio,
     panY: offsetY - (offsetY - transform.panY) * ratio
   };
-  return clampPan(next, image, viewport);
+  // Panning is free (the user may drag the picture anywhere), so zooming
+  // keeps the point under the cursor exactly, with no clamping.
+  void image;
+  void viewport;
+  return next;
 }
 
 export function nextZoomStop(scale: number, direction: 1 | -1): number {
