@@ -188,3 +188,17 @@ test("preload exposes exactly the plugin's viewer channels", () => {
   const known = new Set(Object.values(IMAGE_VIEWER_CHANNELS) as string[]);
   for (const channel of used) assert.ok(known.has(channel), `preload uses unknown channel ${channel}`);
 });
+
+test("the settings window bridge exposes only association channels and section pushes", () => {
+  const preload = fs.readFileSync(new URL("../../../apps/desktop/src/preload.cjs", import.meta.url), "utf8");
+  const start = preload.indexOf("const imageViewerSettingsWindowBridge = {");
+  assert.ok(start >= 0, "settings window bridge exists");
+  const body = preload.slice(start, preload.indexOf("\n};", start));
+  const used = new Set([...body.matchAll(/"(mangoo:image-viewer:[a-z-]+)"/g)].map((match) => match[1]));
+  assert.deepEqual([...used].sort(), [
+    IMAGE_VIEWER_CHANNELS.associationStatus,
+    IMAGE_VIEWER_CHANNELS.openDefaultAppsSettings,
+    IMAGE_VIEWER_CHANNELS.setAssociation,
+    IMAGE_VIEWER_CHANNELS.settingsSection
+  ].sort());
+});

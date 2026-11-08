@@ -67,7 +67,20 @@ export function Filmstrip({
       element.scrollLeft += event.deltaY;
     };
     element.addEventListener("wheel", onWheel, { passive: false });
-    return () => element.removeEventListener("wheel", onWheel);
+    // The Host overlay scrollbar appears on scroll activity; pointer movement
+    // over the strip counts as activity, so it comes back every time.
+    let last = 0;
+    const onPointerMove = () => {
+      const now = performance.now();
+      if (now - last < 100 || element.scrollWidth <= element.clientWidth + 1) return;
+      last = now;
+      element.dispatchEvent(new Event("scroll"));
+    };
+    element.addEventListener("pointermove", onPointerMove, { passive: true });
+    return () => {
+      element.removeEventListener("wheel", onWheel);
+      element.removeEventListener("pointermove", onPointerMove);
+    };
   }, []);
 
   return (

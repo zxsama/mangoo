@@ -115,8 +115,8 @@ export function ShortcutEditor({
         const actions = SHORTCUT_ACTIONS.filter((action) => action.group === group && (!normalizedQuery || action.label.toLowerCase().includes(normalizedQuery)));
         if (actions.length === 0) return null;
         return (
-          <section className="iv-settings-section" key={group}>
-            <h3 className="iv-settings-section-title"><span>{group}</span></h3>
+          <section className="iv-shortcut-group-block" key={group}>
+            <h4 className="iv-shortcut-group-heading">{group}</h4>
             <div className="iv-settings-rows">
               {actions.map((action) => {
                 const chords = bindings[action.id];

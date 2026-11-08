@@ -131,7 +131,7 @@ function snapshotAndSubscribeLogs(query, cb) {
 
 const visualHarnessEnabled = readArg("--mangoo-visual-harness=") === "1";
 const requestedWindowRole = readArg("--mangoo-window=");
-const windowRole = ["main", "settings", "plugins", "notifications", "image-viewer"].includes(requestedWindowRole)
+const windowRole = ["main", "settings", "plugins", "notifications", "image-viewer", "image-viewer-settings"].includes(requestedWindowRole)
   ? requestedWindowRole
   : "unknown";
 const windowControls = {
@@ -205,7 +205,17 @@ const imageViewerBridge = {
   toggleFullscreen: () => ipcRenderer.invoke("mangoo:image-viewer:toggle-fullscreen"),
   onFullscreenChanged: (cb) => subscribe("mangoo:image-viewer:fullscreen-changed", cb),
   setAlwaysOnTop: (value) => ipcRenderer.invoke("mangoo:image-viewer:set-always-on-top", value === true),
-  openMainWindow: () => ipcRenderer.invoke("mangoo:image-viewer:open-main-window")
+  openMainWindow: () => ipcRenderer.invoke("mangoo:image-viewer:open-main-window"),
+  openSettings: (section) => ipcRenderer.invoke("mangoo:image-viewer:open-settings", typeof section === "string" ? section : "display")
+};
+const imageViewerSettingsWindowBridge = {
+  ...commonWindowBridge,
+  imageViewerSettings: {
+    associationStatus: () => ipcRenderer.invoke("mangoo:image-viewer:association-status"),
+    setAssociation: (enabled) => ipcRenderer.invoke("mangoo:image-viewer:set-association", enabled === true),
+    openDefaultAppsSettings: () => ipcRenderer.invoke("mangoo:image-viewer:open-default-apps-settings"),
+    onSettingsSection: (cb) => subscribe("mangoo:image-viewer:settings-section", cb)
+  }
 };
 const imageViewerWindowBridge = {
   ...commonWindowBridge,
@@ -268,6 +278,8 @@ const roleBridge = windowRole === "notifications"
   ? notificationWindowBridge
   : windowRole === "image-viewer"
     ? imageViewerWindowBridge
+  : windowRole === "image-viewer-settings"
+    ? imageViewerSettingsWindowBridge
   : ["main", "settings", "plugins"].includes(windowRole)
     ? fullBridge
     : { windowRole };

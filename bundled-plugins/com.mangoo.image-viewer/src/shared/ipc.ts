@@ -10,6 +10,12 @@ export const IMAGE_VIEWER_CAPABILITY = "image-viewer.v1";
 export const IMAGE_VIEWER_WINDOW_ROLE = "image-viewer";
 /** Hash route the shared web bundle renders for the viewer window. */
 export const IMAGE_VIEWER_ROUTE = "#/image-viewer";
+/** The viewer's standalone settings window. */
+export const IMAGE_VIEWER_SETTINGS_WINDOW_ROLE = "image-viewer-settings";
+export const IMAGE_VIEWER_SETTINGS_ROUTE = "#/image-viewer-settings";
+/** Sections of the settings window, in display order. */
+export const IMAGE_VIEWER_SETTINGS_SECTIONS = ["display", "browse", "window", "actions", "shortcuts", "system"] as const;
+export type ImageViewerSettingsSection = (typeof IMAGE_VIEWER_SETTINGS_SECTIONS)[number];
 
 export const IMAGE_VIEWER_CHANNELS = {
   /** viewer -> main (invoke): renderer painted; returns the pending open request. */
@@ -49,7 +55,11 @@ export const IMAGE_VIEWER_CHANNELS = {
   /** viewer / plugins / settings -> main (invoke): OS default-apps settings. */
   openDefaultAppsSettings: "mangoo:image-viewer:open-default-apps-settings",
   /** main / plugins -> main (invoke): open files in the viewer (Library "open with"). */
-  openFiles: "mangoo:image-viewer:open-files"
+  openFiles: "mangoo:image-viewer:open-files",
+  /** viewer -> main (invoke): open (or focus) the settings window at a section. */
+  openSettings: "mangoo:image-viewer:open-settings",
+  /** main -> settings (send): scroll to a section (window was already open). */
+  settingsSection: "mangoo:image-viewer:settings-section"
 } as const;
 
 /** Channels a privileged Host window (main, settings, plugins) may also use. */
@@ -114,6 +124,15 @@ export interface ImageViewerDesktopBridge {
   associationStatus(): Promise<ImageViewerAssociationStatus>;
   setAssociation(enabled: boolean): Promise<ImageViewerAssociationStatus>;
   openDefaultAppsSettings(): Promise<boolean>;
+  openSettings(section?: ImageViewerSettingsSection): Promise<boolean>;
+}
+
+/** Bridge of the standalone settings window. */
+export interface ImageViewerSettingsBridge {
+  associationStatus(): Promise<ImageViewerAssociationStatus>;
+  setAssociation(enabled: boolean): Promise<ImageViewerAssociationStatus>;
+  openDefaultAppsSettings(): Promise<boolean>;
+  onSettingsSection(callback: (section: ImageViewerSettingsSection) => void): () => void;
 }
 
 /** Bridge exposed to privileged Host windows (plugin manager, Library). */

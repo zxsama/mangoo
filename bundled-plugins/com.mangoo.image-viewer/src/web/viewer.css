@@ -53,7 +53,6 @@
   border: 0;
   border-bottom: 1px solid var(--line);
   border-radius: 0;
-  -webkit-app-region: drag;
   transition: opacity 180ms ease, transform 180ms ease;
 }
 
@@ -194,8 +193,19 @@
   pointer-events: none;
 }
 
-.iv-image-layer[data-animate="true"] {
-  transition: transform 180ms cubic-bezier(0.2, 0.7, 0.2, 1);
+/* Every zoom is interpolated. Buttons/keys ease over 200ms; wheel notches
+ * glide (a new notch mid-flight retargets the running transition); trackpad
+ * pinches follow closely with a short smoothing. */
+.iv-image-layer[data-animate="ease"] {
+  transition: transform 200ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+.iv-image-layer[data-animate="wheel"] {
+  transition: transform 170ms cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+.iv-image-layer[data-animate="pinch"] {
+  transition: transform 90ms linear;
 }
 
 .iv-canvas,
@@ -518,7 +528,7 @@
   height: 100%;
   overflow-x: auto;
   overflow-y: hidden;
-  scrollbar-width: thin;
+  scrollbar-width: none;
 }
 
 .iv-filmstrip-track {
@@ -609,14 +619,6 @@
  * titled sections, a row per decision (title + short explanation on the left,
  * the control on the right), and controls matched to the decision. */
 
-.iv-settings-dialog > .overlay-dialog-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  padding: 12px 18px 14px;
-  border-top: 1px solid var(--glass-center-stroke);
-}
-
 /* Rows whose control is wide stack the control under the text. */
 .iv-setting-row[data-layout="stacked"] {
   grid-template-columns: minmax(0, 1fr);
@@ -625,15 +627,6 @@
 
 .iv-setting-row[data-layout="stacked"] .iv-setting-control {
   justify-content: flex-start;
-}
-
-.iv-settings-dialog.file-operation-dialog .overlay-dialog-body.iv-settings-body {
-  display: block;
-  grid-template-rows: none;
-  max-height: min(64vh, 560px);
-  overflow-x: hidden;
-  overflow-y: auto;
-  overscroll-behavior: contain;
 }
 
 .iv-settings-form {
@@ -779,78 +772,6 @@
 .iv-direction-button:focus-visible {
   border-color: var(--interactive-focus);
   outline: none;
-}
-
-/* Background swatches: show the colour, not just its name. */
-.iv-background-swatches {
-  display: inline-flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 6px;
-}
-
-.iv-swatch {
-  display: grid;
-  justify-items: center;
-  gap: 4px;
-  width: 54px;
-  padding: 4px 0 3px;
-  color: var(--text-muted);
-  font: inherit;
-  font-size: var(--iv-text-caption);
-  border: 1px solid transparent;
-  border-radius: var(--radius-control);
-  background: transparent;
-  cursor: pointer;
-}
-
-.iv-swatch:hover {
-  color: var(--text-primary);
-  background: rgba(142, 199, 208, 0.08);
-}
-
-.iv-swatch[data-selected="true"] {
-  color: var(--text-primary);
-  border-color: var(--interactive-focus);
-}
-
-.iv-swatch:focus-visible {
-  border-color: var(--interactive-focus);
-  outline: none;
-}
-
-.iv-swatch-chip {
-  width: 30px;
-  height: 20px;
-  border-radius: 4px;
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.16);
-}
-
-.iv-swatch[data-background="interface"] .iv-swatch-chip {
-  background: var(--glass-center-fill-strong, rgba(8, 12, 16, 0.5));
-}
-
-.iv-swatch[data-background="dark"] .iv-swatch-chip {
-  background: #15181b;
-}
-
-.iv-swatch[data-background="black"] .iv-swatch-chip {
-  background: #000;
-}
-
-.iv-swatch[data-background="light"] .iv-swatch-chip {
-  background: #e9ecef;
-}
-
-.iv-swatch[data-background="checker"] .iv-swatch-chip {
-  background-color: #2a2d31;
-  background-image:
-    linear-gradient(45deg, #4a4e53 25%, transparent 25%),
-    linear-gradient(-45deg, #4a4e53 25%, transparent 25%),
-    linear-gradient(45deg, transparent 75%, #4a4e53 75%),
-    linear-gradient(-45deg, transparent 75%, #4a4e53 75%);
-  background-position: 0 0, 0 5px, 5px -5px, -5px 0;
-  background-size: 10px 10px;
 }
 
 /* System association */
@@ -1059,24 +980,6 @@
 }
 
 /* ------------------------------------------------- feedback while viewing */
-
-/* Centred zoom / rotation readout. */
-.iv-hud {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  z-index: 3;
-  padding: 6px 14px;
-  color: var(--text-primary);
-  font-size: var(--iv-text-title);
-  font-weight: 650;
-  font-variant-numeric: tabular-nums;
-  border-radius: var(--radius-pill);
-  background: rgba(8, 12, 16, 0.66);
-  transform: translate(-50%, -50%);
-  pointer-events: none;
-  animation: iv-fade-in 100ms ease both;
-}
 
 /* Slideshow: a thin progress line instead of a text badge. */
 .iv-slideshow-progress {
@@ -1437,58 +1340,6 @@
 
 /* -------------------------------------------------- settings tabs & keys */
 
-.iv-settings-header {
-  display: flex !important;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-}
-
-.iv-tabs {
-  display: inline-flex;
-  gap: 2px;
-  padding: 2px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-control);
-  background: rgba(0, 0, 0, 0.18);
-}
-
-.iv-tab {
-  min-width: 72px;
-  height: 28px;
-  padding: 0 14px;
-  color: var(--text-muted);
-  font: inherit;
-  font-size: var(--iv-text-body);
-  border: 0;
-  border-radius: calc(var(--radius-control) - 2px);
-  background: transparent;
-  cursor: pointer;
-}
-
-.iv-tab:hover {
-  color: var(--text-primary);
-}
-
-.iv-tab[aria-selected="true"] {
-  color: var(--text-primary);
-  background: rgba(142, 199, 208, 0.2);
-}
-
-.iv-tab:focus-visible {
-  outline: 1px solid var(--interactive-focus);
-}
-
-.iv-settings-dialog > .overlay-dialog-actions {
-  align-items: center;
-}
-
-.iv-settings-footnote {
-  flex: 1 1 auto;
-  color: var(--text-muted);
-  font-size: var(--iv-text-body);
-}
-
 .iv-shortcut-editor {
   display: grid;
   gap: 14px;
@@ -1690,7 +1541,7 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .iv-image-layer[data-animate="true"],
+  .iv-image-layer:not([data-animate="none"]),
   .iv-titlebar,
   .iv-toolbar,
   .iv-nav-zone {
@@ -1840,19 +1691,14 @@
   --glass-saturation: 1.35;
 }
 
-.liquid-glass.iv-titlebar {
-  --glass-fill: rgba(10, 14, 18, 0.46);
-  --glass-blur-current: 24px;
-}
-
-.liquid-glass.iv-toolbar {
-  --glass-fill: rgba(10, 14, 18, 0.52);
-  --glass-blur-current: 20px;
-}
-
-.liquid-glass.iv-float-surface {
-  --glass-fill: rgba(12, 16, 20, 0.58);
-  --glass-blur-current: 28px;
+/* One material for every overlay, the filmstrip's: the interface side fill
+ * and blur, so titlebar, toolbar, panels and filmstrip read as one family. */
+.liquid-glass.iv-titlebar,
+.liquid-glass.iv-toolbar,
+.liquid-glass.iv-float-surface,
+.liquid-glass.iv-filmstrip-pane {
+  --glass-fill: var(--glass-side-fill);
+  --glass-blur-current: var(--glass-side-blur);
 }
 
 /* Round 3 ---------------------------------------------------------------- */
@@ -1966,8 +1812,7 @@ html:has(.iv-window) #root,
 }
 
 /* Toasts and the HUD always sit above floating panels. */
-.iv-toast,
-.iv-hud {
+.iv-toast {
   z-index: 9;
 }
 
@@ -1994,10 +1839,6 @@ html:has(.iv-window) #root,
   margin: 0 5px 0 1px;
 }
 
-.liquid-glass.iv-settings-dialog {
-  --glass-fill: rgba(14, 18, 22, 0.86);
-}
-
 .iv-menu .overlay-menu-item:focus,
 .iv-menu .overlay-menu-item:focus-visible {
   outline: none;
@@ -2012,4 +1853,363 @@ html:has(.iv-window) #root,
  * panelInsets), so window controls and panel headers never overlap. */
 .iv-float:not([data-dragging="true"]) {
   transition: top 200ms ease;
+}
+
+/* Round 4 ---------------------------------------------------------------- */
+
+/* Pinned titlebar: a native drag region (keeps Aero Snap). Auto-hiding: the
+ * titlebar drags the window from pointer events instead, because an OS drag
+ * region swallows them — the reveal logic then saw the pointer "leave" while
+ * it rested on the bar (it hid) and re-enter on every move (it flickered). */
+.iv-window[data-titlebar="pinned"] .iv-titlebar {
+  -webkit-app-region: drag;
+}
+
+.iv-window[data-titlebar="pinned"] .iv-title-actions {
+  -webkit-app-region: no-drag;
+}
+
+/* Edge-quality blur: the blur layer reaches 40px past each overlay and is
+ * clipped by it, so pixels just outside an edge blur in naturally instead of
+ * the blur stopping hard at the boundary (dark/bright fringes over the
+ * picture's edge). */
+.iv-titlebar > .liquid-glass-backdrop,
+.iv-toolbar > .liquid-glass-backdrop,
+.iv-float-surface > .liquid-glass-backdrop,
+.iv-filmstrip-pane > .liquid-glass-backdrop {
+  inset: -40px;
+  border-radius: 0;
+}
+
+/* Full-width bars extend only along the picture, never into the area where
+ * other overlays sit: the filmstrip's blur stops at its top edge (it used to
+ * pick up the toolbar / a panel just above it — the dark band), and the
+ * titlebar's at its bottom edge (panels below it). */
+.iv-filmstrip-pane > .liquid-glass-backdrop {
+  top: 0;
+}
+
+.iv-titlebar > .liquid-glass-backdrop {
+  bottom: 0;
+}
+
+/* Thin, stable surfaces: no shadow may land on the filmstrip. The toolbar's
+ * and the panels' soft shadows used to paint (and be re-blurred) across its
+ * top edge — the occasional black band while dragging a panel or when the
+ * toolbar appeared. Panels live in a layer that ends at the filmstrip, and
+ * the picture area clips its own overlays. */
+.iv-body {
+  overflow: clip;
+}
+
+.iv-float-layer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  z-index: 6;
+  overflow: clip;
+  pointer-events: none;
+}
+
+.iv-float-layer > .iv-float {
+  pointer-events: auto;
+}
+
+.iv-filmstrip-pane {
+  position: relative;
+  z-index: 7;
+}
+
+/* Notices: one frosted pill, top centre, for everything (wrap-around, zoom
+ * level, fit / 100%, rotation, results). It moves below a visible titlebar. */
+.iv-toast {
+  top: 14px;
+  bottom: auto;
+  gap: 10px;
+  min-height: 32px;
+  padding: 0 16px;
+  color: var(--text-primary);
+  font-size: var(--iv-text-label);
+  font-weight: 550;
+  font-variant-numeric: tabular-nums;
+  border: 1px solid var(--glass-side-stroke);
+  background: var(--glass-side-fill);
+  box-shadow: var(--glass-shadow-tight);
+  -webkit-backdrop-filter: blur(var(--glass-side-blur)) saturate(1.35);
+  backdrop-filter: blur(var(--glass-side-blur)) saturate(1.35);
+  transition: top 200ms ease;
+}
+
+.iv-window[data-titlebar="revealed"] .iv-toast {
+  top: calc(var(--iv-titlebar-height) + 12px);
+}
+
+.iv-toast-action {
+  margin-left: 0;
+}
+
+/* ------------------------------------------------- settings content */
+
+.iv-settings-form {
+  gap: 26px;
+}
+
+.iv-setting-row[data-layout="stacked"] {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+}
+
+.iv-setting-row[data-layout="stacked"] .iv-setting-control {
+  justify-content: flex-start;
+}
+
+/* Background picker: preview cards (a little picture on each background). */
+.iv-bg-picker {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+  width: 100%;
+}
+
+.iv-bg-card {
+  display: grid;
+  gap: 7px;
+  padding: 0;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--iv-text-body);
+  text-align: center;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.iv-bg-preview {
+  position: relative;
+  display: grid;
+  place-items: center;
+  aspect-ratio: 16 / 10;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  transition: border-color 140ms ease;
+}
+
+.iv-bg-card[data-selected="true"] {
+  color: var(--text-primary);
+}
+
+.iv-bg-card[data-selected="true"] .iv-bg-preview,
+.iv-bg-card:focus-visible .iv-bg-preview {
+  border-color: var(--accent);
+}
+
+.iv-bg-card:focus-visible {
+  outline: none;
+}
+
+/* A stylised photo with a transparent surround, so the background shows. */
+.iv-bg-photo {
+  width: 46%;
+  aspect-ratio: 4 / 3;
+  border-radius: 3px;
+  background:
+    radial-gradient(circle at 72% 30%, #f6d58a 0 9%, transparent 10%),
+    linear-gradient(160deg, transparent 0 52%, #4f7f6a 53% 100%),
+    linear-gradient(200deg, transparent 0 40%, #6e9c84 41% 100%),
+    linear-gradient(180deg, #8fb7d6, #c9dceb);
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.28);
+}
+
+.iv-bg-check {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  color: #0b1014;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.iv-bg-card[data-background="interface"] .iv-bg-preview {
+  background: var(--glass-center-fill-strong, rgba(8, 12, 16, 0.5));
+}
+
+.iv-bg-card[data-background="dark"] .iv-bg-preview {
+  background: #15181b;
+}
+
+.iv-bg-card[data-background="black"] .iv-bg-preview {
+  background: #000;
+}
+
+.iv-bg-card[data-background="light"] .iv-bg-preview {
+  background: #e9ecef;
+}
+
+.iv-bg-card[data-background="checker"] .iv-bg-preview {
+  background-color: #2a2d31;
+  background-image:
+    linear-gradient(45deg, #4a4e53 25%, transparent 25%),
+    linear-gradient(-45deg, #4a4e53 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #4a4e53 75%),
+    linear-gradient(-45deg, transparent 75%, #4a4e53 75%);
+  background-position: 0 0, 0 6px, 6px -6px, -6px 0;
+  background-size: 12px 12px;
+}
+
+/* Shortcuts inside the merged settings column. */
+.iv-shortcut-group-block {
+  display: grid;
+  gap: 6px;
+}
+
+.iv-shortcut-group-heading {
+  margin: 4px 0 0 2px;
+  color: var(--text-muted);
+  font-size: var(--iv-text-caption);
+  font-weight: 600;
+}
+
+.iv-settings-section[data-section="shortcuts"] > .iv-settings-rows {
+  border: 0;
+  background: transparent;
+}
+
+/* ------------------------------------------- standalone settings window */
+
+html:has(.iv-settings-window),
+html:has(.iv-settings-window) body,
+html:has(.iv-settings-window) #root {
+  overflow: clip;
+}
+
+.iv-settings-window {
+  display: flex;
+  flex-direction: column;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  color: var(--text-soft);
+  border-radius: var(--radius-window);
+  background: transparent;
+  user-select: none;
+}
+
+.liquid-glass.iv-settings-window {
+  --glass-fill: var(--glass-side-fill);
+  --glass-blur-current: var(--glass-side-blur);
+  --glass-border-current: var(--glass-side-stroke);
+  --glass-saturation: var(--glass-side-saturation);
+}
+
+.iv-settings-window-titlebar {
+  display: flex;
+  flex: 0 0 40px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 6px 0 16px;
+  border-bottom: 1px solid var(--line);
+  -webkit-app-region: drag;
+}
+
+.iv-settings-window-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-primary);
+  font-size: var(--iv-text-label);
+  font-weight: 650;
+}
+
+.iv-settings-window-close {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  color: var(--text-muted);
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+
+.iv-settings-window-close:focus-visible {
+  outline: 1px solid var(--interactive-focus);
+}
+
+.iv-settings-window-body {
+  display: grid;
+  flex: 1 1 auto;
+  grid-template-columns: 168px minmax(0, 1fr);
+  min-height: 0;
+}
+
+.iv-settings-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 14px 10px;
+  border-right: 1px solid var(--line);
+}
+
+.iv-settings-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 34px;
+  padding: 0 12px;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--iv-text-label);
+  text-align: left;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  cursor: pointer;
+  transition: color 140ms ease, background-color 140ms ease;
+}
+
+.iv-settings-nav-item[data-active="true"] {
+  color: var(--text-primary);
+  background: rgba(142, 199, 208, 0.16);
+}
+
+.iv-settings-nav-item[data-active="true"] > svg {
+  color: var(--accent);
+}
+
+.iv-settings-nav-item:focus-visible {
+  outline: 1px solid var(--interactive-focus);
+}
+
+.iv-settings-nav-footnote {
+  margin: auto 0 0;
+  padding: 0 12px;
+  color: var(--text-muted);
+  font-size: var(--iv-text-caption);
+}
+
+.iv-settings-scroll {
+  min-height: 0;
+  padding: 18px 22px 28px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.iv-settings-scroll .iv-settings-section-title {
+  color: var(--text-primary);
+  font-size: var(--iv-text-title);
+  letter-spacing: 0;
+  margin-bottom: 8px;
+}
+
+.iv-settings-scroll .iv-settings-section-title > svg {
+  color: var(--accent);
 }

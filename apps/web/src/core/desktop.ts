@@ -107,7 +107,7 @@ export interface MangooDesktopBridge {
   onPluginViewIntent?: (callback: (intent: PluginViewWindowIntent) => void) => () => void;
   coreUrl?: string;
   sessionToken?: string;
-  windowRole?: "main" | DesktopSecondaryWindowRole | "image-viewer";
+  windowRole?: "main" | DesktopSecondaryWindowRole | "image-viewer" | "image-viewer-settings";
   /** Generic Host-engine plugin hook: a plugin lifecycle mutation finished. */
   notifyPluginsChanged?: () => Promise<boolean>;
   notifyShellReady?: () => Promise<boolean>;

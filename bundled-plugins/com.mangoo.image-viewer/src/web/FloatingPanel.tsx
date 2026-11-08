@@ -11,6 +11,7 @@ import {
   relayout,
   snapRect,
   type BottomObstacle,
+  type PanelCorner,
   type PanelPlacement,
   type PanelRect
 } from "../shared/floatingPanel.ts";
@@ -52,7 +53,7 @@ export function FloatingPanel({
   /** Band at the bottom (the toolbar) that the panel must not cover. */
   bottomObstacle?: BottomObstacle | null;
   /** Where the panel first appears. */
-  defaultCorner?: "top-right" | "bottom-left";
+  defaultCorner?: PanelCorner;
   /** Which side edge the panel hugs, so the window can move its edge arrows. */
   onDockChange?(side: "left" | "right" | null): void;
   className?: string;

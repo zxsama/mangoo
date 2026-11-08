@@ -15,8 +15,10 @@ import {
   OverlayMenuList,
   WindowChrome,
   createCoreClient,
+  getWindowControls,
   icons,
   pointOverlayAnchor,
+  useOverlayScrollbars,
   useSecondaryWindowInterfaceStyle
 } from "@mangoo/web/plugin-host";
 
@@ -38,26 +40,25 @@ import {
 } from "../shared/viewTransform.ts";
 import { FloatingPanel } from "./FloatingPanel.tsx";
 import { FrameInspector } from "./FrameInspector.tsx";
-import { ShortcutEditor } from "./ShortcutEditor.tsx";
 import { useAnimationFrames } from "./useAnimationFrames.ts";
 import { useProximityChrome } from "./useProximityChrome.ts";
-import { ViewerSettingsForm } from "./ViewerSettings.tsx";
 import { Filmstrip } from "./Filmstrip.tsx";
 import { InfoPanel } from "./InfoPanel.tsx";
 import { viewerBridge } from "./bridge.ts";
 import { ViewerImageCache, encodePng, viewerViewportLongPx, type LoadedImage } from "./imageSource.ts";
 import { useViewerPreferences } from "./preferences.ts";
 import { describeError, useViewerSession } from "./useViewerSession.ts";
-import { ViewerStage } from "./ViewerStage.tsx";
+import { ViewerStage, type StageAnimation } from "./ViewerStage.tsx";
 import "./viewer.css";
 
 type ZoomState = FitMode | "custom";
-type SettingsTab = "general" | "shortcuts";
 type Dialog =
   | { kind: "delete"; dontAskAgain: boolean }
   | { kind: "rename"; value: string; error: string | null; busy: boolean }
-  | { kind: "settings"; tab: SettingsTab }
   | null;
+
+/** How long each kind of zoom animates (ms); see .iv-image-layer[data-animate]. */
+const ANIMATION_MS: Record<Exclude<StageAnimation, "none">, number> = { ease: 200, wheel: 170, pinch: 90 };
 
 /** Height reserved by the titlebar when it is pinned (px). */
 const TITLEBAR_HEIGHT = 40;
@@ -122,6 +123,9 @@ function IconButton({
 
 export function ImageViewerWindow() {
   useSecondaryWindowInterfaceStyle();
+  // The Host's overlay scrollbars (filmstrip, panels): they come back on
+  // hover and scroll, unlike the native thin bar that faded out for good.
+  useOverlayScrollbars();
   const bridge = viewerBridge();
   const [preferences, setPreferences] = useViewerPreferences();
   const session = useViewerSession(preferences.sortKey, preferences.sortDirection, preferences.loop);
@@ -144,17 +148,15 @@ export function ImageViewerWindow() {
   const [dpr, setDpr] = useState(() => window.devicePixelRatio || 1);
   const [transform, setTransform] = useState<ViewTransform>(identityTransform);
   const [zoomState, setZoomState] = useState<ZoomState>(preferences.fitMode);
-  const [animate, setAnimate] = useState(false);
+  const [animate, setAnimate] = useState<StageAnimation>("none");
   const [fullscreen, setFullscreen] = useState(false);
   const [slideshow, setSlideshow] = useState(false);
   const [chromeVisible, setChromeVisible] = useState(true);
   const [zoomMenuOpen, setZoomMenuOpen] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; byKeyboard?: boolean } | null>(null);
   const [dialog, setDialog] = useState<Dialog>(null);
+  /** The one notice surface: wrap-around, zoom readouts, results, errors. */
   const [toast, setToast] = useState<{ message: string; action?: { label: string; run(): void } } | null>(null);
-  /** Brief centred readout for zoom / rotation changes (like most viewers). */
-  const [hud, setHud] = useState<string | null>(null);
-  const hudTimer = useRef<number | null>(null);
   const [slideshowTick, setSlideshowTick] = useState(0);
   const [alwaysOnTop, setAlwaysOnTop] = useState(false);
 
@@ -188,10 +190,10 @@ export function ImageViewerWindow() {
     [image, dpr]
   );
 
-  const showToast = useCallback((message: string, action?: { label: string; run(): void }) => {
+  const showToast = useCallback((message: string, action?: { label: string; run(): void }, duration?: number) => {
     setToast({ message, action });
     if (toastTimer.current) window.clearTimeout(toastTimer.current);
-    toastTimer.current = window.setTimeout(() => setToast(null), action ? 6000 : 2400);
+    toastTimer.current = window.setTimeout(() => setToast(null), duration ?? (action ? 6000 : 2400));
   }, []);
 
   /** Step through the folder, telling the user when it wraps around. */
@@ -207,11 +209,8 @@ export function ImageViewerWindow() {
     session.go(delta);
   }, [preferences.loop, session, showToast, state.entries.length, state.index]);
 
-  const flashHud = useCallback((message: string) => {
-    setHud(message);
-    if (hudTimer.current) window.clearTimeout(hudTimer.current);
-    hudTimer.current = window.setTimeout(() => setHud(null), 900);
-  }, []);
+  /** Short readouts (zoom level, rotation) use the same notice, briefly. */
+  const flashHud = useCallback((message: string) => showToast(message, undefined, 1100), [showToast]);
 
   // ------------------------------------------------------------- bootstrap
 
@@ -327,7 +326,7 @@ export function ImageViewerWindow() {
   const imageKey = image?.key.split("\u0000")[0] ?? null;
   useEffect(() => {
     if (!imageKey) return;
-    setAnimate(false);
+    setAnimate("none");
     if (!preferences.keepTransform) {
       setZoomState(preferences.fitMode);
       setTransform((value) => ({ ...identityTransform(), scale: value.scale }));
@@ -362,30 +361,47 @@ export function ImageViewerWindow() {
 
   // ------------------------------------------------------------- transforms
 
-  const withAnimation = useCallback(() => {
-    setAnimate(true);
+  // Every zoom is interpolated: the image layer's CSS transition retargets
+  // smoothly when a new wheel notch arrives mid-flight.
+  const withAnimation = useCallback((kind: Exclude<StageAnimation, "none"> = "ease") => {
+    setAnimate(kind);
     if (animateTimer.current) window.clearTimeout(animateTimer.current);
-    animateTimer.current = window.setTimeout(() => setAnimate(false), 200);
+    animateTimer.current = window.setTimeout(() => setAnimate("none"), ANIMATION_MS[kind] + 30);
   }, []);
+  const stopAnimation = useCallback(() => {
+    if (animateTimer.current) window.clearTimeout(animateTimer.current);
+    setAnimate("none");
+  }, []);
+  const transformRef = useRef(transform);
+  transformRef.current = transform;
 
   const center = useMemo(() => ({ x: viewport.width / 2, y: viewport.height / 2 }), [viewport]);
 
   const zoomTo = useCallback((scale: number, anchor = center, animated = true) => {
     if (!imageSize) return;
     if (animated) withAnimation();
-    else setAnimate(false);
+    else stopAnimation();
     setZoomState("custom");
     setTransform((value) => zoomAt(value, scale, anchor, imageSize, viewport));
     flashHud(formatZoom(Math.min(32, Math.max(0.02, scale))));
-  }, [center, flashHud, imageSize, viewport, withAnimation]);
+  }, [center, flashHud, imageSize, stopAnimation, viewport, withAnimation]);
 
-  /** Relative zoom (wheel, pinch): reads the live scale, never a stale one. */
-  const zoomBy = useCallback((factor: number, anchor: { x: number; y: number }) => {
+  /**
+   * Relative zoom (wheel, trackpad pinch, touch pinch). Wheel notches and
+   * trackpad pinches glide to the new scale; a touch pinch follows the
+   * fingers 1:1. Successive events build on the latest target, never a
+   * stale render.
+   */
+  const zoomBy = useCallback((factor: number, anchor: { x: number; y: number }, kind: "wheel" | "pinch" | "touch" = "wheel") => {
     if (!imageSize) return;
-    setAnimate(false);
+    if (kind === "touch") stopAnimation();
+    else withAnimation(kind);
     setZoomState("custom");
-    setTransform((value) => zoomAt(value, value.scale * factor, anchor, imageSize, viewport));
-  }, [imageSize, viewport]);
+    const next = zoomAt(transformRef.current, transformRef.current.scale * factor, anchor, imageSize, viewport);
+    transformRef.current = next;
+    setTransform(next);
+    flashHud(formatZoom(next.scale));
+  }, [flashHud, imageSize, stopAnimation, viewport, withAnimation]);
 
   const zoomStep = useCallback((direction: 1 | -1) => {
     zoomTo(nextZoomStop(transform.scale, direction));
@@ -418,9 +434,11 @@ export function ImageViewerWindow() {
 
   const pan = useCallback((deltaX: number, deltaY: number) => {
     if (!imageSize) return;
-    setAnimate(false);
-    setTransform((value) => clampPan({ ...value, panX: value.panX + deltaX, panY: value.panY + deltaY }, imageSize, viewport));
-  }, [imageSize, viewport]);
+    stopAnimation();
+    const next = clampPan({ ...transformRef.current, panX: transformRef.current.panX + deltaX, panY: transformRef.current.panY + deltaY }, imageSize, viewport);
+    transformRef.current = next;
+    setTransform(next);
+  }, [imageSize, stopAnimation, viewport]);
 
   // -------------------------------------------------------------- actions
 
@@ -547,6 +565,10 @@ export function ImageViewerWindow() {
     return () => window.clearTimeout(timer);
   }, [renameOpen]);
 
+  const openSettings = useCallback((section: "display" | "shortcuts" = "display") => {
+    if (bridge) void bridge.openSettings(section);
+  }, [bridge]);
+
   const toggleAlwaysOnTop = useCallback(async () => {
     if (bridge) setAlwaysOnTop(await bridge.setAlwaysOnTop(!alwaysOnTop));
   }, [alwaysOnTop, bridge]);
@@ -656,7 +678,7 @@ export function ImageViewerWindow() {
           case "copyPath": void copyPath(); break;
           case "rename": requestRename(); break;
           case "delete": requestDelete(); break;
-          case "showShortcuts": setDialog({ kind: "settings", tab: "shortcuts" }); break;
+          case "showShortcuts": openSettings("shortcuts"); break;
           case "closeWindow": window.close(); break;
           default: handled = false;
         }
@@ -670,7 +692,7 @@ export function ImageViewerWindow() {
     return () => window.removeEventListener("keydown", onKey);
   }, [
     animation, bindings, framesOpen, isAnimated, toggleFrames,
-    copyImage, copyPath, flip, fullscreen, imageSize, noteActivity, openFiles, overlaysOpen, pan, preferences,
+    copyImage, copyPath, flip, fullscreen, imageSize, noteActivity, openFiles, openSettings, overlaysOpen, pan, preferences,
     requestDelete, requestRename, rotateBy, session, setFit, setPreferences, slideshow, state.entries.length,
     toggleFullscreen, transform.rotation, transform.scale, viewport, zoomStep, zoomTo
   ]);
@@ -739,7 +761,6 @@ export function ImageViewerWindow() {
           <MediaLoadingRing size={22} />
         </div>
       ) : null}
-      {hud ? <div className="iv-hud" role="status">{hud}</div> : null}
       {slideshow ? (
         <div className="iv-slideshow-progress" aria-hidden="true">
           <span key={slideshowTick} style={{ animationDuration: `${preferences.slideshowSeconds}s` }} />
@@ -776,22 +797,51 @@ export function ImageViewerWindow() {
     { id: "on-top", label: "窗口置顶", icon: <icons.StackTop size={14} />, checked: alwaysOnTop, onSelect: () => void toggleAlwaysOnTop() },
     { id: "main", label: "打开 Mangoo 资料库", icon: <icons.Library size={14} />, disabled: !bridge, onSelect: () => void bridge?.openMainWindow() },
     { id: "s2", separator: true },
-    { id: "settings", label: "看图设置…", icon: <icons.Settings size={14} />, onSelect: () => openDialog({ kind: "settings", tab: "general" }) },
-    { id: "shortcuts", label: "快捷键…", icon: <icons.Keyboard size={14} />, shortcut: keyOf("showShortcuts"), onSelect: () => openDialog({ kind: "settings", tab: "shortcuts" }) }
+    { id: "settings", label: "看图设置…", icon: <icons.Settings size={14} />, disabled: !bridge, onSelect: () => openSettings("display") },
+    { id: "shortcuts", label: "快捷键…", icon: <icons.Keyboard size={14} />, shortcut: keyOf("showShortcuts"), disabled: !bridge, onSelect: () => openSettings("shortcuts") }
   ];
   const [menuSource, setMenuSource] = useState<"stage" | "more">("stage");
+  const windowControls = getWindowControls();
+  const windowDrag = useRef<{ pointerId: number; x: number; y: number; started: boolean } | null>(null);
+  const beginWindowDrag = (event: React.PointerEvent<HTMLElement>) => {
+    if (event.button !== 0 || fullscreen || !windowControls || preferences.titlebarPinned) return;
+    if ((event.target as HTMLElement).closest("button, input, a, [data-no-drag]")) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    windowDrag.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, started: false };
+  };
+  const moveWindowDrag = (event: React.PointerEvent<HTMLElement>) => {
+    const drag = windowDrag.current;
+    if (!drag || drag.pointerId !== event.pointerId || !windowControls) return;
+    if (!drag.started) {
+      // Like Windows: a press only becomes a drag past a small threshold.
+      if (Math.hypot(event.clientX - drag.x, event.clientY - drag.y) < 4) return;
+      drag.started = true;
+      void windowControls.beginDrag({
+        clientX: drag.x,
+        screenX: event.screenX,
+        screenY: event.screenY,
+        titlebarOffsetY: drag.y,
+        viewportWidth: window.innerWidth
+      }).then(() => windowControls.moveDrag());
+      return;
+    }
+    void windowControls.moveDrag();
+  };
+  const endWindowDrag = (event: React.PointerEvent<HTMLElement>) => {
+    const drag = windowDrag.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    windowDrag.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    if (drag.started) void windowControls?.endDrag();
+  };
   const filmstripShown = preferences.showFilmstrip && state.entries.length > 1 && !slideshow && !(fullscreen && !chromeVisible);
-  const chromeTopShown = chrome.shown("top");
-  // Panels float over the whole window but never under the pinned titlebar
-  // or the filmstrip, so their headers stay reachable.
-  // An unpinned titlebar overlays the top edge: keep panels below it so its
-  // controls are never covered when it slides in.
+  // Panels float over the window but always below the titlebar's row (pinned
+  // or auto-hiding alike), so they never jump as it reveals and never cover
+  // its controls; and never over the filmstrip.
   const panelInsets = useMemo(() => ({
-    // Hidden titlebar: panels may hug the top edge. Pinned or revealed: they
-    // sit below it, so its controls are never covered.
-    top: !immersive && (preferences.titlebarPinned || chrome.shown("top")) ? TITLEBAR_HEIGHT : 0,
+    top: immersive ? 0 : TITLEBAR_HEIGHT,
     bottom: filmstripShown ? FILMSTRIP_HEIGHT : 0
-  }), [immersive, filmstripShown, preferences.titlebarPinned, chromeTopShown]);
+  }), [immersive, filmstripShown]);
   // The centred toolbar is the only thing panels avoid at the bottom edge.
   const [toolbarSpan, setToolbarSpan] = useState<{ left: number; right: number } | null>(null);
   useLayoutEffect(() => {
@@ -844,6 +894,14 @@ export function ImageViewerWindow() {
         <LiquidGlassSurface
           as="header"
           className="iv-titlebar"
+          onDoubleClick={(event: React.MouseEvent<HTMLElement>) => {
+            if (fullscreen || (event.target as HTMLElement).closest("button, [data-no-drag]")) return;
+            void windowControls?.maximize();
+          }}
+          onPointerCancel={endWindowDrag}
+          onPointerDown={beginWindowDrag}
+          onPointerMove={moveWindowDrag}
+          onPointerUp={endWindowDrag}
           tone="chrome"
         >
           <div className="iv-title">
@@ -905,11 +963,11 @@ export function ImageViewerWindow() {
               onDropFiles={(files) => void dropFiles(files)}
               onNavigate={navigate}
               onPan={pan}
-              onPinch={zoomBy}
+              onPinch={(factor, anchor) => zoomBy(factor, anchor, "touch")}
               onToggleActualSize={toggleActualSize}
               onViewportChange={setViewport}
               onWheelNavigate={navigate}
-              onWheelZoom={zoomBy}
+              onWheelZoom={(factor, anchor, pinch) => zoomBy(factor, anchor, pinch ? "pinch" : "wheel")}
               overlay={stageOverlay}
               pixelated={pixelated}
               renderLevel={canvasLevel}
@@ -1008,12 +1066,14 @@ export function ImageViewerWindow() {
             <Filmstrip entries={state.entries} index={state.index} onSelect={session.goTo} />
           </LiquidGlassSurface>
         ) : null}
+        <div className="iv-float-layer" style={{ bottom: filmstripShown ? FILMSTRIP_HEIGHT : 0 }}>
         {preferences.showInfo && !slideshow ? (
           <FloatingPanel
+            defaultCorner="top-left"
             defaultSize={{ width: 300, height: 460 }}
             icon={<icons.Info aria-hidden="true" size={14} />}
             bottomObstacle={bottomObstacle}
-            id="info"
+            id="info-v3"
             onDockChange={(side) => reportDock("info", side)}
             insets={panelInsets}
             onClose={() => setPreferences({ showInfo: false })}
@@ -1046,6 +1106,7 @@ export function ImageViewerWindow() {
             />
           </FloatingPanel>
         ) : null}
+        </div>
       </div>
 
       <AnchoredOverlay
@@ -1083,47 +1144,6 @@ export function ImageViewerWindow() {
         </OverlayMenuList>
       </AnchoredOverlay>
 
-      <ModalSurface
-        ariaLabelledBy="image-viewer-settings-title"
-        className="file-operation-dialog overlay-dialog-wide iv-settings-dialog iv-dialog"
-        id="image-viewer-settings-dialog"
-        onDismiss={() => setDialog(null)}
-        open={dialog?.kind === "settings"}
-        rootId="file-operation"
-      >
-        <header className="overlay-dialog-header iv-settings-header">
-          <h2 id="image-viewer-settings-title">看图设置</h2>
-          <div aria-label="设置分类" className="iv-tabs" role="tablist">
-            {([["general", "常规"], ["shortcuts", "快捷键"]] as const).map(([tab, label]) => (
-              <button
-                aria-selected={dialog?.kind === "settings" && dialog.tab === tab}
-                className="iv-tab"
-                data-pointer-glow="off"
-                key={tab}
-                onClick={() => {
-                  setDialog({ kind: "settings", tab });
-                  document.querySelector("#image-viewer-settings-dialog .iv-settings-body")?.scrollTo({ top: 0 });
-                }}
-                role="tab"
-                type="button"
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-        </header>
-        <OverlayDialogBody className="iv-settings-body">
-          {dialog?.kind === "settings" && dialog.tab === "shortcuts" ? (
-            <ShortcutEditor onChange={(shortcuts) => setPreferences({ shortcuts })} overrides={preferences.shortcuts} />
-          ) : (
-            <ViewerSettingsForm onChange={setPreferences} preferences={preferences} />
-          )}
-        </OverlayDialogBody>
-        <OverlayDialogActions>
-          <span className="iv-settings-footnote">更改会立即生效，并在下次打开时保留。</span>
-          <LiquidGlassButton className="overlay-dialog-button overlay-dialog-button-primary" onClick={() => setDialog(null)} tone="primary" type="button">完成</LiquidGlassButton>
-        </OverlayDialogActions>
-      </ModalSurface>
 
       {contextMenu ? (
         <AnchoredOverlay

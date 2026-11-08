@@ -4,12 +4,15 @@ import { cssTransform, type Size, type ViewTransform } from "../shared/viewTrans
 import type { LoadedImage } from "./imageSource.ts";
 import type { ViewerBackground } from "./preferences.ts";
 
+/** Which interpolation the image layer uses for the current change. */
+export type StageAnimation = "none" | "ease" | "wheel" | "pinch";
+
 export interface ViewerStageProps {
   image: LoadedImage | null;
   /** Image box in CSS px at scale 1 (source px / devicePixelRatio). */
   imageSize: Size | null;
   transform: ViewTransform;
-  animate: boolean;
+  animate: StageAnimation;
   background: ViewerBackground;
   pixelated: boolean;
   /** Backing-store scale for the canvas (see renderLevel). */
@@ -18,7 +21,7 @@ export interface ViewerStageProps {
   frameBitmap?: ImageBitmap | null;
   overlay?: ReactNode;
   onViewportChange(size: Size): void;
-  onWheelZoom(factor: number, anchor: { x: number; y: number }): void;
+  onWheelZoom(factor: number, anchor: { x: number; y: number }, pinch: boolean): void;
   onWheelNavigate(direction: 1 | -1): void;
   wheelNavigates: boolean;
   /** Picture larger than the window: plain wheel pans instead of navigating. */
@@ -112,7 +115,7 @@ export function ViewerStage(props: ViewerStageProps) {
       const clamped = Math.max(-240, Math.min(240, pixels));
       const pinch = event.ctrlKey && event.deltaMode === 0 && Math.abs(pixels) < 50;
       const factor = Math.exp(-clamped * (pinch ? 0.01 : 0.0015));
-      current.onWheelZoom(factor, pointIn(stage, event.clientX, event.clientY));
+      current.onWheelZoom(factor, pointIn(stage, event.clientX, event.clientY), pinch);
     };
     stage.addEventListener("wheel", onWheel, { passive: false });
     return () => stage.removeEventListener("wheel", onWheel);
@@ -223,7 +226,7 @@ export function ViewerStage(props: ViewerStageProps) {
     >
       <div
         className="iv-image-layer"
-        data-animate={props.animate ? "true" : "false"}
+        data-animate={props.animate}
         data-pixelated={props.pixelated ? "true" : "false"}
         hidden={!props.image}
         style={layerStyle}

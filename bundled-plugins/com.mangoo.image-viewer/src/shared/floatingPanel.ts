@@ -108,15 +108,17 @@ export function relayout(placement: PanelPlacement, bounds: Bounds, insets: { to
   return clampRect(rect, bounds, insets);
 }
 
-/** Default: snapped to a corner (top-right below the titlebar, or bottom-left). */
+export type PanelCorner = "top-left" | "top-right" | "bottom-left";
+
+/** Default: snapped to a corner (top corners sit below the titlebar). */
 export function defaultPlacement(
   size: { width: number; height: number },
-  corner: "top-right" | "bottom-left",
+  corner: PanelCorner,
   bounds: Bounds,
   insets: { top: number; bottom: number }
 ): PanelPlacement {
   const x = corner === "top-right" ? bounds.width : 0;
-  const y = corner === "top-right" ? 0 : bounds.height;
+  const y = corner === "bottom-left" ? bounds.height : 0;
   return snapRect({ x, y, width: size.width, height: size.height }, bounds, insets);
 }
 

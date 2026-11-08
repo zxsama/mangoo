@@ -20,6 +20,7 @@ export {
   readInterfaceStyle
 } from "../design/liquid-glass";
 export { useSecondaryWindowInterfaceStyle } from "../app-shell/useSecondaryWindowInterfaceStyle";
+export { useOverlayScrollbars } from "../app-shell/useOverlayScrollbars";
 export * as icons from "../design/icons";
 export type { AppIcon } from "../design/icons";
 export {

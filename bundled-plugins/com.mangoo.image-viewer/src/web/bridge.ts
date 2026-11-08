@@ -1,8 +1,17 @@
 import { getDesktopBridge } from "@mangoo/web/plugin-host";
 
-import type { ImageViewerDesktopBridge, ImageViewerHostWindowBridge } from "../shared/ipc.ts";
+import type { ImageViewerDesktopBridge, ImageViewerHostWindowBridge, ImageViewerSettingsBridge } from "../shared/ipc.ts";
 
-type ViewerBridgeHost = { imageViewer?: ImageViewerDesktopBridge; imageViewerHost?: ImageViewerHostWindowBridge };
+type ViewerBridgeHost = {
+  imageViewer?: ImageViewerDesktopBridge;
+  imageViewerHost?: ImageViewerHostWindowBridge;
+  imageViewerSettings?: ImageViewerSettingsBridge;
+};
+
+/** The standalone settings window's bridge. */
+export function settingsBridge(): ImageViewerSettingsBridge | null {
+  return (getDesktopBridge() as ViewerBridgeHost | null)?.imageViewerSettings ?? null;
+}
 
 /** The viewer window's own Desktop bridge (null in a plain browser build). */
 export function viewerBridge(): ImageViewerDesktopBridge | null {
@@ -14,5 +23,5 @@ export type ImageViewerAssociationBridge = Pick<ImageViewerHostWindowBridge, "as
 
 export function viewerHostBridge(): ImageViewerAssociationBridge | null {
   const bridge = getDesktopBridge() as ViewerBridgeHost | null;
-  return bridge?.imageViewerHost ?? bridge?.imageViewer ?? null;
+  return bridge?.imageViewerHost ?? bridge?.imageViewer ?? bridge?.imageViewerSettings ?? null;
 }

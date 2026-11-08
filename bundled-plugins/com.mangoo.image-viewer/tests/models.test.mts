@@ -70,6 +70,9 @@ test("floating panels snap to edges and stay docked through resizes", () => {
   const insets = { top: 40, bottom: 92 };
   const initial = defaultPlacement({ width: 300, height: 400 }, "top-right", bounds, insets);
   const bottomLeft = defaultPlacement({ width: 252, height: 132 }, "bottom-left", bounds, insets);
+  const topLeft = defaultPlacement({ width: 300, height: 460 }, "top-left", bounds, insets);
+  assert.deepEqual(topLeft.dock, { horizontal: "left", vertical: "top" });
+  assert.deepEqual([topLeft.rect.x, topLeft.rect.y], [0, 40], "flush top-left, below the titlebar inset");
   assert.deepEqual(bottomLeft.dock, { horizontal: "left", vertical: "bottom" });
   assert.equal(bottomLeft.rect.x, 0, "flush with the left edge");
   assert.equal(bottomLeft.rect.y, 700 - 92 - 132);

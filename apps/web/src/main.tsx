@@ -31,11 +31,23 @@ const isPluginsWindow =
   window.location.hash.startsWith("#/plugins") || windowRole === "plugins";
 const isNotificationsWindow =
   window.location.hash.startsWith("#/notifications") || windowRole === "notifications";
-// Host-engine plugin window: the built-in image viewer (com.mangoo.image-viewer).
+// Host-engine plugin windows: the built-in image viewer (com.mangoo.image-viewer)
+// and its standalone settings window. Settings is matched first: its route
+// shares the viewer's prefix.
+const isImageViewerSettingsWindow =
+  window.location.hash.startsWith("#/image-viewer-settings") || windowRole === "image-viewer-settings";
 const isImageViewerWindow =
-  window.location.hash.startsWith("#/image-viewer") || windowRole === "image-viewer";
+  !isImageViewerSettingsWindow && (window.location.hash.startsWith("#/image-viewer") || windowRole === "image-viewer");
 
-if (isImageViewerWindow) {
+if (isImageViewerSettingsWindow) {
+  void import("@mangoo/plugin-image-viewer/web").then(({ ImageViewerSettingsWindow }) => {
+    ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+      <React.StrictMode>
+        <ApplicationProviders><ImageViewerSettingsWindow /></ApplicationProviders>
+      </React.StrictMode>
+    );
+  });
+} else if (isImageViewerWindow) {
   void import("@mangoo/plugin-image-viewer/web").then(({ ImageViewerWindow }) => {
     ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
       <React.StrictMode>

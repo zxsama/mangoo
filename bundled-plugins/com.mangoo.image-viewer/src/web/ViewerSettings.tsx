@@ -2,16 +2,29 @@ import type { ReactNode } from "react";
 import { icons } from "@mangoo/web/plugin-host";
 
 import type { ImageSortKey } from "../shared/navigation.ts";
+import type { ImageViewerSettingsSection } from "../shared/ipc.ts";
+import type { ShortcutOverrides } from "../shared/shortcuts.ts";
 import { AssociationControls } from "./AssociationControls.tsx";
+import { ShortcutEditor } from "./ShortcutEditor.tsx";
 import { SLIDESHOW_INTERVALS, type ViewerBackground, type ViewerPreferences } from "./preferences.ts";
 
 /**
  * The viewer's settings, laid out as a real settings page: titled sections,
  * one row per decision with a short explanation, and the control that fits
  * the decision (switch for on/off, segmented control for a small choice).
- * Rendered in the viewer's settings dialog AND in Plugin Manager; both read
+ * Rendered in the viewer's settings window AND in Plugin Manager; both read
  * the same localStorage preferences, so a change in one shows in the other.
  */
+
+/** Section labels, in display order (the settings window's left column). */
+export const SETTINGS_SECTION_LABELS: Record<ImageViewerSettingsSection, string> = {
+  display: "显示",
+  browse: "浏览",
+  window: "窗口",
+  actions: "操作",
+  shortcuts: "快捷键",
+  system: "系统"
+};
 
 export function Switch({ checked, label, onChange, disabled = false }: {
   checked: boolean;
@@ -85,9 +98,9 @@ export function SettingRow({ title, description, children, htmlFor, stacked = fa
   );
 }
 
-function Section({ title, icon, children }: { title: string; icon: ReactNode; children: ReactNode }) {
+function Section({ id, title, icon, children }: { id: ImageViewerSettingsSection; title: string; icon: ReactNode; children: ReactNode }) {
   return (
-    <section className="iv-settings-section">
+    <section className="iv-settings-section" data-section={id} id={`iv-settings-${id}`}>
       <h3 className="iv-settings-section-title">
         {icon}
         <span>{title}</span>
@@ -112,35 +125,55 @@ const SORT_KEYS: Array<{ value: ImageSortKey; label: string }> = [
   { value: "type", label: "类型" }
 ];
 
-export function ViewerSettingsForm({ preferences, onChange, showSystem = true }: {
+/**
+ * Background picker: one preview card per choice, showing a small picture on
+ * that background, so the choice is made by looking rather than by name.
+ */
+function BackgroundPicker({ value, onChange }: { value: ViewerBackground; onChange(next: ViewerBackground): void }) {
+  return (
+    <div aria-label="背景" className="iv-bg-picker" role="radiogroup">
+      {BACKGROUNDS.map((option) => {
+        const selected = value === option.value;
+        return (
+          <button
+            aria-checked={selected}
+            className="iv-bg-card"
+            data-background={option.value}
+            data-selected={selected ? "true" : "false"}
+            key={option.value}
+            onClick={() => onChange(option.value)}
+            role="radio"
+            type="button"
+          >
+            <span aria-hidden="true" className="iv-bg-preview">
+              <span className="iv-bg-photo" />
+              {selected ? (
+                <span className="iv-bg-check">
+                  <icons.Check size={11} weight="fill" />
+                </span>
+              ) : null}
+            </span>
+            <span className="iv-bg-label">{option.label}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+export function ViewerSettingsForm({ preferences, onChange, showSystem = true, showShortcuts = false }: {
   preferences: ViewerPreferences;
   onChange(change: Partial<ViewerPreferences>): void;
   /** The plugin manager shows the system section separately. */
   showSystem?: boolean;
+  /** The settings window lists the editable shortcuts in the same column. */
+  showShortcuts?: boolean;
 }) {
   return (
     <div className="iv-settings-form">
-      <Section icon={<icons.Image aria-hidden="true" size={14} />} title="显示">
+      <Section icon={<icons.Image aria-hidden="true" size={14} />} id="display" title="显示">
         <SettingRow description="图片后面的底色。查看带透明区域的图片时，用棋盘格更容易分辨透明部分。" stacked title="背景">
-          <span className="iv-background-swatches" role="radiogroup" aria-label="背景">
-            {BACKGROUNDS.map((option) => (
-              <button
-                aria-checked={preferences.background === option.value}
-                className="iv-swatch"
-                data-background={option.value}
-                data-pointer-glow="off"
-                data-selected={preferences.background === option.value ? "true" : "false"}
-                key={option.value}
-                onClick={() => onChange({ background: option.value })}
-                role="radio"
-                title={option.label}
-                type="button"
-              >
-                <span className="iv-swatch-chip" aria-hidden="true" />
-                <span className="iv-swatch-label">{option.label}</span>
-              </button>
-            ))}
-          </span>
+          <BackgroundPicker onChange={(background) => onChange({ background })} value={preferences.background} />
         </SettingRow>
         <SettingRow description="打开或切换图片时的初始大小。" title="默认缩放">
           <Segmented
@@ -162,7 +195,7 @@ export function ViewerSettingsForm({ preferences, onChange, showSystem = true }:
         </SettingRow>
       </Section>
 
-      <Section icon={<icons.Images aria-hidden="true" size={14} />} title="浏览">
+      <Section icon={<icons.Images aria-hidden="true" size={14} />} id="browse" title="浏览">
         <SettingRow description="按住 Ctrl 滚动总是缩放。图片放大后，滚轮会先平移图片。" title="鼠标滚轮">
           <Segmented
             label="鼠标滚轮"
@@ -206,7 +239,7 @@ export function ViewerSettingsForm({ preferences, onChange, showSystem = true }:
         </SettingRow>
       </Section>
 
-      <Section icon={<icons.LayoutPanelTop aria-hidden="true" size={14} />} title="窗口">
+      <Section icon={<icons.LayoutPanelTop aria-hidden="true" size={14} />} id="window" title="窗口">
         <SettingRow description="关闭后标题栏会自动隐藏，把鼠标移到窗口顶部即可显示。也可以用标题栏上的图钉按钮切换。" title="固定标题栏">
           <Switch checked={preferences.titlebarPinned} label="固定标题栏" onChange={(titlebarPinned) => onChange({ titlebarPinned })} />
         </SettingRow>
@@ -215,7 +248,7 @@ export function ViewerSettingsForm({ preferences, onChange, showSystem = true }:
         </SettingRow>
       </Section>
 
-      <Section icon={<icons.SlidersHorizontal aria-hidden="true" size={14} />} title="操作">
+      <Section icon={<icons.SlidersHorizontal aria-hidden="true" size={14} />} id="actions" title="操作">
         <SettingRow description="删除的图片会移到回收站，随时可以恢复。" title="删除前确认">
           <Switch checked={preferences.confirmDelete} label="删除前确认" onChange={(confirmDelete) => onChange({ confirmDelete })} />
         </SettingRow>
@@ -224,8 +257,14 @@ export function ViewerSettingsForm({ preferences, onChange, showSystem = true }:
         </SettingRow>
       </Section>
 
+      {showShortcuts ? (
+        <Section icon={<icons.Keyboard aria-hidden="true" size={14} />} id="shortcuts" title="快捷键">
+          <ShortcutEditor onChange={(shortcuts: ShortcutOverrides) => onChange({ shortcuts })} overrides={preferences.shortcuts} />
+        </Section>
+      ) : null}
+
       {showSystem ? (
-        <Section icon={<icons.Settings aria-hidden="true" size={14} />} title="系统">
+        <Section icon={<icons.Settings aria-hidden="true" size={14} />} id="system" title="系统">
           <AssociationControls />
         </Section>
       ) : null}

@@ -25,6 +25,9 @@ import {
   IMAGE_VIEWER_PLUGIN_ID,
   IMAGE_VIEWER_PRIVILEGED_CHANNELS,
   IMAGE_VIEWER_ROUTE,
+  IMAGE_VIEWER_SETTINGS_ROUTE,
+  IMAGE_VIEWER_SETTINGS_SECTIONS,
+  IMAGE_VIEWER_SETTINGS_WINDOW_ROLE,
   IMAGE_VIEWER_WINDOW_ROLE,
   MAX_COPY_IMAGE_BYTES,
   parsePathList,
@@ -109,6 +112,7 @@ export function createImageViewerHost(electron: ElectronModule, options: ImageVi
   let started = false;
   let formats: string[] = [];
   let viewerWindow: BrowserWindow | null = null;
+  let settingsWindow: BrowserWindow | null = null;
   let viewerReady = false;
   let pendingRequest: ImageViewerOpenRequest | null = null;
   let nextRequestId = 1;
@@ -305,7 +309,72 @@ export function createImageViewerHost(electron: ElectronModule, options: ImageVi
     return true;
   }
 
+  /**
+   * The viewer's settings as its own frameless acrylic OS window: it can be
+   * dragged anywhere (even off the viewer) and keeps the system blur behind it.
+   */
+  async function openSettingsWindow(section: string): Promise<boolean> {
+    const target = (IMAGE_VIEWER_SETTINGS_SECTIONS as readonly string[]).includes(section) ? section : "display";
+    if (settingsWindow && !settingsWindow.isDestroyed()) {
+      settingsWindow.webContents.send(IMAGE_VIEWER_CHANNELS.settingsSection, target);
+      if (settingsWindow.isMinimized()) settingsWindow.restore();
+      settingsWindow.show();
+      settingsWindow.focus();
+      return true;
+    }
+    const session = await options.ensureCoreSession();
+    const parent = viewerWindow && !viewerWindow.isDestroyed() ? viewerWindow : undefined;
+    const width = 780;
+    const height = 600;
+    const anchor = parent?.getBounds();
+    const window = new BrowserWindow({
+      title: "看图设置",
+      width,
+      height,
+      minWidth: 640,
+      minHeight: 440,
+      ...(anchor ? { x: Math.round(anchor.x + (anchor.width - width) / 2), y: Math.round(anchor.y + Math.max(24, (anchor.height - height) / 2)) } : {}),
+      parent,
+      modal: false,
+      maximizable: false,
+      fullscreenable: false,
+      backgroundMaterial: "acrylic",
+      transparent: false,
+      backgroundColor: "#00000000",
+      roundedCorners: true,
+      ...(options.windowIconPath ? { icon: options.windowIconPath } : {}),
+      show: false,
+      frame: false,
+      autoHideMenuBar: true,
+      webPreferences: {
+        preload: options.preloadPath,
+        contextIsolation: true,
+        nodeIntegration: false,
+        // No Core URL / session token: settings never talk to Core.
+        additionalArguments: [
+          `--mangoo-window=${IMAGE_VIEWER_SETTINGS_WINDOW_ROLE}`,
+          ...(options.extraRendererArguments?.() ?? [])
+        ]
+      }
+    });
+    settingsWindow = window;
+    options.applyWindowMaterial(window);
+    window.once("ready-to-show", () => {
+      options.applyWindowMaterial(window);
+      window.show();
+    });
+    window.on("closed", () => {
+      if (settingsWindow === window) settingsWindow = null;
+    });
+    window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    window.webContents.on("will-navigate", (event) => event.preventDefault());
+    await window.loadURL(options.rendererUrl(session, `${IMAGE_VIEWER_SETTINGS_ROUTE}/${target}`));
+    return true;
+  }
+
   function closeViewer(): void {
+    if (settingsWindow && !settingsWindow.isDestroyed()) settingsWindow.destroy();
+    settingsWindow = null;
     if (viewerWindow && !viewerWindow.isDestroyed()) {
       persistWindow();
       viewerWindow.destroy();
@@ -414,10 +483,17 @@ export function createImageViewerHost(electron: ElectronModule, options: ImageVi
     return Boolean(window && viewerWindow && window === viewerWindow && !window.isDestroyed());
   }
 
+  function isSettingsSender(event: IpcMainInvokeEvent): boolean {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    return Boolean(window && settingsWindow && window === settingsWindow && !window.isDestroyed());
+  }
+
   function handle(channel: string, scope: "viewer" | "viewer-or-host", handler: (event: IpcMainInvokeEvent, ...args: unknown[]) => unknown): void {
     ipcMain.handle(channel, async (event, ...args) => {
       const viewer = isViewerSender(event);
-      if (!viewer && !(scope === "viewer-or-host" && options.authorizeHostWindow(event, channel))) {
+      // The settings window may only use the shared (association) channels.
+      const settings = scope === "viewer-or-host" && isSettingsSender(event);
+      if (!viewer && !settings && !(scope === "viewer-or-host" && options.authorizeHostWindow(event, channel))) {
         throw new Error(`Image viewer IPC access denied: ${channel}`);
       }
       return handler(event, ...args);
@@ -584,7 +660,11 @@ export function createImageViewerHost(electron: ElectronModule, options: ImageVi
     return true;
   });
 
-  handle(IMAGE_VIEWER_CHANNELS.openFiles, "viewer-or-host", async (_event, value) => {
+  handle(IMAGE_VIEWER_CHANNELS.openSettings, "viewer", (_event, section) =>
+    openSettingsWindow(typeof section === "string" ? section : "display"));
+
+  handle(IMAGE_VIEWER_CHANNELS.openFiles, "viewer-or-host", async (event, value) => {
+    if (isSettingsSender(event)) return false;
     const paths = parsePathList(value);
     if (!paths) return false;
     return openInViewer(paths);
@@ -614,7 +694,7 @@ export function createImageViewerHost(electron: ElectronModule, options: ImageVi
     },
     refresh,
     ownsWindow(window) {
-      return Boolean(window && viewerWindow && window === viewerWindow);
+      return Boolean(window && ((viewerWindow && window === viewerWindow) || (settingsWindow && window === settingsWindow)));
     },
     isEnabled() {
       return enabled;
