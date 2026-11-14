@@ -10,12 +10,13 @@ export type ShortcutActionId =
   | "rotateRight" | "rotateLeft" | "flipHorizontal" | "flipVertical"
   | "fullscreen" | "slideshow" | "toggleInfo" | "toggleFilmstrip" | "toggleTitlebarPin"
   | "playPause" | "nextFrame" | "previousFrame"
-  | "open" | "copyImage" | "copyPath" | "rename" | "delete" | "showShortcuts" | "closeWindow";
+  | "open" | "copyImage" | "copyPath" | "rename" | "delete" | "showShortcuts" | "closeWindow"
+  | "channelRed" | "channelGreen" | "channelBlue" | "channelAlpha" | "channelAll" | "toggleRawSource";
 
 export interface ShortcutAction {
   id: ShortcutActionId;
   label: string;
-  group: "浏览" | "缩放与旋转" | "动图" | "窗口" | "文件";
+  group: "浏览" | "缩放与旋转" | "通道" | "动图" | "窗口" | "文件";
   /** Default chords; the first one is shown in menus and tooltips. */
   defaults: string[];
 }
@@ -34,6 +35,12 @@ export const SHORTCUT_ACTIONS: readonly ShortcutAction[] = [
   { id: "rotateLeft", label: "向左旋转", group: "缩放与旋转", defaults: ["Shift+R"] },
   { id: "flipHorizontal", label: "水平翻转", group: "缩放与旋转", defaults: ["H"] },
   { id: "flipVertical", label: "垂直翻转", group: "缩放与旋转", defaults: ["V"] },
+  { id: "channelAll", label: "显示全部通道（RGBA）", group: "通道", defaults: ["Alt+0"] },
+  { id: "channelRed", label: "只看红色通道（R）", group: "通道", defaults: ["Alt+1"] },
+  { id: "channelGreen", label: "只看绿色通道（G）", group: "通道", defaults: ["Alt+2"] },
+  { id: "channelBlue", label: "只看蓝色通道（B）", group: "通道", defaults: ["Alt+3"] },
+  { id: "channelAlpha", label: "只看透明通道（A）", group: "通道", defaults: ["Alt+4"] },
+  { id: "toggleRawSource", label: "RAW：切换原图 / 内嵌 JPEG", group: "文件", defaults: ["J"] },
   { id: "playPause", label: "播放 / 暂停动图", group: "动图", defaults: ["Space"] },
   { id: "nextFrame", label: "下一帧", group: "动图", defaults: ["."] },
   { id: "previousFrame", label: "上一帧", group: "动图", defaults: [","] },
@@ -50,7 +57,7 @@ export const SHORTCUT_ACTIONS: readonly ShortcutAction[] = [
   { id: "delete", label: "删除到回收站", group: "文件", defaults: ["Delete"] }
 ];
 
-export const SHORTCUT_GROUPS = ["浏览", "缩放与旋转", "动图", "窗口", "文件"] as const;
+export const SHORTCUT_GROUPS = ["浏览", "缩放与旋转", "通道", "动图", "窗口", "文件"] as const;
 
 /** Persisted overrides: only actions the user changed are stored. */
 export type ShortcutOverrides = Partial<Record<ShortcutActionId, string[]>>;

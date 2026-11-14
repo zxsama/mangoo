@@ -387,6 +387,15 @@ pub fn generate_preview_webp(
             purpose: crate::decode::DecodePurpose::Preview,
         })
         .map_err(|error| anyhow::anyhow!("preview decode failed: {error}"))?;
+    generate_preview_webp_from(decoded, max_px)
+}
+
+/// Downscale already-decoded pixels to `max_px` (long side) and WebP-encode
+/// them, exactly like [`generate_preview_webp`] does after decoding.
+pub fn generate_preview_webp_from(
+    decoded: crate::decode::DecodedImage,
+    max_px: u32,
+) -> anyhow::Result<GeneratedPreviewTier> {
     if decoded.width == 0 || decoded.height == 0 {
         return Err(anyhow::anyhow!(
             "preview decode failed: zero-sized source image"

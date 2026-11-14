@@ -162,7 +162,6 @@ export function ImageViewerSettingsWindow() {
                 </button>
               );
             })}
-            <p className="iv-settings-nav-footnote">更改会立即生效</p>
           </nav>
           <div className="iv-settings-scroll" ref={scrollRef}>
             <ViewerSettingsForm onChange={setPreferences} preferences={preferences} showShortcuts />

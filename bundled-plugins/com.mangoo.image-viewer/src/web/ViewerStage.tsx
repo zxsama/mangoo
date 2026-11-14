@@ -7,6 +7,35 @@ import type { ViewerBackground } from "./preferences.ts";
 /** Which interpolation the image layer uses for the current change. */
 export type StageAnimation = "none" | "ease" | "wheel" | "pinch";
 
+export type ViewerChannel = "red" | "green" | "blue" | "alpha";
+
+/**
+ * Single-channel view as an SVG colour-matrix filter on the canvas (GPU, no
+ * pixel copy). Each channel is shown as greyscale; alpha shows white =
+ * opaque. "Premultiplied" multiplies R/G/B by alpha first, so transparent
+ * pixels read as black, like a premultiplied buffer would store them.
+ */
+function ChannelFilters() {
+  const rows = { red: "1 0 0 0 0", green: "0 1 0 0 0", blue: "0 0 1 0 0", alpha: "0 0 0 1 0" } as const;
+  return (
+    <svg aria-hidden="true" className="iv-channel-defs" height="0" width="0">
+      {(Object.keys(rows) as ViewerChannel[]).map((channel) => (
+        <filter colorInterpolationFilters="sRGB" id={`iv-channel-${channel}`} key={channel}>
+          <feColorMatrix type="matrix" values={`${rows[channel]} ${rows[channel]} ${rows[channel]} 0 0 0 0 1`} />
+        </filter>
+      ))}
+      {(["red", "green", "blue"] as const).map((channel) => (
+        <filter colorInterpolationFilters="sRGB" id={`iv-channel-${channel}-pm`} key={`${channel}-pm`}>
+          {/* Channel as grey, alpha kept; over black = channel × alpha. */}
+          <feColorMatrix result="grey" type="matrix" values={`${rows[channel]} ${rows[channel]} ${rows[channel]} 0 0 0 1 0`} />
+          <feFlood floodColor="#000" result="black" />
+          <feComposite in="grey" in2="black" operator="over" />
+        </filter>
+      ))}
+    </svg>
+  );
+}
+
 export interface ViewerStageProps {
   image: LoadedImage | null;
   /** Image box in CSS px at scale 1 (source px / devicePixelRatio). */
@@ -14,7 +43,11 @@ export interface ViewerStageProps {
   transform: ViewTransform;
   animate: StageAnimation;
   background: ViewerBackground;
-  pixelated: boolean;
+  /** Canvas interpolation for the current scale (upscale vs downscale choice). */
+  interpolation: "smooth" | "nearest";
+  /** Single-channel view (null = all channels). */
+  channel: ViewerChannel | null;
+  premultiply: boolean;
   /** Backing-store scale for the canvas (see renderLevel). */
   renderLevel: number;
   /** Animation frame to paint instead of the image (frame inspector). */
@@ -80,6 +113,8 @@ export function ViewerStage(props: ViewerStageProps) {
     }
     const context = canvas.getContext("2d", { alpha: true });
     if (!context) return;
+    // Downscaled backing stores always smooth (the CSS interpolation below
+    // decides how the canvas reaches the screen).
     context.imageSmoothingEnabled = true;
     context.imageSmoothingQuality = "high";
     context.clearRect(0, 0, width, height);
@@ -101,7 +136,9 @@ export function ViewerStage(props: ViewerStageProps) {
       const current = propsRef.current;
       current.onActivity();
       const zoomGesture = event.ctrlKey || !current.wheelNavigates;
-      if (!zoomGesture && current.zoomedIn) {
+      // A zoomed-in picture still switches with the wheel (the user asked for
+      // it); a trackpad's horizontal swipe pans it instead.
+      if (!zoomGesture && current.zoomedIn && Math.abs(event.deltaX) > Math.abs(event.deltaY)) {
         current.onPan(-event.deltaX, -event.deltaY, true);
         return;
       }
@@ -236,15 +273,28 @@ export function ViewerStage(props: ViewerStageProps) {
       <div
         className="iv-image-layer"
         data-animate={props.animate}
-        data-pixelated={props.pixelated ? "true" : "false"}
+        data-interpolation={props.interpolation}
+        data-channel={props.channel ?? "all"}
         hidden={!props.image}
         style={layerStyle}
       >
-        <canvas className="iv-canvas" hidden={props.image?.kind !== "bitmap" && !props.frameBitmap} ref={canvasRef} />
+        <canvas
+          className="iv-canvas"
+          hidden={props.image?.kind !== "bitmap" && !props.frameBitmap}
+          ref={canvasRef}
+          style={props.channel ? { filter: `url(#iv-channel-${props.channel}${props.premultiply && props.channel !== "alpha" ? "-pm" : ""})` } : undefined}
+        />
         {props.image?.kind === "animated" && !props.frameBitmap ? (
-          <img alt="" className="iv-animated" draggable={false} src={props.image.url} />
+          <img
+            alt=""
+            className="iv-animated"
+            draggable={false}
+            src={props.image.url}
+            style={props.channel ? { filter: `url(#iv-channel-${props.channel}${props.premultiply && props.channel !== "alpha" ? "-pm" : ""})` } : undefined}
+          />
         ) : null}
       </div>
+      <ChannelFilters />
       {props.overlay}
     </div>
   );

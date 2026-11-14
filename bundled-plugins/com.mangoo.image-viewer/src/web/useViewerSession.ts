@@ -4,6 +4,7 @@ import type { ImageViewerFolderEntry } from "@mangoo/core-client";
 
 import { extensionOf, splitPath } from "../shared/formats.ts";
 import {
+  collapseRawPairs,
   indexAfterRemoval,
   indexOfPath,
   samePath,
@@ -53,25 +54,48 @@ export function describeError(error: unknown): string {
 }
 
 function toEntry(entry: ImageViewerFolderEntry): ImageEntry {
-  return { path: entry.path, name: entry.name, ext: entry.ext, sizeBytes: entry.sizeBytes, modifiedAtMs: entry.modifiedAtMs };
+  return {
+    path: entry.path,
+    name: entry.name,
+    ext: entry.ext,
+    sizeBytes: entry.sizeBytes,
+    modifiedAtMs: entry.modifiedAtMs,
+    cameraRaw: entry.cameraRaw,
+    ...(entry.pairPath ? { pairPath: entry.pairPath } : {})
+  };
 }
 
 function fallbackEntry(path: string): ImageEntry {
   return { path, name: splitPath(path).name, ext: extensionOf(path), sizeBytes: 0, modifiedAtMs: 0 };
 }
 
-export function useViewerSession(sortKey: ImageSortKey, sortDirection: ImageSortDirection, loop: boolean) {
+export { hiddenPairOf } from "../shared/navigation.ts";
+
+export function useViewerSession(sortKey: ImageSortKey, sortDirection: ImageSortDirection, loop: boolean, pairRawJpeg = true) {
   const [state, setState] = useState<ViewerSessionState>(EMPTY);
   const requestToken = useRef(0);
   const stateRef = useRef(state);
   stateRef.current = state;
 
-  const sortRef = useRef({ sortKey, sortDirection });
-  sortRef.current = { sortKey, sortDirection };
+  const sortRef = useRef({ sortKey, sortDirection, pairRawJpeg });
+  sortRef.current = { sortKey, sortDirection, pairRawJpeg };
+  /** Every entry of the folder, before pairing (pairing is a view on it). */
+  const allEntries = useRef<ImageEntry[]>([]);
+
+  /** The file the user explicitly opened: it is never hidden behind its pair. */
+  const openedPath = useRef<string | null>(null);
 
   const apply = useCallback((entries: ImageEntry[], focusPath: string | null, extra: Partial<ViewerSessionState>) => {
-    const sorted = sortEntries(entries, sortRef.current.sortKey, sortRef.current.sortDirection);
-    const found = focusPath ? indexOfPath(sorted, focusPath) : -1;
+    allEntries.current = entries;
+    const mode = extra.mode ?? stateRef.current.mode;
+    const visible = sortRef.current.pairRawJpeg && mode === "folder" ? collapseRawPairs(entries, openedPath.current) : entries;
+    const sorted = sortEntries(visible, sortRef.current.sortKey, sortRef.current.sortDirection);
+    let found = focusPath ? indexOfPath(sorted, focusPath) : -1;
+    if (found < 0 && focusPath) {
+      // The focused file is a hidden pair member: focus its RAW.
+      const hidden = entries.find((entry) => samePath(entry.path, focusPath));
+      if (hidden?.pairPath) found = indexOfPath(sorted, hidden.pairPath);
+    }
     setState((current) => ({
       ...current,
       ...extra,
@@ -89,11 +113,13 @@ export function useViewerSession(sortKey: ImageSortKey, sortDirection: ImageSort
     setState((current) => ({ ...current, loading: true, error: null }));
     const client = createCoreClient();
     try {
+      openedPath.current = null;
       if (paths.length === 1) {
         const listing = await client.getImageViewerFolder(paths[0]);
         if (token !== requestToken.current) return;
         const entries = listing.entries.map(toEntry);
         const isFile = indexOfPath(entries, paths[0]) >= 0 || extensionOf(paths[0]) !== "";
+        openedPath.current = isFile ? paths[0] : null;
         if (isFile && indexOfPath(entries, paths[0]) < 0) entries.push(fallbackEntry(paths[0]));
         apply(entries, isFile ? paths[0] : null, { directory: listing.directory, mode: "folder", truncated: listing.truncated });
         return;
@@ -131,12 +157,15 @@ export function useViewerSession(sortKey: ImageSortKey, sortDirection: ImageSort
     try {
       const listing = await createCoreClient().getImageViewerFolder(current.directory, { requestPriority: "background" });
       const entries = listing.entries.map(toEntry);
-      const unchanged = entries.length === current.entries.length
-        && entries.every((entry) => current.entries.some((other) => samePath(other.path, entry.path) && other.modifiedAtMs === entry.modifiedAtMs));
+      const known = allEntries.current;
+      const unchanged = entries.length === known.length
+        && entries.every((entry) => known.some((other) => samePath(other.path, entry.path) && other.modifiedAtMs === entry.modifiedAtMs));
       if (unchanged) return;
       if (focus && indexOfPath(entries, focus) < 0) {
         // The picture on screen vanished: keep the position, like deleting.
-        const sorted = sortEntries(entries, sortRef.current.sortKey, sortRef.current.sortDirection);
+        allEntries.current = entries;
+        const visible = sortRef.current.pairRawJpeg && current.mode === "folder" ? collapseRawPairs(entries, openedPath.current) : entries;
+        const sorted = sortEntries(visible, sortRef.current.sortKey, sortRef.current.sortDirection);
         setState((value) => ({ ...value, entries: sorted, index: indexAfterRemoval(sorted.length, value.index), truncated: listing.truncated }));
         return;
       }
@@ -146,12 +175,12 @@ export function useViewerSession(sortKey: ImageSortKey, sortDirection: ImageSort
     }
   }, [apply]);
 
-  // Re-sort when the sort preference changes.
+  // Re-sort / re-pair when those preferences change.
   useEffect(() => {
     const current = stateRef.current;
     if (current.entries.length === 0) return;
-    apply(current.entries, current.entries[current.index]?.path ?? null, {});
-  }, [apply, sortKey, sortDirection]);
+    apply(allEntries.current.length ? allEntries.current : current.entries, current.entries[current.index]?.path ?? null, {});
+  }, [apply, sortKey, sortDirection, pairRawJpeg]);
 
   const go = useCallback((delta: number) => {
     setState((current) => {
@@ -165,25 +194,49 @@ export function useViewerSession(sortKey: ImageSortKey, sortDirection: ImageSort
     setState((current) => (index >= 0 && index < current.entries.length ? { ...current, index } : current));
   }, []);
 
-  const removeCurrent = useCallback(() => {
+  /** Forget files that left the folder (deleted), keeping both lists in step. */
+  const removePaths = useCallback((paths: readonly string[]) => {
+    const gone = (path: string) => paths.some((other) => samePath(other, path));
+    allEntries.current = allEntries.current.filter((entry) => !gone(entry.path));
     setState((current) => {
       if (current.index < 0) return current;
-      const entries = current.entries.filter((_, index) => index !== current.index);
+      const entries = current.entries.filter((entry) => !gone(entry.path));
       return { ...current, entries, index: indexAfterRemoval(entries.length, current.index) };
     });
   }, []);
 
+  const removeCurrent = useCallback(() => {
+    const current = stateRef.current;
+    const entry = current.entries[current.index];
+    if (entry) removePaths([entry.path]);
+  }, [removePaths]);
+
+  /** Renamed files (`from` -> `to`), applied to every entry list. */
+  const renamePaths = useCallback((renames: ReadonlyArray<{ from: string; to: string }>) => {
+    const target = (path: string) => renames.find((rename) => samePath(rename.from, path))?.to ?? null;
+    const rewrite = (entry: ImageEntry): ImageEntry => {
+      const to = target(entry.path);
+      const pair = entry.pairPath ? target(entry.pairPath) ?? entry.pairPath : entry.pairPath;
+      if (!to) return pair === entry.pairPath ? entry : { ...entry, pairPath: pair };
+      return { ...entry, path: to, name: splitPath(to).name, ext: extensionOf(to), ...(pair ? { pairPath: pair } : {}) };
+    };
+    const current = stateRef.current;
+    const focus = current.entries[current.index]?.path ?? null;
+    // The explicitly opened file keeps its identity through a rename.
+    if (openedPath.current) openedPath.current = target(openedPath.current) ?? openedPath.current;
+    const base = allEntries.current.length ? allEntries.current : current.entries;
+    apply(base.map(rewrite), focus ? target(focus) ?? focus : null, {});
+  }, [apply]);
+
   const replaceCurrent = useCallback((path: string) => {
     const current = stateRef.current;
     const entry = current.entries[current.index];
-    if (!entry) return;
-    const renamed: ImageEntry = { ...entry, path, name: splitPath(path).name, ext: extensionOf(path) };
-    apply(current.entries.map((item, index) => (index === current.index ? renamed : item)), path, {});
-  }, [apply]);
+    if (entry) renamePaths([{ from: entry.path, to: path }]);
+  }, [renamePaths]);
 
   const current = state.index >= 0 ? state.entries[state.index] ?? null : null;
   return useMemo(
-    () => ({ state, current, open, refresh, go, goTo, removeCurrent, replaceCurrent }),
-    [state, current, open, refresh, go, goTo, removeCurrent, replaceCurrent]
+    () => ({ state, current, open, refresh, go, goTo, removeCurrent, removePaths, replaceCurrent, renamePaths }),
+    [state, current, open, refresh, go, goTo, removeCurrent, removePaths, replaceCurrent, renamePaths]
   );
 }

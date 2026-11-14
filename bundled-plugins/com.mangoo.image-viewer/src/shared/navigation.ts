@@ -12,6 +12,10 @@ export interface ImageEntry {
   ext: string;
   sizeBytes: number;
   modifiedAtMs: number;
+  /** Camera RAW (has an embedded JPEG preview). */
+  cameraRaw?: boolean;
+  /** The other half of a camera RAW+JPEG pair. */
+  pairPath?: string;
 }
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
@@ -114,4 +118,29 @@ export function formatBytes(bytes: number): string {
     unit += 1;
   }
   return `${value >= 100 ? value.toFixed(0) : value >= 10 ? value.toFixed(1) : value.toFixed(2)} ${units[unit]}`;
+}
+
+/**
+ * Camera RAW+JPEG pairs (the camera wrote both) show as ONE picture: the RAW
+ * entry stays (it is the original; its embedded/companion JPEG is one toggle
+ * away), the JPEG is hidden. Opening the JPEG itself focuses its RAW.
+ */
+export function collapseRawPairs(entries: ImageEntry[], keepPath: string | null = null): ImageEntry[] {
+  const keep = keepPath?.toLowerCase() ?? null;
+  // The JPEG the user opened stands for the pair; its RAW is hidden instead.
+  const keptJpeg = keep ? entries.find((entry) => !entry.cameraRaw && entry.pairPath && entry.path.toLowerCase() === keep) : undefined;
+  const hiddenRaw = keptJpeg?.pairPath?.toLowerCase() ?? null;
+  const raws = new Set(entries.filter((entry) => entry.cameraRaw && entry.pairPath).map((entry) => entry.path.toLowerCase()));
+  return entries.filter((entry) => {
+    const path = entry.path.toLowerCase();
+    if (entry === keptJpeg) return true;
+    if (entry.cameraRaw) return path !== hiddenRaw;
+    return !entry.pairPath || !raws.has(entry.pairPath.toLowerCase());
+  });
+}
+
+/** The other half of `entry`'s RAW+JPEG pair, when the pair is shown as one. */
+export function hiddenPairOf(entry: ImageEntry | null, visible: readonly ImageEntry[]): string | null {
+  if (!entry?.pairPath) return null;
+  return visible.some((other) => samePath(other.path, entry.pairPath ?? "")) ? null : entry.pairPath;
 }

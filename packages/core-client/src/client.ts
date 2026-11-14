@@ -126,6 +126,8 @@ export interface ImageViewerImageOptions extends BlobRequestOptions {
   viewportLongPx?: number;
   /** Request the original bytes (zoomed past fit) when Chromium can paint them. */
   full?: boolean;
+  /** Camera RAW: develop the sensor data (default) or show the embedded JPEG. */
+  rawSource?: "developed" | "embedded";
 }
 
 export interface ImageViewerImageResource extends PreviewResource {
@@ -872,6 +874,7 @@ export function createCoreClient(config: CoreClientConfig) {
       const search = new URLSearchParams({ path });
       if (options.viewportLongPx && options.viewportLongPx > 0) search.set("viewportLongPx", String(Math.round(options.viewportLongPx)));
       if (options.full) search.set("full", "true");
+      if (options.rawSource === "embedded") search.set("rawSource", "embedded");
       return fetchImageViewerResource(`/image-viewer/image?${search}`, options);
     },
     getImageViewerThumbnail: (path: string, options: BlobRequestOptions & { size?: number } = {}) => {

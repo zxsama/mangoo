@@ -10,9 +10,25 @@ use std::path::Path;
 /// Extensions indexed as `media.kind = "image"`. The decode registry mirrors
 /// this set across browser-native, PSD, camera RAW, and ffmpeg-backed decoders.
 pub const IMAGE_EXTENSIONS: &[&str] = &[
-    ".apng", ".arw", ".avif", ".bmp", ".cr2", ".dng", ".gif", ".heic", ".heif", ".jpeg", ".jpg",
-    ".nef", ".orf", ".png", ".psd", ".raw", ".rw2", ".tif", ".tiff", ".webp",
+    ".3fr", ".apng", ".ari", ".arw", ".avif", ".bmp", ".cr2", ".cr3", ".crw", ".dcr", ".dcs",
+    ".dng", ".erf", ".fff", ".gif", ".heic", ".heif", ".iiq", ".jpeg", ".jpg", ".kdc", ".mef",
+    ".mos", ".mrw", ".nef", ".nrw", ".orf", ".ori", ".pef", ".png", ".psd", ".qtk", ".raf", ".raw",
+    ".rw2", ".rwl", ".srw", ".tif", ".tiff", ".webp", ".x3f",
 ];
+
+/// Camera RAW families: every format the `rawler` decoder reads (its
+/// `SUPPORTED_FILES_EXT`, minus `.crm` Canon RAW *video*). All of them are
+/// image extensions above, never browser-renderable, and carry the camera's
+/// own embedded JPEG preview.
+pub const CAMERA_RAW_EXTENSIONS: &[&str] = &[
+    ".3fr", ".ari", ".arw", ".cr2", ".cr3", ".crw", ".dcr", ".dcs", ".dng", ".erf", ".fff", ".iiq",
+    ".kdc", ".mef", ".mos", ".mrw", ".nef", ".nrw", ".orf", ".ori", ".pef", ".qtk", ".raf", ".raw",
+    ".rw2", ".rwl", ".srw", ".x3f",
+];
+
+pub fn is_camera_raw(ext: &str) -> bool {
+    CAMERA_RAW_EXTENSIONS.contains(&ext)
+}
 
 /// Extensions indexed as `media.kind = "video"`.
 pub const VIDEO_EXTENSIONS: &[&str] = &[".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm", ".wmv"];
@@ -105,6 +121,29 @@ mod tests {
         for name in ["a.txt", "a.zip", "a", "a.PDF"] {
             assert_eq!(media_kind_for_path(Path::new(name)), None, "{name}");
         }
+    }
+
+    #[test]
+    fn every_camera_raw_family_is_an_indexed_image_that_must_transcode() {
+        for ext in CAMERA_RAW_EXTENSIONS {
+            assert!(IMAGE_EXTENSIONS.contains(ext), "{ext} must be indexed");
+            assert!(!is_browser_renderable_image(ext), "{ext} must transcode");
+            assert!(is_camera_raw(ext));
+        }
+        // rawler's own list, so a rawler upgrade that adds a family is noticed.
+        let mut rawler: Vec<String> = rawler::decoders::supported_extensions()
+            .iter()
+            .map(|ext| format!(".{}", ext.to_ascii_lowercase()))
+            .filter(|ext| ext != ".crm")
+            .collect();
+        rawler.sort();
+        let mut ours: Vec<String> = CAMERA_RAW_EXTENSIONS
+            .iter()
+            .map(|ext| (*ext).to_owned())
+            .collect();
+        ours.sort();
+        assert_eq!(ours, rawler);
+        assert!(!is_camera_raw(".jpg"));
     }
 
     #[test]

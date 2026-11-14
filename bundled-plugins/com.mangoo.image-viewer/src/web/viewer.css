@@ -222,8 +222,8 @@
   display: none;
 }
 
-.iv-image-layer[data-pixelated="true"] .iv-canvas,
-.iv-image-layer[data-pixelated="true"] .iv-animated {
+.iv-image-layer[data-interpolation="nearest"] .iv-canvas,
+.iv-image-layer[data-interpolation="nearest"] .iv-animated {
   image-rendering: pixelated;
 }
 
@@ -2306,4 +2306,354 @@ html:has(.iv-settings-window) #root {
 /* Free panning: the grab cursor applies to any picture. */
 .iv-stage[data-has-image="true"] {
   cursor: grab;
+}
+
+/* Round 6 ---------------------------------------------------------------- */
+
+/* Item 6: active titlebar / toolbar buttons — a quiet neutral fill and an
+ * accent-tinted icon instead of a saturated teal block (the main window's
+ * titlebar language). One boundary only: the fill, no border ring. */
+.iv-icon-button[aria-pressed="true"] {
+  color: var(--accent);
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.iv-icon-button[aria-pressed="true"] > .liquid-glass-backdrop {
+  background: transparent;
+}
+
+.liquid-glass.iv-icon-button[data-glass-active="true"] {
+  --glass-border-current: transparent;
+}
+
+/* Item 4: the info panel scrolls under a fixed histogram; File and EXIF fold
+ * open/closed with a plain, borderless header. */
+.iv-float .iv-float-body:has(> .iv-info) {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.iv-float .iv-info {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 0;
+  min-height: 0;
+  padding: 0;
+}
+
+.iv-info-pinned {
+  flex: 0 0 auto;
+  padding: 12px 14px 10px;
+}
+
+.iv-info-scroll {
+  display: grid;
+  flex: 1 1 auto;
+  align-content: start;
+  gap: 4px;
+  min-height: 0;
+  padding: 0 14px 16px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.iv-info-scroll > .iv-info-section {
+  gap: 4px;
+  padding-top: 4px;
+  border-top: 0;
+}
+
+.iv-info-fold {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  height: 28px;
+  padding: 0 2px;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--iv-text-caption);
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-align: left;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  cursor: pointer;
+}
+
+.iv-info-fold:focus-visible {
+  outline: 1px solid var(--interactive-focus);
+}
+
+.iv-info-fold-chevron {
+  transition: transform 160ms ease;
+}
+
+.iv-info-section[data-open="true"] .iv-info-fold-chevron {
+  transform: rotate(90deg);
+}
+
+.iv-info-fold-body {
+  display: grid;
+  gap: 6px;
+  padding: 0 0 6px 2px;
+}
+
+/* Titlebar status chips (RAW source, channel). */
+.iv-title-chip {
+  flex: 0 0 auto;
+  height: 20px;
+  padding: 0 8px;
+  color: var(--text-soft);
+  font: inherit;
+  font-size: var(--iv-text-caption);
+  font-weight: 600;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  background: rgba(255, 255, 255, 0.05);
+  cursor: pointer;
+}
+
+.iv-title-chip:focus-visible {
+  border-color: var(--interactive-focus);
+  outline: none;
+}
+
+.iv-title-chip[data-channel="red"] { color: #f1958c; }
+.iv-title-chip[data-channel="green"] { color: #8fdca6; }
+.iv-title-chip[data-channel="blue"] { color: #8fb6f1; }
+
+.iv-channel-defs {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.iv-menu-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+
+.iv-menu-swatch[data-channel="red"] { background: #e2665b; }
+.iv-menu-swatch[data-channel="green"] { background: #4fbf72; }
+.iv-menu-swatch[data-channel="blue"] { background: #4f86e2; }
+.iv-menu-swatch[data-channel="alpha"] {
+  background: linear-gradient(135deg, #fff 0 50%, #444 50% 100%);
+}
+
+/* Item 5: a switch that is applying keeps the normal cursor (never the
+ * not-allowed one) and dims slightly instead. */
+.plugin-toggle.iv-switch.busy {
+  cursor: progress;
+  opacity: 0.75;
+}
+
+.plugin-toggle.iv-switch.busy .plugin-toggle-thumb {
+  transition: transform 160ms ease;
+}
+
+/* Round 7 ---------------------------------------------------------------- */
+
+/* Item 5: fold headers never light up (the global button hover / active
+ * fill and lift). Only the chevron says open / closed. */
+.iv-info-fold,
+.iv-info-fold:hover:not(:disabled),
+.iv-info-fold:active:not(:disabled),
+.iv-info-fold[aria-expanded="true"] {
+  color: var(--text-muted);
+  background: transparent;
+  box-shadow: none;
+  transform: none;
+}
+
+.iv-info-fold:hover:not(:disabled) {
+  color: var(--text-soft);
+}
+
+/* Histogram: header with mode switch, plot with clip markers and a hover
+ * readout, tonal scale, and a compact statistics grid. */
+.iv-histo-block {
+  display: grid;
+  gap: 6px;
+}
+
+.iv-histo-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.iv-histo-title {
+  color: var(--text-muted);
+  font-size: var(--iv-text-caption);
+  font-weight: 650;
+  letter-spacing: 0.04em;
+}
+
+.iv-histo-modes {
+  display: inline-flex;
+  gap: 2px;
+}
+
+.iv-histo-mode {
+  height: 20px;
+  padding: 0 8px;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--iv-text-caption);
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  cursor: pointer;
+}
+
+.iv-histo-mode:hover:not(:disabled) {
+  color: var(--text-soft);
+  transform: none;
+}
+
+.iv-histo-mode[data-selected="true"] {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.iv-histogram {
+  position: relative;
+  cursor: crosshair;
+}
+
+.iv-histo-clip {
+  position: absolute;
+  top: 6px;
+  width: 0;
+  height: 0;
+  border-top: 6px solid transparent;
+  border-bottom: 6px solid transparent;
+}
+
+.iv-histo-clip[data-side="shadows"] {
+  left: 4px;
+  border-right: 7px solid #8fb6f1;
+}
+
+.iv-histo-clip[data-side="highlights"] {
+  right: 4px;
+  border-left: 7px solid #f1958c;
+}
+
+.iv-histo-cursor {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgba(255, 255, 255, 0.55);
+  pointer-events: none;
+}
+
+.iv-histo-readout {
+  position: absolute;
+  top: 4px;
+  padding: 1px 6px;
+  color: var(--text-primary);
+  font-size: var(--iv-text-caption);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  border-radius: var(--radius-pill);
+  background: rgba(8, 12, 16, 0.72);
+  pointer-events: none;
+}
+
+.iv-histo-readout[data-align="right"] {
+  transform: translateX(6px);
+}
+
+.iv-histo-readout[data-align="left"] {
+  transform: translateX(calc(-100% - 6px));
+}
+
+.iv-histo-scale {
+  display: flex;
+  justify-content: space-between;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  opacity: 0.75;
+}
+
+.iv-histo-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px 14px;
+  margin: 2px 0 0;
+}
+
+.iv-histo-stats > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.iv-histo-stats dt {
+  color: var(--text-muted);
+  font-size: var(--iv-text-caption);
+}
+
+.iv-histo-stats dd {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: var(--iv-text-body);
+  font-variant-numeric: tabular-nums;
+}
+
+.iv-histo-stats > div[data-tone="warn"] dd {
+  color: #f1c27d;
+}
+
+.iv-histo-stats-placeholder {
+  height: 58px;
+}
+
+/* Item 4: RAW / JPEG source switch in the toolbar — a two-option segmented
+ * pill; the selected half carries the fill. */
+.iv-raw-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  height: 28px;
+  margin: 0 2px;
+  padding: 2px;
+  border-radius: var(--radius-control);
+}
+
+.iv-raw-switch > .liquid-glass-content {
+  display: inline-flex;
+  gap: 2px;
+}
+
+.iv-raw-option {
+  display: inline-grid;
+  place-items: center;
+  min-width: 40px;
+  height: 22px;
+  padding: 0 6px;
+  color: var(--text-muted);
+  font-size: var(--iv-text-caption);
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  border-radius: calc(var(--radius-control) - 2px);
+  transition: color 140ms ease, background-color 140ms ease;
+}
+
+.iv-raw-option[data-selected="true"] {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.11);
 }

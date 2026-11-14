@@ -6,6 +6,8 @@ import { normalizeOverrides, type ShortcutOverrides } from "../shared/shortcuts.
 
 export type ViewerBackground = "interface" | "black" | "dark" | "checker" | "light";
 export type WheelAction = "zoom" | "navigate";
+/** Canvas interpolation. "smooth" = high-quality bilinear/area, "nearest" = hard pixels. */
+export type Interpolation = "smooth" | "nearest";
 
 export interface ViewerPreferences {
   background: ViewerBackground;
@@ -27,6 +29,14 @@ export interface ViewerPreferences {
   titlebarPinned: boolean;
   /** Show the frame panel automatically for animated images. */
   framesAutoOpen: boolean;
+  /** Interpolation when the picture is shown larger than its pixels. */
+  upscaleInterpolation: Interpolation;
+  /** Interpolation when the picture is shown smaller than its pixels. */
+  downscaleInterpolation: Interpolation;
+  /** Single-channel view: premultiply R/G/B by alpha. */
+  channelPremultiply: boolean;
+  /** Show a camera RAW and its same-name JPEG as one picture. */
+  pairRawJpeg: boolean;
   shortcuts: ShortcutOverrides;
 }
 
@@ -47,6 +57,10 @@ export const DEFAULT_VIEWER_PREFERENCES: ViewerPreferences = {
   keepTransform: true,
   titlebarPinned: false,
   framesAutoOpen: true,
+  upscaleInterpolation: "nearest",
+  downscaleInterpolation: "smooth",
+  channelPremultiply: false,
+  pairRawJpeg: true,
   shortcuts: {}
 };
 
@@ -86,6 +100,15 @@ export function normalizeViewerPreferences(value: unknown): ViewerPreferences {
     keepTransform: bool("keepTransform"),
     titlebarPinned: bool("titlebarPinned"),
     framesAutoOpen: bool("framesAutoOpen"),
+    // The old "pixelated past 200%" switch maps to the upscale choice.
+    upscaleInterpolation: oneOf(
+      raw.upscaleInterpolation,
+      ["smooth", "nearest"] as const,
+      typeof raw.pixelatedZoom === "boolean" ? (raw.pixelatedZoom ? "nearest" : "smooth") : d.upscaleInterpolation
+    ),
+    downscaleInterpolation: oneOf(raw.downscaleInterpolation, ["smooth", "nearest"] as const, d.downscaleInterpolation),
+    channelPremultiply: bool("channelPremultiply"),
+    pairRawJpeg: bool("pairRawJpeg"),
     shortcuts: normalizeOverrides(raw.shortcuts)
   };
 }

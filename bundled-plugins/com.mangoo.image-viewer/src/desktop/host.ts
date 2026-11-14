@@ -63,6 +63,8 @@ export interface ImageViewerHostOptions {
   authorizeHostWindow(event: IpcMainInvokeEvent, channel: string): boolean;
   /** Extra renderer switches (e.g. the visual harness flag). */
   extraRendererArguments?: () => string[];
+  /** Arm the Host's pointer-driven window drag for `window` at its current bounds. */
+  beginWindowDrag(window: BrowserWindow): boolean;
   log(level: "info" | "warn" | "error", message: string, data?: Record<string, unknown>): void;
 }
 
@@ -622,6 +624,42 @@ export function createImageViewerHost(electron: ElectronModule, options: ImageVi
     if (!window) return false;
     window.setFullScreen(!window.isFullScreen());
     return window.isFullScreen();
+  });
+
+  handle(IMAGE_VIEWER_CHANNELS.dragOutOfFullscreen, "viewer", async (event, input) => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    if (!window || !window.isFullScreen()) return false;
+    const raw = (input && typeof input === "object" ? input : {}) as { pointerRatioX?: unknown; titlebarOffsetY?: unknown };
+    const ratio = typeof raw.pointerRatioX === "number" && Number.isFinite(raw.pointerRatioX) ? Math.min(1, Math.max(0, raw.pointerRatioX)) : 0.5;
+    const offsetY = typeof raw.titlebarOffsetY === "number" && Number.isFinite(raw.titlebarOffsetY) ? Math.min(40, Math.max(0, raw.titlebarOffsetY)) : 16;
+    // The size to restore to. While fullscreen (and often maximized),
+    // getNormalBounds() reports the screen-sized bounds, so prefer the last
+    // persisted normal size, else a comfortable default for this display.
+    const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea;
+    const saved = store.get().window?.bounds;
+    const fallback = { width: Math.round(display.width * 0.6), height: Math.round(display.height * 0.66) };
+    const candidate = saved && saved.width < display.width * 0.98 ? saved : fallback;
+    const normal = {
+      width: Math.max(520, Math.min(candidate.width, display.width)),
+      height: Math.max(360, Math.min(candidate.height, display.height))
+    };
+    await new Promise<void>((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        window.removeListener("leave-full-screen", done);
+        resolve();
+      };
+      const timer = setTimeout(done, 600);
+      window.once("leave-full-screen", done);
+      window.setFullScreen(false);
+    });
+    if (window.isMaximized()) window.unmaximize();
+    const cursor = screen.getCursorScreenPoint();
+    const x = Math.round(cursor.x - normal.width * ratio);
+    const y = Math.round(cursor.y - offsetY);
+    window.setBounds({ x, y, width: normal.width, height: normal.height });
+    // Arm the shared Host window drag (main.ts) relative to the new bounds.
+    return options.beginWindowDrag(window);
   });
 
   handle(IMAGE_VIEWER_CHANNELS.setAlwaysOnTop, "viewer", (event, value) => {

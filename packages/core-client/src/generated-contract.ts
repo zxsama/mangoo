@@ -693,6 +693,7 @@ export interface ImageViewerFormats {
   browserRenderableExtensions: string[];
   animatedExtensions: string[];
   pluginExtensions: string[];
+  cameraRawExtensions: string[];
 }
 
 export interface ImageViewerFolderEntry {
@@ -701,6 +702,9 @@ export interface ImageViewerFolderEntry {
   ext: string;
   sizeBytes: number;
   modifiedAtMs: number;
+  cameraRaw: boolean;
+  /** Same-stem camera RAW + JPEG sibling, on both entries of a pair. */
+  pairPath?: string;
 }
 
 export interface ImageViewerFolder {

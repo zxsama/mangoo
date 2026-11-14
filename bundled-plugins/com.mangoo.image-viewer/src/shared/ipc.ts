@@ -44,6 +44,8 @@ export const IMAGE_VIEWER_CHANNELS = {
   toggleFullscreen: "mangoo:image-viewer:toggle-fullscreen",
   /** main -> viewer (send): fullscreen state changed. */
   fullscreenChanged: "mangoo:image-viewer:fullscreen-changed",
+  /** viewer -> main (invoke): leave fullscreen into a normal window under the pointer and start dragging it. */
+  dragOutOfFullscreen: "mangoo:image-viewer:drag-out-of-fullscreen",
   /** viewer -> main (invoke): keep the window above others. */
   setAlwaysOnTop: "mangoo:image-viewer:set-always-on-top",
   /** viewer -> main (invoke): bring up the main Mangoo window. */
@@ -119,6 +121,7 @@ export interface ImageViewerDesktopBridge {
   copyText(text: string): Promise<ImageViewerActionResult>;
   toggleFullscreen(): Promise<boolean>;
   onFullscreenChanged(callback: (fullscreen: boolean) => void): () => void;
+  dragOutOfFullscreen(input: { pointerRatioX: number; titlebarOffsetY: number }): Promise<boolean>;
   setAlwaysOnTop(value: boolean): Promise<boolean>;
   openMainWindow(): Promise<boolean>;
   associationStatus(): Promise<ImageViewerAssociationStatus>;

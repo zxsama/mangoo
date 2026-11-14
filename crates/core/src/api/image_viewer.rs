@@ -395,6 +395,12 @@ fn png_has_actl(head: &[u8]) -> bool {
 
 /// Display dimensions (EXIF orientation applied) without decoding pixels.
 fn probe_dimensions(path: &Path, ext: &str) -> Option<(u32, u32)> {
+    if formats::is_camera_raw(ext) {
+        // Developed size; a camera rawler does not know falls back to the
+        // largest embedded preview (what is shown), never the EXIF size of a
+        // smaller thumbnail.
+        return raw_dimensions(path).or_else(|| raw_preview_dimensions(path));
+    }
     let (mut width, mut height) = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
@@ -410,6 +416,41 @@ fn probe_dimensions(path: &Path, ext: &str) -> Option<(u32, u32)> {
         .and_then(|exif| exif.orientation)
         .is_some_and(|orientation| orientation >= 5)
     {
+        std::mem::swap(&mut width, &mut height);
+    }
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+/// Size of the largest JPEG preview embedded in a camera RAW, oriented.
+fn raw_preview_dimensions(path: &Path) -> Option<(u32, u32)> {
+    // Locate only (one streamed window at a time); the pixels are never read.
+    let jpeg = crate::decode::raw_preview::locate_largest_jpeg(path).ok()??;
+    let (mut width, mut height) = (jpeg.width, jpeg.height);
+    let ext = formats::lowercase_extension(path);
+    let orientation = crate::decode::exif::read_exif_summary(path, &ext)
+        .and_then(|exif| exif.orientation)
+        .unwrap_or(1);
+    if orientation >= 5 {
+        std::mem::swap(&mut width, &mut height);
+    }
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+/// Developed size of a camera RAW (crop + orientation), header-only.
+fn raw_dimensions(path: &Path) -> Option<(u32, u32)> {
+    std::panic::catch_unwind(|| raw_dimensions_inner(path))
+        .ok()
+        .flatten()
+}
+
+fn raw_dimensions_inner(path: &Path) -> Option<(u32, u32)> {
+    let source = rawler::rawsource::RawSource::new(path).ok()?;
+    let probe = rawler::decode_dummy(&source).ok()?;
+    let (mut width, mut height) = match probe.crop_area {
+        Some(crop) => (crop.d.w as u32, crop.d.h as u32),
+        None => (probe.width as u32, probe.height as u32),
+    };
+    if crate::decode::rawler::raw_orientation(path) >= 5 {
         std::mem::swap(&mut width, &mut height);
     }
     (width > 0 && height > 0).then_some((width, height))
@@ -435,12 +476,39 @@ fn psd_dimensions(path: &Path, ext: &str) -> Option<(u32, u32)> {
 
 /// Builtin-registry WebP transcode bounded to `max_px` on the long side,
 /// served from / stored into `cache`.
+/// Which picture of a camera RAW to show: the developed sensor data, or the
+/// JPEG preview the camera embedded in the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawSourceChoice {
+    Developed,
+    Embedded,
+}
+
 async fn builtin_webp(
     image: &ResolvedImage,
     max_px: u32,
     tier: &'static str,
     variant: String,
     thumbnail: bool,
+) -> ViewerResult<CachedImage> {
+    builtin_webp_from(
+        image,
+        max_px,
+        tier,
+        variant,
+        thumbnail,
+        RawSourceChoice::Developed,
+    )
+    .await
+}
+
+async fn builtin_webp_from(
+    image: &ResolvedImage,
+    max_px: u32,
+    tier: &'static str,
+    variant: String,
+    thumbnail: bool,
+    raw_source: RawSourceChoice,
 ) -> ViewerResult<CachedImage> {
     let services = runtime();
     let key = CacheKey {
@@ -473,8 +541,37 @@ async fn builtin_webp(
     let path = image.path.clone();
     let ext = image.ext.clone();
     let generated = tokio::task::spawn_blocking(move || {
-        let dimensions = probe_dimensions(&path, &ext);
-        crate::thumbnails::generate_preview_webp(&path, max_px).map(|tier| (tier, dimensions))
+        let embedded = raw_source == RawSourceChoice::Embedded && formats::is_camera_raw(&ext);
+        let dimensions = if embedded {
+            None
+        } else {
+            probe_dimensions(&path, &ext)
+        };
+        let tier = if embedded {
+            crate::thumbnails::generate_preview_webp_from(
+                crate::decode::rawler::decode_embedded_preview(&path)?,
+                max_px,
+            )
+        } else if thumbnail && formats::is_camera_raw(&ext) {
+            // Filmstrip thumbnails of a RAW come from the embedded preview
+            // when there is one (milliseconds instead of a full develop).
+            match crate::decode::rawler::embedded_preview(&path) {
+                Ok(Some(preview)) => crate::thumbnails::generate_preview_webp_from(preview, max_px),
+                // No embedded preview: develop directly (the registry's
+                // Preview path would scan for a preview a second time).
+                _ => crate::decode::rawler::develop(&path).and_then(|developed| {
+                    crate::thumbnails::generate_preview_webp_from(developed, max_px)
+                }),
+            }
+        } else {
+            crate::thumbnails::generate_preview_webp(&path, max_px)
+        };
+        tier.map(|tier| {
+            // The embedded JPEG's own size is what is shown.
+            let dimensions =
+                dimensions.or(Some((tier.width as u32, tier.height as u32)).filter(|_| embedded));
+            (tier, dimensions)
+        })
     })
     .await
     .map_err(|error| decode_failed(error))?
@@ -592,6 +689,7 @@ struct ImageViewerFormats {
     browser_renderable_extensions: Vec<String>,
     animated_extensions: Vec<String>,
     plugin_extensions: Vec<String>,
+    camera_raw_extensions: Vec<String>,
 }
 
 async fn get_formats(State(state): State<AppState>) -> ViewerResult<Json<ImageViewerFormats>> {
@@ -617,6 +715,10 @@ async fn get_formats(State(state): State<AppState>) -> ViewerResult<Json<ImageVi
             .cloned()
             .collect(),
         plugin_extensions,
+        camera_raw_extensions: formats::CAMERA_RAW_EXTENSIONS
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect(),
     }))
 }
 
@@ -633,6 +735,13 @@ struct ImageViewerFolderEntry {
     ext: String,
     size_bytes: u64,
     modified_at_ms: i64,
+    /// Camera RAW (any rawler family).
+    camera_raw: bool,
+    /// For a camera RAW: the same-stem JPEG the camera wrote alongside it
+    /// (`IMG_0001.CR3` + `IMG_0001.JPG`); for that JPEG: the RAW. The client
+    /// may present each pair as one picture.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pair_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -691,11 +800,14 @@ async fn get_folder(
             entries.push(ImageViewerFolderEntry {
                 path: path_text.to_owned(),
                 name,
+                camera_raw: formats::is_camera_raw(&ext),
                 ext,
                 size_bytes: metadata.len(),
                 modified_at_ms: millis(metadata.modified()).unwrap_or(0),
+                pair_path: None,
             });
         }
+        link_raw_pairs(&mut entries);
         Ok(ImageViewerFolder {
             directory: directory.to_string_lossy().into_owned(),
             entries,
@@ -713,6 +825,32 @@ async fn get_folder(
     Ok(Json(listing))
 }
 
+/// Same-stem (case-insensitive) camera RAW + JPEG siblings point at each
+/// other. A stem with several RAWs or several JPEGs is left unpaired: the
+/// pairing must never hide a picture that is genuinely different.
+fn link_raw_pairs(entries: &mut [ImageViewerFolderEntry]) {
+    let stem = |entry: &ImageViewerFolderEntry| {
+        let name = entry.name.as_str();
+        name[..name.len() - entry.ext.len()].to_lowercase()
+    };
+    let mut groups: HashMap<String, (Vec<usize>, Vec<usize>)> = HashMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let slot = groups.entry(stem(entry)).or_default();
+        if entry.camera_raw {
+            slot.0.push(index);
+        } else if entry.ext == ".jpg" || entry.ext == ".jpeg" {
+            slot.1.push(index);
+        }
+    }
+    for (raws, jpegs) in groups.into_values() {
+        if let ([raw], [jpeg]) = (raws.as_slice(), jpegs.as_slice()) {
+            let raw_path = entries[*raw].path.clone();
+            entries[*raw].pair_path = Some(entries[*jpeg].path.clone());
+            entries[*jpeg].pair_path = Some(raw_path);
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ImageQuery {
     path: String,
@@ -720,6 +858,10 @@ struct ImageQuery {
     viewport_long_px: Option<u32>,
     #[serde(rename = "full")]
     full: Option<bool>,
+    /// Camera RAW only: `embedded` serves the camera's embedded JPEG preview
+    /// instead of developing the sensor data.
+    #[serde(rename = "rawSource")]
+    raw_source: Option<String>,
 }
 
 /// The viewer's image source. Small browser-paintable images stream verbatim;
@@ -739,6 +881,34 @@ async fn get_image(
     }
     let renderable = formats::is_browser_renderable_image(&image.ext);
     let full = query.full.unwrap_or(false);
+    let raw_source = match query.raw_source.as_deref() {
+        None | Some("developed") => RawSourceChoice::Developed,
+        Some("embedded") => RawSourceChoice::Embedded,
+        Some(_) => return Err(invalid_path("rawSource must be developed or embedded")),
+    };
+    if raw_source == RawSourceChoice::Embedded && formats::is_camera_raw(&image.ext) {
+        let viewport = query
+            .viewport_long_px
+            .unwrap_or(0)
+            .min(MAX_VIEWPORT_LONG_PX);
+        // Embedded previews are at most a few thousand px: bound by the
+        // viewport tier like any other transcode, never upscaled.
+        let max_px = if full || viewport == 0 {
+            MAX_VIEWPORT_LONG_PX
+        } else {
+            viewport.max(2048)
+        };
+        let cached = builtin_webp_from(
+            &image,
+            max_px,
+            "raw_embedded",
+            format!("raw_embedded:{max_px}"),
+            false,
+            RawSourceChoice::Embedded,
+        )
+        .await?;
+        return Ok(webp_response(cached));
+    }
     let sniff_path = image.path.clone();
     let sniff_ext = image.ext.clone();
     let animated = renderable
@@ -884,6 +1054,42 @@ async fn get_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(name: &str) -> ImageViewerFolderEntry {
+        let ext = formats::lowercase_extension(Path::new(name));
+        ImageViewerFolderEntry {
+            path: format!("C:/p/{name}"),
+            name: name.to_owned(),
+            camera_raw: formats::is_camera_raw(&ext),
+            ext,
+            size_bytes: 1,
+            modified_at_ms: 0,
+            pair_path: None,
+        }
+    }
+
+    #[test]
+    fn raw_and_jpeg_with_the_same_stem_are_paired_both_ways() {
+        let mut entries = vec![
+            entry("IMG_0001.CR3"),
+            entry("img_0001.JPG"),
+            entry("IMG_0002.NEF"),
+            entry("IMG_0003.jpg"),
+            // Ambiguous stems stay unpaired.
+            entry("DSC_9.arw"),
+            entry("DSC_9.jpg"),
+            entry("DSC_9.jpeg"),
+            entry("pic.png"),
+            entry("pic.dng"),
+        ];
+        link_raw_pairs(&mut entries);
+        assert_eq!(entries[0].pair_path.as_deref(), Some("C:/p/img_0001.JPG"));
+        assert_eq!(entries[1].pair_path.as_deref(), Some("C:/p/IMG_0001.CR3"));
+        for index in 2..9 {
+            assert_eq!(entries[index].pair_path, None, "{}", entries[index].name);
+        }
+        assert!(entries[0].camera_raw && !entries[1].camera_raw);
+    }
 
     #[test]
     fn png_animation_sniff_requires_actl_before_idat() {

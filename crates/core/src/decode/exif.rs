@@ -66,12 +66,67 @@ pub fn read_exif_summary(path: &Path, ext: &str) -> Option<ExifSummary> {
         ".png" => png_exif(&bytes)?,
         ".webp" => webp_exif(&bytes)?,
         ".heic" | ".heif" | ".avif" => heif_exif(&bytes)?,
-        ".tif" | ".tiff" | ".dng" | ".cr2" | ".nef" | ".arw" | ".orf" | ".rw2" | ".raw" => {
-            bytes.as_slice()
+        ".tif" | ".tiff" => bytes.as_slice(),
+        // TIFF-based camera RAWs keep EXIF in the container itself; the
+        // others (CR3, RAF, X3F, ...) go through rawler's metadata reader.
+        ext if crate::decode::formats::is_camera_raw(ext) => {
+            if tiff_header(&bytes) {
+                bytes.as_slice()
+            } else {
+                return raw_exif_summary(path);
+            }
         }
         _ => return None,
     };
     let summary = parse_tiff(tiff)?;
+    (!summary.is_empty()).then_some(summary)
+}
+
+fn tiff_header(bytes: &[u8]) -> bool {
+    matches!(bytes.get(0..2), Some(b"II") | Some(b"MM"))
+}
+
+/// EXIF of a non-TIFF camera RAW (CR3, RAF, ...) from rawler's reader
+/// (which panics on damaged files; contained like every rawler call).
+fn raw_exif_summary(path: &Path) -> Option<ExifSummary> {
+    std::panic::catch_unwind(|| raw_exif_summary_inner(path))
+        .ok()
+        .flatten()
+}
+
+fn raw_exif_summary_inner(path: &Path) -> Option<ExifSummary> {
+    use rawler::decoders::RawDecodeParams;
+    let source = rawler::rawsource::RawSource::new(path).ok()?;
+    let decoder = rawler::get_decoder(&source).ok()?;
+    let metadata = decoder
+        .raw_metadata(&source, &RawDecodeParams::default())
+        .ok()?;
+    let exif = metadata.exif;
+    let rational = |value: Option<rawler::formats::tiff::Rational>| {
+        value.and_then(|v| (v.d != 0).then(|| v.n as f64 / v.d as f64))
+    };
+    let summary = ExifSummary {
+        make: (!metadata.make.is_empty()).then_some(metadata.make),
+        model: (!metadata.model.is_empty()).then_some(metadata.model),
+        lens_model: exif.lens_model,
+        artist: exif.artist,
+        copyright: exif.copyright,
+        date_time_original: exif.date_time_original,
+        exposure_time: exif.exposure_time.and_then(|v| {
+            if v.d == 0 {
+                None
+            } else if v.n >= v.d {
+                Some(format!("{}", v.n as f64 / v.d as f64))
+            } else {
+                Some(format!("1/{}", (v.d as f64 / v.n.max(1) as f64).round()))
+            }
+        }),
+        f_number: rational(exif.fnumber),
+        iso: exif.iso_speed_ratings.map(u32::from).or(exif.iso_speed),
+        focal_length_mm: rational(exif.focal_length),
+        orientation: exif.orientation,
+        ..ExifSummary::default()
+    };
     (!summary.is_empty()).then_some(summary)
 }
 

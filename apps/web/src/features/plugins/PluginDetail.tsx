@@ -34,6 +34,8 @@ export function PluginDetail({
 }: PluginDetailProps) {
   const hasSetup = !plugin.contributions?.ui && Boolean(plugin.contributions?.configuration.length || plugin.contributions?.authentication);
   const toggleDisabled = busy || plugin.runtimeState === "incompatible" || plugin.runtimeState === "stopping";
+  /** Truly unavailable (not merely busy applying a change). */
+  const toggleUnavailable = plugin.runtimeState === "incompatible";
   const toggleLabel = plugin.enabledIntent ? "停用插件" : "启用插件";
 
   return (
@@ -53,15 +55,21 @@ export function PluginDetail({
             <div className="plugin-detail-enable-row">
               <span>启用插件</span>
               <label
+                aria-busy={busy || undefined}
                 aria-disabled={toggleDisabled}
-                className={`plugin-toggle${plugin.enabledIntent ? " on" : ""}${toggleDisabled ? " disabled" : ""}`}
+                className={`plugin-toggle${plugin.enabledIntent ? " on" : ""}${toggleUnavailable ? " disabled" : ""}${toggleDisabled && !toggleUnavailable ? " busy" : ""}`}
                 title={plugin.runtimeState === "incompatible" ? plugin.compatibilityReason ?? "插件不兼容" : toggleLabel}
               >
                 <input
                   aria-label={toggleLabel}
                   checked={plugin.enabledIntent}
-                  disabled={toggleDisabled}
-                  onChange={onToggleEnabled}
+                  disabled={toggleUnavailable}
+                  onChange={() => {
+                    // A click while applying is ignored (not disabled: that
+                    // flashed the not-allowed cursor under the pointer).
+                    if (toggleDisabled) return;
+                    onToggleEnabled();
+                  }}
                   type="checkbox"
                 />
                 <span aria-hidden="true" className="plugin-toggle-track">

@@ -45,10 +45,10 @@ import { useProximityChrome } from "./useProximityChrome.ts";
 import { Filmstrip } from "./Filmstrip.tsx";
 import { InfoPanel } from "./InfoPanel.tsx";
 import { viewerBridge } from "./bridge.ts";
-import { ViewerImageCache, encodePng, viewerViewportLongPx, type LoadedImage } from "./imageSource.ts";
+import { ViewerImageCache, encodePng, holdThumbnails, viewerViewportLongPx, type LoadedImage, type RawSource } from "./imageSource.ts";
 import { useViewerPreferences } from "./preferences.ts";
-import { describeError, useViewerSession } from "./useViewerSession.ts";
-import { ViewerStage, type StageAnimation } from "./ViewerStage.tsx";
+import { describeError, hiddenPairOf, useViewerSession } from "./useViewerSession.ts";
+import { ViewerStage, type StageAnimation, type ViewerChannel } from "./ViewerStage.tsx";
 import "./viewer.css";
 
 type ZoomState = FitMode | "custom";
@@ -128,7 +128,7 @@ export function ImageViewerWindow() {
   useOverlayScrollbars();
   const bridge = viewerBridge();
   const [preferences, setPreferences] = useViewerPreferences();
-  const session = useViewerSession(preferences.sortKey, preferences.sortDirection, preferences.loop);
+  const session = useViewerSession(preferences.sortKey, preferences.sortDirection, preferences.loop, preferences.pairRawJpeg);
   const { state, current } = session;
   const bindings = useMemo(() => resolveBindings(preferences.shortcuts), [preferences.shortcuts]);
   /** First chord of an action, formatted for tooltips and menus. */
@@ -137,6 +137,12 @@ export function ImageViewerWindow() {
     return chord ? formatChord(chord) : undefined;
   }, [bindings]);
   const [framesOpen, setFramesOpen] = useState(false);
+  /** Single-channel view (null = normal RGBA). */
+  const [channel, setChannel] = useState<ViewerChannel | null>(null);
+  /** Camera RAW: developed sensor data or the camera's embedded JPEG. */
+  const [rawSource, setRawSource] = useState<RawSource>("developed");
+  const isRaw = Boolean(current?.cameraRaw);
+  const effectiveRawSource: RawSource = isRaw ? rawSource : "developed";
   const cache = useMemo(() => new ViewerImageCache(), []);
 
   const [animatedExtensions, setAnimatedExtensions] = useState<string[]>([".gif", ".webp", ".avif"]);
@@ -318,7 +324,8 @@ export function ImageViewerWindow() {
     }
     let cancelled = false;
     setImageError(null);
-    const cached = cache.peek(ViewerImageCache.key(current, false)) ?? cache.peek(ViewerImageCache.key(current, true));
+    const source = effectiveRawSource;
+    const cached = cache.peek(ViewerImageCache.key(current, false, source)) ?? cache.peek(ViewerImageCache.key(current, true, source));
     if (cached) {
       setImage(cached);
       setImageLoading(false);
@@ -328,35 +335,52 @@ export function ImageViewerWindow() {
       setImageLoading(true);
     }
     const viewportLongPx = viewerViewportLongPx();
+    let visibleLoad: Promise<LoadedImage> | null = null;
     if (!cached) {
-      cache
-        .load(current, { viewportLongPx, full: false, animatedExtensions })
+      // The picture on screen first: filmstrip thumbnails wait until it is up.
+      holdThumbnails(true);
+      visibleLoad = cache
+        .load(current, { viewportLongPx, full: false, animatedExtensions, rawSource: source });
+      visibleLoad
         .then((loaded) => {
           if (cancelled) return;
           setImage(loaded);
           setImageLoading(false);
+          holdThumbnails(false);
         }, (error) => {
           if (cancelled) return;
           setImage(null);
           setImageLoading(false);
           setImageError(describeError(error));
+          holdThumbnails(false);
         });
+    } else {
+      holdThumbnails(false);
     }
-    cache.pin([ViewerImageCache.key(current, false), ViewerImageCache.key(current, true)]);
-    // Warm the neighbours once the visible picture is underway.
-    const prefetch = window.setTimeout(() => {
-      for (const index of prefetchOrder(state.entries.length, state.index, 2, preferences.loop)) {
-        const entry = state.entries[index];
-        if (entry) void cache.load(entry, { viewportLongPx, full: false, animatedExtensions, priority: "resource" }).catch(() => undefined);
-      }
-    }, 180);
+    cache.pin([ViewerImageCache.key(current, false, source), ViewerImageCache.key(current, true, source)]);
+    // Warm the neighbours only once the visible picture is painted: they
+    // would otherwise share Core's decode slots with it.
+    let prefetch = 0;
+    const warmNeighbours = () => {
+      if (cancelled) return;
+      prefetch = window.setTimeout(() => {
+        for (const index of prefetchOrder(state.entries.length, state.index, 2, preferences.loop)) {
+          const entry = state.entries[index];
+          if (entry) void cache.load(entry, { viewportLongPx, full: false, animatedExtensions, priority: "resource", rawSource: entry.cameraRaw ? rawSource : "developed" }).catch(() => undefined);
+        }
+      }, 120);
+    };
+    if (cached) warmNeighbours();
+    else visibleLoad?.then(warmNeighbours, warmNeighbours);
     return () => {
       cancelled = true;
       window.clearTimeout(prefetch);
+      // A navigation away never leaves the strip blocked.
+      holdThumbnails(false);
     };
     // Entries are read for prefetch only; navigation is keyed by `current`.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [current, cache, animatedExtensions]);
+  }, [current, cache, animatedExtensions, effectiveRawSource]);
 
   // Reset the view for a new picture (unless the user asked to keep it).
   const imageKey = image?.key.split("\u0000")[0] ?? null;
@@ -390,13 +414,13 @@ export function ImageViewerWindow() {
     const needed = transform.scale * image.width;
     if (needed <= image.bitmap.width * 1.1) return;
     let cancelled = false;
-    void cache.load(current, { viewportLongPx: viewerViewportLongPx(), full: true, animatedExtensions }).then((full) => {
+    void cache.load(current, { viewportLongPx: viewerViewportLongPx(), full: true, animatedExtensions, rawSource: effectiveRawSource }).then((full) => {
       if (!cancelled) setImage(full);
     }, () => undefined);
     return () => {
       cancelled = true;
     };
-  }, [current, image, transform.scale, cache, animatedExtensions]);
+  }, [current, image, transform.scale, cache, animatedExtensions, effectiveRawSource]);
 
   // ------------------------------------------------------------- transforms
 
@@ -543,9 +567,15 @@ export function ImageViewerWindow() {
     if (!result.ok) showToast(friendlyActionError(result.error, "无法用其他应用打开"));
   }, [bridge, current, showToast]);
 
+  /** A RAW+JPEG pair shown as one picture: its hidden half. */
+  const pairedPath = hiddenPairOf(current, state.entries);
+
   const performDelete = useCallback(async (dontAskAgain = false) => {
     if (!bridge || !current) return;
     const target = current;
+    // A picture shown as one is deleted as one: both halves of a RAW+JPEG
+    // pair go to the recycle bin (otherwise the other half pops back).
+    const companion = hiddenPairOf(target, state.entries);
     const result = await bridge.trash(target.path);
     setDialog(null);
     if (dontAskAgain) setPreferences({ confirmDelete: false });
@@ -554,9 +584,22 @@ export function ImageViewerWindow() {
       return;
     }
     cache.forget(target.path);
-    session.removeCurrent();
-    showToast(`“${target.name}”已移到回收站，可在回收站中恢复`);
-  }, [bridge, cache, current, session, setPreferences, showToast]);
+    const removed = [target.path];
+    let companionFailed = false;
+    if (companion) {
+      const second = await bridge.trash(companion);
+      if (second.ok) {
+        cache.forget(companion);
+        removed.push(companion);
+      } else companionFailed = true;
+    }
+    session.removePaths(removed);
+    showToast(companion && !companionFailed
+      ? `“${target.name}”及同名 JPEG 已移到回收站，可在回收站中恢复`
+      : companionFailed
+        ? `“${target.name}”已移到回收站，但同名 JPEG 无法删除`
+        : `“${target.name}”已移到回收站，可在回收站中恢复`);
+  }, [bridge, cache, current, session, setPreferences, showToast, state.entries]);
 
   const requestDelete = useCallback(() => {
     if (!current) return;
@@ -590,10 +633,23 @@ export function ImageViewerWindow() {
       return;
     }
     cache.forget(current.path);
-    session.replaceCurrent(result.path);
+    const renames = [{ from: current.path, to: result.path }];
+    // Keep a RAW+JPEG pair together: rename the hidden half to the same stem.
+    const companion = hiddenPairOf(current, state.entries);
+    let companionFailed = false;
+    if (companion) {
+      const stem = finalName.slice(0, finalName.length - current.ext.length);
+      const companionName = `${stem}${extensionOf(companion) ? companion.slice(companion.length - extensionOf(companion).length) : ""}`;
+      const second = await bridge.rename(companion, companionName);
+      if (second.ok && second.path) {
+        cache.forget(companion);
+        renames.push({ from: companion, to: second.path });
+      } else companionFailed = true;
+    }
+    session.renamePaths(renames);
     setDialog(null);
-    showToast("已重命名");
-  }, [bridge, cache, current, dialog, session, showToast]);
+    showToast(companionFailed ? "已重命名，但同名 JPEG 未能一起重命名" : companion ? "已重命名（含同名 JPEG）" : "已重命名");
+  }, [bridge, cache, current, dialog, session, showToast, state.entries]);
 
   const renameOpen = dialog?.kind === "rename";
   useEffect(() => {
@@ -612,6 +668,23 @@ export function ImageViewerWindow() {
   const openSettings = useCallback((section: "display" | "shortcuts" = "display") => {
     if (bridge) void bridge.openSettings(section);
   }, [bridge]);
+
+  const showChannel = useCallback((next: ViewerChannel | null) => {
+    setChannel((value) => {
+      const resolved = value === next ? null : next;
+      showToast(resolved ? `${{ red: "红色", green: "绿色", blue: "蓝色", alpha: "透明" }[resolved]}通道（${resolved[0].toUpperCase()}）` : "全部通道（RGBA）", undefined, 1100);
+      return resolved;
+    });
+  }, [showToast]);
+
+  const toggleRawSource = useCallback(() => {
+    if (!isRaw) return;
+    setRawSource((value) => {
+      const next = value === "developed" ? "embedded" : "developed";
+      showToast(next === "embedded" ? "RAW：显示内嵌 JPEG 预览" : "RAW：显示 RAW 原图", undefined, 1300);
+      return next;
+    });
+  }, [isRaw, showToast]);
 
   const toggleAlwaysOnTop = useCallback(async () => {
     if (bridge) setAlwaysOnTop(await bridge.setAlwaysOnTop(!alwaysOnTop));
@@ -726,6 +799,12 @@ export function ImageViewerWindow() {
           case "rename": requestRename(); break;
           case "delete": requestDelete(); break;
           case "showShortcuts": openSettings("shortcuts"); break;
+          case "channelAll": setChannel(null); showToast("全部通道（RGBA）", undefined, 1100); break;
+          case "channelRed": showChannel("red"); break;
+          case "channelGreen": showChannel("green"); break;
+          case "channelBlue": showChannel("blue"); break;
+          case "channelAlpha": showChannel("alpha"); break;
+          case "toggleRawSource": if (isRaw) toggleRawSource(); else handled = false; break;
           case "closeWindow": window.close(); break;
           default: handled = false;
         }
@@ -740,6 +819,7 @@ export function ImageViewerWindow() {
   }, [
     animation, bindings, framesOpen, isAnimated, toggleFrames,
     copyImage, copyPath, flip, fullscreen, imageSize, noteActivity, openFiles, openSettings, overlaysOpen, pan, preferences,
+    isRaw, showChannel, showToast, toggleRawSource,
     requestDelete, requestRename, rotateBy, session, setFit, setPreferences, slideshow, state.entries.length,
     toggleFullscreen, transform.rotation, transform.scale, viewport, zoomStep, zoomTo
   ]);
@@ -756,7 +836,14 @@ export function ImageViewerWindow() {
   const hasImage = Boolean(current);
   const counter = state.entries.length ? `${state.index + 1} / ${state.entries.length}` : "";
   const dims = image ? `${image.width} × ${image.height}` : null;
-  const pixelated = preferences.pixelatedZoom && transform.scale >= 2;
+  // On-screen pixels per source pixel decides magnify vs minify.
+  const paintedWidth = image ? (image.kind === "bitmap" ? image.bitmap.width : image.width) : 1;
+  // Device pixels per painted pixel (an adaptive tier is smaller than the
+  // source, so it is magnified sooner than the zoom readout suggests).
+  const displayRatio = image ? (transform.scale * dpr * image.width) / Math.max(1, paintedWidth) : 1;
+  const interpolation = displayRatio >= 2 ? preferences.upscaleInterpolation
+    : displayRatio <= 1 ? preferences.downscaleInterpolation
+    : "smooth";
   const canvasLevel = image?.kind === "bitmap" ? renderLevel((transform.scale * image.width) / Math.max(1, image.bitmap.width)) : 1;
   const zoomLabel = !image ? "—" : zoomState === "fit" ? `适应 · ${formatZoom(transform.scale)}` : zoomState === "fill" ? `填满 · ${formatZoom(transform.scale)}` : formatZoom(transform.scale);
   const fileSize = current && current.sizeBytes > 0 ? formatBytes(current.sizeBytes) : null;
@@ -816,7 +903,17 @@ export function ImageViewerWindow() {
     </>
   );
 
-  const menuItems: Array<{ id: string; label?: string; icon?: ReactNode; shortcut?: string; disabled?: boolean; danger?: boolean; checked?: boolean; onSelect?: () => void; separator?: boolean }> = [
+  type MenuItem = { id: string; label?: string; icon?: ReactNode; shortcut?: string; disabled?: boolean; danger?: boolean; checked?: boolean; onSelect?: () => void; separator?: boolean; submenu?: MenuItem[] };
+  const channelItems: MenuItem[] = [
+    { id: "ch-all", label: "全部通道（RGBA）", icon: <icons.Layers size={14} />, shortcut: keyOf("channelAll"), checked: channel === null, onSelect: () => setChannel(null) },
+    { id: "ch-r", label: "红色通道（R）", icon: <span className="iv-menu-swatch" data-channel="red" />, shortcut: keyOf("channelRed"), checked: channel === "red", onSelect: () => showChannel("red") },
+    { id: "ch-g", label: "绿色通道（G）", icon: <span className="iv-menu-swatch" data-channel="green" />, shortcut: keyOf("channelGreen"), checked: channel === "green", onSelect: () => showChannel("green") },
+    { id: "ch-b", label: "蓝色通道（B）", icon: <span className="iv-menu-swatch" data-channel="blue" />, shortcut: keyOf("channelBlue"), checked: channel === "blue", onSelect: () => showChannel("blue") },
+    { id: "ch-a", label: "透明通道（A）", icon: <span className="iv-menu-swatch" data-channel="alpha" />, shortcut: keyOf("channelAlpha"), checked: channel === "alpha", onSelect: () => showChannel("alpha") },
+    { id: "ch-s", separator: true },
+    { id: "ch-pm", label: "预乘 Alpha", icon: <icons.Layers3 size={14} />, checked: preferences.channelPremultiply, onSelect: () => setPreferences({ channelPremultiply: !preferences.channelPremultiply }) }
+  ];
+  const menuItems: MenuItem[] = [
     { id: "copy", label: "复制图片", icon: <icons.Copy size={14} />, shortcut: keyOf("copyImage"), disabled: !image, onSelect: () => void copyImage() },
     { id: "copy-path", label: "复制文件路径", icon: <icons.Clipboard size={14} />, shortcut: keyOf("copyPath"), disabled: !hasImage, onSelect: () => void copyPath() },
     { id: "s1", separator: true },
@@ -826,6 +923,8 @@ export function ImageViewerWindow() {
     { id: "flip-y", label: "垂直翻转", icon: <icons.FlipVertical size={14} />, shortcut: keyOf("flipVertical"), disabled: !hasImage, checked: transform.flipY, onSelect: () => flip("y") },
     ...(isAnimated ? [{ id: "frames", label: "逐帧查看动图", icon: <icons.FilmReel size={14} />, shortcut: keyOf("nextFrame"), checked: framesOpen, onSelect: () => toggleFrames() }] : []),
     { id: "info", label: "图片信息", icon: <icons.Info size={14} />, shortcut: keyOf("toggleInfo"), checked: preferences.showInfo, onSelect: () => setPreferences({ showInfo: !preferences.showInfo }) },
+    ...(isRaw ? [{ id: "raw-source", label: effectiveRawSource === "embedded" ? "显示 RAW 原图" : "显示内嵌 JPEG 预览", icon: <icons.Camera size={14} />, shortcut: keyOf("toggleRawSource"), onSelect: toggleRawSource }] : []),
+    { id: "channels", label: channel ? `通道：${{ red: "R", green: "G", blue: "B", alpha: "A" }[channel]}` : "查看通道", icon: <icons.Layers size={14} />, disabled: !image, submenu: channelItems },
     { id: "s2", separator: true },
     { id: "reveal", label: "在文件夹中显示", icon: <icons.FolderOpen size={14} />, disabled: !hasImage, onSelect: () => void reveal() },
     { id: "open-external", label: "用其他应用打开", icon: <icons.ExternalLink size={14} />, disabled: !hasImage, onSelect: () => void openExternally() },
@@ -837,7 +936,7 @@ export function ImageViewerWindow() {
   ];
 
   /** Titlebar "more" menu: window-level things that are not about the picture. */
-  const moreItems: typeof menuItems = [
+  const moreItems: MenuItem[] = [
     { id: "open", label: "打开图片…", icon: <icons.FolderOpen size={14} />, shortcut: keyOf("open"), onSelect: () => void openFiles() },
     { id: "open-folder", label: "打开文件夹…", icon: <icons.Folder size={14} />, onSelect: () => void openFolder() },
     { id: "s1", separator: true },
@@ -847,10 +946,16 @@ export function ImageViewerWindow() {
     { id: "settings", label: "看图设置…", icon: <icons.Settings size={14} />, disabled: !bridge, onSelect: () => openSettings("display") }
   ];
   const [menuSource, setMenuSource] = useState<"stage" | "more">("stage");
+  const [openSubmenu, setOpenSubmenu] = useState<{ item: MenuItem; anchor: HTMLElement } | null>(null);
+  useEffect(() => {
+    if (!contextMenu) setOpenSubmenu(null);
+  }, [contextMenu]);
   const windowControls = getWindowControls();
   const windowDrag = useRef<{ pointerId: number; x: number; y: number; started: boolean } | null>(null);
   const beginWindowDrag = (event: React.PointerEvent<HTMLElement>) => {
-    if (event.button !== 0 || fullscreen || !windowControls || preferences.titlebarPinned) return;
+    if (event.button !== 0 || !windowControls) return;
+    // A pinned titlebar outside fullscreen is a native OS drag region.
+    if (preferences.titlebarPinned && !fullscreen) return;
     if ((event.target as HTMLElement).closest("button, input, a, [data-no-drag]")) return;
     event.currentTarget.setPointerCapture(event.pointerId);
     windowDrag.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, started: false };
@@ -862,6 +967,20 @@ export function ImageViewerWindow() {
       // Like Windows: a press only becomes a drag past a small threshold.
       if (Math.hypot(event.clientX - drag.x, event.clientY - drag.y) < 4) return;
       drag.started = true;
+      if (fullscreen && bridge) {
+        // Fullscreen cannot be dragged: the Desktop host leaves fullscreen
+        // AND maximized in one step, restores the normal size centred under
+        // the pointer, and arms the move — the same "drag a maximized
+        // window" behaviour as the pinned titlebar.
+        const ratio = drag.x / Math.max(1, window.innerWidth);
+        void bridge.dragOutOfFullscreen({ pointerRatioX: ratio, titlebarOffsetY: Math.min(drag.y, 20) }).then((armed) => {
+          if (!armed) return;
+          // Released before the window came out of fullscreen: disarm.
+          if (windowDrag.current?.started) void windowControls.moveDrag();
+          else void windowControls.endDrag();
+        });
+        return;
+      }
       void windowControls.beginDrag({
         clientX: drag.x,
         screenX: event.screenX,
@@ -942,8 +1061,9 @@ export function ImageViewerWindow() {
           as="header"
           className="iv-titlebar"
           onDoubleClick={(event: React.MouseEvent<HTMLElement>) => {
-            if (fullscreen || (event.target as HTMLElement).closest("button, [data-no-drag]")) return;
-            void windowControls?.maximize();
+            if ((event.target as HTMLElement).closest("button, [data-no-drag]")) return;
+            if (fullscreen) void toggleFullscreen();
+            else void windowControls?.maximize();
           }}
           onPointerCancel={endWindowDrag}
           onPointerDown={beginWindowDrag}
@@ -958,6 +1078,29 @@ export function ImageViewerWindow() {
               <span className="iv-title-meta" title={state.directory ?? undefined}>
                 {[dims, fileSize].filter(Boolean).join("  ·  ")}
               </span>
+            ) : null}
+            {isRaw ? (
+              <button
+                className="iv-title-chip no-drag"
+                data-no-drag="true"
+                onClick={toggleRawSource}
+                title={`${effectiveRawSource === "embedded" ? "正在显示相机内嵌的 JPEG 预览" : "正在显示 RAW 原图"}，点击切换（${keyOf("toggleRawSource") ?? "J"}）`}
+                type="button"
+              >
+                {effectiveRawSource === "embedded" ? "内嵌 JPEG" : "RAW"}
+              </button>
+            ) : null}
+            {channel ? (
+              <button
+                className="iv-title-chip no-drag"
+                data-channel={channel}
+                data-no-drag="true"
+                onClick={() => setChannel(null)}
+                title="点击恢复全部通道"
+                type="button"
+              >
+                {channel[0].toUpperCase()} 通道{preferences.channelPremultiply && channel !== "alpha" ? " · 预乘" : ""}
+              </button>
             ) : null}
           </div>
           <div className="iv-title-actions no-drag" data-no-drag="true">
@@ -1016,7 +1159,9 @@ export function ImageViewerWindow() {
               onWheelNavigate={navigate}
               onWheelZoom={(factor, anchor, pinch) => zoomBy(factor, anchor, pinch ? "pinch" : "wheel")}
               overlay={stageOverlay}
-              pixelated={pixelated}
+              interpolation={interpolation}
+              channel={channel}
+              premultiply={preferences.channelPremultiply}
               renderLevel={canvasLevel}
               transform={transform}
               wheelNavigates={preferences.wheelAction === "navigate"}
@@ -1078,6 +1223,21 @@ export function ImageViewerWindow() {
               <IconButton disabled={!image} label="向右旋转" onClick={() => rotateBy(1)} shortcut={keyOf("rotateRight")}>
                 <icons.RotateCw aria-hidden="true" size={15} />
               </IconButton>
+              {isRaw ? (
+                <LiquidGlassButton
+                  aria-label={effectiveRawSource === "embedded" ? "正在显示内嵌 JPEG，切换为 RAW 原图" : "正在显示 RAW 原图，切换为内嵌 JPEG"}
+                  className="iv-raw-switch no-drag"
+                  data-pointer-glow="off"
+                  aria-pressed={effectiveRawSource === "embedded"}
+                  onClick={toggleRawSource}
+                  title={`RAW 原图 / 相机内嵌 JPEG（${keyOf("toggleRawSource") ?? "J"}）`}
+                  tone="control"
+                  type="button"
+                >
+                  <span className="iv-raw-option" data-selected={effectiveRawSource === "developed" ? "true" : "false"}>RAW</span>
+                  <span className="iv-raw-option" data-selected={effectiveRawSource === "embedded" ? "true" : "false"}>JPEG</span>
+                </LiquidGlassButton>
+              ) : null}
               {isAnimated ? (
                 <IconButton active={framesOpen} label="逐帧查看动图" onClick={() => toggleFrames()} shortcut={keyOf("nextFrame")}>
                   <icons.FilmReel aria-hidden="true" size={15} />
@@ -1216,9 +1376,75 @@ export function ImageViewerWindow() {
                   disabled={item.disabled}
                   icon={item.icon}
                   key={item.id}
+                  onClick={(event) => {
+                    if (item.submenu) {
+                      setOpenSubmenu({ item, anchor: event.currentTarget });
+                      return;
+                    }
+                    setContextMenu(null);
+                    item.onSelect?.();
+                  }}
+                  onKeyDown={(event) => {
+                    if (item.submenu && event.key === "ArrowRight") {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      setOpenSubmenu({ item, anchor: event.currentTarget });
+                    }
+                  }}
+                  onPointerEnter={(event) => {
+                    // Hovering opens the submenu; hovering a sibling closes it.
+                    if (item.submenu) setOpenSubmenu({ item, anchor: event.currentTarget });
+                    else setOpenSubmenu(null);
+                  }}
+                  role="menuitem"
+                  shortcut={item.submenu ? undefined : item.checked ? <icons.Check aria-hidden="true" size={13} /> : item.shortcut}
+                  submenu={Boolean(item.submenu)}
+                >
+                  {item.label}
+                </OverlayMenuItem>
+              )
+            )}
+          </OverlayMenuList>
+        </AnchoredOverlay>
+      ) : null}
+      {contextMenu && openSubmenu?.item.submenu ? (
+        <AnchoredOverlay
+          anchor={openSubmenu.anchor}
+          ariaLabel={openSubmenu.item.label ?? ""}
+          className={`context-menu iv-menu${contextMenu.byKeyboard ? "" : " iv-menu-pointer"}`}
+          id="image-viewer-context-submenu"
+          onDismiss={() => setOpenSubmenu(null)}
+          open
+          parentId="image-viewer-context-menu"
+          placement="right-start"
+          preferredWidth={210}
+          restoreFocusTarget={openSubmenu.anchor}
+          role="group"
+          rootId="context-menu"
+          surfaceRole="nested"
+        >
+          <OverlayMenuList ariaLabel={openSubmenu.item.label ?? ""}>
+            {openSubmenu.item.submenu.map((item) =>
+              item.separator ? (
+                <div className="overlay-menu-separator" key={item.id} role="separator" />
+              ) : (
+                <OverlayMenuItem
+                  checked={item.checked}
+                  disabled={item.disabled}
+                  icon={item.icon}
+                  key={item.id}
                   onClick={() => {
                     setContextMenu(null);
                     item.onSelect?.();
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "ArrowLeft") {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      const anchor = openSubmenu.anchor;
+                      setOpenSubmenu(null);
+                      anchor.focus();
+                    }
                   }}
                   role="menuitem"
                   shortcut={item.checked ? <icons.Check aria-hidden="true" size={13} /> : item.shortcut}
@@ -1242,7 +1468,7 @@ export function ImageViewerWindow() {
         rootId="file-operation"
       >
         <OverlayDialogHeader
-          description="图片会移到回收站，需要时可以从回收站恢复。"
+          description={pairedPath ? "这张 RAW 和它的同名 JPEG 会一起移到回收站，需要时可以从回收站恢复。" : "图片会移到回收站，需要时可以从回收站恢复。"}
           descriptionId="image-viewer-delete-description"
           title="删除这张图片？"
           titleId="image-viewer-delete-title"

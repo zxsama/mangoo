@@ -41,6 +41,18 @@ export type LoadedImage =
 
 type DecodeDispatcher = ReturnType<typeof createDecodeDispatcher>;
 
+/** Camera RAW: developed sensor data, or the camera's embedded JPEG. */
+export type RawSource = "developed" | "embedded";
+
+export interface LoadOptions {
+  viewportLongPx: number;
+  full: boolean;
+  animatedExtensions: readonly string[];
+  signal?: AbortSignal;
+  priority?: "navigation" | "interactive" | "resource";
+  rawSource?: RawSource;
+}
+
 let dispatcher: DecodeDispatcher | null | undefined;
 
 function decoder(): DecodeDispatcher | null {
@@ -101,8 +113,8 @@ export class ViewerImageCache {
     this.budgetBytes = budgetBytes;
   }
 
-  static key(entry: ImageEntry, full: boolean): string {
-    return `${entry.path}\u0000${entry.modifiedAtMs}\u0000${entry.sizeBytes}\u0000${full ? "full" : "fit"}`;
+  static key(entry: ImageEntry, full: boolean, rawSource: RawSource = "developed"): string {
+    return `${entry.path}\u0000${entry.modifiedAtMs}\u0000${entry.sizeBytes}\u0000${full ? "full" : "fit"}${rawSource === "embedded" ? "\u0000embedded" : ""}`;
   }
 
   peek(key: string): LoadedImage | null {
@@ -120,9 +132,9 @@ export class ViewerImageCache {
 
   load(
     entry: ImageEntry,
-    options: { viewportLongPx: number; full: boolean; animatedExtensions: readonly string[]; signal?: AbortSignal; priority?: "interactive" | "resource" }
+    options: LoadOptions
   ): Promise<LoadedImage> {
-    const key = ViewerImageCache.key(entry, options.full);
+    const key = ViewerImageCache.key(entry, options.full, options.rawSource);
     const hit = this.peek(key);
     if (hit) return Promise.resolve(hit);
     const pending = this.inflight.get(key);
@@ -135,7 +147,7 @@ export class ViewerImageCache {
   private async fetch(
     entry: ImageEntry,
     key: string,
-    options: { viewportLongPx: number; full: boolean; animatedExtensions: readonly string[]; priority?: "interactive" | "resource" }
+    options: LoadOptions
   ): Promise<LoadedImage> {
     const client = createCoreClient();
     // Core sniffs animation itself and then always serves the original bytes
@@ -143,7 +155,9 @@ export class ViewerImageCache {
     const resource = await client.getImageViewerImage(entry.path, {
       viewportLongPx: options.viewportLongPx,
       full: options.full,
-      requestPriority: options.priority ?? "interactive"
+      // The picture on screen jumps every queue (filmstrip thumbnails, neighbours).
+      requestPriority: options.priority ?? "navigation",
+      ...(options.rawSource === "embedded" ? { rawSource: "embedded" as const } : {})
     });
     if (resource.animated || (options.animatedExtensions.includes(entry.ext) && resource.tier === "original")) {
       const header = new Uint8Array(await resource.blob.slice(0, 64).arrayBuffer());
@@ -224,6 +238,30 @@ export function viewerViewportLongPx(): number {
   return Math.max(128, Math.ceil(longest / 128) * 128);
 }
 
+/**
+ * The picture on screen always loads before filmstrip thumbnails: thumbnail
+ * requests wait on this gate, which the viewer closes while it is loading the
+ * main picture and opens once it is painted.
+ */
+let thumbnailGate: Promise<void> = Promise.resolve();
+let openThumbnailGate: (() => void) | null = null;
+let thumbnailGateTimer: ReturnType<typeof setTimeout> | null = null;
+/** A slow RAW develop or a hung fetch must not freeze the strip. */
+const THUMBNAIL_HOLD_MAX_MS = 1500;
+export function holdThumbnails(hold: boolean): void {
+  if (hold && !openThumbnailGate) {
+    thumbnailGate = new Promise((resolve) => {
+      openThumbnailGate = resolve;
+    });
+    thumbnailGateTimer = setTimeout(() => holdThumbnails(false), THUMBNAIL_HOLD_MAX_MS);
+  } else if (!hold && openThumbnailGate) {
+    if (thumbnailGateTimer) clearTimeout(thumbnailGateTimer);
+    thumbnailGateTimer = null;
+    openThumbnailGate();
+    openThumbnailGate = null;
+  }
+}
+
 const thumbnailUrls = new Map<string, Promise<string>>();
 const THUMBNAIL_URL_LIMIT = 600;
 
@@ -236,8 +274,8 @@ export function thumbnailUrl(entry: ImageEntry, size: number): Promise<string> {
     thumbnailUrls.set(key, existing);
     return existing;
   }
-  const promise = createCoreClient()
-    .getImageViewerThumbnail(entry.path, { size, requestPriority: "background" })
+  const promise = thumbnailGate
+    .then(() => createCoreClient().getImageViewerThumbnail(entry.path, { size, requestPriority: "background" }))
     .then((blob) => URL.createObjectURL(blob));
   promise.catch(() => thumbnailUrls.delete(key));
   thumbnailUrls.set(key, promise);
@@ -270,6 +308,17 @@ export interface Histogram {
   blue: Uint32Array;
   luma: Uint32Array;
   max: number;
+  /** Opaque pixels sampled. */
+  samples: number;
+  /** Luma mean / median / standard deviation (0..255). */
+  mean: number;
+  median: number;
+  deviation: number;
+  /** Share of pixels with any channel at 0 / 255 (clipped shadows / highlights). */
+  clippedShadows: number;
+  clippedHighlights: number;
+  /** Share of pixels that are not fully opaque. */
+  transparent: number;
 }
 
 /** RGB + luma histogram from a downscaled copy of the picture. */
@@ -288,22 +337,52 @@ export async function computeHistogram(image: LoadedImage): Promise<Histogram> {
     const green = new Uint32Array(256);
     const blue = new Uint32Array(256);
     const luma = new Uint32Array(256);
+    let samples = 0;
+    let shadows = 0;
+    let highlights = 0;
+    let translucent = 0;
+    let sum = 0;
+    let sumSquares = 0;
     for (let index = 0; index < pixels.length; index += 4) {
-      if (pixels[index + 3] === 0) continue;
+      const alpha = pixels[index + 3];
+      if (alpha < 255) translucent += 1;
+      if (alpha === 0) continue;
       const r = pixels[index];
       const g = pixels[index + 1];
       const b = pixels[index + 2];
       red[r] += 1;
       green[g] += 1;
       blue[b] += 1;
-      luma[Math.round(0.2126 * r + 0.7152 * g + 0.0722 * b)] += 1;
+      const y = Math.round(0.2126 * r + 0.7152 * g + 0.0722 * b);
+      luma[y] += 1;
+      samples += 1;
+      sum += y;
+      sumSquares += y * y;
+      if (r === 0 || g === 0 || b === 0) shadows += 1;
+      if (r === 255 || g === 255 || b === 255) highlights += 1;
     }
+    const mean = samples ? sum / samples : 0;
+    const deviation = samples ? Math.sqrt(Math.max(0, sumSquares / samples - mean * mean)) : 0;
+    let median = 0;
+    for (let value = 0, seen = 0; value < 256; value += 1) {
+      seen += luma[value];
+      if (seen * 2 >= samples) {
+        median = value;
+        break;
+      }
+    }
+    const total = pixels.length / 4 || 1;
     let max = 1;
     for (const channel of [red, green, blue, luma]) {
       // Ignore the clipped extremes when scaling, like most editors.
       for (let value = 1; value < 255; value += 1) max = Math.max(max, channel[value]);
     }
-    return { red, green, blue, luma, max };
+    return {
+      red, green, blue, luma, max, samples, mean, median, deviation,
+      clippedShadows: samples ? shadows / samples : 0,
+      clippedHighlights: samples ? highlights / samples : 0,
+      transparent: translucent / total
+    };
   } finally {
     if (image.kind !== "bitmap") source.close();
   }

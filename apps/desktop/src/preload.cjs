@@ -204,6 +204,7 @@ const imageViewerBridge = {
   copyText: (text) => ipcRenderer.invoke("mangoo:image-viewer:copy-text", text),
   toggleFullscreen: () => ipcRenderer.invoke("mangoo:image-viewer:toggle-fullscreen"),
   onFullscreenChanged: (cb) => subscribe("mangoo:image-viewer:fullscreen-changed", cb),
+  dragOutOfFullscreen: (input) => ipcRenderer.invoke("mangoo:image-viewer:drag-out-of-fullscreen", input),
   setAlwaysOnTop: (value) => ipcRenderer.invoke("mangoo:image-viewer:set-always-on-top", value === true),
   openMainWindow: () => ipcRenderer.invoke("mangoo:image-viewer:open-main-window"),
   openSettings: (section) => ipcRenderer.invoke("mangoo:image-viewer:open-settings", typeof section === "string" ? section : "display")

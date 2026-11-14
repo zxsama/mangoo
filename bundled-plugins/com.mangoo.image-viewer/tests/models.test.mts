@@ -110,3 +110,19 @@ test("panel widths never fall below the rendered minimum and never overflow", as
   assert.equal(snapped.rect.width, MIN_PANEL_WIDTH);
   assert.equal(snapped.rect.x + snapped.rect.width, 1120, "right edge flush, not past the window");
 });
+
+test("camera RAW+JPEG pairs show as one picture, never hiding what the user opened", async () => {
+  const { collapseRawPairs, hiddenPairOf } = await import("../src/shared/navigation.ts");
+  const entry = (name: string, pair?: string) => ({
+    path: `C:/p/${name}`, name, ext: name.slice(name.lastIndexOf(".")).toLowerCase(), sizeBytes: 1, modifiedAtMs: 0,
+    cameraRaw: /\.(nef|cr3|arw)$/i.test(name), ...(pair ? { pairPath: `C:/p/${pair}` } : {})
+  });
+  const all = [entry("A.NEF", "A.JPG"), entry("A.JPG", "A.NEF"), entry("B.jpg")];
+  assert.deepEqual(collapseRawPairs(all).map((e) => e.name), ["A.NEF", "B.jpg"]);
+  // Opening the JPEG itself shows the JPEG (and hides the RAW instead).
+  assert.deepEqual(collapseRawPairs(all, "C:/p/A.JPG").map((e) => e.name), ["A.JPG", "B.jpg"]);
+  const shown = collapseRawPairs(all);
+  assert.equal(hiddenPairOf(shown[0], shown), "C:/p/A.JPG");
+  assert.equal(hiddenPairOf(shown[1], shown), null);
+  assert.equal(hiddenPairOf(all[0], all), null, "both halves visible: nothing hidden");
+});

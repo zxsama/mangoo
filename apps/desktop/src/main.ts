@@ -2271,6 +2271,18 @@ const imageViewerHost: ImageViewerHost | null = hasSingleInstanceLock
       openMainWindow: showOrCreateMainWindow,
       authorizeHostWindow: (event, channel) => canAccessDesktopIpc(roleForWebContents(event.sender), channel),
       extraRendererArguments: () => (isVisualHarnessEnabled() ? ["--mangoo-visual-harness=1"] : []),
+      beginWindowDrag: (window) => {
+        if (window.isDestroyed()) return false;
+        const cursor = screen.getCursorScreenPoint();
+        const bounds = window.getBounds();
+        refreshWindowComposition(window);
+        activeWindowDrag = {
+          windowId: window.id,
+          pointerOffsetX: cursor.x - bounds.x,
+          pointerOffsetY: cursor.y - bounds.y
+        };
+        return true;
+      },
       log: (level, message, data) => desktopLogger[level]("main", `[mangoo] ${message}`, data ?? "")
     })
   : null;

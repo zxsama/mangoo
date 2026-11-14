@@ -4802,6 +4802,13 @@ button:disabled {
   opacity: 0.55;
 }
 
+/* Applying a change is not "disabled": no forbidden cursor flashes under the
+   pointer while the switch settles (busy and stopping states). */
+.plugin-toggle.busy,
+.plugin-toggle.busy input {
+  cursor: progress;
+}
+
 .plugin-toggle input {
   position: absolute;
   width: 1px;

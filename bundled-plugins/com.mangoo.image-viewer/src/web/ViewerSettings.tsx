@@ -190,8 +190,30 @@ export function ViewerSettingsForm({ preferences, onChange, showSystem = true, s
         <SettingRow description="关闭时，比窗口小的图片保持原始大小，不会被放大到模糊。" title="放大小图片以适应窗口">
           <Switch checked={preferences.upscaleSmall} label="放大小图片以适应窗口" onChange={(upscaleSmall) => onChange({ upscaleSmall })} />
         </SettingRow>
-        <SettingRow description="放大到 200% 以上时清晰显示每个像素，适合检查细节和像素画。" title="高倍放大时显示像素">
-          <Switch checked={preferences.pixelatedZoom} label="高倍放大时显示像素" onChange={(pixelatedZoom) => onChange({ pixelatedZoom })} />
+        <SettingRow description="图片显示得比原始像素更大时如何补出中间的像素。“像素”清晰显示每个像素，适合检查细节和像素画。" title="放大时的插值">
+          <Segmented
+            label="放大时的插值"
+            onChange={(upscaleInterpolation) => onChange({ upscaleInterpolation })}
+            options={[
+              { value: "smooth", label: "平滑", title: "双线性插值，过渡柔和" },
+              { value: "nearest", label: "像素", title: "最近邻，保留每个像素的硬边" }
+            ]}
+            value={preferences.upscaleInterpolation}
+          />
+        </SettingRow>
+        <SettingRow description="图片显示得比原始像素更小时如何合并像素。“平滑”画质更好，“像素”保留锐利的细线但可能出现锯齿。" title="缩小时的插值">
+          <Segmented
+            label="缩小时的插值"
+            onChange={(downscaleInterpolation) => onChange({ downscaleInterpolation })}
+            options={[
+              { value: "smooth", label: "平滑", title: "高质量缩小，减少锯齿和摩尔纹" },
+              { value: "nearest", label: "像素", title: "最近邻，不做模糊" }
+            ]}
+            value={preferences.downscaleInterpolation}
+          />
+        </SettingRow>
+        <SettingRow description={<>按 Alt+1/2/3/4 只看红、绿、蓝或透明通道，Alt+0 恢复。开启后红绿蓝通道先乘以透明度，半透明区域会按透明度变暗。完全透明的像素不保存颜色，两种方式下都显示为黑色。</>} title="单通道显示预乘 Alpha">
+          <Switch checked={preferences.channelPremultiply} label="单通道显示预乘 Alpha" onChange={(channelPremultiply) => onChange({ channelPremultiply })} />
         </SettingRow>
       </Section>
 
@@ -225,6 +247,9 @@ export function ViewerSettingsForm({ preferences, onChange, showSystem = true, s
         </SettingRow>
         <SettingRow description="在最后一张按下一张时回到第一张。" title="循环浏览">
           <Switch checked={preferences.loop} label="循环浏览" onChange={(loop) => onChange({ loop })} />
+        </SettingRow>
+        <SettingRow description="相机同时保存 RAW 和 JPEG 时，同名的两个文件只显示为一张图片（显示 RAW，可按 J 切换为内嵌 JPEG）。关闭后两个文件分别显示。" title="合并同名 RAW 与 JPEG">
+          <Switch checked={preferences.pairRawJpeg} label="合并同名 RAW 与 JPEG" onChange={(pairRawJpeg) => onChange({ pairRawJpeg })} />
         </SettingRow>
         <SettingRow description="比较同一构图的多张照片时很有用。" title="切换图片时保持缩放与旋转">
           <Switch checked={preferences.keepTransform} label="切换图片时保持缩放与旋转" onChange={(keepTransform) => onChange({ keepTransform })} />

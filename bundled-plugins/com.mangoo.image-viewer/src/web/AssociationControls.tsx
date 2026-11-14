@@ -14,6 +14,8 @@ export function AssociationControls() {
   const bridge = viewerHostBridge();
   const [status, setStatus] = useState<ImageViewerAssociationStatus | null>(null);
   const [busy, setBusy] = useState(false);
+  /** The state being applied, shown immediately so the thumb moves at once. */
+  const [pendingTarget, setPendingTarget] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -42,6 +44,7 @@ export function AssociationControls() {
 
   async function toggle(next: boolean) {
     if (!bridge) return;
+    setPendingTarget(next);
     setBusy(true);
     setError(null);
     try {
@@ -79,12 +82,20 @@ export function AssociationControls() {
           <span className="iv-assoc-state" data-on={status.registered ? "true" : "false"}>
             {busy ? "正在应用…" : status.registered ? "已开启" : "未开启"}
           </span>
-          <label className={`plugin-toggle iv-switch${status.registered ? " on" : ""}${!actionable || busy ? " disabled" : ""}`}>
+          <label
+            aria-busy={busy || undefined}
+            className={`plugin-toggle iv-switch${(busy ? pendingTarget : status.registered) ? " on" : ""}${!actionable ? " disabled" : ""}${busy ? " busy" : ""}`}
+          >
             <input
               aria-label="用 Mangoo 打开图片"
-              checked={status.registered}
-              disabled={!actionable || busy}
-              onChange={(event) => void toggle(event.target.checked)}
+              checked={busy ? pendingTarget : status.registered}
+              disabled={!actionable}
+              onChange={(event) => {
+                // While applying, further clicks are ignored (not "disabled":
+                // that flashed a not-allowed cursor under the pointer).
+                if (busy) return;
+                void toggle(event.target.checked);
+              }}
               role="switch"
               type="checkbox"
             />

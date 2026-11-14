@@ -2454,12 +2454,20 @@ paths:
           in: query
           required: false
           schema: { type: boolean }
+        - name: rawSource
+          in: query
+          required: false
+          description: >-
+            Camera RAW only. developed (default) develops the sensor data;
+            embedded serves the camera's embedded JPEG preview (as WebP, tier
+            raw_embedded). Ignored for other formats.
+          schema: { type: string, enum: [developed, embedded] }
       responses:
         "200":
           description: Original image bytes or a WebP representation.
           headers:
             x-mangoo-preview-tier:
-              description: original | preview_2048 | preview_3072 | preview_native | decoder
+              description: original | preview_2048 | preview_3072 | preview_native | decoder | raw_embedded
               schema: { type: string }
             x-mangoo-source-width:
               schema: { type: integer }
@@ -2738,22 +2746,32 @@ components:
     ImageViewerFormats:
       type: object
       additionalProperties: false
-      required: [imageExtensions, browserRenderableExtensions, animatedExtensions, pluginExtensions]
+      required: [imageExtensions, browserRenderableExtensions, animatedExtensions, pluginExtensions, cameraRawExtensions]
       properties:
         imageExtensions: { type: array, items: { type: string } }
         browserRenderableExtensions: { type: array, items: { type: string } }
         animatedExtensions: { type: array, items: { type: string } }
         pluginExtensions: { type: array, items: { type: string } }
+        cameraRawExtensions:
+          type: array
+          description: Camera RAW families; each carries an embedded JPEG preview.
+          items: { type: string }
     ImageViewerFolderEntry:
       type: object
       additionalProperties: false
-      required: [path, name, ext, sizeBytes, modifiedAtMs]
+      required: [path, name, ext, sizeBytes, modifiedAtMs, cameraRaw]
       properties:
         path: { type: string }
         name: { type: string }
         ext: { type: string }
         sizeBytes: { type: integer, minimum: 0 }
         modifiedAtMs: { type: integer }
+        cameraRaw: { type: boolean }
+        pairPath:
+          type: string
+          description: >-
+            Same-stem camera RAW + JPEG sibling (the camera's RAW+JPEG output).
+            Present only for unambiguous one-to-one pairs, on both entries.
     ImageViewerFolder:
       type: object
       additionalProperties: false
