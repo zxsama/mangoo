@@ -175,10 +175,18 @@ export function FloatingPanel({
 
   const docked = placement.dock.horizontal || placement.dock.vertical;
   const horizontalDock = placement.dock.horizontal;
+  // The callback is usually an inline arrow (new every render). Depending on
+  // it made the unmount-cleanup report `null` and the effect report the side
+  // again on EVERY render: an endless render loop while docked to an edge.
+  // Read it through a ref and report only real dock changes / unmount.
+  const dockChangeRef = useRef(onDockChange);
+  useLayoutEffect(() => {
+    dockChangeRef.current = onDockChange;
+  });
   useEffect(() => {
-    onDockChange?.(horizontalDock);
-  }, [horizontalDock, onDockChange]);
-  useEffect(() => () => onDockChange?.(null), [onDockChange]);
+    dockChangeRef.current?.(horizontalDock);
+  }, [horizontalDock]);
+  useEffect(() => () => dockChangeRef.current?.(null), []);
   return (
     <div
       className={`iv-float${className ? ` ${className}` : ""}`}

@@ -267,22 +267,59 @@ const thumbnailUrls = new Map<string, Promise<string>>();
 const THUMBNAIL_URL_LIMIT = 600;
 
 /** Filmstrip thumbnail object URL, cached per path + mtime. */
-export function thumbnailUrl(entry: ImageEntry, size: number): Promise<string> {
-  const key = `${entry.path}\u0000${entry.modifiedAtMs}\u0000${size}`;
+/** Resolved thumbnail URLs, readable synchronously (instant scrub preview). */
+const readyThumbnails = new Map<string, string>();
+/** Keys whose request still waits at the thumbnail gate (not yet sent). */
+const gatedThumbnails = new Set<string>();
+
+function thumbnailKey(entry: ImageEntry, size: number): string {
+  return `${entry.path}\u0000${entry.modifiedAtMs}\u0000${size}`;
+}
+
+/** A thumbnail already fetched, or null. */
+export function readyThumbnailUrl(entry: ImageEntry, size: number): string | null {
+  return readyThumbnails.get(thumbnailKey(entry, size)) ?? null;
+}
+
+/**
+ * `urgent`: the user is looking at it right now (scrub-bar preview). It skips
+ * the "picture first" gate and jumps Core's background queue.
+ */
+export function thumbnailUrl(entry: ImageEntry, size: number, urgent = false): Promise<string> {
+  const key = thumbnailKey(entry, size);
   const existing = thumbnailUrls.get(key);
-  if (existing) {
+  // An urgent caller does not wait behind a request still parked at the
+  // "picture first" gate: it issues its own (the parked one is dropped).
+  if (existing && !(urgent && gatedThumbnails.has(key))) {
     thumbnailUrls.delete(key);
     thumbnailUrls.set(key, existing);
     return existing;
   }
-  const promise = thumbnailGate
-    .then(() => createCoreClient().getImageViewerThumbnail(entry.path, { size, requestPriority: "background" }))
-    .then((blob) => URL.createObjectURL(blob));
-  promise.catch(() => thumbnailUrls.delete(key));
+  const request = () => {
+    gatedThumbnails.delete(key);
+    return createCoreClient().getImageViewerThumbnail(entry.path, { size, requestPriority: urgent ? "interactive" : "background" });
+  };
+  if (!urgent) gatedThumbnails.add(key);
+  const promise: Promise<string> = (urgent ? request() : thumbnailGate.then(request))
+    .then((blob) => {
+      const url = URL.createObjectURL(blob);
+      // Evicted (or superseded) while in flight: nobody owns this URL.
+      if (thumbnailUrls.get(key) !== promise) {
+        URL.revokeObjectURL(url);
+        throw new Error("thumbnail superseded");
+      }
+      readyThumbnails.set(key, url);
+      return url;
+    });
+  promise.catch(() => {
+    if (thumbnailUrls.get(key) === promise) thumbnailUrls.delete(key);
+  });
   thumbnailUrls.set(key, promise);
   while (thumbnailUrls.size > THUMBNAIL_URL_LIMIT) {
     const [oldestKey, oldest] = thumbnailUrls.entries().next().value as [string, Promise<string>];
     thumbnailUrls.delete(oldestKey);
+    readyThumbnails.delete(oldestKey);
+    gatedThumbnails.delete(oldestKey);
     void oldest.then((url) => URL.revokeObjectURL(url), () => undefined);
   }
   return promise;

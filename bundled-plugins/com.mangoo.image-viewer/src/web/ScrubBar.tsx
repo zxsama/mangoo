@@ -2,7 +2,7 @@ import { memo, useCallback, useEffect, useRef, useState, type PointerEvent as Re
 import { createPortal } from "react-dom";
 
 import type { ImageEntry } from "../shared/navigation.ts";
-import { thumbnailUrl } from "./imageSource.ts";
+import { readyThumbnailUrl, thumbnailUrl } from "./imageSource.ts";
 
 /**
  * Scrub bar: a thin track spanning the window, one position per picture.
@@ -19,27 +19,32 @@ import { thumbnailUrl } from "./imageSource.ts";
  *   folder" ruler. Keyboard: Home / End / ←→ (±1) / PgUp PgDn (±10%).
  */
 
+/** Same size as the filmstrip's thumbnails: they share one cache. */
 const PREVIEW_PX = 160;
 
 const Preview = memo(function Preview({ entry }: { entry: ImageEntry }) {
-  const [url, setUrl] = useState<string | null>(null);
+  // Already fetched (filmstrip, earlier scrub): shown in the same frame.
+  const ready = readyThumbnailUrl(entry, PREVIEW_PX);
+  const [url, setUrl] = useState<string | null>(ready);
   useEffect(() => {
+    if (ready) {
+      setUrl(ready);
+      return;
+    }
     let cancelled = false;
-    // A short delay: a fast scrub passes over many positions; only ones the
-    // pointer lingers on (>~60 ms) cost a thumbnail request.
-    const timer = window.setTimeout(() => {
-      thumbnailUrl(entry, PREVIEW_PX).then((value) => {
-        if (!cancelled) setUrl(value);
-      }, () => undefined);
-    }, 60);
+    // Not cached: fetched at once, ahead of the filmstrip's background queue;
+    // only the latest position's answer is shown.
+    thumbnailUrl(entry, PREVIEW_PX, true).then((value) => {
+      if (!cancelled) setUrl(value);
+    }, () => undefined);
     return () => {
       cancelled = true;
-      window.clearTimeout(timer);
     };
-  }, [entry]);
+  }, [entry, ready]);
   // The previous thumbnail stays until the next one is ready (no blink).
   const shown = useRef<string | null>(null);
-  if (url) shown.current = url;
+  if (ready) shown.current = ready;
+  else if (url) shown.current = url;
   return shown.current
     ? <img alt="" className="iv-scrub-preview-image" draggable={false} src={shown.current} />
     : <span className="iv-scrub-preview-placeholder">{entry.ext.replace(".", "").toUpperCase()}</span>;
@@ -123,15 +128,16 @@ export function ScrubBar({
     if (commitTimer.current) window.clearTimeout(commitTimer.current);
   }, []);
 
-  // While dragging, a pause of 220 ms on one position opens it (so the main
-  // view follows a slow, deliberate scrub), but a moving drag never does.
+  // While dragging, the main view follows LIVE (it paints the target's
+  // thumbnail at once and sharpens when the picture lands); a short 40 ms
+  // coalescing window keeps a fast sweep from queueing every position.
   useEffect(() => {
     if (!dragging || !probe) return;
     if (commitTimer.current) window.clearTimeout(commitTimer.current);
     commitTimer.current = window.setTimeout(() => {
       commitTimer.current = null;
       if (probe.index !== index) onSelect(probe.index);
-    }, 220);
+    }, 40);
     // A cancelled / finished drag (or a new probe) drops the pending commit.
     return () => {
       if (commitTimer.current) window.clearTimeout(commitTimer.current);

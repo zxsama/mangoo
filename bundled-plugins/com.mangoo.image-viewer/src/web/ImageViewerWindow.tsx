@@ -47,7 +47,7 @@ import { ComicView, comicScrollBy } from "./ComicView.tsx";
 import { ScrubBar } from "./ScrubBar.tsx";
 import { InfoPanel } from "./InfoPanel.tsx";
 import { viewerBridge } from "./bridge.ts";
-import { ViewerImageCache, encodePng, holdThumbnails, viewerViewportLongPx, type LoadedImage, type RawSource } from "./imageSource.ts";
+import { readyThumbnailUrl, thumbnailUrl, ViewerImageCache, encodePng, holdThumbnails, viewerViewportLongPx, type LoadedImage, type RawSource } from "./imageSource.ts";
 import { useViewerPreferences } from "./preferences.ts";
 import { describeError, hiddenPairOf, useViewerSession } from "./useViewerSession.ts";
 import { ViewerStage, type StageAnimation, type ViewerChannel } from "./ViewerStage.tsx";
@@ -66,7 +66,7 @@ const ANIMATION_MS: Record<Exclude<StageAnimation, "none">, number> = { ease: 20
 const TITLEBAR_HEIGHT = 40;
 const FILMSTRIP_HEIGHT = 92;
 /** Filmstrip pane height with the scrub bar row on top. */
-const FILMSTRIP_WITH_SCRUB_HEIGHT = 114;
+const FILMSTRIP_WITH_SCRUB_HEIGHT = 106;
 const TOOLBAR_CLEARANCE = 64;
 
 const ZOOM_PRESETS = [0.25, 0.5, 1, 2, 4];
@@ -146,6 +146,8 @@ export function ImageViewerWindow() {
   /** Comic mode: scroll a picture to the top (← →, filmstrip, scrub bar). */
   const [comicJump, setComicJump] = useState<{ index: number; token: number } | null>(null);
   const comicJumpToken = useRef(0);
+  /** Thumbnail of a picture still loading, painted over the stage meanwhile. */
+  const [standIn, setStandIn] = useState<string | null>(null);
   /** Camera RAW: developed sensor data or the camera's embedded JPEG. */
   const [rawSource, setRawSource] = useState<RawSource>("developed");
   const isRaw = Boolean(current?.cameraRaw);
@@ -273,6 +275,8 @@ export function ImageViewerWindow() {
   }, [imageLoading, navigate]);
 
   const comic = preferences.comicMode && state.entries.length > 0;
+  const comicRef = useRef(comic);
+  comicRef.current = comic;
   /** Comic mode jumps by scrolling the strip; single-picture mode switches. */
   const goToIndex = useCallback((target: number) => {
     if (preferences.comicMode) {
@@ -364,16 +368,34 @@ export function ImageViewerWindow() {
       return;
     }
     let cancelled = false;
+    let standInTimer = 0;
     setImageError(null);
     const source = effectiveRawSource;
     const cached = cache.peek(ViewerImageCache.key(current, false, source)) ?? cache.peek(ViewerImageCache.key(current, true, source));
     if (cached) {
       setImage(cached);
       setImageLoading(false);
+      setStandIn(null);
     } else {
       // Stamped per picture: a hung picture's grace never carries over.
       loadStartedAt.current = performance.now();
       setImageLoading(true);
+      // Fast browsing (scrub bar, held arrow key): show THIS picture's
+      // thumbnail instead of the previous picture until it is decoded. Only
+      // for a DIFFERENT picture (a RAW/JPEG switch keeps the sharp one), not
+      // in comic mode, and after a short grace so a quick load never flashes
+      // the low-res stand-in.
+      const switching = (image?.key.split("\u0000")[0] ?? null) !== current.path;
+      setStandIn(null);
+      if (switching && !comicRef.current) {
+        const ready = readyThumbnailUrl(current, 160);
+        const urgentThumb = ready ? Promise.resolve(ready) : thumbnailUrl(current, 160, true);
+        standInTimer = window.setTimeout(() => {
+          void urgentThumb.then((url) => {
+            if (!cancelled) setStandIn(url);
+          }, () => undefined);
+        }, ready ? 50 : 0);
+      }
     }
     const viewportLongPx = viewerViewportLongPx();
     let visibleLoad: Promise<LoadedImage> | null = null;
@@ -387,11 +409,13 @@ export function ImageViewerWindow() {
           if (cancelled) return;
           setImage(loaded);
           setImageLoading(false);
+          setStandIn(null);
           holdThumbnails(false);
         }, (error) => {
           if (cancelled) return;
           setImage(null);
           setImageLoading(false);
+          setStandIn(null);
           setImageError(describeError(error));
           holdThumbnails(false);
         });
@@ -415,6 +439,7 @@ export function ImageViewerWindow() {
     else visibleLoad?.then(warmNeighbours, warmNeighbours);
     return () => {
       cancelled = true;
+      window.clearTimeout(standInTimer);
       window.clearTimeout(prefetch);
       // A navigation away never leaves the strip blocked.
       holdThumbnails(false);
@@ -920,6 +945,11 @@ export function ImageViewerWindow() {
 
   const stageOverlay = (
     <>
+      {standIn && imageLoading && !comic ? (
+        <div aria-hidden="true" className="iv-stage-standin">
+          <img alt="" draggable={false} src={standIn} />
+        </div>
+      ) : null}
       {imageLoading ? (
         <div className="iv-stage-status" data-delay="true">
           <MediaLoadingRing size={22} />

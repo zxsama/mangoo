@@ -2762,8 +2762,30 @@ html:has(.iv-settings-window) #root {
 .iv-comic-page {
   display: grid;
   place-items: center;
+  width: var(--iv-comic-page-width);
   min-height: 120px;
   background: rgba(255, 255, 255, 0.025);
+}
+
+/* Measured page: its height follows the width exactly (aspect-ratio). */
+.iv-comic-page[data-measured="true"] {
+  min-height: 0;
+}
+
+/* Left-button drag scrolls the strip. */
+.iv-comic {
+  cursor: grab;
+  user-select: none;
+}
+
+.iv-comic[data-grabbing="true"] {
+  cursor: grabbing;
+}
+
+/* The thumbnail stand-in: soft, so it reads as "still loading". */
+.iv-comic-preview {
+  filter: blur(6px);
+  transform: scale(1.02);
 }
 
 .iv-comic-page[data-loaded="true"] {
@@ -2772,8 +2794,9 @@ html:has(.iv-settings-window) #root {
 
 .iv-comic-canvas {
   display: block;
+  grid-area: 1 / 1;
   width: 100%;
-  height: auto;
+  height: 100%;
 }
 
 .iv-comic-placeholder {
@@ -2791,12 +2814,14 @@ html:has(.iv-settings-window) #root {
 
 /* Scrub bar -------------------------------------------------------------- */
 
-/* The filmstrip pane grows a 22px scrub row on top. */
+/* The filmstrip pane grows a 14px scrub row on top: 10px above the track,
+ * the 4px track, then the filmstrip's own 10px inset below it, so the track
+ * sits exactly midway between the pane's top edge and the thumbnails. */
 .iv-filmstrip-pane[data-scrub="true"] {
-  --iv-filmstrip-height: 114px;
+  --iv-filmstrip-height: 106px;
   display: flex;
   flex-direction: column;
-  flex-basis: 114px;
+  flex-basis: 106px;
 }
 
 .iv-filmstrip-pane[data-scrub="true"] > .iv-filmstrip {
@@ -2807,43 +2832,72 @@ html:has(.iv-settings-window) #root {
 .iv-scrub {
   position: relative;
   z-index: 3;
-  flex: 0 0 22px;
+  flex: 0 0 14px;
   padding: 0 16px;
   cursor: pointer;
   outline: none;
   touch-action: none;
 }
 
+/* The track's BOX never changes (whole-pixel 4px band, 10px from the top),
+ * so the thumb centred on it never moves. Only the painted bar (::after,
+ * plus the fill) grows on hover, by scaleY around the same centre line —
+ * animating top/height re-centred the thumb by half pixels (a 1px jitter). */
 .iv-scrub-track {
   position: relative;
   top: 10px;
-  height: 3px;
-  border-radius: var(--radius-pill);
-  background: rgba(255, 255, 255, 0.12);
-  transition: height 120ms ease, top 120ms ease;
+  height: 4px;
 }
 
-.iv-scrub:hover .iv-scrub-track,
-.iv-scrub[data-dragging="true"] .iv-scrub-track,
-.iv-scrub:focus-visible .iv-scrub-track {
-  top: 9px;
-  height: 5px;
+.iv-scrub-track::after,
+.iv-scrub-fill {
+  transform: scaleY(0.75);
+  transition: transform 120ms ease;
+}
+
+.iv-scrub-track::after {
+  position: absolute;
+  inset: 0;
+  border-radius: var(--radius-pill);
+  background: rgba(255, 255, 255, 0.12);
+  content: "";
+}
+
+.iv-scrub:hover .iv-scrub-fill,
+.iv-scrub[data-dragging="true"] .iv-scrub-fill,
+.iv-scrub:focus-visible .iv-scrub-fill {
+  transform: scaleY(1.25);
+}
+
+.iv-scrub:hover .iv-scrub-track::after,
+.iv-scrub[data-dragging="true"] .iv-scrub-track::after,
+.iv-scrub:focus-visible .iv-scrub-track::after {
+  transform: scaleY(1.25);
+}
+
+/* A taller invisible hit area than the 14px row, so the thin bar is easy to grab. */
+.iv-scrub::before {
+  position: absolute;
+  inset: 2px 0 -6px;
+  content: "";
 }
 
 .iv-scrub-fill {
   position: absolute;
+  z-index: 1;
   inset: 0 auto 0 0;
-  border-radius: inherit;
+  border-radius: var(--radius-pill);
   background: color-mix(in srgb, var(--accent) 55%, transparent);
 }
 
 .iv-scrub-thumb {
   position: absolute;
-  top: 50%;
+  z-index: 2;
+  /* (4px track - 12px thumb) / 2: an exact pixel, no 50% rounding. */
+  top: -4px;
   left: -6px;
   width: 12px;
   height: 12px;
-  margin-top: -6px;
   border-radius: 50%;
   background: var(--accent);
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
@@ -2925,4 +2979,32 @@ html:has(.iv-settings-window) #root {
   font-size: var(--iv-text-caption);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Stand-in while the picture decodes: its thumbnail, fitted like the
+ * picture, so fast browsing always shows the RIGHT picture at once. */
+.iv-stage-standin {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+}
+
+.iv-stage-standin img {
+  max-width: 100%;
+  max-height: 100%;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  image-rendering: auto;
+}
+
+.iv-stage-standin + .iv-stage-status {
+  display: none;
+}
+
+/* While the stand-in shows, the previous picture is not painted under it. */
+.iv-stage:has(> .iv-stage-standin) > .iv-image-layer {
+  visibility: hidden;
 }
