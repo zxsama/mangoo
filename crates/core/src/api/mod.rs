@@ -24,6 +24,7 @@ use crate::roots::reachability::{refresh_root_reachability, RootReachability};
 
 mod image_viewer;
 mod playback;
+mod plugin_data;
 mod plugin_ui_admission;
 pub mod routes;
 
@@ -473,6 +474,7 @@ pub fn router_with_state(state: AppState, config: ApiConfig) -> Router {
     let api_router = routes::router(state.clone())
         .merge(playback::authenticated_router(state.clone()))
         .merge(image_viewer::router(state.clone()))
+        .merge(plugin_data::router(state.clone()))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             attach_library_context,
@@ -1430,6 +1432,9 @@ async fn attach_library_context(
         // The standalone viewer opens OS files outside any Library and is
         // gated by its Host-engine plugin capability instead.
         || request.uri().path().starts_with("/api/image-viewer/")
+        // Plugin-data change long-polls must not hold the request gate: a
+        // held poll would otherwise delay every Library activation.
+        || plugin_data::is_ungated_path(request.uri().path())
         || request
             .uri()
             .path()

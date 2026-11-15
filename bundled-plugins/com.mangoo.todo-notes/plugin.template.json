@@ -1,0 +1,29 @@
+{
+  "manifestVersion": 2,
+  "id": "com.mangoo.todo-notes",
+  "name": "Mangoo 便笺",
+  "version": "1.0.0",
+  "engine": "host",
+  "host": {
+    "capabilities": [
+      "todo-notes.v1"
+    ]
+  },
+  "activationEvents": [
+    "startup"
+  ],
+  "requestedPermissions": [
+    {
+      "kind": "library-data",
+      "access": "plugin-records"
+    },
+    {
+      "kind": "system-tray",
+      "scope": "current-session"
+    },
+    {
+      "kind": "login-item",
+      "scope": "current-user"
+    }
+  ]
+}

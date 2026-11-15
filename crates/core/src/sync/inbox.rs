@@ -132,6 +132,9 @@ pub(crate) fn materialize_truth(
             if field == "entity-kind" {
                 rematerialize_location_projection(transaction, remote_apply)?;
             }
+            if crate::db::plugin_records::is_plugin_record_field(field) {
+                crate::db::plugin_records::rebuild_plugin_record(transaction, entity)?;
+            }
         }
         Operation::SetAdd { member_uuid, .. } => {
             transaction.execute(
@@ -193,6 +196,7 @@ pub(crate) fn materialize_truth(
                 "UPDATE sync_root_descriptors SET lifecycle='tombstoned',logical_revision=logical_revision+1,updated_at=?1 WHERE root_folder_uuid=?2",
                 params![unix_timestamp_millis(), entity],
             )?;
+            crate::db::plugin_records::rebuild_plugin_record(transaction, entity)?;
         }
         Operation::Restore { observed_tokens } => {
             for observed in observed_tokens {
@@ -224,6 +228,7 @@ pub(crate) fn materialize_truth(
                     params![unix_timestamp_millis(), entity],
                 )?;
             }
+            crate::db::plugin_records::rebuild_plugin_record(transaction, entity)?;
             rematerialize_location_projection(transaction, remote_apply)?;
         }
         Operation::SetContent {

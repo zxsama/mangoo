@@ -1,4 +1,5 @@
 mod directory_preferences;
+pub mod plugin_records;
 pub use directory_preferences::{
     DirectorySortMutationResult, DirectorySortRule, DirectorySortState, DirectoryTarget,
     FolderChildrenPage,
@@ -1900,6 +1901,10 @@ impl Database {
         if !self.migration_applied(39)? {
             self.connection
                 .execute_batch(migrations::DIRECTORY_PREFERENCES_MIGRATION)?;
+        }
+        if !self.migration_applied(40)? {
+            self.connection
+                .execute_batch(migrations::PLUGIN_RECORDS_MIGRATION)?;
         }
         self.backfill_media_fts_if_empty()?;
         self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)?;

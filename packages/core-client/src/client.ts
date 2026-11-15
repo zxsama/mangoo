@@ -80,6 +80,7 @@ import type {
   UserMetadataRecord,
   UserMetadataUpdate
 } from "./generated-contract.ts";
+import type { ListPluginRecordsParams, ListSharedPluginRecordsParams, PluginRecord, PluginRecordBatchResponse, PluginRecordChanges, PluginRecordOperation, PluginRecordPage, WaitPluginRecordChangesParams } from "./generated-contract.ts";
 import type { RemoteLibraryListResponse, RemoteLibraryRootListResponse, SyncCommandRequest, SyncConflictListResponse, SyncConflictResolutionRequest, SyncEnableRequest, SyncOperation, SyncPreflightRequest, SyncPreflightResponse, SyncReconnectCommitRequest, SyncReconnectPlan, SyncReconnectPreflightRequest, SyncRestoreListResponse, SyncRestorePlan, SyncRestorePreflight, SyncRestorePreflightRequest, SyncRestoreStartRequest, SyncStatusSnapshot, SyncUnbindCommitRequest, SyncUnbindPlan } from "./generated-contract.ts";
 import type { RootCommandRequest, RootComparisonItem, RootComparisonItemListResponse, RootComparisonItemResolutionRequest, RootComparisonPlan, RootConflictListResponse, RootEnrollmentCommitRequest, RootLocationConflictResolutionRequest, RootLogicalRenameCommitRequest, RootLogicalRenamePlan, RootLogicalRenameRequest, RootOperation, RootOperationFenceRequest, RootOperationListResponse, RootOperationPageResponse, RootPathPreflightRequest, RootPathPreflightResult, RootRebindCommitRequest, RootRebindPlan, RootRebindPreflightRequest, RootReenableCommitRequest, RootRelocationCommitRequest, RootRelocationPreflightRequest, RootSelectionCommitRequest, RootSelectionPreflightRequest, RootSelectionPreflightResult, RootStopCommitRequest, RootStopPlan, SyncFolderListResponse, SyncFolderRecord, SyncFolderSettings, UpdateSyncFolderSettingsRequest } from "./generated-contract.ts";
 
@@ -890,6 +891,61 @@ export function createCoreClient(config: CoreClientConfig) {
         requestPriority: options.requestPriority ?? "metadata",
         signal: options.signal
       }),
+    // Generic Host-engine plugin data in the active Library (library-data).
+    listPluginRecords: (pluginId: string, params: ListPluginRecordsParams, options: CoreRequestOptions = {}) => {
+      const search = new URLSearchParams({ collection: params.collection });
+      if (params.cursor) search.set("cursor", params.cursor);
+      if (params.limit !== undefined) search.set("limit", String(params.limit));
+      if (params.includeDeleted) search.set("includeDeleted", "true");
+      return request<PluginRecordPage>(`/plugin-data/${encodeURIComponent(pluginId)}/records?${search}`, {
+        requestPriority: options.requestPriority ?? "metadata",
+        signal: options.signal
+      });
+    },
+    getPluginRecord: (pluginId: string, recordId: string, options: CoreRequestOptions = {}) =>
+      request<PluginRecord>(`/plugin-data/${encodeURIComponent(pluginId)}/records/${encodeURIComponent(recordId)}`, {
+        requestPriority: options.requestPriority ?? "metadata",
+        signal: options.signal
+      }),
+    applyPluginRecordBatch: (pluginId: string, operations: PluginRecordOperation[], options: CoreRequestOptions = {}) =>
+      request<PluginRecordBatchResponse>(`/plugin-data/${encodeURIComponent(pluginId)}/batch`, {
+        method: "POST",
+        requestPriority: options.requestPriority ?? "interactive",
+        signal: options.signal,
+        body: JSON.stringify({ operations })
+      }),
+    // Cross-Library shared scope (Host-held, mirrored into the active Library).
+    listSharedPluginRecords: (pluginId: string, params: ListSharedPluginRecordsParams, options: CoreRequestOptions = {}) => {
+      const search = new URLSearchParams({ collection: params.collection });
+      if (params.includeDeleted) search.set("includeDeleted", "true");
+      return request<PluginRecordPage>(`/plugin-data/${encodeURIComponent(pluginId)}/shared/records?${search}`, {
+        requestPriority: options.requestPriority ?? "metadata",
+        signal: options.signal
+      });
+    },
+    getSharedPluginRecord: (pluginId: string, recordId: string, options: CoreRequestOptions = {}) =>
+      request<PluginRecord>(`/plugin-data/${encodeURIComponent(pluginId)}/shared/records/${encodeURIComponent(recordId)}`, {
+        requestPriority: options.requestPriority ?? "metadata",
+        signal: options.signal
+      }),
+    applySharedPluginRecordBatch: (pluginId: string, operations: PluginRecordOperation[], options: CoreRequestOptions = {}) =>
+      request<PluginRecordBatchResponse>(`/plugin-data/${encodeURIComponent(pluginId)}/shared/batch`, {
+        method: "POST",
+        requestPriority: options.requestPriority ?? "interactive",
+        signal: options.signal,
+        body: JSON.stringify({ operations })
+      }),
+    waitPluginRecordChanges: (pluginId: string, params: WaitPluginRecordChangesParams = {}, options: CoreRequestOptions = {}) => {
+      const search = new URLSearchParams();
+      if (params.afterRevision !== undefined) search.set("afterRevision", String(params.afterRevision));
+      if (params.afterSharedRevision !== undefined) search.set("afterSharedRevision", String(params.afterSharedRevision));
+      if (params.libraryId) search.set("libraryId", params.libraryId);
+      if (params.waitMs !== undefined) search.set("waitMs", String(params.waitMs));
+      return request<PluginRecordChanges>(`/plugin-data/${encodeURIComponent(pluginId)}/changes?${search}`, {
+        requestPriority: options.requestPriority ?? "background",
+        signal: options.signal
+      });
+    },
     listPlugins: (options: CoreRequestOptions = {}) => request<HostPluginListResponse>("/plugins", {
       requestPriority: options.requestPriority ?? "metadata",
       signal: options.signal

@@ -8,6 +8,7 @@ mod host_registry;
 mod library_manager;
 mod library_path;
 mod plugin_configuration;
+mod plugin_shared;
 mod plugins;
 mod roots;
 mod scan;

@@ -96,6 +96,21 @@ describe("resolveOverlayPosition", () => {
     });
   });
 
+  it("slides a menu taller than either side into the viewport instead of capping it", () => {
+    // Context menu opened mid-window: 418px tall, 300px below, 360px above.
+    const result = resolveOverlayPosition({
+      trigger: rect(150, 360, 0, 0),
+      overlay: { width: 240, height: 418 },
+      viewport: { width: 400, height: 680 },
+      preferredPlacement: "bottom-start",
+      offset: 6,
+      gutter: 12,
+      fitToViewport: true
+    });
+    assert.equal(result.top, 680 - 12 - 418);
+    assert.ok(result.maxHeight >= 418, "nothing is cut off");
+  });
+
   it("flips above when the bottom side cannot fit", () => {
     const result = resolveOverlayPosition({
       trigger: rect(400, 540, 28, 28),

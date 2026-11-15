@@ -511,6 +511,18 @@ assertInterfaceMatchesSchema("HostPluginViewDocument");
 assertInterfaceMatchesSchema("PluginUiView");
 assertInterfaceMatchesSchema("PluginUiContribution");
 assertEnumMatchesGeneratedType("PluginUiSlot");
+for (const name of ["PluginRecord", "PluginRecordPage", "PluginRecordBatchRequest", "PluginRecordBatchResponse", "PluginRecordChanges"]) {
+  assertInterfaceMatchesSchema(name);
+}
+assertOperationRoute("listPluginRecords", "get", "/plugin-data/{pluginId}/records");
+assertOperationRoute("getPluginRecord", "get", "/plugin-data/{pluginId}/records/{recordId}");
+assertOperationRoute("applyPluginRecordBatch", "post", "/plugin-data/{pluginId}/batch");
+assertOperationRequestSchema("applyPluginRecordBatch", "PluginRecordBatchRequest");
+assertOperationRoute("waitPluginRecordChanges", "get", "/plugin-data/{pluginId}/changes");
+assertOperationRoute("listSharedPluginRecords", "get", "/plugin-data/{pluginId}/shared/records");
+assertOperationRoute("getSharedPluginRecord", "get", "/plugin-data/{pluginId}/shared/records/{recordId}");
+assertOperationRoute("applySharedPluginRecordBatch", "post", "/plugin-data/{pluginId}/shared/batch");
+assertOperationRequestSchema("applySharedPluginRecordBatch", "PluginRecordBatchRequest");
 for (const name of ["ImageViewerFormats", "ImageViewerFolderEntry", "ImageViewerFolder", "ImageViewerExif", "ImageViewerMetadata"]) {
   assertInterfaceMatchesSchema(name);
 }
@@ -718,6 +730,13 @@ for (const method of [
   "getImageViewerImage",
   "getImageViewerThumbnail",
   "getImageViewerMetadata",
+  "listPluginRecords",
+  "getPluginRecord",
+  "applyPluginRecordBatch",
+  "waitPluginRecordChanges",
+  "listSharedPluginRecords",
+  "getSharedPluginRecord",
+  "applySharedPluginRecordBatch",
   "listTasks",
   "cancelTask",
   "retryTask",

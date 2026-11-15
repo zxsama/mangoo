@@ -107,15 +107,49 @@ for the corresponding local capture, compatibility and acceptance boundaries.
 
 `engine: "host"` declares a trusted bundled feature implemented by the Host itself
 (Core, Desktop and Web) from the plugin directory, e.g. the built-in image viewer
-`com.mangoo.image-viewer`. A Host manifest declares `host: { capabilities: ["image-viewer.v1"] }`
-and omits `entry`, `rpc`, `integrity` and `contributions`. Its only activation events are
-`file-open-requested` / `diagnostics-requested`, and its only permissions are
-`{ kind: "local-files", access: "opened-folders" }` and `{ kind: "file-association", scope: "current-user" }`.
+`com.mangoo.image-viewer` and TODO notes `com.mangoo.todo-notes`. A Host manifest declares
+`host: { capabilities: [...] }` (`image-viewer.v1`, `todo-notes.v1`) and omits `entry`, `rpc`,
+`integrity` and `contributions`. Its only activation events are `file-open-requested`,
+`diagnostics-requested` and `startup`, and its only permissions are the Host permissions:
+
+| Permission | Grants |
+| --- | --- |
+| `{ kind: "local-files", access: "opened-folders" }` | read the files the user opens and their folder |
+| `{ kind: "file-association", scope: "current-user" }` | per-user OS file-type registration |
+| `{ kind: "library-data", access: "plugin-records" }` | the plugin's own records in the active Library via `/api/plugin-data/{pluginId}` (synchronized with that Library) |
+| `{ kind: "system-tray", scope: "current-session" }` | a notification-area icon while enabled |
+| `{ kind: "login-item", scope: "current-user" }` | optional start at login, only when the user turns it on |
+
 Process manifests cannot declare Host capabilities, permissions or activation.
+
+### Plugin data (all Host plugins)
+
+`library-data` is the single storage contract for plugin content. Records live in the
+active Library Catalog (`plugin_records`), grouped by plugin and `collection`, and each is an
+ordinary synchronized entity: an immutable header field `plugin-record.v1` plus one
+last-writer-wins field `plugin-field.v1:<name>` per top-level field, with canonical
+Delete/Restore tombstones. Concurrent edits of different fields on two devices both survive;
+the same field converges to the later edit. Remote apply and checkpoint restore rebuild the
+projection; older builds keep the events and project nothing. Limits: 64 fields per record,
+160 KiB per serialized field value (one sync event), 1 MiB per record, 200 operations per
+batch. Device-local presentation state (window positions, per-screen layout) is NOT plugin
+data: Desktop-side Host plugins keep it in their own `userData` store. Disabling a plugin
+answers `403 plugin_data_disabled` but never deletes or stops synchronizing its records.
+
+**Shared scope (across Libraries).** `/api/plugin-data/{pluginId}/shared/{records,records/{id},batch}`
+holds records in the Host registry (`host_plugin_records`, Host migration `0023`): visible from every
+Library and with none open. Each field is stored as `{v, t, d}` (value, edit time, device) and merges
+last-writer-wins; deletion is the merged field `deleted`. While a Library is active, Core reconciles the
+shared store with that Library's reserved `mirror--<collection>` records (ordinary Library records that
+travel with its sync), so shared data reaches another device through any Library both sync, and from
+there every other Library on it. `mirror--` collections are refused by the Library-scope API. The change
+feed reports `sharedRevision` beside `revision`. Moving a record between scopes means a new id (each
+Library already mirrors shared ids).
 
 The artifact is exactly `plugin.json`. Compiled trust pins its digest with a zero executable digest,
 and the inventory row is `{ id, version, platform, engine: "host", manifestSha256 }`.
 Enable, grants and disable use the ordinary lifecycle; an enabled and granted Host plugin is `ready`
 with its capabilities published, and Core gates each Host service on
-`HostRegistry::host_capability_enabled`. `fixtures/valid-host-image-viewer-v2.json` is the canonical fixture.
+`HostRegistry::host_capability_enabled` (per-plugin services on `host_plugin_permission_enabled`).
+`fixtures/valid-host-image-viewer-v2.json` and `fixtures/valid-host-todo-notes-v2.json` are the canonical fixtures.
 See [the image viewer design](../../docs/superpowers/specs/2026-11-08-image-viewer-plugin.md).

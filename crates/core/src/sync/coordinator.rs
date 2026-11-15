@@ -2518,11 +2518,24 @@ fn seal_next_outbox_segment(
     let mut statement = connection.prepare(
         "SELECT e.payload FROM sync_outbox o JOIN sync_events e ON e.event_uuid=o.event_uuid WHERE o.state='pending' AND e.actor_epoch=?1 ORDER BY e.actor_seq LIMIT 256",
     )?;
-    let events = statement
+    // Bound the segment by bytes as well as count: a run of large events
+    // (long notes, plugin-record attachments) would otherwise exceed
+    // MAX_SEGMENT_DECODED_BYTES and fail sealing on every turn. One event is
+    // always taken; each is itself bounded by MAX_EVENT_BYTES.
+    let payloads = statement
         .query_map([&actor], |row| row.get::<_, Vec<u8>>(0))?
-        .map(|row| Ok(super::codec::decode_event(&row?)?))
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
+    let mut budget = 2usize;
+    let mut events = Vec::with_capacity(payloads.len());
+    for payload in payloads {
+        let size = payload.len() + 1;
+        if !events.is_empty() && budget + size > super::codec::MAX_SEGMENT_DECODED_BYTES {
+            break;
+        }
+        budget += size;
+        events.push(super::codec::decode_event(&payload)?);
+    }
     if events.is_empty() {
         return Ok(false);
     }

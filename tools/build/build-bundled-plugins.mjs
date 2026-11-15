@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { assertNoLinks, currentPlatform, DEFAULT_PLUGIN_IDS, FAKE_PLUGIN_ID, IMAGE_VIEWER_PLUGIN_ID, PPM_PLUGIN_ID, parsePluginArgs, renderTrust, sha256, stageArtifacts, validateArtifact, validateSelection } from "./plugin-artifacts.mjs";
+import { assertNoLinks, currentPlatform, DEFAULT_PLUGIN_IDS, FAKE_PLUGIN_ID, HOST_ENGINE_PLUGIN_IDS, PPM_PLUGIN_ID, parsePluginArgs, renderTrust, sha256, stageArtifacts, validateArtifact, validateSelection } from "./plugin-artifacts.mjs";
 
 const root = process.cwd();
 const options = parsePluginArgs(process.argv.slice(2));
@@ -35,7 +35,7 @@ try {
   }
   // Host-engine built-ins ship only their manifest; their feature code is
   // compiled into Core, Desktop and Web from the plugin directory.
-  for (const id of [IMAGE_VIEWER_PLUGIN_ID]) {
+  for (const id of HOST_ENGINE_PLUGIN_IDS) {
     const directory = path.join(scratch, id);
     fs.mkdirSync(directory, { recursive: true });
     fs.copyFileSync(path.join(root, "bundled-plugins", id, "plugin.template.json"), path.join(directory, "plugin.json"));

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import Ajv2020 from "ajv/dist/2020.js";
-import { assertSelectedInventory, currentPlatform, FAKE_PLUGIN_ID, IMAGE_VIEWER_PLUGIN_ID, PPM_PLUGIN_ID, INVENTORY_FILE, MAX_UI_DOCUMENT_BYTES, parsePluginArgs, readInventory, renderTrust, sha256, stageArtifacts, validateArtifact, validateSelection } from "./plugin-artifacts.mjs";
+import { assertSelectedInventory, currentPlatform, FAKE_PLUGIN_ID, IMAGE_VIEWER_PLUGIN_ID, PPM_PLUGIN_ID, TODO_NOTES_PLUGIN_ID, INVENTORY_FILE, MAX_UI_DOCUMENT_BYTES, parsePluginArgs, readInventory, renderTrust, sha256, stageArtifacts, validateArtifact, validateSelection } from "./plugin-artifacts.mjs";
 
 const platform = currentPlatform();
 const entry = platform === "windowsX64" ? "bin/provider.exe" : "bin/provider";
@@ -29,10 +29,10 @@ function artifact(root, id = "com.example.storage", change = {}) {
   return dir;
 }
 
-function hostArtifact(root, change = {}) {
-  const dir = path.join(root, IMAGE_VIEWER_PLUGIN_ID);
+function hostArtifact(root, change = {}, id = IMAGE_VIEWER_PLUGIN_ID) {
+  const dir = path.join(root, id);
   fs.mkdirSync(dir, { recursive: true });
-  const manifest = { ...JSON.parse(fs.readFileSync(new URL("../../bundled-plugins/com.mangoo.image-viewer/plugin.template.json", import.meta.url), "utf8")), ...change };
+  const manifest = { ...JSON.parse(fs.readFileSync(new URL(`../../bundled-plugins/${id}/plugin.template.json`, import.meta.url), "utf8")), ...change };
   fs.writeFileSync(path.join(dir, "plugin.json"), JSON.stringify(manifest));
   return dir;
 }
@@ -47,21 +47,22 @@ test("default selection stages fake, viewer and decoder and removes stale genera
   const fake = validateArtifact(artifact(root, FAKE_PLUGIN_ID));
   const ppm = validateArtifact(artifact(root, PPM_PLUGIN_ID, decoderFields()));
   const viewer = validateArtifact(hostArtifact(root));
+  const todo = validateArtifact(hostArtifact(root, {}, TODO_NOTES_PLUGIN_ID));
   const external = validateArtifact(artifact(root));
   const targetRoot = path.join(root, "target");
-  stageArtifacts({ targetRoot, profile: "debug", artifacts: [fake, viewer, ppm, external] });
+  stageArtifacts({ targetRoot, profile: "debug", artifacts: [fake, viewer, ppm, todo, external] });
   const stale = path.join(targetRoot, "debug", "bundled-plugins", external.row.id);
   assert.equal(fs.existsSync(stale), true);
-  stageArtifacts({ targetRoot, profile: "debug", artifacts: [fake, viewer, ppm] });
+  stageArtifacts({ targetRoot, profile: "debug", artifacts: [fake, viewer, ppm, todo] });
   assert.equal(fs.existsSync(stale), false);
   const inventory = readInventory(path.join(targetRoot, "debug", "bundled-plugins"));
-  assert.deepEqual(inventory.plugins.map((row) => row.id), [FAKE_PLUGIN_ID, IMAGE_VIEWER_PLUGIN_ID, PPM_PLUGIN_ID]);
+  assert.deepEqual(inventory.plugins.map((row) => row.id), [FAKE_PLUGIN_ID, IMAGE_VIEWER_PLUGIN_ID, PPM_PLUGIN_ID, TODO_NOTES_PLUGIN_ID]);
   assertSelectedInventory(inventory, []);
   assert.throws(() => assertSelectedInventory(inventory, [external]), /explicitly selected/);
   assert.equal(fs.existsSync(path.join(external.root, entry)), true);
   const backup = fs.readdirSync(path.join(targetRoot, "debug")).find((name) => name.startsWith(".bundled-plugins-backup-"));
   const previous = readInventory(path.join(targetRoot, "debug", backup, "previous"));
-  assert.deepEqual(previous.plugins.map((row) => row.id).sort(), [external.row.id, FAKE_PLUGIN_ID, IMAGE_VIEWER_PLUGIN_ID, PPM_PLUGIN_ID].sort());
+  assert.deepEqual(previous.plugins.map((row) => row.id).sort(), [external.row.id, FAKE_PLUGIN_ID, IMAGE_VIEWER_PLUGIN_ID, PPM_PLUGIN_ID, TODO_NOTES_PLUGIN_ID].sort());
 });
 
 test("host-engine artifacts are exactly a schema-valid manifest pinned with the no-executable marker", (t) => {
@@ -93,7 +94,8 @@ test("explicit artifact selection preserves exact identity, platform, executable
   const ppm = validateArtifact(artifact(root, PPM_PLUGIN_ID, decoderFields()));
   const external = validateArtifact(artifact(root));
   const viewer = validateArtifact(hostArtifact(root));
-  const inventory = stageArtifacts({ targetRoot: path.join(root, "target"), profile: "release", artifacts: [external, fake, viewer, ppm] });
+  const todo = validateArtifact(hostArtifact(root, {}, TODO_NOTES_PLUGIN_ID));
+  const inventory = stageArtifacts({ targetRoot: path.join(root, "target"), profile: "release", artifacts: [external, fake, viewer, ppm, todo] });
   const loaded = readInventory(path.join(root, "target", "release", "bundled-plugins"));
   assert.deepEqual(loaded, inventory);
   assertSelectedInventory(loaded, [external]);
@@ -102,7 +104,8 @@ test("explicit artifact selection preserves exact identity, platform, executable
   assert.match(trust, /"com.example.storage"/);
   assert.match(trust, /"1.2.3"/);
   assert.ok(trust.includes(platform === "windowsX64" ? "Platform::WindowsX64" : "Platform::LinuxX64"));
-  assert.equal((trust.match(/0x[0-9a-f]{2}/g) ?? []).length, 256);
+  // Five plugins x two 32-byte digests.
+  assert.equal((trust.match(/0x[0-9a-f]{2}/g) ?? []).length, 320);
   const changed = { ...external, row: { ...external.row, manifestSha256: "0".repeat(64) } };
   assert.throws(() => assertSelectedInventory(loaded, [changed]), /selected artifact changed/);
   assert.throws(() => assertSelectedInventory(loaded, []), /explicitly selected/);

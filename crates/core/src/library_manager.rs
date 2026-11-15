@@ -8057,7 +8057,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(migration, 39);
+        assert_eq!(migration, 40);
         let presentation_tables: i64 = database
             .connection_for_fsops()
             .query_row(

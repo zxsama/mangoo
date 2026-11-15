@@ -10,6 +10,8 @@ pub const SYNC_PROVIDER_V1_CAPABILITY: &str = "sync-provider.v1";
 pub const FILE_DECODER_V1_CAPABILITY: &str = "file-decoder.v1";
 /// Host-engine capability: the standalone image viewer feature.
 pub const IMAGE_VIEWER_V1_CAPABILITY: &str = "image-viewer.v1";
+#[allow(dead_code)]
+pub const TODO_NOTES_V1_CAPABILITY: &str = "todo-notes.v1";
 /// Entry path recorded for a Host-engine plugin version. It has no executable;
 /// the verified artifact is exactly its manifest.
 pub const HOST_ENGINE_ENTRY: &str = "plugin.json";

@@ -45,6 +45,8 @@ export interface AnchoredOverlayProps {
   open: boolean;
   parentId?: string;
   placement?: OverlayPlacement;
+  /** A menu taller than the space on either side of its anchor slides into the viewport instead of scrolling. */
+  fitToViewport?: boolean;
   preferredWidth?: number;
   role?: "menu" | "listbox" | "dialog" | "group" | "status";
   restoreFocusTarget?: HTMLElement | null;
@@ -88,6 +90,7 @@ export function AnchoredOverlay({
   open,
   parentId,
   placement = "bottom-start",
+  fitToViewport = false,
   preferredWidth,
   role = "menu",
   restoreFocusTarget,
@@ -244,7 +247,8 @@ export function AnchoredOverlay({
         minWidth,
         maxWidth: viewportMaxWidth,
         offset: resolveOverlayAnchorOffset(anchor, kind === "nested"),
-        gutter: OVERLAY_VIEWPORT_GUTTER_PX
+        gutter: OVERLAY_VIEWPORT_GUTTER_PX,
+        fitToViewport
       });
       setLayout((current) => layoutUnchanged(current, next) ? current : next);
     };
@@ -276,7 +280,7 @@ export function AnchoredOverlay({
       window.removeEventListener("resize", scheduleMeasure);
       window.removeEventListener("scroll", handleScroll, true);
     };
-  }, [anchor, integratedAnchor, kind, minWidth, open, placement, preferredWidth, presence.present]);
+  }, [anchor, fitToViewport, integratedAnchor, kind, minWidth, open, placement, preferredWidth, presence.present]);
 
   if (!presence.present || !renderedAnchor) return null;
 

@@ -1,4 +1,4 @@
-export type DesktopIpcWindowRole = "main" | "settings" | "plugins" | "notifications" | "image-viewer";
+export type DesktopIpcWindowRole = "main" | "settings" | "plugins" | "notifications" | "image-viewer" | "todo-notes";
 
 const ALL_WINDOW_ROLES = new Set<DesktopIpcWindowRole>([
   "main",
@@ -7,7 +7,9 @@ const ALL_WINDOW_ROLES = new Set<DesktopIpcWindowRole>([
   "notifications",
   // The Host-engine image viewer window owns frameless chrome too. Its own
   // feature channels are authorized by the plugin host, not this table.
-  "image-viewer"
+  "image-viewer",
+  // TODO notes windows (main notes window and pinned notes), likewise.
+  "todo-notes"
 ]);
 const PRIVILEGED_WINDOW_ROLES = new Set<DesktopIpcWindowRole>([
   "main",
@@ -51,7 +53,13 @@ const PRIVILEGED_CHANNELS = new Set([
   "mangoo:image-viewer:association-status",
   "mangoo:image-viewer:set-association",
   "mangoo:image-viewer:open-default-apps-settings",
-  "mangoo:image-viewer:open-files"
+  "mangoo:image-viewer:open-files",
+  // TODO notes plugin: open the notes window and manage its Desktop settings.
+  "mangoo:todo-notes:open-window",
+  "mangoo:todo-notes:status",
+  "mangoo:todo-notes:get-settings",
+  "mangoo:todo-notes:set-settings",
+  "mangoo:todo-notes:open-settings"
 ]);
 
 export function canAccessDesktopIpc(

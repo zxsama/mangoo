@@ -40,6 +40,7 @@ const HOST_MIGRATION_0021: &str =
     include_str!("../host_migrations/0021_library_registration_visibility.sql");
 const HOST_MIGRATION_0022: &str =
     include_str!("../host_migrations/0022_separated_library_storage.sql");
+const HOST_MIGRATION_0023: &str = include_str!("../host_migrations/0023_host_plugin_records.sql");
 
 #[cfg(test)]
 pub const CONFIGURABLE_SECRET_NAMESPACE: &str = "configurable-sync";
@@ -6006,6 +6007,176 @@ impl HostRegistry {
             )?)
     }
 
+    /// Whether `plugin_id` is an enabled, granted, trusted Host-engine plugin
+    /// whose manifest requests a permission of `permission_kind`. `ready`
+    /// implies every requested permission is granted. Generic Host services
+    /// that are scoped per plugin (plugin data) consult this gate.
+    pub fn host_plugin_permission_enabled(
+        &self,
+        plugin_id: &str,
+        permission_kind: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .connection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM plugin_installations i JOIN plugin_versions v ON v.plugin_id=i.plugin_id AND v.version=i.selected_version JOIN plugin_runtime_state r ON r.plugin_id=i.plugin_id WHERE i.plugin_id=?1 AND i.enabled_intent=1 AND i.trust_policy_id='embedded-v1' AND r.state='ready' AND r.stop_pending=0 AND json_extract(v.manifest_json,'$.engine')='host' AND EXISTS(SELECT 1 FROM json_each(json_extract(v.manifest_json,'$.requestedPermissions')) WHERE json_extract(value,'$.kind')=?2))",
+                params![plugin_id, permission_kind],
+                |row| row.get(0),
+            )?)
+    }
+
+    // ------------------------------------------------ shared plugin records
+
+    /// Shared-scope (cross-Library) records of one plugin, optionally of one
+    /// collection, ordered by record id.
+    pub fn shared_plugin_records(
+        &self,
+        plugin_id: &str,
+        collection: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::plugin_shared::SharedRecordRow>> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let mut statement = connection.prepare(
+            "SELECT record_uuid,collection,fields_json,revision,created_at FROM host_plugin_records WHERE plugin_id=?1 AND (?2 IS NULL OR collection=?2) ORDER BY record_uuid",
+        )?;
+        let rows = statement
+            .query_map(params![plugin_id, collection], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(id, collection, fields, revision, created_at)| {
+                let fields = match serde_json::from_str::<serde_json::Value>(&fields)? {
+                    serde_json::Value::Object(map) => map,
+                    _ => serde_json::Map::new(),
+                };
+                Ok(crate::plugin_shared::SharedRecordRow {
+                    id: uuid::Uuid::from_slice(&id)?,
+                    collection,
+                    fields,
+                    revision,
+                    created_at,
+                })
+            })
+            .collect()
+    }
+
+    /// Owner plugin of a shared record id (ids are global across plugins).
+    pub fn shared_plugin_record_owner(&self, id: &uuid::Uuid) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .connection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .query_row(
+                "SELECT plugin_id FROM host_plugin_records WHERE record_uuid=?1",
+                [id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Write changed shared rows in one transaction; each gets a new revision.
+    /// Returns the plugin's revision afterwards.
+    pub fn upsert_shared_plugin_records(
+        &self,
+        plugin_id: &str,
+        rows: &[crate::plugin_shared::SharedRecordRow],
+    ) -> anyhow::Result<i64> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let transaction = connection.transaction()?;
+        let now = unix_timestamp_millis();
+        for row in rows {
+            let owner: Option<String> = transaction
+                .query_row(
+                    "SELECT plugin_id FROM host_plugin_records WHERE record_uuid=?1",
+                    [row.id.as_bytes().as_slice()],
+                    |value| value.get(0),
+                )
+                .optional()?;
+            if owner.as_deref().is_some_and(|owner| owner != plugin_id) {
+                anyhow::bail!("shared record belongs to another plugin");
+            }
+            let revision: i64 = transaction.query_row(
+                "INSERT INTO host_plugin_record_revisions(plugin_id,revision) VALUES (?1,1) ON CONFLICT(plugin_id) DO UPDATE SET revision=revision+1 RETURNING revision",
+                [plugin_id],
+                |value| value.get(0),
+            )?;
+            transaction.execute(
+                "INSERT INTO host_plugin_records(record_uuid,plugin_id,collection,fields_json,revision,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(record_uuid) DO UPDATE SET fields_json=excluded.fields_json,revision=excluded.revision,updated_at=excluded.updated_at",
+                params![
+                    row.id.as_bytes().as_slice(),
+                    plugin_id,
+                    row.collection,
+                    serde_json::to_string(&row.fields)?,
+                    revision,
+                    row.created_at,
+                    now
+                ],
+            )?;
+        }
+        let revision = Self::shared_revision_in(&transaction, plugin_id)?;
+        transaction.commit()?;
+        Ok(revision)
+    }
+
+    fn shared_revision_in(connection: &Connection, plugin_id: &str) -> anyhow::Result<i64> {
+        Ok(connection
+            .query_row(
+                "SELECT revision FROM host_plugin_record_revisions WHERE plugin_id=?1",
+                [plugin_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    pub fn shared_plugin_revision(&self, plugin_id: &str) -> anyhow::Result<i64> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        Self::shared_revision_in(&connection, plugin_id)
+    }
+
+    /// Last reconciled `(library_revision, host_revision)` for a Library.
+    pub fn shared_mirror_state(
+        &self,
+        plugin_id: &str,
+        library_uuid: &str,
+    ) -> anyhow::Result<Option<(i64, i64)>> {
+        Ok(self
+            .connection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .query_row(
+                "SELECT library_revision,host_revision FROM host_plugin_mirror_state WHERE plugin_id=?1 AND library_uuid=?2",
+                params![plugin_id, library_uuid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn set_shared_mirror_state(
+        &self,
+        plugin_id: &str,
+        library_uuid: &str,
+        library_revision: i64,
+        host_revision: i64,
+    ) -> anyhow::Result<()> {
+        self.connection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .execute(
+                "INSERT INTO host_plugin_mirror_state(plugin_id,library_uuid,library_revision,host_revision) VALUES (?1,?2,?3,?4) ON CONFLICT(plugin_id,library_uuid) DO UPDATE SET library_revision=excluded.library_revision,host_revision=excluded.host_revision",
+                params![plugin_id, library_uuid, library_revision, host_revision],
+            )?;
+        Ok(())
+    }
+
     pub fn plugin_binding_fences(&self, plugin_id: &str) -> anyhow::Result<Vec<BindingFence>> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let mut statement = connection.prepare("SELECT account_uuid,binding_epoch,transport_generation FROM library_sync_bindings WHERE plugin_id=?1")?;
@@ -7277,6 +7448,9 @@ impl HostRegistry {
         }
         if schema_version < 22 {
             connection.execute_batch(HOST_MIGRATION_0022)?;
+        }
+        if schema_version < 23 {
+            connection.execute_batch(HOST_MIGRATION_0023)?;
         }
         // A stopped Host has no surviving child. Complete a crashed stop locally.
         connection.execute(
@@ -9844,6 +10018,60 @@ mod tests {
             .unwrap();
     }
 
+    /// `library-data` is a per-plugin gate: only the enabled, granted plugin
+    /// that requests it may use `/api/plugin-data/{pluginId}`.
+    #[test]
+    fn host_plugin_library_data_gate_follows_the_plugin_lifecycle() {
+        let path = temp_registry_path();
+        let registry = HostRegistry::open(&path).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../contracts/plugins/fixtures/valid-host-todo-notes-v2.json"
+        ))
+        .unwrap();
+        let requested = serde_json::to_string(&manifest["requestedPermissions"]).unwrap();
+        let plugin = "com.mangoo.todo-notes";
+        registry
+            .register_bundled_plugin(RegisterBundledPlugin {
+                plugin_id: plugin,
+                version: "1.0.0",
+                manifest_json: &serde_json::to_string(&manifest).unwrap(),
+                entry_relative_path: crate::plugins::HOST_ENGINE_ENTRY,
+                entry_sha256: &[0; 32],
+                install_root: Path::new("bundled"),
+                trust_policy_id: "embedded-v1",
+                requested_permissions_json: &requested,
+            })
+            .unwrap();
+        let gate = |registry: &HostRegistry, kind: &str| {
+            registry
+                .host_plugin_permission_enabled(plugin, kind)
+                .unwrap()
+        };
+        assert!(!gate(&registry, "library-data"));
+        registry.set_plugin_intent(plugin, true, false).unwrap();
+        assert!(!gate(&registry, "library-data"), "grants are still pending");
+        registry
+            .set_plugin_grants(plugin, &requested, false)
+            .unwrap();
+        registry.mark_plugin_stop_pending(plugin).unwrap();
+        registry.finish_plugin_runtime_restart(plugin).unwrap();
+        assert!(gate(&registry, "library-data"));
+        assert!(gate(&registry, "system-tray"));
+        assert!(
+            !gate(&registry, "local-files"),
+            "not requested by this plugin"
+        );
+        assert!(registry
+            .host_capability_enabled(crate::plugins::TODO_NOTES_V1_CAPABILITY)
+            .unwrap());
+        assert!(!registry
+            .host_plugin_permission_enabled("com.mangoo.image-viewer", "library-data")
+            .unwrap());
+        registry.set_plugin_intent(plugin, false, false).unwrap();
+        registry.finish_plugin_stop(plugin).unwrap();
+        assert!(!gate(&registry, "library-data"));
+    }
+
     #[test]
     fn host_engine_plugin_lifecycle_gates_its_capability_without_a_process() {
         let path = temp_registry_path();
@@ -10225,7 +10453,7 @@ mod tests {
                     |row| row.get::<_, i64>(0)
                 )
                 .unwrap(),
-            22
+            23
         );
         for table in [
             "provider_remote_descriptor_heads",

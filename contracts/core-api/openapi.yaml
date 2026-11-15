@@ -2570,6 +2570,251 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+  /plugin-data/{pluginId}/records:
+    get:
+      operationId: listPluginRecords
+      description: >-
+        Keyset page over one collection of a Host-engine plugin's own records in
+        the active Library (ordered by record id). Records synchronize with the
+        Library. Available only while the plugin is enabled and granted
+        library-data.
+      parameters:
+        - $ref: "#/components/parameters/pluginId"
+        - { name: collection, in: query, required: true, schema: { type: string, pattern: "^[a-z][a-z0-9-]{0,31}$" } }
+        - { name: cursor, in: query, required: false, schema: { type: string, format: uuid } }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 1000 } }
+        - { name: includeDeleted, in: query, required: false, schema: { type: boolean } }
+      responses:
+        "200":
+          description: One page of records and the plugin's current change revision.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PluginRecordPage"
+        "400":
+          description: Invalid collection, cursor or limit (code invalid_plugin_record).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: The plugin is not enabled for Library data (code plugin_data_disabled).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: No Library is active (code no_active_library).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /plugin-data/{pluginId}/records/{recordId}:
+    get:
+      operationId: getPluginRecord
+      description: One record of the plugin, including a deleted one.
+      parameters:
+        - $ref: "#/components/parameters/pluginId"
+        - { name: recordId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The record.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PluginRecord"
+        "403":
+          description: The plugin is not enabled for Library data.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: No such record for this plugin (code plugin_record_not_found).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /plugin-data/{pluginId}/batch:
+    post:
+      operationId: applyPluginRecordBatch
+      description: >-
+        Apply put / delete / restore operations to the plugin's records in one
+        all-or-nothing transaction. A put patches only the listed top-level
+        fields (null or unset removes a field); each field merges independently
+        across synchronized devices.
+      parameters:
+        - $ref: "#/components/parameters/pluginId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PluginRecordBatchRequest"
+      responses:
+        "200":
+          description: Resulting records in operation order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PluginRecordBatchResponse"
+        "400":
+          description: Invalid operation or limits exceeded (code invalid_plugin_record).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: The plugin is not enabled for Library data.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Delete of an unknown record (code plugin_record_not_found); restoring an unknown record is a no-op.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: >-
+            Record owned by another plugin or collection (plugin_record_conflict),
+            put on a deleted record (plugin_record_deleted), or a stale Library context.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /plugin-data/{pluginId}/changes:
+    get:
+      operationId: waitPluginRecordChanges
+      description: >-
+        Bounded long-poll. Returns at once when the active Library differs from
+        libraryId or the plugin's revision differs from afterRevision; otherwise
+        waits up to waitMs for a local write or a synchronized change. Does not
+        hold the Library request gate, so it never delays a Library switch.
+      parameters:
+        - $ref: "#/components/parameters/pluginId"
+        - { name: afterRevision, in: query, required: false, schema: { type: integer } }
+        - { name: afterSharedRevision, in: query, required: false, schema: { type: integer } }
+        - { name: libraryId, in: query, required: false, schema: { type: string } }
+        - { name: waitMs, in: query, required: false, schema: { type: integer, minimum: 0, maximum: 30000 } }
+      responses:
+        "200":
+          description: The current Library and revision.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PluginRecordChanges"
+        "403":
+          description: The plugin is not enabled for Library data.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /plugin-data/{pluginId}/shared/records:
+    get:
+      operationId: listSharedPluginRecords
+      description: >-
+        All records of one collection in the plugin's cross-Library shared
+        scope. Shared records are held by the Host, visible from every Library
+        (and with none open), and reconciled with the active Library's mirror
+        so they also synchronize with it. Needs no active Library.
+      parameters:
+        - $ref: "#/components/parameters/pluginId"
+        - { name: collection, in: query, required: true, schema: { type: string, pattern: "^[a-z][a-z0-9-]{0,23}$" } }
+        - { name: includeDeleted, in: query, required: false, schema: { type: boolean } }
+      responses:
+        "200":
+          description: The shared records and the plugin's shared revision.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PluginRecordPage"
+        "400":
+          description: Invalid shared collection (code invalid_plugin_record).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: The plugin is not enabled for Library data (code plugin_data_disabled).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /plugin-data/{pluginId}/shared/records/{recordId}:
+    get:
+      operationId: getSharedPluginRecord
+      description: One shared record of the plugin, including a deleted one.
+      parameters:
+        - $ref: "#/components/parameters/pluginId"
+        - { name: recordId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The record.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PluginRecord"
+        "403":
+          description: The plugin is not enabled for Library data.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: No such shared record for this plugin (code plugin_record_not_found).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /plugin-data/{pluginId}/shared/batch:
+    post:
+      operationId: applySharedPluginRecordBatch
+      description: >-
+        Put / delete / restore shared records. Every written field is stamped
+        (edit time, device) and merges last-writer-wins with every other
+        device and Library mirror; deletion is a merged field, so it can be
+        restored anywhere.
+      parameters:
+        - $ref: "#/components/parameters/pluginId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PluginRecordBatchRequest"
+      responses:
+        "200":
+          description: Resulting records in operation order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PluginRecordBatchResponse"
+        "400":
+          description: Invalid operation or limits exceeded (code invalid_plugin_record).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: The plugin is not enabled for Library data.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Delete of an unknown record (code plugin_record_not_found); restoring an unknown record is a no-op.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Record owned by another plugin or collection, or put on a deleted record.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 components:
   securitySchemes:
     sessionToken:
@@ -2743,6 +2988,75 @@ components:
       description: Unexpected persistence or runtime failure.
       content: { application/json: { schema: { $ref: "#/components/schemas/SyncFolderErrorResponse" } } }
   schemas:
+    PluginRecord:
+      type: object
+      additionalProperties: false
+      required: [id, collection, fields, deleted, revision, createdAt, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        collection: { type: string }
+        fields: { $ref: "#/components/schemas/PluginRecordFields" }
+        deleted: { type: boolean }
+        revision: { type: integer }
+        createdAt: { type: integer, description: Unix milliseconds. }
+        updatedAt: { type: integer, description: Unix milliseconds. }
+    PluginRecordFields:
+      type: object
+      description: Top-level record fields (at most 64; each serialized value at most 160 KiB).
+      additionalProperties: true
+    PluginRecordPage:
+      type: object
+      additionalProperties: false
+      required: [libraryId, items, nextCursor, revision]
+      properties:
+        libraryId: { type: string, nullable: true }
+        items: { type: array, items: { $ref: "#/components/schemas/PluginRecord" } }
+        nextCursor: { type: string, nullable: true }
+        revision: { type: integer }
+    PluginRecordOperation:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [op, id, collection]
+          properties:
+            op: { const: put }
+            id: { type: string, format: uuid }
+            collection: { type: string, pattern: "^[a-z][a-z0-9-]{0,31}$" }
+            fields: { $ref: "#/components/schemas/PluginRecordFields" }
+            unset: { type: array, items: { type: string } }
+        - type: object
+          additionalProperties: false
+          required: [op, id]
+          properties:
+            op: { enum: [delete, restore] }
+            id: { type: string, format: uuid }
+    PluginRecordBatchRequest:
+      type: object
+      additionalProperties: false
+      required: [operations]
+      properties:
+        operations:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items: { $ref: "#/components/schemas/PluginRecordOperation" }
+    PluginRecordBatchResponse:
+      type: object
+      additionalProperties: false
+      required: [libraryId, revision, records]
+      properties:
+        libraryId: { type: string, nullable: true }
+        revision: { type: integer }
+        records: { type: array, items: { $ref: "#/components/schemas/PluginRecord" } }
+    PluginRecordChanges:
+      type: object
+      additionalProperties: false
+      required: [libraryId, revision, sharedRevision, changed]
+      properties:
+        libraryId: { type: string, nullable: true }
+        revision: { type: integer }
+        sharedRevision: { type: integer }
+        changed: { type: boolean }
     ImageViewerFormats:
       type: object
       additionalProperties: false
@@ -4903,7 +5217,7 @@ components:
           type: boolean
     PluginCapability:
       type: string
-      enum: [sync-provider.v1, file-decoder.v1, image-viewer.v1]
+      enum: [sync-provider.v1, file-decoder.v1, image-viewer.v1, todo-notes.v1]
     PluginRuntimeState:
       type: string
       enum: [disabled, stopping, permission-required, starting, ready, degraded, crashed-backoff, incompatible, configuration-required]
@@ -4978,6 +5292,24 @@ components:
           additionalProperties: false
           properties:
             kind: { const: file-association }
+            scope: { const: current-user }
+        - type: object
+          required: [kind, access]
+          additionalProperties: false
+          properties:
+            kind: { const: library-data }
+            access: { const: plugin-records }
+        - type: object
+          required: [kind, scope]
+          additionalProperties: false
+          properties:
+            kind: { const: system-tray }
+            scope: { const: current-session }
+        - type: object
+          required: [kind, scope]
+          additionalProperties: false
+          properties:
+            kind: { const: login-item }
             scope: { const: current-user }
     HostPluginViewDocument:
       type: object

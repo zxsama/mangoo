@@ -149,6 +149,8 @@ pub fn capture_enrolled_root_identities(connection: &rusqlite::Connection) -> an
             )?;
         }
     }
+    // Plugin records written before this binding enabled capture.
+    crate::db::plugin_records::capture_uncaptured_plugin_records(&transaction)?;
     transaction.commit()?;
     Ok(())
 }

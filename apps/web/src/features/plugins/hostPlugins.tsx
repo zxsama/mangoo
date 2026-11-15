@@ -19,6 +19,9 @@ interface HostPluginPanelProps {
 const HOST_PLUGIN_PANELS: Record<string, ComponentType<HostPluginPanelProps>> = {
   "com.mangoo.image-viewer": lazy(() =>
     import("@mangoo/plugin-image-viewer/web").then((module) => ({ default: module.ImageViewerPluginPanel }))
+  ),
+  "com.mangoo.todo-notes": lazy(() =>
+    import("@mangoo/plugin-todo-notes/web").then((module) => ({ default: module.TodoNotesPluginPanel }))
   )
 };
 
@@ -57,6 +60,12 @@ export function permissionLabel(permission: PluginPermission): string {
       return "读取你打开的图片及其所在文件夹";
     case "file-association":
       return "注册为当前用户的系统图片查看器";
+    case "library-data":
+      return "在当前资料库中保存插件自己的数据（随资料库同步）";
+    case "system-tray":
+      return "在系统通知区域显示图标";
+    case "login-item":
+      return "可选：登录系统时在后台启动 Mangoo";
     case "temp-storage":
       return `临时存储（${Math.round(permission.maxBytes / 1024 / 1024)} MiB）`;
     case "network":

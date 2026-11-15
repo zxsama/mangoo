@@ -216,6 +216,13 @@ pub const PHASE1_API_PATHS: &[&str] = &[
     "/api/image-viewer/image",
     "/api/image-viewer/thumbnail",
     "/api/image-viewer/metadata",
+    "/api/plugin-data/{pluginId}/records",
+    "/api/plugin-data/{pluginId}/records/{recordId}",
+    "/api/plugin-data/{pluginId}/batch",
+    "/api/plugin-data/{pluginId}/changes",
+    "/api/plugin-data/{pluginId}/shared/records",
+    "/api/plugin-data/{pluginId}/shared/records/{recordId}",
+    "/api/plugin-data/{pluginId}/shared/batch",
 ];
 
 #[derive(Debug, Serialize)]
@@ -6967,7 +6974,7 @@ where
 /// Run an unrecoverable user-authored mutation under SQLite `FULL` durability.
 /// Sync capture, when enabled for the Library, executes inside the same closure
 /// and therefore the same transaction as the browse projection mutation.
-async fn run_authoritative_database<T, F>(state: AppState, operation: F) -> ApiResult<T>
+pub(super) async fn run_authoritative_database<T, F>(state: AppState, operation: F) -> ApiResult<T>
 where
     T: Send + 'static,
     F: FnOnce(&Database) -> ApiResult<T> + Send + 'static,
@@ -10599,6 +10606,10 @@ async fn enqueue_task(state: &AppState, task_id: i64, attempt_generation: i64) -
 }
 
 impl CoreError {
+    pub(super) fn message(&self) -> &str {
+        &self.message
+    }
+
     fn bad_request(message: String) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,

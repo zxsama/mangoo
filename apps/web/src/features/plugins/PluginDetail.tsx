@@ -20,7 +20,8 @@ interface PluginDetailProps {
 const CAPABILITY_LABEL: Record<PluginCapability, string> = {
   "sync-provider.v1": "Sync provider v1",
   "file-decoder.v1": "文件解析",
-  "image-viewer.v1": "看图"
+  "image-viewer.v1": "看图",
+  "todo-notes.v1": "便笺"
 };
 
 export function PluginDetail({

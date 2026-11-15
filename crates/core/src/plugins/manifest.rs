@@ -76,6 +76,10 @@ pub enum HostCapability {
     /// Desktop viewer window and optional OS file-association registration.
     #[serde(rename = "image-viewer.v1")]
     ImageViewerV1,
+    /// TODO notes: a tray-resident notes window and pinned desktop notes whose
+    /// records live in the active Library (`/api/plugin-data`).
+    #[serde(rename = "todo-notes.v1")]
+    TodoNotesV1,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +133,8 @@ pub enum ActivationEvent {
     FileDecodeRequested,
     /// Host engine: the user opened a file that the plugin's capability handles.
     FileOpenRequested,
+    /// Host engine: the feature starts with the application (e.g. a tray icon).
+    Startup,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +168,31 @@ pub enum Permission {
     FileAssociation {
         scope: FileAssociationScope,
     },
+    /// Host engine: keep the plugin's own records in the active Library
+    /// (`/api/plugin-data/{pluginId}`), synchronized with that Library.
+    LibraryData {
+        access: LibraryDataAccess,
+    },
+    /// Host engine: show a notification-area (tray) icon while enabled.
+    SystemTray {
+        scope: DesktopSessionScope,
+    },
+    /// Host engine: optionally start the application at login (current user).
+    LoginItem {
+        scope: FileAssociationScope,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LibraryDataAccess {
+    PluginRecords,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DesktopSessionScope {
+    CurrentSession,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -300,7 +331,11 @@ pub(crate) fn parse_manifest_bytes(
 fn is_host_engine_permission(permission: &Permission) -> bool {
     matches!(
         permission,
-        Permission::LocalFiles { .. } | Permission::FileAssociation { .. }
+        Permission::LocalFiles { .. }
+            | Permission::FileAssociation { .. }
+            | Permission::LibraryData { .. }
+            | Permission::SystemTray { .. }
+            | Permission::LoginItem { .. }
     )
 }
 
@@ -332,7 +367,9 @@ fn validate_host_engine(m: &ManifestRecord) -> Result<(), ManifestError> {
         || m.activation_events.iter().any(|event| {
             !matches!(
                 event,
-                ActivationEvent::FileOpenRequested | ActivationEvent::DiagnosticsRequested
+                ActivationEvent::FileOpenRequested
+                    | ActivationEvent::DiagnosticsRequested
+                    | ActivationEvent::Startup
             )
         })
     {
@@ -380,6 +417,7 @@ fn validate(m: &ManifestRecord) -> Result<(), ManifestError> {
             .any(is_host_engine_permission)
         || m.activation_events
             .contains(&ActivationEvent::FileOpenRequested)
+        || m.activation_events.contains(&ActivationEvent::Startup)
     {
         return Err(ManifestError::Invalid(
             "host capabilities, permissions and activation require the host engine",
@@ -707,6 +745,37 @@ mod tests {
             .unwrap();
         let manifest = parse_manifest(&fixture).expect("shared v2 fixture");
         assert_eq!(manifest.id, "com.mangoo.fake-sync");
+    }
+
+    #[test]
+    fn todo_notes_host_manifest_declares_data_tray_and_login_permissions() {
+        let fixture =
+            include_str!("../../../../contracts/plugins/fixtures/valid-host-todo-notes-v2.json");
+        let manifest = parse_manifest_bytes(fixture.as_bytes(), Path::new("plugin.json"))
+            .expect("todo notes fixture");
+        assert_eq!(
+            manifest.host.as_ref().unwrap().capabilities,
+            [HostCapability::TodoNotesV1]
+        );
+        assert_eq!(manifest.activation_events, [ActivationEvent::Startup]);
+        assert!(manifest
+            .requested_permissions
+            .contains(&Permission::LibraryData {
+                access: LibraryDataAccess::PluginRecords
+            }));
+        assert!(manifest
+            .requested_permissions
+            .contains(&Permission::SystemTray {
+                scope: DesktopSessionScope::CurrentSession
+            }));
+        // A process plugin cannot borrow Host permissions or the startup event.
+        let process = valid().replace(
+            "\"requestedPermissions\":[",
+            "\"requestedPermissions\":[{\"kind\":\"library-data\",\"access\":\"plugin-records\"},",
+        );
+        if let Ok(parsed) = serde_json::from_str::<ManifestRecord>(&process) {
+            assert!(validate(&parsed).is_err());
+        }
     }
 
     #[test]

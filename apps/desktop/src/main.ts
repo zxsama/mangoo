@@ -36,6 +36,7 @@ import { parseFolderPickerRequest, showFolderPicker } from "./folder-picker.js";
 import { createCoreClient } from "@mangoo/core-client/node";
 import * as electronModule from "electron";
 import { createImageViewerHost, type ImageViewerHost } from "@mangoo/plugin-image-viewer/desktop";
+import { BACKGROUND_LAUNCH_SWITCH, createTodoNotesHost, type TodoNotesHost } from "@mangoo/plugin-todo-notes/desktop";
 import { notificationPluginEntries, resolveNotificationPluginIntent } from "./plugin-notification-views.js";
 import { openPluginExternalLink, parsePluginExternalLinkInput } from "./plugin-external-link.js";
 import {
@@ -293,6 +294,7 @@ function roleForWebContents(sender: WebContents): DesktopIpcWindowRole | null {
   if (!window || window.isDestroyed()) return null;
   if (window === mainWindow) return "main";
   if (imageViewerHost?.ownsWindow(window)) return "image-viewer";
+  if (todoNotesHost?.ownsWindow(window)) return "todo-notes";
   for (const role of Object.keys(secondaryWindows) as SecondaryWindowRole[]) {
     if (secondaryWindows[role] === window) return role;
   }
@@ -313,8 +315,8 @@ function requireNotificationIpcAccess(
   channel: string
 ): NotificationIpcWindowRole {
   const windowRole = roleForWebContents(event.sender);
-  // The image viewer window has no notification access.
-  const role = windowRole === "image-viewer" ? null : windowRole;
+  // Host-engine plugin windows have no notification access.
+  const role = windowRole === "image-viewer" || windowRole === "todo-notes" ? null : windowRole;
   assertNotificationIpcAccess(role, channel);
   return role;
 }
@@ -2296,6 +2298,33 @@ const imageViewerHost: ImageViewerHost | null = hasSingleInstanceLock
     })
   : null;
 
+// Built-in Host-engine plugin com.mangoo.todo-notes: a TODO notes window, a
+// notification-area icon and notes pinned to the desktop. Its records live in
+// the active Library through Core's generic plugin-data service. While the
+// plugin is disabled none of its windows, tray icon, shortcut or login item
+// exist and Mangoo behaves exactly as without it.
+const todoNotesHost: TodoNotesHost | null = hasSingleInstanceLock
+  ? createTodoNotesHost(electronModule, {
+      userDataDir: app.getPath("userData"),
+      preloadPath: fileURLToPath(new URL("./preload.cjs", import.meta.url)),
+      windowIconPath: windowIconPath(app.isPackaged, process.resourcesPath) ?? null,
+      trayIconPath: windowIconPath(app.isPackaged, process.resourcesPath) ?? null,
+      ensureCoreSession: () => ensureCoreReady(),
+      rendererUrl: (session, route) =>
+        process.env.MANGOO_WEB_URL
+          ? `${process.env.MANGOO_WEB_URL}${route}`
+          : rendererUrlForSession(session, route),
+      applyWindowMaterial,
+      openMainWindow: showOrCreateMainWindow,
+      quitApplication: () => app.quit(),
+      authorizeHostWindow: (event, channel) => canAccessDesktopIpc(roleForWebContents(event.sender), channel),
+      extraRendererArguments: () => (isVisualHarnessEnabled() ? ["--mangoo-visual-harness=1"] : []),
+      log: (level, message, data) => desktopLogger[level]("main", `[mangoo] ${message}`, data ?? "")
+    })
+  : null;
+/** Login-item start (todo-notes "launch at login"): tray and pinned notes only. */
+const launchedInBackground = process.argv.includes(BACKGROUND_LAUNCH_SWITCH);
+
 // macOS delivers Finder "Open with" through open-file (queued until ready).
 app.on("open-file", (event, filePath) => {
   if (!imageViewerHost) return;
@@ -2327,6 +2356,7 @@ if (app.isPackaged) {
 ipcMain.handle("mangoo:plugins-changed", async (event) => {
   requireDesktopIpcAccess(event, "mangoo:plugins-changed");
   await imageViewerHost?.refresh();
+  await todoNotesHost?.refresh();
   return true;
 });
 
@@ -2344,7 +2374,10 @@ if (hasSingleInstanceLock) app
     // A launch that only opens image files shows just the viewer window, like
     // any standalone image viewer; every other launch opens the Library.
     const viewerLaunch = imageViewerHost ? await imageViewerHost.start() : { openedViewer: false };
-    if (!viewerLaunch.openedViewer) await createWindow();
+    await todoNotesHost?.start();
+    // A login-item launch stays in the tray when the TODO plugin keeps one.
+    const backgroundOnly = launchedInBackground && Boolean(todoNotesHost?.keepsAppAlive());
+    if (!viewerLaunch.openedViewer && !backgroundOnly) await createWindow();
     app.on("browser-window-focus", () => { void wakeCoreSync("foreground"); });
     powerMonitor.on("resume", () => { void wakeCoreSync("foreground"); });
     powerMonitor.on("unlock-screen", () => { void wakeCoreSync("foreground"); });
@@ -2585,6 +2618,8 @@ async function maybeAutoAddRoot(session: CoreSession): Promise<void> {
 }
 
 app.on("window-all-closed", () => {
+  // The TODO notes tray icon keeps Mangoo running without windows.
+  if (todoNotesHost?.keepsAppAlive()) return;
   if (process.platform !== "darwin") {
     app.quit();
   }
@@ -2599,6 +2634,7 @@ app.on("activate", () => {
 app.on("before-quit", (event) => {
   oauthReturnFocusEntitlements.clear();
   imageViewerHost?.dispose();
+  todoNotesHost?.dispose();
   // Persist window state synchronously before tearing Core down. The
   // `persisted` guard prevents the second `before-quit` (after `app.exit`)
   // from re-entering this branch — Node would otherwise double-stop Core

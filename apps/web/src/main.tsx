@@ -38,8 +38,37 @@ const isImageViewerSettingsWindow =
   window.location.hash.startsWith("#/image-viewer-settings") || windowRole === "image-viewer-settings";
 const isImageViewerWindow =
   !isImageViewerSettingsWindow && (window.location.hash.startsWith("#/image-viewer") || windowRole === "image-viewer");
+// TODO notes (com.mangoo.todo-notes): the notes window and each pinned note.
+const isTodoStickyWindow = window.location.hash.startsWith("#/todo-sticky") || windowRole === "todo-sticky";
+// Settings first: its route shares the notes window's prefix.
+const isTodoSettingsWindow = window.location.hash.startsWith("#/todo-notes-settings") || windowRole === "todo-notes-settings";
+const isTodoNotesWindow = !isTodoStickyWindow && !isTodoSettingsWindow && (window.location.hash.startsWith("#/todo-notes") || windowRole === "todo-notes");
 
-if (isImageViewerSettingsWindow) {
+if (isTodoSettingsWindow) {
+  void import("@mangoo/plugin-todo-notes/web").then(({ TodoSettingsWindow }) => {
+    ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+      <React.StrictMode>
+        <ApplicationProviders><TodoSettingsWindow /></ApplicationProviders>
+      </React.StrictMode>
+    );
+  });
+} else if (isTodoStickyWindow) {
+  void import("@mangoo/plugin-todo-notes/web").then(({ TodoStickyWindow }) => {
+    ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+      <React.StrictMode>
+        <ApplicationProviders><TodoStickyWindow /></ApplicationProviders>
+      </React.StrictMode>
+    );
+  });
+} else if (isTodoNotesWindow) {
+  void import("@mangoo/plugin-todo-notes/web").then(({ TodoNotesWindow }) => {
+    ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+      <React.StrictMode>
+        <ApplicationProviders><TodoNotesWindow /></ApplicationProviders>
+      </React.StrictMode>
+    );
+  });
+} else if (isImageViewerSettingsWindow) {
   void import("@mangoo/plugin-image-viewer/web").then(({ ImageViewerSettingsWindow }) => {
     ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
       <React.StrictMode>

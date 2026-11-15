@@ -660,7 +660,7 @@ export interface ListFileOperationsParams {
   cursor?: string;
 }
 
-export type PluginCapability = "sync-provider.v1" | "file-decoder.v1" | "image-viewer.v1";
+export type PluginCapability = "sync-provider.v1" | "file-decoder.v1" | "image-viewer.v1" | "todo-notes.v1";
 export type PluginRuntimeState =
   | "disabled"
   | "stopping"
@@ -685,7 +685,71 @@ export type PluginPermission =
   | { kind: "temp-storage"; maxBytes: number }
   | { kind: "host-ui"; operations: ("core-api" | "pick-folder" | "reveal-path" | "clipboard-write" | "external-link")[] }
   | { kind: "local-files"; access: "opened-folders" }
-  | { kind: "file-association"; scope: "current-user" };
+  | { kind: "file-association"; scope: "current-user" }
+  | { kind: "library-data"; access: "plugin-records" }
+  | { kind: "system-tray"; scope: "current-session" }
+  | { kind: "login-item"; scope: "current-user" };
+
+/** Top-level fields of a plugin record (at most 64; 160 KiB per serialized value). */
+export type PluginRecordFields = Record<string, unknown>;
+
+/** One Host-engine plugin record in the active Library (synchronized with it). */
+export interface PluginRecord {
+  id: string;
+  collection: string;
+  fields: PluginRecordFields;
+  deleted: boolean;
+  revision: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface PluginRecordPage {
+  libraryId: string | null;
+  items: PluginRecord[];
+  nextCursor: string | null;
+  revision: number;
+}
+
+export type PluginRecordOperation =
+  | { op: "put"; id: string; collection: string; fields?: PluginRecordFields; unset?: string[] }
+  | { op: "delete" | "restore"; id: string };
+
+export interface PluginRecordBatchRequest {
+  operations: PluginRecordOperation[];
+}
+
+export interface PluginRecordBatchResponse {
+  libraryId: string | null;
+  revision: number;
+  records: PluginRecord[];
+}
+
+export interface PluginRecordChanges {
+  libraryId: string | null;
+  revision: number;
+  sharedRevision: number;
+  changed: boolean;
+}
+
+export interface ListSharedPluginRecordsParams {
+  collection: string;
+  includeDeleted?: boolean;
+}
+
+export interface ListPluginRecordsParams {
+  collection: string;
+  cursor?: string;
+  limit?: number;
+  includeDeleted?: boolean;
+}
+
+export interface WaitPluginRecordChangesParams {
+  afterRevision?: number;
+  afterSharedRevision?: number;
+  libraryId?: string | null;
+  waitMs?: number;
+}
 
 /** Image formats the standalone viewer opens (lowercase dotted extensions). */
 export interface ImageViewerFormats {

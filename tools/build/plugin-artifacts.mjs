@@ -7,8 +7,11 @@ export const INVENTORY_FILE = ".inventory.json";
 export const FAKE_PLUGIN_ID = "com.mangoo.fake-sync";
 export const PPM_PLUGIN_ID = "com.mangoo.ppm-decoder";
 export const IMAGE_VIEWER_PLUGIN_ID = "com.mangoo.image-viewer";
+export const TODO_NOTES_PLUGIN_ID = "com.mangoo.todo-notes";
+/** Host-engine built-ins: their artifact is only the manifest template. */
+export const HOST_ENGINE_PLUGIN_IDS = [IMAGE_VIEWER_PLUGIN_ID, TODO_NOTES_PLUGIN_ID];
 /** Built-in defaults staged by build-bundled-plugins.mjs, in id order. */
-export const DEFAULT_PLUGIN_IDS = [FAKE_PLUGIN_ID, IMAGE_VIEWER_PLUGIN_ID, PPM_PLUGIN_ID];
+export const DEFAULT_PLUGIN_IDS = [FAKE_PLUGIN_ID, IMAGE_VIEWER_PLUGIN_ID, PPM_PLUGIN_ID, TODO_NOTES_PLUGIN_ID];
 /** Compiled-trust marker for a Host-engine plugin, which has no executable. */
 export const HOST_ENGINE_SHA256 = "0".repeat(64);
 const ID = /^[a-z0-9]+(\.[a-z0-9][a-z0-9-]*)+$/;

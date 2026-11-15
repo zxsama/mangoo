@@ -19,6 +19,8 @@ export interface ResolveOverlayPositionInput {
   preferredPlacement: OverlayPlacement;
   offset: number;
   gutter: number;
+  /** Slide a menu taller than either side of its anchor into the viewport. */
+  fitToViewport?: boolean;
 }
 
 export interface ResolveOverlayWidthInput {
@@ -78,6 +80,7 @@ export interface ResolveAnchoredOverlayLayoutInput {
   maxWidth?: number;
   offset: number;
   gutter: number;
+  fitToViewport?: boolean;
 }
 
 export interface AnchoredOverlayLayoutResult extends OverlayPositionResult {
@@ -103,7 +106,8 @@ export function resolveAnchoredOverlayLayout(
     viewport: input.viewport,
     preferredPlacement: input.preferredPlacement,
     offset: input.integratedAnchor ? -input.trigger.height : input.offset,
-    gutter: input.gutter
+    gutter: input.gutter,
+    fitToViewport: input.fitToViewport
   });
   return {
     ...position,
@@ -155,19 +159,27 @@ export function resolveOverlayPosition(
   );
   const isSidePlacement = placement === "left-start" || placement === "right-start";
   const sideOverlayHeight = Math.min(overlay.height, Math.max(0, viewport.height - gutter * 2));
-  const top = isSidePlacement
+  // A menu taller than the space on either side of its anchor (a context
+  // menu opened mid-window) slides to fit the viewport rather than being cut
+  // off behind an internal scroll: it may then overlap the anchor point.
+  const fitsNeitherSide = input.fitToViewport === true && !isSidePlacement
+    && overlay.height > Math.max(availableAbove, availableBelow)
+    && overlay.height <= viewport.height - gutter * 2;
+  const top = isSidePlacement || fitsNeitherSide
     ? Math.min(
-        Math.max(gutter, rawTop),
-        Math.max(gutter, viewport.height - gutter - sideOverlayHeight)
+        Math.max(gutter, fitsNeitherSide ? viewport.height - gutter - overlay.height : rawTop),
+        Math.max(gutter, viewport.height - gutter - (fitsNeitherSide ? overlay.height : sideOverlayHeight))
       )
     : Math.max(gutter, rawTop);
   const maxHeight = Math.max(
     0,
-    placement.startsWith("top")
-      ? trigger.top - offset - gutter
-      : placement.startsWith("bottom")
-        ? viewport.height - trigger.bottom - offset - gutter
-        : viewport.height - top - gutter
+    fitsNeitherSide
+      ? viewport.height - top - gutter
+      : placement.startsWith("top")
+        ? trigger.top - offset - gutter
+        : placement.startsWith("bottom")
+          ? viewport.height - trigger.bottom - offset - gutter
+          : viewport.height - top - gutter
   );
 
   return { left, top, maxWidth, maxHeight, placement };

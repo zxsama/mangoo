@@ -28,6 +28,7 @@ HOST_MIGRATIONS = [
     ROOT / "crates" / "core" / "host_migrations" / "0020_plugin_contributions.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0021_library_registration_visibility.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0022_separated_library_storage.sql",
+    ROOT / "crates" / "core" / "host_migrations" / "0023_host_plugin_records.sql",
 ]
 MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0001_initial.sql",
@@ -68,6 +69,7 @@ MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0037_decoder_presentations.sql",
     ROOT / "crates" / "core" / "migrations" / "0038_folder_appearance.sql",
     ROOT / "crates" / "core" / "migrations" / "0039_directory_preferences.sql",
+    ROOT / "crates" / "core" / "migrations" / "0040_plugin_records.sql",
 ]
 
 TASK_PROGRESS_COLUMNS = {
@@ -83,6 +85,8 @@ TASK_PROGRESS_COLUMNS = {
 
 REQUIRED_TABLES = {
     "schema_migrations",
+    "plugin_records",
+    "plugin_record_revisions",
     "directory_sort_rules",
     "roots",
     "folders",
@@ -160,6 +164,9 @@ REQUIRED_HOST_SYNC_ROOT_TABLES = {
 }
 
 REQUIRED_INDEXES = {
+    "idx_plugin_records_owner_collection",
+    "idx_plugin_records_owner_revision",
+    "idx_plugin_records_uncaptured",
     "idx_sync_file_os_identity",
     "idx_sync_file_fingerprint",
     "idx_sync_file_last_path",
@@ -1304,7 +1311,11 @@ def verify_host_sync_root_binding_contract() -> None:
             "DELETE FROM remote_sync_roots WHERE library_uuid=? AND root_uuid=?",
             (library_uuid, "00000000-0000-7000-8000-000000000002"),
         )
-        if conn.execute("SELECT schema_version FROM host_meta WHERE singleton=1").fetchone()[0] != 22:
+        host_tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        for table in ("host_plugin_records", "host_plugin_record_revisions", "host_plugin_mirror_state"):
+            if table not in host_tables:
+                fail(f"host migrations missing {table}")
+        if conn.execute("SELECT schema_version FROM host_meta WHERE singleton=1").fetchone()[0] != 23:
             fail("managed-root orchestration migrations did not update schema_version")
         expected_host_tables = {
             "library_list_visibility",
@@ -1761,7 +1772,7 @@ def main() -> None:
         meta = host_conn.execute(
             "SELECT schema_version, active_library_uuid, context_revision, sync_scheduler_state FROM host_meta WHERE singleton = 1"
         ).fetchone()
-        if meta != (22, None, 0, "stopped"):
+        if meta != (23, None, 0, "stopped"):
             fail(f"unexpected Host Registry metadata seed: {meta}")
         auth_flow_columns = {
             row[1]

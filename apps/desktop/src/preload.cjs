@@ -131,7 +131,7 @@ function snapshotAndSubscribeLogs(query, cb) {
 
 const visualHarnessEnabled = readArg("--mangoo-visual-harness=") === "1";
 const requestedWindowRole = readArg("--mangoo-window=");
-const windowRole = ["main", "settings", "plugins", "notifications", "image-viewer", "image-viewer-settings"].includes(requestedWindowRole)
+const windowRole = ["main", "settings", "plugins", "notifications", "image-viewer", "image-viewer-settings", "todo-notes", "todo-sticky", "todo-notes-settings"].includes(requestedWindowRole)
   ? requestedWindowRole
   : "unknown";
 const windowControls = {
@@ -222,6 +222,58 @@ const imageViewerSettingsWindowBridge = {
     onSettingsSection: (cb) => subscribe("mangoo:image-viewer:settings-section", cb)
   }
 };
+// Built-in TODO notes plugin (com.mangoo.todo-notes). Channel names mirror
+// bundled-plugins/com.mangoo.todo-notes/src/shared/ipc.ts (guarded by a test).
+const todoNotesHostBridge = {
+  openWindow: () => ipcRenderer.invoke("mangoo:todo-notes:open-window"),
+  status: () => ipcRenderer.invoke("mangoo:todo-notes:status"),
+  getSettings: () => ipcRenderer.invoke("mangoo:todo-notes:get-settings"),
+  setSettings: (patch) => ipcRenderer.invoke("mangoo:todo-notes:set-settings", patch),
+  openSettings: (section) => ipcRenderer.invoke("mangoo:todo-notes:open-settings", typeof section === "string" ? section : "capture")
+};
+const todoNotesSettingsWindowBridge = {
+  ...commonWindowBridge,
+  todoNotesSettings: {
+    getSettings: () => ipcRenderer.invoke("mangoo:todo-notes:get-settings"),
+    setSettings: (patch) => ipcRenderer.invoke("mangoo:todo-notes:set-settings", patch),
+    onSettingsChanged: (cb) => subscribe("mangoo:todo-notes:settings-changed", cb),
+    onSettingsSection: (cb) => subscribe("mangoo:todo-notes:settings-section", cb),
+    status: () => ipcRenderer.invoke("mangoo:todo-notes:status"),
+    exportBackup: () => ipcRenderer.invoke("mangoo:todo-notes:export-backup"),
+    importBackup: () => ipcRenderer.invoke("mangoo:todo-notes:import-backup")
+  }
+};
+const todoNotesBridge = {
+  ready: () => ipcRenderer.invoke("mangoo:todo-notes:ready"),
+  onDataChanged: (cb) => subscribe("mangoo:todo-notes:data-changed", cb),
+  onFocusItem: (cb) => subscribe("mangoo:todo-notes:focus-item", cb),
+  onQuickAdd: (cb) => subscribe("mangoo:todo-notes:quick-add", cb),
+  getSettings: () => ipcRenderer.invoke("mangoo:todo-notes:get-settings"),
+  setSettings: (patch) => ipcRenderer.invoke("mangoo:todo-notes:set-settings", patch),
+  onSettingsChanged: (cb) => subscribe("mangoo:todo-notes:settings-changed", cb),
+  pin: (itemId) => ipcRenderer.invoke("mangoo:todo-notes:pin", itemId),
+  unpin: (itemId) => ipcRenderer.invoke("mangoo:todo-notes:unpin", itemId),
+  listPinned: () => ipcRenderer.invoke("mangoo:todo-notes:list-pinned"),
+  onPinnedChanged: (cb) => subscribe("mangoo:todo-notes:pinned-changed", cb),
+  setStickiesVisible: (visible) => ipcRenderer.invoke("mangoo:todo-notes:set-stickies-visible", visible === true),
+  stickyExpand: (expanded) => ipcRenderer.invoke("mangoo:todo-notes:sticky-expand", expanded === true),
+  stickyMeasure: (height, contentHeight) => ipcRenderer.invoke("mangoo:todo-notes:sticky-measure", height, contentHeight),
+  stickyUpdate: (patch) => ipcRenderer.invoke("mangoo:todo-notes:sticky-update", patch),
+  onStickyStateChanged: (cb) => subscribe("mangoo:todo-notes:sticky-state-changed", cb),
+  openItem: (itemId) => ipcRenderer.invoke("mangoo:todo-notes:open-item", itemId),
+  openLink: (url) => ipcRenderer.invoke("mangoo:todo-notes:open-link", url),
+  copyText: (text) => ipcRenderer.invoke("mangoo:todo-notes:copy-text", text),
+  setAlwaysOnTop: (value) => ipcRenderer.invoke("mangoo:todo-notes:set-always-on-top", value === true),
+  openMainWindow: () => ipcRenderer.invoke("mangoo:todo-notes:open-main-window"),
+  openSettings: (section) => ipcRenderer.invoke("mangoo:todo-notes:open-settings", typeof section === "string" ? section : "capture")
+};
+const todoNotesWindowBridge = {
+  ...commonWindowBridge,
+  coreUrl: readArg("--mangoo-core-url="),
+  sessionToken: readArg("--mangoo-session-token="),
+  todoItemId: readArg("--mangoo-todo-item="),
+  todoNotes: todoNotesBridge
+};
 const imageViewerWindowBridge = {
   ...commonWindowBridge,
   coreUrl: readArg("--mangoo-core-url="),
@@ -232,6 +284,7 @@ const fullBridge = {
   ...commonWindowBridge,
   notifyPluginsChanged: () => ipcRenderer.invoke("mangoo:plugins-changed"),
   imageViewerHost: imageViewerHostBridge,
+  todoNotesHost: todoNotesHostBridge,
   coreUrl: readArg("--mangoo-core-url="),
   sessionToken: readArg("--mangoo-session-token="),
   notifyShellReady: () => ipcRenderer.invoke("mangoo:shell-ready"),
@@ -285,6 +338,10 @@ const roleBridge = windowRole === "notifications"
     ? imageViewerWindowBridge
   : windowRole === "image-viewer-settings"
     ? imageViewerSettingsWindowBridge
+  : windowRole === "todo-notes" || windowRole === "todo-sticky"
+    ? todoNotesWindowBridge
+  : windowRole === "todo-notes-settings"
+    ? todoNotesSettingsWindowBridge
   : ["main", "settings", "plugins"].includes(windowRole)
     ? fullBridge
     : { windowRole };
