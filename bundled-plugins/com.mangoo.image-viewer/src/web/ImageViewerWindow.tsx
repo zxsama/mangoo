@@ -427,7 +427,15 @@ export function ImageViewerWindow() {
   // Sharpen: zoomed past what the adaptive tier holds -> fetch the original.
   useEffect(() => {
     if (!current || !image || image.kind !== "bitmap" || !image.upgradable) return;
-    const needed = transform.scale * image.width;
+    // The scale the picture is (or is about to be) shown at. In a fit mode
+    // use the fit's own target, not transform.scale: on the first frame that
+    // still holds the previous picture's scale, which fetched — for a camera
+    // RAW, developed — the full-size original for nothing. "actual" (100%) or
+    // "fill" on a large picture still upgrades as it should.
+    const scale = zoomState === "custom" || !imageSize || viewport.width === 0
+      ? transform.scale
+      : fitScale(imageSize, viewport, transform.rotation, zoomState, preferences.upscaleSmall);
+    const needed = scale * image.width;
     if (needed <= image.bitmap.width * 1.1) return;
     let cancelled = false;
     void cache.load(current, { viewportLongPx: viewerViewportLongPx(), full: true, animatedExtensions, rawSource: effectiveRawSource }).then((full) => {
@@ -436,7 +444,7 @@ export function ImageViewerWindow() {
     return () => {
       cancelled = true;
     };
-  }, [current, image, transform.scale, cache, animatedExtensions, effectiveRawSource]);
+  }, [current, image, transform.scale, transform.rotation, zoomState, imageSize, viewport, preferences.upscaleSmall, cache, animatedExtensions, effectiveRawSource]);
 
   // ------------------------------------------------------------- transforms
 
@@ -1356,7 +1364,7 @@ export function ImageViewerWindow() {
       <AnchoredOverlay
         anchor={zoomButtonRef.current}
         ariaLabel="缩放比例"
-        className="overlay-titlebar-popover"
+        className="overlay-titlebar-popover iv-menu iv-menu-pointer"
         id="image-viewer-zoom"
         onDismiss={() => setZoomMenuOpen(false)}
         open={zoomMenuOpen}

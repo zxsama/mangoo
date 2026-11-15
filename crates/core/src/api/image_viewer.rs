@@ -59,6 +59,8 @@ const DECODER_PREVIEW_MAX_PX: u32 = 3072;
 const MAX_VIEWPORT_LONG_PX: u32 = 16_384;
 const IMAGE_CACHE_BYTES: usize = 384 * 1024 * 1024;
 const THUMBNAIL_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// Concurrent full-view decodes (the picture on screen and its neighbours).
+const IMAGE_DECODE_SLOTS: usize = 2;
 
 pub(super) fn router(state: AppState) -> Router {
     Router::new()
@@ -288,13 +290,26 @@ struct ViewerRuntime {
     thumbnail_decodes: Arc<Semaphore>,
 }
 
+/// Concurrent filmstrip thumbnail decodes: half the logical CPUs, between 2
+/// and 6 (an 8-thread machine gets 4).
+fn thumbnail_decode_slots() -> usize {
+    std::thread::available_parallelism()
+        .map(|threads| threads.get() / 2)
+        .unwrap_or(2)
+        .clamp(2, 6)
+}
+
 fn runtime() -> &'static ViewerRuntime {
     static RUNTIME: OnceLock<ViewerRuntime> = OnceLock::new();
     RUNTIME.get_or_init(|| ViewerRuntime {
         images: Mutex::new(ByteLru::new(IMAGE_CACHE_BYTES)),
         thumbnails: Mutex::new(ByteLru::new(THUMBNAIL_CACHE_BYTES)),
-        image_decodes: Arc::new(Semaphore::new(2)),
-        thumbnail_decodes: Arc::new(Semaphore::new(2)),
+        image_decodes: Arc::new(Semaphore::new(IMAGE_DECODE_SLOTS)),
+        // Filmstrip thumbnails of big originals (10-30 MB JPEGs) are full
+        // decodes; two at a time left most of the strip queued for seconds.
+        // Scale with the machine, leaving headroom for the picture on screen
+        // (its own gate) and for the Library's workers.
+        thumbnail_decodes: Arc::new(Semaphore::new(thumbnail_decode_slots())),
     })
 }
 
@@ -530,6 +545,17 @@ async fn builtin_webp_from(
     } else {
         services.image_decodes.clone()
     };
+    // The picture on screen goes first: a thumbnail waits while any full
+    // view decode is running (bounded wait, so a hung decode cannot freeze
+    // the filmstrip).
+    if thumbnail {
+        let started = std::time::Instant::now();
+        while services.image_decodes.available_permits() < IMAGE_DECODE_SLOTS
+            && started.elapsed() < std::time::Duration::from_millis(1500)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
     let _permit = gate
         .acquire_owned()
         .await
@@ -556,13 +582,14 @@ async fn builtin_webp_from(
         } else if thumbnail && formats::is_camera_raw(&ext) {
             // Filmstrip thumbnails of a RAW come from the embedded preview
             // when there is one (milliseconds instead of a full develop).
-            match crate::decode::rawler::embedded_preview(&path) {
+            // The smallest embedded JPEG that still covers the strip size.
+            match crate::decode::rawler::embedded_thumbnail(&path, max_px) {
                 Ok(Some(preview)) => crate::thumbnails::generate_preview_webp_from(preview, max_px),
                 // No embedded preview: develop directly (the registry's
                 // Preview path would scan for a preview a second time).
-                _ => crate::decode::rawler::develop_for_thumbnail(&path).and_then(|developed| {
-                    crate::thumbnails::generate_preview_webp_from(developed, max_px)
-                }),
+                _ => crate::decode::rawler::develop_for_thumbnail_sized(&path, max_px).and_then(
+                    |developed| crate::thumbnails::generate_preview_webp_from(developed, max_px),
+                ),
             }
         } else {
             crate::thumbnails::generate_preview_webp(&path, max_px)
@@ -965,6 +992,18 @@ async fn get_image(
     let plan = resolve_preview_plan(Some("image"), &image.ext, source_max_px, plan_viewport);
     let Some(plan) = plan else {
         return stream_original(&image).await;
+    };
+    // `full=true` on a format Chromium cannot paint (camera RAW, HEIC, PSD):
+    // the original cannot be streamed, so serve the bounded native-size
+    // transcode instead of the viewport tier — otherwise zooming past fit
+    // never got sharper than 2048 px.
+    let plan = if full && !renderable {
+        super::routes::PreviewPlan {
+            profile: crate::thumbnails::PREVIEW_NATIVE_PROFILE,
+            max_px: crate::thumbnails::PREVIEW_NATIVE_MAX_PX,
+        }
+    } else {
+        plan
     };
     match builtin_webp(
         &image,

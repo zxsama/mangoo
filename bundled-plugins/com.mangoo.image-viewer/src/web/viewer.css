@@ -2680,3 +2680,29 @@ html:has(.iv-settings-window) #root {
     linear-gradient(var(--glass-center-fill-strong, rgba(8, 12, 16, 0.5)), var(--glass-center-fill-strong, rgba(8, 12, 16, 0.5))),
     color-mix(in srgb, var(--iv-acrylic-base, rgb(118, 119, 120)) 62%, #000);
 }
+
+/* Round 9 ---------------------------------------------------------------- */
+
+/* Menu shortcut hints read as secondary information: dimmer, a touch
+ * smaller and tabular, so the command names stay the focus. The check mark
+ * of a toggled item (rendered in the same slot) keeps the accent. */
+.iv-menu .overlay-menu-item-shortcut {
+  color: rgba(244, 247, 249, 0.38);
+  font-size: 11.5px;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+}
+
+.iv-menu .overlay-menu-item-shortcut > svg {
+  color: var(--accent);
+}
+
+.iv-menu .overlay-menu-item:focus-visible .overlay-menu-item-shortcut {
+  color: rgba(244, 247, 249, 0.5);
+}
+
+.iv-menu .overlay-menu-item[aria-disabled="true"] .overlay-menu-item-shortcut,
+.iv-menu .overlay-menu-item:disabled .overlay-menu-item-shortcut {
+  color: rgba(244, 247, 249, 0.22);
+}

@@ -187,6 +187,7 @@ export class ViewerImageCache {
       height,
       tier: resource.tier,
       // Only adaptive tiers of a browser-paintable original can sharpen further.
+      // A transcoded RAW / HEIC also has a sharper (native-size) version.
       upgradable: resource.tier === "preview_2048" || resource.tier === "preview_3072"
     };
     this.store(key, image, bitmap.width * bitmap.height * 4);

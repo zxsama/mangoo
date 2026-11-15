@@ -1584,6 +1584,7 @@ dependencies = [
  "psd",
  "rand 0.8.7",
  "rawler",
+ "rayon",
  "rusqlite",
  "semver",
  "serde",

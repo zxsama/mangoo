@@ -19,6 +19,7 @@
 //! then ≈ 1.9× the 8-bit frame during sharpening (not 5× as before).
 
 use image::{DynamicImage, RgbImage};
+use rayon::prelude::*;
 
 const CURVE_LEN: usize = 4096;
 const FIT_W: u32 = 192;
@@ -191,38 +192,47 @@ pub fn sharpen_luma(image: &mut RgbImage) {
         return;
     }
     let luma: Vec<u8> = image
-        .pixels()
-        .map(|p| luma8(p).round().min(255.0) as u8)
+        .as_raw()
+        .par_chunks(3)
+        .map(|p| {
+            (0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32)
+                .round()
+                .min(255.0) as u8
+        })
         .collect();
     let mut horizontal = vec![0u16; w * h];
-    for y in 0..h {
-        let row = &luma[y * w..(y + 1) * w];
-        for x in 0..w {
-            let left = row[x.saturating_sub(1)] as u16;
-            let right = row[(x + 1).min(w - 1)] as u16;
-            horizontal[y * w + x] = left + 2 * row[x] as u16 + right;
-        }
-    }
+    horizontal
+        .par_chunks_mut(w)
+        .zip(luma.par_chunks(w))
+        .for_each(|(out, row)| {
+            for x in 0..w {
+                let left = row[x.saturating_sub(1)] as u16;
+                let right = row[(x + 1).min(w - 1)] as u16;
+                out[x] = left + 2 * row[x] as u16 + right;
+            }
+        });
     let buffer: &mut [u8] = image.as_mut();
-    for y in 0..h {
-        let up = y.saturating_sub(1) * w;
-        let down = (y + 1).min(h - 1) * w;
-        for x in 0..w {
-            let blurred = (horizontal[up + x] as f32
-                + 2.0 * horizontal[y * w + x] as f32
-                + horizontal[down + x] as f32)
-                / 16.0;
-            let detail = luma[y * w + x] as f32 - blurred;
-            if detail.abs() < 2.0 {
-                continue;
+    buffer
+        .par_chunks_mut(w * 3)
+        .enumerate()
+        .for_each(|(y, out)| {
+            let up = y.saturating_sub(1) * w;
+            let down = (y + 1).min(h - 1) * w;
+            for x in 0..w {
+                let blurred = (horizontal[up + x] as f32
+                    + 2.0 * horizontal[y * w + x] as f32
+                    + horizontal[down + x] as f32)
+                    / 16.0;
+                let detail = luma[y * w + x] as f32 - blurred;
+                if detail.abs() < 2.0 {
+                    continue;
+                }
+                let delta = detail * 0.5;
+                for channel in &mut out[x * 3..x * 3 + 3] {
+                    *channel = (*channel as f32 + delta).clamp(0.0, 255.0).round() as u8;
+                }
             }
-            let delta = detail * 0.5;
-            let base = (y * w + x) * 3;
-            for channel in &mut buffer[base..base + 3] {
-                *channel = (*channel as f32 + delta).clamp(0.0, 255.0).round() as u8;
-            }
-        }
-    }
+        });
 }
 
 /// The finishing pipeline. `reference` is the camera's embedded preview in
@@ -233,6 +243,28 @@ pub fn finish(
     reference: Option<&DynamicImage>,
     sharpen: bool,
 ) -> RgbImage {
+    finish_at(developed, reference, sharpen, None)
+}
+
+/// [`finish`], but when the caller only needs `max_px` on the long side the
+/// 16-bit develop is first reduced to it (area average), so toning and
+/// sharpening touch a few megapixels instead of the whole sensor. Sharpening
+/// then runs at the display size, where it is actually seen.
+pub fn finish_at(
+    developed: DynamicImage,
+    reference: Option<&DynamicImage>,
+    sharpen: bool,
+    max_px: Option<u32>,
+) -> RgbImage {
+    let developed = match max_px {
+        Some(limit) if developed.width().max(developed.height()) > limit.max(1) => {
+            let scale = limit as f64 / developed.width().max(developed.height()) as f64;
+            let w = ((developed.width() as f64 * scale).round() as u32).max(1);
+            let h = ((developed.height() as f64 * scale).round() as u32).max(1);
+            developed.thumbnail_exact(w, h)
+        }
+        _ => developed,
+    };
     let (width, height) = (developed.width(), developed.height());
     let dev_aspect = width as f32 / height.max(1) as f32;
     let small = |image: &DynamicImage| {
@@ -268,24 +300,35 @@ pub fn finish(
         // A modest boost, like a camera's "standard" picture style.
         None => (default_curve(), 1.12),
     };
-    // Tone straight from 16-bit into the 8-bit output, then drop the source.
+    // Tone straight from 16-bit into the 8-bit output (rows in parallel),
+    // then drop the source.
     let mut output = RgbImage::new(width, height);
+    let row = width as usize * 3;
+    let tone_rows = |source: &[u16], scale: f32, out: &mut [u8]| {
+        out.par_chunks_mut(row)
+            .zip(source.par_chunks(row))
+            .for_each(|(out_row, in_row)| {
+                for (out_px, in_px) in out_row.chunks_exact_mut(3).zip(in_row.chunks_exact(3)) {
+                    let toned = tone_pixel(
+                        [
+                            in_px[0] as f32 * scale,
+                            in_px[1] as f32 * scale,
+                            in_px[2] as f32 * scale,
+                        ],
+                        &curve,
+                        saturation,
+                    );
+                    out_px.copy_from_slice(&toned);
+                }
+            });
+    };
     match &developed {
         DynamicImage::ImageRgb16(source) => {
-            for (out, pixel) in output.pixels_mut().zip(source.pixels()) {
-                out.0 = tone_pixel(pixel.0.map(|v| v as f32 / 65535.0), &curve, saturation);
-            }
-        }
-        DynamicImage::ImageRgb8(source) => {
-            for (out, pixel) in output.pixels_mut().zip(source.pixels()) {
-                out.0 = tone_pixel(pixel.0.map(|v| v as f32 / 255.0), &curve, saturation);
-            }
+            tone_rows(source.as_raw(), 1.0 / 65535.0, output.as_mut())
         }
         other => {
             let source = other.to_rgb16();
-            for (out, pixel) in output.pixels_mut().zip(source.pixels()) {
-                out.0 = tone_pixel(pixel.0.map(|v| v as f32 / 65535.0), &curve, saturation);
-            }
+            tone_rows(source.as_raw(), 1.0 / 65535.0, output.as_mut());
         }
     }
     drop(developed);
