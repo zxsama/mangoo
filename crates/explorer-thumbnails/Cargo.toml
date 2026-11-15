@@ -1,0 +1,19 @@
+[package]
+name = "mangoo-explorer-thumbnails"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Windows Explorer thumbnail provider (IThumbnailProvider) for formats Windows lacks."
+
+[lib]
+# A COM in-process server loaded by Explorer (dllhost / explorer.exe), plus
+# an rlib so the decoding logic is unit-testable on any platform.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "tiff", "bmp", "gif"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.56", features = ["implement", "Win32_Foundation", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader"] }
+windows-core = "0.56"

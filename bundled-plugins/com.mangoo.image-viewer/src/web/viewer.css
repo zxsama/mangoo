@@ -2706,3 +2706,223 @@ html:has(.iv-settings-window) #root {
 .iv-menu .overlay-menu-item:disabled .overlay-menu-item-shortcut {
   color: rgba(244, 247, 249, 0.22);
 }
+
+/* Round 10 --------------------------------------------------------------- */
+
+/* Info panel: switching pictures keeps the layout and fades the values in,
+ * instead of collapsing to "正在读取…" and back (the flicker). Rows taken
+ * from the previous picture's metadata dim briefly until the new values
+ * land; layout never changes height mid-browse. */
+.iv-info .iv-info-row dd,
+.iv-info .iv-info-exposure,
+.iv-info .iv-histo-stats dd {
+  transition: opacity 140ms ease;
+}
+
+.iv-info[data-stale="true"] .iv-info-fold-body .iv-info-row dd,
+.iv-info[data-stale="true"] .iv-info-exposure {
+  opacity: 0.45;
+}
+
+.iv-histogram canvas {
+  transition: opacity 120ms ease;
+}
+
+/* Comic / webtoon mode ------------------------------------------------- */
+
+/* The strip replaces the single-picture stage; the stage stays mounted
+ * (so leaving comic mode is instant) but is hidden and inert. */
+.iv-main[data-comic="true"] > .iv-stage {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.iv-comic {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  overflow-x: auto;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  outline: none;
+  scrollbar-gutter: stable;
+}
+
+.iv-comic-track {
+  position: relative;
+  margin: 0 auto;
+}
+
+.iv-comic-slot {
+  position: absolute;
+  top: 0;
+  left: 0;
+}
+
+.iv-comic-page {
+  display: grid;
+  place-items: center;
+  min-height: 120px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.iv-comic-page[data-loaded="true"] {
+  background: transparent;
+}
+
+.iv-comic-canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.iv-comic-placeholder {
+  max-width: 80%;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: var(--iv-text-body);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.iv-comic-placeholder[data-failed="true"] {
+  color: #f1958c;
+}
+
+/* Scrub bar -------------------------------------------------------------- */
+
+/* The filmstrip pane grows a 22px scrub row on top. */
+.iv-filmstrip-pane[data-scrub="true"] {
+  --iv-filmstrip-height: 114px;
+  display: flex;
+  flex-direction: column;
+  flex-basis: 114px;
+}
+
+.iv-filmstrip-pane[data-scrub="true"] > .iv-filmstrip {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.iv-scrub {
+  position: relative;
+  z-index: 3;
+  flex: 0 0 22px;
+  padding: 0 16px;
+  cursor: pointer;
+  outline: none;
+  touch-action: none;
+}
+
+.iv-scrub-track {
+  position: relative;
+  top: 10px;
+  height: 3px;
+  border-radius: var(--radius-pill);
+  background: rgba(255, 255, 255, 0.12);
+  transition: height 120ms ease, top 120ms ease;
+}
+
+.iv-scrub:hover .iv-scrub-track,
+.iv-scrub[data-dragging="true"] .iv-scrub-track,
+.iv-scrub:focus-visible .iv-scrub-track {
+  top: 9px;
+  height: 5px;
+}
+
+.iv-scrub-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: inherit;
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.iv-scrub-thumb {
+  position: absolute;
+  top: 50%;
+  left: -6px;
+  width: 12px;
+  height: 12px;
+  margin-top: -6px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.iv-scrub:hover .iv-scrub-thumb,
+.iv-scrub[data-dragging="true"] .iv-scrub-thumb,
+.iv-scrub:focus-visible .iv-scrub-thumb {
+  opacity: 1;
+}
+
+.iv-scrub-hover {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  left: 0;
+  width: 1px;
+  background: rgba(255, 255, 255, 0.55);
+  pointer-events: none;
+}
+
+/* Floating preview: thumbnail + "n / N" + name, above the track. */
+.iv-scrub-bubble {
+  position: fixed;
+  z-index: 40;
+  display: grid;
+  gap: 5px;
+  width: 140px;
+  padding: 6px;
+  border: 1px solid var(--glass-side-stroke);
+  border-radius: var(--radius-panel);
+  background: var(--glass-side-fill);
+  box-shadow: var(--glass-shadow-tight);
+  -webkit-backdrop-filter: var(--iv-glass-prefill) blur(var(--glass-side-blur)) saturate(1.35);
+  backdrop-filter: var(--iv-glass-prefill) blur(var(--glass-side-blur)) saturate(1.35);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.iv-scrub-preview {
+  display: grid;
+  place-items: center;
+  height: 86px;
+  overflow: hidden;
+  border-radius: calc(var(--radius-panel) - 3px);
+  background: rgba(0, 0, 0, 0.25);
+}
+
+.iv-scrub-preview-image {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.iv-scrub-preview-placeholder {
+  color: var(--text-muted);
+  font-size: var(--iv-text-caption);
+}
+
+.iv-scrub-caption {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+  text-align: center;
+}
+
+.iv-scrub-count {
+  color: var(--text-primary);
+  font-size: var(--iv-text-body);
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.iv-scrub-name {
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: var(--iv-text-caption);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

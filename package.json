@@ -19,7 +19,7 @@
     "check:core-client": "npm --workspace @mangoo/core-client run check && npm --workspace @mangoo/core-client run typecheck && npm --workspace @mangoo/core-client run test",
     "check:notification-contract": "npm --workspace @mangoo/notification-contract run check && npm --workspace @mangoo/notification-contract run typecheck && npm --workspace @mangoo/notification-contract run test",
     "check:desktop": "node --test tools/dev/web-dev-url.test.mjs && node tools/checks/validate-desktop-core.mjs && npm --workspace @mangoo/desktop run typecheck && npm --workspace @mangoo/desktop run test",
-    "build:desktop-package": "node tools/build/build-bundled-plugins.mjs --release-profile && cargo build --release -p mangoo-core && npm --workspace @mangoo/web run build && npm --workspace @mangoo/desktop run build && node tools/build/package-desktop.mjs",
+    "build:desktop-package": "node tools/build/build-bundled-plugins.mjs --release-profile && cargo build --release -p mangoo-core -p mangoo-explorer-thumbnails && npm --workspace @mangoo/web run build && npm --workspace @mangoo/desktop run build && node tools/build/package-desktop.mjs",
     "check:web": "node tools/checks/validate-web-client.mjs && npm --workspace @mangoo/web run typecheck && npm --workspace @mangoo/web run test",
     "check:ui-design": "node tools/checks/validate-ui-design.mjs",
     "check:schema": "python tools/checks/validate_sqlite_schema.py",

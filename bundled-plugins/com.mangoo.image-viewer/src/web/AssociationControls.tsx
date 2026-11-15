@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { LiquidGlassButton, icons } from "@mangoo/web/plugin-host";
 
-import type { ImageViewerAssociationStatus } from "../shared/ipc.ts";
-import { viewerHostBridge } from "./bridge.ts";
+import type { ImageViewerAssociationStatus, ImageViewerExplorerThumbnailStatus } from "../shared/ipc.ts";
+import { explorerThumbnailBridge, viewerHostBridge } from "./bridge.ts";
 
 /**
  * "Use Mangoo to open pictures" as the user experiences it on each OS:
@@ -128,6 +128,96 @@ export function AssociationControls() {
           <p>{formats.join("、")}</p>
         </details>
       ) : null}
+    </div>
+  );
+}
+
+/**
+ * "Show thumbnails in File Explorer": one switch. Windows already draws
+ * JPEG / PNG / GIF / BMP / TIFF; the switch adds camera RAW, PSD and WebP so
+ * that every picture in a folder gets a thumbnail.
+ */
+export function ExplorerThumbnailControls() {
+  const bridge = explorerThumbnailBridge();
+  const [status, setStatus] = useState<ImageViewerExplorerThumbnailStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [pendingTarget, setPendingTarget] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    if (!bridge) return;
+    try {
+      setStatus(await bridge.explorerThumbnailStatus());
+    } catch {
+      setStatus(null);
+    }
+  }, [bridge]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  if (!bridge || !status) return null;
+  // Not a Windows feature elsewhere: say nothing rather than show a dead switch.
+  if (!status.supported && status.detail.startsWith("仅 Windows")) return null;
+
+  async function toggle(next: boolean) {
+    if (!bridge) return;
+    setPendingTarget(next);
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await bridge.setExplorerThumbnails(next);
+      setStatus(result);
+      if (result.registered !== next && result.supported) setError(result.detail);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const actionable = status.supported && status.pluginEnabled;
+  const on = busy ? pendingTarget : status.registered;
+  const formats = status.extensions.map((ext) => ext.replace(".", "").toUpperCase());
+
+  return (
+    <div className="iv-assoc">
+      <div className="iv-setting-row">
+        <div className="iv-setting-text">
+          <span className="iv-setting-title">在文件资源管理器中显示缩略图</span>
+          <p className="iv-setting-description">{status.detail}</p>
+        </div>
+        <div className="iv-setting-control">
+          <span className="iv-assoc-state" data-on={status.registered ? "true" : "false"}>
+            {busy ? "正在应用…" : status.registered ? "已开启" : "未开启"}
+          </span>
+          <label
+            aria-busy={busy || undefined}
+            className={`plugin-toggle iv-switch${on ? " on" : ""}${!actionable ? " disabled" : ""}${busy ? " busy" : ""}`}
+          >
+            <input
+              aria-label="在文件资源管理器中显示缩略图"
+              checked={on}
+              disabled={!actionable}
+              onChange={(event) => {
+                if (busy) return;
+                void toggle(event.target.checked);
+              }}
+              role="switch"
+              type="checkbox"
+            />
+            <span aria-hidden="true" className="plugin-toggle-track">
+              <span className="plugin-toggle-thumb" />
+            </span>
+          </label>
+        </div>
+      </div>
+      {error ? <p className="iv-assoc-error" role="alert">{error}</p> : null}
+      <details className="iv-assoc-formats">
+        <summary data-pointer-glow="off">新增 {formats.length} 种格式的缩略图</summary>
+        <p>{formats.join("、")}</p>
+      </details>
     </div>
   );
 }

@@ -12,6 +12,11 @@ function orientationLabel(value: number): string {
   return ({ 2: "水平翻转", 3: "旋转 180°", 4: "垂直翻转", 5: "转置", 6: "顺时针 90°", 7: "反转置", 8: "逆时针 90°" } as Record<number, string>)[value] ?? String(value);
 }
 
+function splitDirectory(path: string): string {
+  const index = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return index > 0 ? path.slice(0, index) : path;
+}
+
 function formatDate(ms: number | null | undefined): string | null {
   if (!ms) return null;
   return new Date(ms).toLocaleString();
@@ -102,8 +107,13 @@ function HistogramView({ image }: { image: LoadedImage | null }) {
   const [probe, setProbe] = useState<{ value: number; x: number } | null>(null);
   useEffect(() => {
     let cancelled = false;
-    setHistogram(null);
-    if (!image) return;
+    // Keep the previous histogram on screen until the new one is computed:
+    // clearing it first made the plot (and the stats grid under it) blink
+    // on every picture change.
+    if (!image) {
+      setHistogram(null);
+      return;
+    }
     const timer = window.setTimeout(() => {
       computeHistogram(image).then((value) => {
         if (!cancelled) setHistogram(value);
@@ -236,19 +246,43 @@ function HistogramView({ image }: { image: LoadedImage | null }) {
 export function InfoPanel({ entry, image, animation }: { entry: ImageEntry | null; image: LoadedImage | null; animation?: FramePlaybackState | null }) {
   const [metadata, setMetadata] = useState<ImageViewerMetadata | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** Metadata of recently shown pictures: going back and forth is instant. */
+  const metadataCache = useRef(new Map<string, ImageViewerMetadata>());
 
   useEffect(() => {
-    setMetadata(null);
     setError(null);
-    if (!entry) return;
+    if (!entry) {
+      setMetadata(null);
+      return;
+    }
+    const key = `${entry.path}\u0000${entry.modifiedAtMs}`;
+    const cached = metadataCache.current.get(key);
+    if (cached) {
+      setMetadata(cached);
+      return;
+    }
+    // No blanking: the previous picture's rows stay (dimmed via data-stale)
+    // until the new metadata arrives, so the panel never collapses to
+    // "正在读取…" and back while browsing.
     const controller = new AbortController();
     createCoreClient()
       .getImageViewerMetadata(entry.path, { signal: controller.signal })
-      .then(setMetadata, (cause) => {
-        if (!controller.signal.aborted) setError(describeError(cause));
+      .then((value) => {
+        metadataCache.current.set(key, value);
+        if (metadataCache.current.size > 200) {
+          const oldest = metadataCache.current.keys().next().value;
+          if (oldest !== undefined) metadataCache.current.delete(oldest);
+        }
+        setMetadata(value);
+      }, (cause) => {
+        if (controller.signal.aborted) return;
+        // Never leave the previous picture's EXIF / GPS under this name.
+        setMetadata(null);
+        setError(describeError(cause));
       });
     return () => controller.abort();
   }, [entry?.path, entry?.modifiedAtMs]);
+  const metadataStale = Boolean(entry && metadata && metadata.path !== entry.path);
 
   if (!entry) {
     return (
@@ -258,8 +292,12 @@ export function InfoPanel({ entry, image, animation }: { entry: ImageEntry | nul
     );
   }
   const exif = metadata?.exif ?? null;
-  const width = metadata?.width ?? image?.width ?? null;
-  const height = metadata?.height ?? image?.height ?? null;
+  // Values that come from the PREVIOUS picture's metadata are not shown as
+  // this picture's: size/dates fall back to the entry until the new data
+  // lands; EXIF keeps the old rows only dimmed (no layout collapse).
+  const fresh = metadataStale ? null : metadata;
+  const width = fresh?.width ?? image?.width ?? null;
+  const height = fresh?.height ?? image?.height ?? null;
   const format = image?.kind === "animated"
     ? ({ ".png": "APNG（动态 PNG）", ".apng": "APNG", ".gif": "GIF 动图", ".webp": "WebP 动图", ".avif": "AVIF 动图" } as Record<string, string>)[entry.ext] ?? entry.ext.replace(".", "").toUpperCase()
     : entry.ext.replace(".", "").toUpperCase();
@@ -277,7 +315,7 @@ export function InfoPanel({ entry, image, animation }: { entry: ImageEntry | nul
     : null;
 
   return (
-    <aside aria-label="图片信息" className="iv-info">
+    <aside aria-label="图片信息" className="iv-info" data-stale={metadataStale ? "true" : "false"}>
       <div className="iv-info-title" title={entry.name}>{entry.name}</div>
       {/* The histogram stays put; only the sections below it scroll. */}
       {image ? <div className="iv-info-pinned"><HistogramView image={image} /></div> : null}
@@ -286,13 +324,13 @@ export function InfoPanel({ entry, image, animation }: { entry: ImageEntry | nul
         <dl>
           <Row label="名称" value={<span className="iv-info-name">{entry.name}</span>} />
           <Row label="尺寸" value={width && height ? `${width} × ${height}` : null} />
-          <Row label="大小" value={formatBytes(metadata?.sizeBytes ?? entry.sizeBytes)} />
+          <Row label="大小" value={formatBytes(fresh?.sizeBytes ?? entry.sizeBytes)} />
           <Row label="格式" value={format} />
           <Row label="帧数" value={animation ? `${animation.frameCount} 帧` : null} />
           <Row label="时长" value={animation ? formatFrameTime(animation.totalMs) : null} />
-          <Row label="修改时间" value={formatDate(metadata?.modifiedAtMs ?? entry.modifiedAtMs)} />
-          <Row label="创建时间" value={formatDate(metadata?.createdAtMs)} />
-          <Row label="位置" value={<span className="iv-info-path">{metadata?.directory ?? null}</span>} />
+          <Row label="修改时间" value={formatDate(fresh?.modifiedAtMs ?? entry.modifiedAtMs)} />
+          <Row label="创建时间" value={formatDate(fresh?.createdAtMs)} />
+          <Row label="位置" value={<span className="iv-info-path">{fresh?.directory ?? splitDirectory(entry.path)}</span>} />
         </dl>
       </Fold>
       <Fold icon={<icons.Camera aria-hidden="true" size={13} />} id="exif" title="EXIF">

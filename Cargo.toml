@@ -3,7 +3,8 @@ resolver = "2"
 members = [
   "crates/core",
   "crates/fake-provider",
-  "crates/ppm-decoder"
+  "crates/ppm-decoder",
+  "crates/explorer-thumbnails"
 ]
 
 [workspace.package]

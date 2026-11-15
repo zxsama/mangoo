@@ -2235,6 +2235,14 @@ function resolvePluginsDir(): string {
   );
 }
 
+/** The image viewer's File Explorer thumbnail provider (Windows only). */
+function explorerThumbnailDllPath(): string | null {
+  if (process.platform !== "win32") return null;
+  if (app.isPackaged) return path.join(process.resourcesPath, "core", "mangoo_explorer_thumbnails.dll");
+  const profile = process.env.MANGOO_CORE_PROFILE === "release" ? "release" : "debug";
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "target", profile, "mangoo_explorer_thumbnails.dll");
+}
+
 configurePackagedRuntime({
   isPackaged: app.isPackaged,
   resourcesPath: process.resourcesPath,
@@ -2262,6 +2270,7 @@ const imageViewerHost: ImageViewerHost | null = hasSingleInstanceLock
       associationIconPath: app.isPackaged
         ? path.join(process.resourcesPath, "icon.png")
         : fileURLToPath(new URL("../build/icon.png", import.meta.url)),
+      explorerThumbnailDllPath: explorerThumbnailDllPath(),
       ensureCoreSession: () => ensureCoreReady(),
       rendererUrl: (session, route) =>
         process.env.MANGOO_WEB_URL

@@ -1607,6 +1607,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mangoo-explorer-thumbnails"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "windows",
+ "windows-core 0.56.0",
+]
+
+[[package]]
 name = "mangoo-fake-provider"
 version = "0.1.0"
 dependencies = [

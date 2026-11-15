@@ -189,7 +189,7 @@ test("preload exposes exactly the plugin's viewer channels", () => {
   for (const channel of used) assert.ok(known.has(channel), `preload uses unknown channel ${channel}`);
 });
 
-test("the settings window bridge exposes only association channels and section pushes", () => {
+test("the settings window bridge exposes only system-integration channels and section pushes", () => {
   const preload = fs.readFileSync(new URL("../../../apps/desktop/src/preload.cjs", import.meta.url), "utf8");
   const start = preload.indexOf("const imageViewerSettingsWindowBridge = {");
   assert.ok(start >= 0, "settings window bridge exists");
@@ -197,8 +197,51 @@ test("the settings window bridge exposes only association channels and section p
   const used = new Set([...body.matchAll(/"(mangoo:image-viewer:[a-z-]+)"/g)].map((match) => match[1]));
   assert.deepEqual([...used].sort(), [
     IMAGE_VIEWER_CHANNELS.associationStatus,
+    IMAGE_VIEWER_CHANNELS.explorerThumbnailStatus,
     IMAGE_VIEWER_CHANNELS.openDefaultAppsSettings,
     IMAGE_VIEWER_CHANNELS.setAssociation,
+    IMAGE_VIEWER_CHANNELS.setExplorerThumbnails,
     IMAGE_VIEWER_CHANNELS.settingsSection
   ].sort());
+});
+
+test("explorer thumbnail registration is per-user, matches the provider crate and is reversible", async () => {
+  const thumbs = await import("../src/desktop/explorerThumbnails.ts");
+  const crate = fs.readFileSync(new URL("../../../crates/explorer-thumbnails/src/render.rs", import.meta.url), "utf8");
+  const listed = [...crate.slice(crate.indexOf("pub const EXTENSIONS"), crate.indexOf("];", crate.indexOf("pub const EXTENSIONS"))).matchAll(/"(\.[a-z0-9]+)"/g)].map((match) => match[1]);
+  assert.deepEqual([...thumbs.EXPLORER_THUMBNAIL_EXTENSIONS], listed);
+  const lib = fs.readFileSync(new URL("../../../crates/explorer-thumbnails/src/lib.rs", import.meta.url), "utf8");
+  assert.ok(lib.includes(`"${thumbs.EXPLORER_THUMBNAIL_CLSID}"`), "CLSID matches the DLL");
+  for (const native of [".jpg", ".png", ".gif", ".bmp", ".tif"]) assert.ok(!(thumbs.EXPLORER_THUMBNAIL_EXTENSIONS as readonly string[]).includes(native));
+
+  const dll = String.raw`C:\Program Files\Mangoo\resources\core\mangoo_explorer_thumbnails.dll`;
+  const bs = "\\";
+  const classes = ["HKEY_CURRENT_USER", "Software", "Classes", ""].join(bs);
+  const script = thumbs.explorerThumbnailRegistrationScript(dll);
+  for (const line of script.split("\r\n").filter((value) => value.startsWith("["))) {
+    assert.ok(line.startsWith(`[${classes}`), line);
+  }
+  assert.ok(script.includes(`@="${dll.split(bs).join(bs + bs)}"`));
+  assert.ok(script.includes('"ThreadingModel"="Apartment"'));
+  assert.ok(script.includes(`[${classes}.nef${bs}ShellEx${bs}${thumbs.THUMBNAIL_HANDLER_SLOT}]`));
+
+  // Removal deletes the CLSID and only the slots that still name us.
+  const removal = thumbs.explorerThumbnailUnregistrationScript([".nef"]);
+  assert.ok(removal.includes(`[-${classes}CLSID${bs}${thumbs.EXPLORER_THUMBNAIL_CLSID}]`));
+  assert.ok(removal.includes(`[-${classes}.nef${bs}ShellEx${bs}${thumbs.THUMBNAIL_HANDLER_SLOT}]`));
+  assert.ok(!removal.includes(".cr3"));
+
+  // Another app's handler that was replaced is restored, not deleted.
+  const restoring = thumbs.explorerThumbnailUnregistrationScript([".nef"], { ".nef": "{0002DEAD-9BF7-4CFA-8A5C-DE8679340003}" });
+  assert.ok(!restoring.includes(`[-${classes}.nef`));
+  assert.ok(restoring.includes('@="{0002DEAD-9BF7-4CFA-8A5C-DE8679340003}"'));
+
+  const parsed = thumbs.parseHandlerQuery([
+    `${classes}.nef${bs}shellex${bs}${thumbs.THUMBNAIL_HANDLER_SLOT}`,
+    "    (Default)    REG_SZ    {0002DEAD-9BF7-4CFA-8A5C-DE8679340003}",
+    "",
+    `${classes}.psd${bs}ShellEx${bs}${thumbs.THUMBNAIL_HANDLER_SLOT.toUpperCase()}`,
+    `    (Default)    REG_SZ    ${thumbs.EXPLORER_THUMBNAIL_CLSID}`
+  ].join("\r\n"));
+  assert.deepEqual(parsed, { ".nef": "{0002DEAD-9BF7-4CFA-8A5C-DE8679340003}", ".psd": thumbs.EXPLORER_THUMBNAIL_CLSID });
 });

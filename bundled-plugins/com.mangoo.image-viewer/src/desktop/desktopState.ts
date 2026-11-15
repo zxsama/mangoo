@@ -21,12 +21,18 @@ export interface ImageViewerDesktopState {
     bounds: ViewerWindowBounds;
     maximized: boolean;
   } | null;
+  /** The user wants Explorer thumbnails (re-applied when the plugin is re-enabled). */
+  explorerThumbnailsWanted: boolean;
+  /** The DLL path last registered, so a moved install re-registers. */
+  explorerThumbnailsDll: string | null;
+  /** Other apps' per-user handlers our registration replaced (restored on removal). */
+  explorerThumbnailsReplaced: Record<string, string>;
 }
 
 export const DEFAULT_VIEWER_SIZE = { width: 1120, height: 760 };
 
 export function defaultDesktopState(): ImageViewerDesktopState {
-  return { version: 1, associationWanted: false, registration: null, window: null };
+  return { version: 1, associationWanted: false, registration: null, window: null, explorerThumbnailsWanted: false, explorerThumbnailsDll: null, explorerThumbnailsReplaced: {} };
 }
 
 function finite(value: unknown): value is number {
@@ -56,6 +62,16 @@ export function parseDesktopState(text: string): ImageViewerDesktopState {
     const window = raw.window as Record<string, unknown> | null | undefined;
     const bounds = parseBounds(window?.bounds);
     if (bounds) state.window = { bounds, maximized: window?.maximized === true };
+    state.explorerThumbnailsWanted = raw.explorerThumbnailsWanted === true;
+    state.explorerThumbnailsDll = typeof raw.explorerThumbnailsDll === "string" ? raw.explorerThumbnailsDll : null;
+    const replaced = raw.explorerThumbnailsReplaced;
+    if (replaced && typeof replaced === "object") {
+      for (const [ext, value] of Object.entries(replaced as Record<string, unknown>)) {
+        if (/^\.[a-z0-9]{1,16}$/.test(ext) && typeof value === "string" && /^\{[0-9A-Fa-f-]{36}\}$/.test(value)) {
+          state.explorerThumbnailsReplaced[ext] = value;
+        }
+      }
+    }
     return state;
   } catch {
     return defaultDesktopState();

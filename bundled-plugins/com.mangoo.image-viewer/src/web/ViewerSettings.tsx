@@ -4,7 +4,7 @@ import { icons } from "@mangoo/web/plugin-host";
 import type { ImageSortKey } from "../shared/navigation.ts";
 import type { ImageViewerSettingsSection } from "../shared/ipc.ts";
 import type { ShortcutOverrides } from "../shared/shortcuts.ts";
-import { AssociationControls } from "./AssociationControls.tsx";
+import { AssociationControls, ExplorerThumbnailControls } from "./AssociationControls.tsx";
 import { ShortcutEditor } from "./ShortcutEditor.tsx";
 import { SLIDESHOW_INTERVALS, type ViewerBackground, type ViewerPreferences } from "./preferences.ts";
 
@@ -251,6 +251,24 @@ export function ViewerSettingsForm({ preferences, onChange, showSystem = true, s
         <SettingRow description="相机同时保存 RAW 和 JPEG 时，同名的两个文件只显示为一张图片（显示 RAW，可按 J 切换为内嵌 JPEG）。关闭后两个文件分别显示。" title="合并同名 RAW 与 JPEG">
           <Switch checked={preferences.pairRawJpeg} label="合并同名 RAW 与 JPEG" onChange={(pairRawJpeg) => onChange({ pairRawJpeg })} />
         </SettingRow>
+        <SettingRow description="把文件夹里的图片纵向连成一条长图，像在浏览器里看条漫一样滚动阅读。按 M 或工具栏按钮开关，Ctrl+滚轮或 +/- 调整宽度，0 恢复铺满宽度。" title="漫画（条漫）模式">
+          <Switch checked={preferences.comicMode} label="漫画（条漫）模式" onChange={(comicMode) => onChange({ comicMode })} />
+        </SettingRow>
+        <SettingRow description="漫画模式下相邻两张图片之间的空隙。条漫一般用“无”，单页漫画可以留一点间距。" title="漫画页间距">
+          <Segmented
+            label="漫画页间距"
+            onChange={(comicGap) => onChange({ comicGap })}
+            options={[
+              { value: 0, label: "无" },
+              { value: 8, label: "窄" },
+              { value: 24, label: "宽" }
+            ]}
+            value={preferences.comicGap}
+          />
+        </SettingRow>
+        <SettingRow description="缩略图条上方的细长拖动条：拖动或悬停即可预览文件夹里任意位置的图片，松开后打开。图片很多时只加载拖动条像素能覆盖到的图片。" title="快速浏览拖动条">
+          <Switch checked={preferences.showScrubBar} label="快速浏览拖动条" onChange={(showScrubBar) => onChange({ showScrubBar })} />
+        </SettingRow>
         <SettingRow description="比较同一构图的多张照片时很有用。" title="切换图片时保持缩放与旋转">
           <Switch checked={preferences.keepTransform} label="切换图片时保持缩放与旋转" onChange={(keepTransform) => onChange({ keepTransform })} />
         </SettingRow>
@@ -291,6 +309,7 @@ export function ViewerSettingsForm({ preferences, onChange, showSystem = true, s
       {showSystem ? (
         <Section icon={<icons.Settings aria-hidden="true" size={14} />} id="system" title="系统">
           <AssociationControls />
+          <ExplorerThumbnailControls />
         </Section>
       ) : null}
     </div>

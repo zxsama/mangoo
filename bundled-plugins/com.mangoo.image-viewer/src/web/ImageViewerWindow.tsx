@@ -43,6 +43,8 @@ import { FrameInspector } from "./FrameInspector.tsx";
 import { useAnimationFrames } from "./useAnimationFrames.ts";
 import { useProximityChrome } from "./useProximityChrome.ts";
 import { Filmstrip } from "./Filmstrip.tsx";
+import { ComicView, comicScrollBy } from "./ComicView.tsx";
+import { ScrubBar } from "./ScrubBar.tsx";
 import { InfoPanel } from "./InfoPanel.tsx";
 import { viewerBridge } from "./bridge.ts";
 import { ViewerImageCache, encodePng, holdThumbnails, viewerViewportLongPx, type LoadedImage, type RawSource } from "./imageSource.ts";
@@ -63,6 +65,8 @@ const ANIMATION_MS: Record<Exclude<StageAnimation, "none">, number> = { ease: 20
 /** Height reserved by the titlebar when it is pinned (px). */
 const TITLEBAR_HEIGHT = 40;
 const FILMSTRIP_HEIGHT = 92;
+/** Filmstrip pane height with the scrub bar row on top. */
+const FILMSTRIP_WITH_SCRUB_HEIGHT = 114;
 const TOOLBAR_CLEARANCE = 64;
 
 const ZOOM_PRESETS = [0.25, 0.5, 1, 2, 4];
@@ -139,6 +143,9 @@ export function ImageViewerWindow() {
   const [framesOpen, setFramesOpen] = useState(false);
   /** Single-channel view (null = normal RGBA). */
   const [channel, setChannel] = useState<ViewerChannel | null>(null);
+  /** Comic mode: scroll a picture to the top (← →, filmstrip, scrub bar). */
+  const [comicJump, setComicJump] = useState<{ index: number; token: number } | null>(null);
+  const comicJumpToken = useRef(0);
   /** Camera RAW: developed sensor data or the camera's embedded JPEG. */
   const [rawSource, setRawSource] = useState<RawSource>("developed");
   const isRaw = Boolean(current?.cameraRaw);
@@ -264,6 +271,24 @@ export function ImageViewerWindow() {
     }, 1550);
     return () => window.clearTimeout(timer);
   }, [imageLoading, navigate]);
+
+  const comic = preferences.comicMode && state.entries.length > 0;
+  /** Comic mode jumps by scrolling the strip; single-picture mode switches. */
+  const goToIndex = useCallback((target: number) => {
+    if (preferences.comicMode) {
+      comicJumpToken.current += 1;
+      setComicJump({ index: target, token: comicJumpToken.current });
+    }
+    session.goTo(target);
+  }, [preferences.comicMode, session]);
+  const toggleComic = useCallback(() => {
+    const next = !preferences.comicMode;
+    setPreferences({ comicMode: next });
+    if (next) {
+      comicJumpToken.current += 1;
+      setComicJump({ index: state.index, token: comicJumpToken.current });
+    }
+  }, [preferences.comicMode, setPreferences, state.index]);
 
   /** Short readouts (zoom level, rotation) use the same notice, briefly. */
   const flashHud = useCallback((message: string) => showToast(message, undefined, 1100), [showToast]);
@@ -775,7 +800,26 @@ export function ImageViewerWindow() {
       const zoomedIn = Boolean(imageSize) && transform.scale > fitScale(imageSize ?? { width: 1, height: 1 }, viewport, transform.rotation, "fit", preferences.upscaleSmall) + 1e-3;
       const key = event.key;
       let handled = true;
-      if (key === "Escape") {
+      const comicKey = comic && !event.altKey && !event.metaKey;
+      if (comicKey && (key === "ArrowLeft" || key === "ArrowRight" || ((key === "PageUp" || key === "PageDown") && event.shiftKey))) {
+        // ← → / Shift+PgUp PgDn: previous / next picture's top.
+        const delta = key === "ArrowLeft" || key === "PageUp" ? -1 : 1;
+        goToIndex(Math.min(state.entries.length - 1, Math.max(0, state.index + delta)));
+      } else if (comicKey && (key === "PageDown" || key === " ") && !event.ctrlKey) {
+        comicScrollBy(document.querySelector(".iv-comic"), event.shiftKey ? -0.9 : 0.9);
+      } else if (comicKey && key === "PageUp" && !event.ctrlKey) {
+        comicScrollBy(document.querySelector(".iv-comic"), -0.9);
+      } else if (comicKey && (key === "ArrowDown" || key === "ArrowUp") && !event.ctrlKey && !event.shiftKey) {
+        comicScrollBy(document.querySelector(".iv-comic"), key === "ArrowDown" ? 0.25 : -0.25);
+      } else if (comicKey && (key === "Home" || key === "End") && !event.ctrlKey) {
+        goToIndex(key === "Home" ? 0 : state.entries.length - 1);
+      } else if (comicKey && (key === "=" || key === "+" || key === "-" || key === "0") && !event.ctrlKey) {
+        const next = key === "0" ? 1 : Math.min(3, Math.max(0.2, preferences.comicZoom * (key === "-" ? 1 / 1.15 : 1.15)));
+        setPreferences({ comicZoom: next });
+        flashHud(`宽度 ${Math.round(next * 100)}%`);
+      } else if (key === "Escape" && comic && !fullscreen && !slideshow) {
+        toggleComic();
+      } else if (key === "Escape") {
         if (slideshow) setSlideshow(false);
         else if (fullscreen) void toggleFullscreen();
         else if (framesOpen) toggleFrames(false);
@@ -806,6 +850,7 @@ export function ImageViewerWindow() {
           case "slideshow": setSlideshow((value) => !value); break;
           case "toggleInfo": setPreferences({ showInfo: !preferences.showInfo }); break;
           case "toggleFilmstrip": setPreferences({ showFilmstrip: !preferences.showFilmstrip }); break;
+          case "toggleComic": toggleComic(); break;
           case "toggleTitlebarPin": setPreferences({ titlebarPinned: !preferences.titlebarPinned }); break;
           case "playPause":
             // First press freezes native playback on the frame being shown.
@@ -844,7 +889,7 @@ export function ImageViewerWindow() {
   }, [
     animation, bindings, framesOpen, isAnimated, toggleFrames,
     copyImage, copyPath, flip, fullscreen, imageSize, noteActivity, openFiles, openSettings, overlaysOpen, pan, preferences,
-    isRaw, showChannel, showToast, toggleRawSource,
+    isRaw, showChannel, showToast, toggleRawSource, comic, goToIndex, toggleComic, flashHud,
     requestDelete, requestRename, rotateBy, session, setFit, setPreferences, slideshow, state.entries.length,
     toggleFullscreen, transform.rotation, transform.scale, viewport, zoomStep, zoomTo
   ]);
@@ -947,6 +992,7 @@ export function ImageViewerWindow() {
     { id: "flip-x", label: "水平翻转", icon: <icons.FlipHorizontal size={14} />, shortcut: keyOf("flipHorizontal"), disabled: !hasImage, checked: transform.flipX, onSelect: () => flip("x") },
     { id: "flip-y", label: "垂直翻转", icon: <icons.FlipVertical size={14} />, shortcut: keyOf("flipVertical"), disabled: !hasImage, checked: transform.flipY, onSelect: () => flip("y") },
     ...(isAnimated ? [{ id: "frames", label: "逐帧查看动图", icon: <icons.FilmReel size={14} />, shortcut: keyOf("nextFrame"), checked: framesOpen, onSelect: () => toggleFrames() }] : []),
+    { id: "comic", label: "漫画（条漫）模式", icon: <icons.ScrollText size={14} />, shortcut: keyOf("toggleComic"), checked: comic, disabled: state.entries.length < 1, onSelect: toggleComic },
     { id: "info", label: "图片信息", icon: <icons.Info size={14} />, shortcut: keyOf("toggleInfo"), checked: preferences.showInfo, onSelect: () => setPreferences({ showInfo: !preferences.showInfo }) },
     ...(isRaw ? [{ id: "raw-source", label: effectiveRawSource === "embedded" ? "显示 RAW 原图" : "显示内嵌 JPEG 预览", icon: <icons.Camera size={14} />, shortcut: keyOf("toggleRawSource"), onSelect: toggleRawSource }] : []),
     { id: "channels", label: channel ? `通道：${{ red: "R", green: "G", blue: "B", alpha: "A" }[channel]}` : "查看通道", icon: <icons.Layers size={14} />, disabled: !image, submenu: channelItems },
@@ -1042,6 +1088,7 @@ export function ImageViewerWindow() {
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
     if (drag.started) void windowControls?.endDrag();
   };
+  const filmstripHeight = preferences.showScrubBar ? FILMSTRIP_WITH_SCRUB_HEIGHT : FILMSTRIP_HEIGHT;
   const filmstripShown = preferences.showFilmstrip && state.entries.length > 1 && !slideshow && !(fullscreen && !chromeVisible);
   // Panels float over the window and step down below the titlebar while it is
   // shown (pinned or revealed), so its controls are never covered; a panel
@@ -1049,8 +1096,8 @@ export function ImageViewerWindow() {
   const chromeTopShown = chrome.shown("top");
   const panelInsets = useMemo(() => ({
     top: !immersive && (preferences.titlebarPinned || chromeTopShown) ? TITLEBAR_HEIGHT : 0,
-    bottom: filmstripShown ? FILMSTRIP_HEIGHT : 0
-  }), [immersive, filmstripShown, preferences.titlebarPinned, chromeTopShown]);
+    bottom: filmstripShown ? filmstripHeight : 0
+  }), [immersive, filmstripShown, filmstripHeight, preferences.titlebarPinned, chromeTopShown]);
   // The centred toolbar is the only thing panels avoid at the bottom edge.
   const [toolbarSpan, setToolbarSpan] = useState<{ left: number; right: number } | null>(null);
   useLayoutEffect(() => {
@@ -1183,7 +1230,26 @@ export function ImageViewerWindow() {
         </LiquidGlassSurface>
 
         <div className="iv-body">
-          <div className="iv-main">
+          <div className="iv-main" data-comic={comic ? "true" : "false"}>
+            {comic ? (
+              <ComicView
+                animatedExtensions={animatedExtensions}
+                background={preferences.background === "black" ? "#000" : preferences.background === "light" ? "#e9ecef" : preferences.background === "dark" ? "#15181b" : "transparent"}
+                cache={cache}
+                entries={state.entries}
+                gap={preferences.comicGap}
+                index={state.index}
+                jump={comicJump}
+                rawSource={rawSource}
+                onActivity={noteActivity}
+                onCurrentChange={session.goTo}
+                onZoom={(comicZoom) => {
+                  setPreferences({ comicZoom });
+                  flashHud(`宽度 ${Math.round(comicZoom * 100)}%`);
+                }}
+                zoom={preferences.comicZoom}
+              />
+            ) : null}
             <ViewerStage
               animate={animate}
               background={preferences.background}
@@ -1213,7 +1279,7 @@ export function ImageViewerWindow() {
               zoomedIn={Boolean(imageSize) && zoomState === "custom" && transform.scale > fitScale(imageSize ?? { width: 1, height: 1 }, viewport, transform.rotation, "fit", preferences.upscaleSmall) + 1e-3}
             />
 
-            {state.entries.length > 1 ? (
+            {state.entries.length > 1 && !comic ? (
               <>
                 <button aria-label="上一张" className="iv-nav-zone iv-nav-prev no-drag" data-pointer-glow="off" onClick={() => navigate(-1)} title="上一张（←）" type="button">
                   <icons.ChevronLeft aria-hidden="true" size={40} weight="light" />
@@ -1264,7 +1330,10 @@ export function ImageViewerWindow() {
                 {zoomState === "fit" ? <span className="iv-one-to-one" aria-hidden="true">1:1</span> : <icons.Minimize2 aria-hidden="true" size={14} />}
               </IconButton>
               <span className="iv-toolbar-divider" />
-              <IconButton disabled={!image} label="向右旋转" onClick={() => rotateBy(1)} shortcut={keyOf("rotateRight")}>
+              <IconButton active={comic} disabled={state.entries.length < 1} label={comic ? "退出漫画模式" : "漫画（条漫）模式"} onClick={toggleComic} shortcut={keyOf("toggleComic")}>
+                <icons.ScrollText aria-hidden="true" size={15} />
+              </IconButton>
+              <IconButton disabled={!image || comic} label="向右旋转" onClick={() => rotateBy(1)} shortcut={keyOf("rotateRight")}>
                 <icons.RotateCw aria-hidden="true" size={15} />
               </IconButton>
               {isRaw ? (
@@ -1314,11 +1383,12 @@ export function ImageViewerWindow() {
         </div>
 
         {preferences.showFilmstrip && state.entries.length > 1 && !slideshow ? (
-          <LiquidGlassSurface as="div" className="iv-filmstrip-pane" tone="chrome">
-            <Filmstrip entries={state.entries} index={state.index} onSelect={session.goTo} />
+          <LiquidGlassSurface as="div" className="iv-filmstrip-pane" data-scrub={preferences.showScrubBar ? "true" : "false"} tone="chrome">
+            {preferences.showScrubBar ? <ScrubBar entries={state.entries} index={state.index} onSelect={goToIndex} /> : null}
+            <Filmstrip entries={state.entries} index={state.index} onSelect={goToIndex} />
           </LiquidGlassSurface>
         ) : null}
-        <div className="iv-float-layer" style={{ bottom: filmstripShown ? FILMSTRIP_HEIGHT : 0 }}>
+        <div className="iv-float-layer" style={{ bottom: filmstripShown ? filmstripHeight : 0 }}>
         {preferences.showInfo && !slideshow ? (
           <FloatingPanel
             defaultCorner="top-left"

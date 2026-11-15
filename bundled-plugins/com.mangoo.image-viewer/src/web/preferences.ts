@@ -37,6 +37,14 @@ export interface ViewerPreferences {
   channelPremultiply: boolean;
   /** Show a camera RAW and its same-name JPEG as one picture. */
   pairRawJpeg: boolean;
+  /** Comic / webtoon reading: the folder as one vertical strip. */
+  comicMode: boolean;
+  /** Comic column width relative to the window (1 = fill). */
+  comicZoom: number;
+  /** Space between comic pages, px. */
+  comicGap: number;
+  /** Show the folder scrub bar above the filmstrip. */
+  showScrubBar: boolean;
   shortcuts: ShortcutOverrides;
 }
 
@@ -61,6 +69,10 @@ export const DEFAULT_VIEWER_PREFERENCES: ViewerPreferences = {
   downscaleInterpolation: "smooth",
   channelPremultiply: false,
   pairRawJpeg: true,
+  comicMode: false,
+  comicZoom: 1,
+  comicGap: 0,
+  showScrubBar: true,
   shortcuts: {}
 };
 
@@ -109,6 +121,10 @@ export function normalizeViewerPreferences(value: unknown): ViewerPreferences {
     downscaleInterpolation: oneOf(raw.downscaleInterpolation, ["smooth", "nearest"] as const, d.downscaleInterpolation),
     channelPremultiply: bool("channelPremultiply"),
     pairRawJpeg: bool("pairRawJpeg"),
+    comicMode: bool("comicMode"),
+    comicZoom: Number.isFinite(Number(raw.comicZoom)) ? Math.min(3, Math.max(0.2, Number(raw.comicZoom))) : d.comicZoom,
+    comicGap: [0, 8, 24].includes(Number(raw.comicGap)) ? Number(raw.comicGap) : d.comicGap,
+    showScrubBar: bool("showScrubBar"),
     shortcuts: normalizeOverrides(raw.shortcuts)
   };
 }

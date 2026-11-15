@@ -148,6 +148,71 @@ pub fn fit_curve(developed: &RgbImage, reference: &RgbImage) -> Option<ToneCurve
     }))
 }
 
+/// Per-channel gains that bring the developed frame's colour balance to the
+/// camera's own JPEG (same framing already checked). rawler's white balance
+/// is wrong for some bodies (X-Trans RAF developed visibly green), and the
+/// embedded JPEG carries the camera's as-shot balance. Measured on mid-tone
+/// pixels of both small copies (no clipped highlights, no noise floor), as
+/// R/G and B/G ratios so overall brightness is left to the tone curve.
+/// `[1, 1, 1]` when the balance already agrees within 3%.
+pub fn fit_white_balance(developed: &RgbImage, reference: &RgbImage) -> [f32; 3] {
+    let mut dev = [0f64; 3];
+    let mut reference_sum = [0f64; 3];
+    let mut used = 0u32;
+    for (a, b) in developed.pixels().zip(reference.pixels()) {
+        let mid = |p: &image::Rgb<u8>| p.0.iter().all(|&v| (16..=235).contains(&v));
+        if !mid(a) || !mid(b) {
+            continue;
+        }
+        for c in 0..3 {
+            dev[c] += a[c] as f64;
+            reference_sum[c] += b[c] as f64;
+        }
+        used += 1;
+    }
+    if used < 200 || dev.iter().any(|&v| v <= 0.0) || reference_sum.iter().any(|&v| v <= 0.0) {
+        return [1.0, 1.0, 1.0];
+    }
+    let ratio = |c: usize| ((reference_sum[c] / reference_sum[1]) / (dev[c] / dev[1])) as f32;
+    let (red, blue) = (ratio(0).clamp(0.5, 2.0), ratio(2).clamp(0.5, 2.0));
+    if (red - 1.0).abs() < 0.03 && (blue - 1.0).abs() < 0.03 {
+        return [1.0, 1.0, 1.0];
+    }
+    // Keep luma: scale all three so the Rec.709 weighted sum is unchanged.
+    let luma = 0.2126 * red + 0.7152 + 0.0722 * blue;
+    [red / luma, 1.0 / luma, blue / luma]
+}
+
+/// Apply WB gains, rolling them off to neutral near the clip point: a
+/// clipped highlight carries no colour information, so (1, 1, 1) must stay
+/// white instead of turning the gain ratio's tint (pink skies, magenta
+/// speculars).
+pub fn white_balanced(rgb: [f32; 3], gains: [f32; 3]) -> [f32; 3] {
+    if gains == [1.0, 1.0, 1.0] {
+        return rgb;
+    }
+    let peak = rgb[0].max(rgb[1]).max(rgb[2]);
+    // Full gains below 85% of full scale, neutral (equal) at the clip.
+    let blend = ((peak - 0.85) / 0.15).clamp(0.0, 1.0);
+    let mean = (gains[0] + gains[1] + gains[2]) / 3.0;
+    let mut out = [0f32; 3];
+    for c in 0..3 {
+        let gain = gains[c] + (mean - gains[c]) * blend;
+        out[c] = rgb[c] * gain;
+    }
+    out
+}
+
+fn balanced(image: &RgbImage, gains: [f32; 3]) -> RgbImage {
+    let mut out = image.clone();
+    for pixel in out.pixels_mut() {
+        for c in 0..3 {
+            pixel[c] = (pixel[c] as f32 * gains[c]).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
 /// Mean chroma (max-min over max), ignoring near-black.
 fn mean_saturation(image: &RgbImage) -> f32 {
     let (mut total, mut count) = (0.0f32, 0u32);
@@ -279,10 +344,21 @@ pub fn finish_at(
         if !same_picture(&dev_small, &ref_small, dev_aspect, ref_aspect) {
             return None;
         }
-        fit_curve(&dev_small, &ref_small).map(|curve| (curve, ref_small))
+        // A monochrome / sepia film simulation carries no colour balance.
+        let gains = if mean_saturation(&ref_small) > 0.06 {
+            fit_white_balance(&dev_small, &ref_small)
+        } else {
+            [1.0, 1.0, 1.0]
+        };
+        let dev_balanced = balanced(&dev_small, gains);
+        fit_curve(&dev_balanced, &ref_small).map(|curve| (curve, ref_small, gains, dev_balanced))
     });
+    let gains = fitted
+        .as_ref()
+        .map(|(_, _, gains, _)| *gains)
+        .unwrap_or([1.0, 1.0, 1.0]);
     let (curve, saturation) = match fitted {
-        Some((curve, ref_small)) => {
+        Some((curve, ref_small, _, dev_small)) => {
             // Saturation factor measured on the small copies after toning.
             let mut toned = dev_small;
             for pixel in toned.pixels_mut() {
@@ -310,11 +386,14 @@ pub fn finish_at(
             .for_each(|(out_row, in_row)| {
                 for (out_px, in_px) in out_row.chunks_exact_mut(3).zip(in_row.chunks_exact(3)) {
                     let toned = tone_pixel(
-                        [
-                            in_px[0] as f32 * scale,
-                            in_px[1] as f32 * scale,
-                            in_px[2] as f32 * scale,
-                        ],
+                        white_balanced(
+                            [
+                                in_px[0] as f32 * scale,
+                                in_px[1] as f32 * scale,
+                                in_px[2] as f32 * scale,
+                            ],
+                            gains,
+                        ),
                         &curve,
                         saturation,
                     );
@@ -413,6 +492,34 @@ mod tests {
             "{} vs {}",
             edge(&crisp),
             edge(&soft)
+        );
+    }
+
+    #[test]
+    fn white_balance_is_matched_to_the_camera_jpeg() {
+        let reference = RgbImage::from_fn(64, 48, |x, y| {
+            let v = (40 + x * 2 + y) as u8;
+            image::Rgb([v, v, v])
+        });
+        // Same picture with a green cast: R and B at ~65%.
+        let developed = RgbImage::from_fn(64, 48, |x, y| {
+            let v = (40 + x * 2 + y) as f32;
+            image::Rgb([(v * 0.65) as u8, v as u8, (v * 0.62) as u8])
+        });
+        let gains = fit_white_balance(&developed, &reference);
+        let fixed = balanced(&developed, gains);
+        let p = fixed.get_pixel(30, 20);
+        assert!(
+            (p[0] as i32 - p[1] as i32).abs() <= 3 && (p[2] as i32 - p[1] as i32).abs() <= 3,
+            "{p:?}"
+        );
+        // Already balanced: untouched.
+        assert_eq!(fit_white_balance(&reference, &reference), [1.0, 1.0, 1.0]);
+        // A clipped white stays neutral whatever the gains.
+        let white = white_balanced([1.0, 1.0, 1.0], gains);
+        assert!(
+            (white[0] - white[1]).abs() < 1e-4 && (white[2] - white[1]).abs() < 1e-4,
+            "{white:?}"
         );
     }
 }

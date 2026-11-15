@@ -21,6 +21,14 @@ export function viewerBridge(): ImageViewerDesktopBridge | null {
 /** Association bridge: the viewer window itself, or a privileged Host window. */
 export type ImageViewerAssociationBridge = Pick<ImageViewerHostWindowBridge, "associationStatus" | "setAssociation" | "openDefaultAppsSettings">;
 
+/** Explorer thumbnails: the viewer window or the settings window only. */
+export type ImageViewerExplorerBridge = Pick<ImageViewerSettingsBridge, "explorerThumbnailStatus" | "setExplorerThumbnails">;
+
+export function explorerThumbnailBridge(): ImageViewerExplorerBridge | null {
+  const bridge = getDesktopBridge() as ViewerBridgeHost | null;
+  return bridge?.imageViewerSettings ?? bridge?.imageViewer ?? null;
+}
+
 export function viewerHostBridge(): ImageViewerAssociationBridge | null {
   const bridge = getDesktopBridge() as ViewerBridgeHost | null;
   return bridge?.imageViewerHost ?? bridge?.imageViewer ?? bridge?.imageViewerSettings ?? null;

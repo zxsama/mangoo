@@ -56,6 +56,10 @@ export const IMAGE_VIEWER_CHANNELS = {
   setAssociation: "mangoo:image-viewer:set-association",
   /** viewer / plugins / settings -> main (invoke): OS default-apps settings. */
   openDefaultAppsSettings: "mangoo:image-viewer:open-default-apps-settings",
+  /** viewer / settings -> main (invoke): File Explorer thumbnail provider status. */
+  explorerThumbnailStatus: "mangoo:image-viewer:explorer-thumbnail-status",
+  /** viewer / settings -> main (invoke): register / unregister the provider. */
+  setExplorerThumbnails: "mangoo:image-viewer:set-explorer-thumbnails",
   /** main / plugins -> main (invoke): open files in the viewer (Library "open with"). */
   openFiles: "mangoo:image-viewer:open-files",
   /** viewer -> main (invoke): open (or focus) the settings window at a section. */
@@ -98,6 +102,18 @@ export interface ImageViewerAssociationStatus {
   extensions: string[];
 }
 
+/** "Show thumbnails in File Explorer" (Windows). */
+export interface ImageViewerExplorerThumbnailStatus {
+  /** This build can register the provider on this OS. */
+  supported: boolean;
+  registered: boolean;
+  pluginEnabled: boolean;
+  /** Human readable explanation (Chinese UI copy). */
+  detail: string;
+  /** Extensions the provider covers (upper-case display is the UI's job). */
+  extensions: string[];
+}
+
 export interface ImageViewerActionResult {
   ok: boolean;
   error?: string;
@@ -127,6 +143,8 @@ export interface ImageViewerDesktopBridge {
   associationStatus(): Promise<ImageViewerAssociationStatus>;
   setAssociation(enabled: boolean): Promise<ImageViewerAssociationStatus>;
   openDefaultAppsSettings(): Promise<boolean>;
+  explorerThumbnailStatus(): Promise<ImageViewerExplorerThumbnailStatus>;
+  setExplorerThumbnails(enabled: boolean): Promise<ImageViewerExplorerThumbnailStatus>;
   openSettings(section?: ImageViewerSettingsSection): Promise<boolean>;
 }
 
@@ -135,6 +153,8 @@ export interface ImageViewerSettingsBridge {
   associationStatus(): Promise<ImageViewerAssociationStatus>;
   setAssociation(enabled: boolean): Promise<ImageViewerAssociationStatus>;
   openDefaultAppsSettings(): Promise<boolean>;
+  explorerThumbnailStatus(): Promise<ImageViewerExplorerThumbnailStatus>;
+  setExplorerThumbnails(enabled: boolean): Promise<ImageViewerExplorerThumbnailStatus>;
   onSettingsSection(callback: (section: ImageViewerSettingsSection) => void): () => void;
 }
 

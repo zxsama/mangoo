@@ -17,6 +17,13 @@ import {
   unregisterAssociations,
   type AssociationEnvironment
 } from "./fileAssociations.ts";
+import {
+  EXPLORER_THUMBNAIL_EXTENSIONS,
+  explorerThumbnailState,
+  registerExplorerThumbnails,
+  unregisterExplorerThumbnails,
+  type ExplorerThumbnailEnvironment
+} from "./explorerThumbnails.ts";
 import { extractOpenPaths } from "./launchArgs.ts";
 import { extensionOf, splitPath } from "../shared/formats.ts";
 import {
@@ -33,6 +40,7 @@ import {
   parsePathList,
   type ImageViewerActionResult,
   type ImageViewerAssociationStatus,
+  type ImageViewerExplorerThumbnailStatus,
   type ImageViewerOpenRequest
 } from "../shared/ipc.ts";
 import { validateFileName } from "../shared/navigation.ts";
@@ -51,6 +59,8 @@ export interface ImageViewerHostOptions {
   windowIconPath: string | null;
   /** PNG used by the Linux desktop entry. */
   associationIconPath: string | null;
+  /** The File Explorer thumbnail provider DLL (Windows), or null when not shipped. */
+  explorerThumbnailDllPath: string | null;
   /** Healthy Core session (starts Core when needed). */
   ensureCoreSession(): Promise<ImageViewerCoreSession>;
   /** URL of the shared web bundle for `route` under `session`. */
@@ -452,6 +462,69 @@ export function createImageViewerHost(electron: ElectronModule, options: ImageVi
     }
   }
 
+  // ------------------------------------------------- explorer thumbnails
+
+  const explorerEnvironment = (): ExplorerThumbnailEnvironment => ({
+    dllPath: options.explorerThumbnailDllPath,
+    tempDir: os.tmpdir(),
+    run
+  });
+
+  /** Registry writes happen only in installed builds (or when dev opts in). */
+  function explorerThumbnailsWritable(): boolean {
+    return process.platform === "win32"
+      && (app.isPackaged || process.env.MANGOO_IMAGE_VIEWER_DEV_ASSOCIATION === "1")
+      && Boolean(options.explorerThumbnailDllPath && fs.existsSync(options.explorerThumbnailDllPath));
+  }
+
+  async function explorerThumbnailStatus(): Promise<ImageViewerExplorerThumbnailStatus> {
+    const supported = explorerThumbnailsWritable();
+    const state = process.platform === "win32" ? await explorerThumbnailState(explorerEnvironment()).catch(() => ({ registered: false, stale: false })) : { registered: false, stale: false };
+    let detail: string;
+    if (process.platform !== "win32") {
+      detail = "仅 Windows 支持在文件资源管理器中显示缩略图。";
+    } else if (!app.isPackaged && process.env.MANGOO_IMAGE_VIEWER_DEV_ASSOCIATION !== "1") {
+      detail = "开发版不会修改系统设置，安装正式版后即可开启。";
+    } else if (!supported) {
+      detail = "缺少缩略图组件，请重新安装 Mangoo。";
+    } else if (!enabled) {
+      detail = "启用看图插件后即可设置。";
+    } else if (state.registered) {
+      detail = "文件资源管理器会为相机 RAW、PSD 和 WebP 显示缩略图。已打开的窗口可能需要刷新 (F5)。";
+    } else {
+      detail = "为 Windows 自身不显示缩略图的相机 RAW、PSD 和 WebP 生成缩略图。JPEG、PNG 等仍由 Windows 显示。";
+    }
+    return {
+      supported,
+      registered: state.registered,
+      pluginEnabled: enabled,
+      detail,
+      extensions: [...EXPLORER_THUMBNAIL_EXTENSIONS]
+    };
+  }
+
+  async function applyExplorerThumbnails(wanted: boolean): Promise<void> {
+    if (!explorerThumbnailsWritable()) return;
+    const env = explorerEnvironment();
+    if (wanted && enabled) {
+      const replaced = await registerExplorerThumbnails(env);
+      store.update((state) => {
+        state.explorerThumbnailsDll = env.dllPath;
+        // Keep the FIRST record: re-registering (moved install) must not
+        // forget what was there before Mangoo ever registered.
+        state.explorerThumbnailsReplaced = { ...replaced, ...state.explorerThumbnailsReplaced };
+      });
+      options.log("info", "explorer thumbnail provider registered");
+    } else if (store.get().explorerThumbnailsDll || (await explorerThumbnailState(env)).registered) {
+      await unregisterExplorerThumbnails(env, store.get().explorerThumbnailsReplaced);
+      store.update((state) => {
+        state.explorerThumbnailsDll = null;
+        state.explorerThumbnailsReplaced = {};
+      });
+      options.log("info", "explorer thumbnail provider removed");
+    }
+  }
+
   // ---------------------------------------------------------- reconciliation
 
   async function reconcile(): Promise<void> {
@@ -467,6 +540,11 @@ export function createImageViewerHost(electron: ElectronModule, options: ImageVi
         ? recorded.extensions.join(",") !== [...formats].sort().join(",") || recorded.executable !== associationEnvironment().executable
         : true;
       if (wanted && formatsChanged) await applyAssociation(true).catch((error) => options.log("warn", "image viewer association failed", { error: String(error) }));
+      // Re-register when wanted but not (or no longer, e.g. moved install) in place.
+      const thumbs = store.get();
+      if (thumbs.explorerThumbnailsWanted && thumbs.explorerThumbnailsDll !== options.explorerThumbnailDllPath) {
+        await applyExplorerThumbnails(true).catch((error) => options.log("warn", "explorer thumbnail registration failed", { error: String(error) }));
+      }
       const queued = pendingMacOpenFiles.splice(0);
       if (queued.length && started) await openInViewer(queued);
     } else {
@@ -474,6 +552,9 @@ export function createImageViewerHost(electron: ElectronModule, options: ImageVi
       if (changed || viewerWindow) closeViewer();
       if (store.get().registration) {
         await applyAssociation(false).catch((error) => options.log("warn", "image viewer association removal failed", { error: String(error) }));
+      }
+      if (store.get().explorerThumbnailsDll) {
+        await applyExplorerThumbnails(false).catch((error) => options.log("warn", "explorer thumbnail removal failed", { error: String(error) }));
       }
     }
   }
@@ -739,6 +820,23 @@ export function createImageViewerHost(electron: ElectronModule, options: ImageVi
     if (!target) return false;
     await shell.openExternal(target);
     return true;
+  });
+
+  handle(IMAGE_VIEWER_CHANNELS.explorerThumbnailStatus, "viewer-or-host", () => explorerThumbnailStatus());
+
+  handle(IMAGE_VIEWER_CHANNELS.setExplorerThumbnails, "viewer-or-host", async (_event, value) => {
+    const wanted = value === true;
+    store.update((state) => {
+      state.explorerThumbnailsWanted = wanted;
+    });
+    try {
+      await applyExplorerThumbnails(wanted);
+    } catch (error) {
+      options.log("warn", "explorer thumbnail change failed", { error: String(error) });
+      const status = await explorerThumbnailStatus();
+      return { ...status, detail: `更新系统缩略图失败：${error instanceof Error ? error.message : String(error)}` };
+    }
+    return explorerThumbnailStatus();
   });
 
   handle(IMAGE_VIEWER_CHANNELS.openSettings, "viewer", (_event, section) =>

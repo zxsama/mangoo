@@ -26,6 +26,7 @@ function assertFile(filePath, label) {
 
 assertFile(path.join(root, "apps", "web", "dist", "index.html"), "web build");
 assertFile(path.join(root, "target", "release", "mangoo-core.exe"), "release Core");
+assertFile(path.join(root, "target", "release", "mangoo_explorer_thumbnails.dll"), "Explorer thumbnail provider");
 const bundledRoot = path.join(root, "target", "release", "bundled-plugins");
 const inventory = readInventory(bundledRoot);
 const generatedTrust = fs.readFileSync(path.join(root, "crates", "core", "src", "plugins", "runtime", "generated_trust.rs"), "utf8");
@@ -102,6 +103,10 @@ await buildElectron({
         to: "core/mangoo-core.exe"
       },
       {
+        from: path.join(root, "target", "release", "mangoo_explorer_thumbnails.dll"),
+        to: "core/mangoo_explorer_thumbnails.dll"
+      },
+      {
         from: path.join(bundledRoot, INVENTORY_FILE),
         to: `core/bundled-plugins/${INVENTORY_FILE}`
       },
@@ -130,7 +135,8 @@ for (const [relativePath, label] of [
   ["resources/app.asar", "packaged application archive"],
   ["resources/icon.png", "packaged window icon"],
   ["resources/web/index.html", "packaged web entry"],
-  ["resources/core/mangoo-core.exe", "packaged Core"]
+  ["resources/core/mangoo-core.exe", "packaged Core"],
+  ["resources/core/mangoo_explorer_thumbnails.dll", "packaged Explorer thumbnail provider"]
 ]) {
   assertFile(path.join(outputDir, "win-unpacked", ...relativePath.split("/")), label);
 }

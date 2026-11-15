@@ -11,7 +11,8 @@ export type ShortcutActionId =
   | "fullscreen" | "slideshow" | "toggleInfo" | "toggleFilmstrip" | "toggleTitlebarPin"
   | "playPause" | "nextFrame" | "previousFrame"
   | "open" | "copyImage" | "copyPath" | "rename" | "delete" | "showShortcuts" | "closeWindow"
-  | "channelRed" | "channelGreen" | "channelBlue" | "channelAlpha" | "channelAll" | "toggleRawSource";
+  | "channelRed" | "channelGreen" | "channelBlue" | "channelAlpha" | "channelAll" | "toggleRawSource"
+  | "toggleComic";
 
 export interface ShortcutAction {
   id: ShortcutActionId;
@@ -47,6 +48,7 @@ export const SHORTCUT_ACTIONS: readonly ShortcutAction[] = [
   { id: "fullscreen", label: "全屏", group: "窗口", defaults: ["F11", "F"] },
   { id: "toggleInfo", label: "显示 / 隐藏图片信息", group: "窗口", defaults: ["I"] },
   { id: "toggleFilmstrip", label: "显示 / 隐藏缩略图条", group: "窗口", defaults: ["T"] },
+  { id: "toggleComic", label: "漫画（条漫）模式", group: "浏览", defaults: ["M"] },
   { id: "toggleTitlebarPin", label: "固定 / 自动隐藏标题栏", group: "窗口", defaults: ["P"] },
   { id: "showShortcuts", label: "查看快捷键", group: "窗口", defaults: ["Shift+/"] },
   { id: "closeWindow", label: "关闭窗口", group: "窗口", defaults: ["Ctrl+W"] },

@@ -206,6 +206,8 @@ const imageViewerBridge = {
   onFullscreenChanged: (cb) => subscribe("mangoo:image-viewer:fullscreen-changed", cb),
   dragOutOfFullscreen: (input) => ipcRenderer.invoke("mangoo:image-viewer:drag-out-of-fullscreen", input),
   setAlwaysOnTop: (value) => ipcRenderer.invoke("mangoo:image-viewer:set-always-on-top", value === true),
+  explorerThumbnailStatus: () => ipcRenderer.invoke("mangoo:image-viewer:explorer-thumbnail-status"),
+  setExplorerThumbnails: (enabled) => ipcRenderer.invoke("mangoo:image-viewer:set-explorer-thumbnails", enabled === true),
   openMainWindow: () => ipcRenderer.invoke("mangoo:image-viewer:open-main-window"),
   openSettings: (section) => ipcRenderer.invoke("mangoo:image-viewer:open-settings", typeof section === "string" ? section : "display")
 };
@@ -215,6 +217,8 @@ const imageViewerSettingsWindowBridge = {
     associationStatus: () => ipcRenderer.invoke("mangoo:image-viewer:association-status"),
     setAssociation: (enabled) => ipcRenderer.invoke("mangoo:image-viewer:set-association", enabled === true),
     openDefaultAppsSettings: () => ipcRenderer.invoke("mangoo:image-viewer:open-default-apps-settings"),
+    explorerThumbnailStatus: () => ipcRenderer.invoke("mangoo:image-viewer:explorer-thumbnail-status"),
+    setExplorerThumbnails: (enabled) => ipcRenderer.invoke("mangoo:image-viewer:set-explorer-thumbnails", enabled === true),
     onSettingsSection: (cb) => subscribe("mangoo:image-viewer:settings-section", cb)
   }
 };
