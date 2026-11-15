@@ -156,6 +156,22 @@ export function ImageViewerWindow() {
   const [zoomState, setZoomState] = useState<ZoomState>(preferences.fitMode);
   const [animate, setAnimate] = useState<StageAnimation>("none");
   const [fullscreen, setFullscreen] = useState(false);
+  /** The OS window is maximized (its floating titlebar drags natively then). */
+  const [maximized, setMaximized] = useState(false);
+  useEffect(() => {
+    const controls = getWindowControls();
+    if (!controls) return;
+    let cancelled = false;
+    const refresh = () => void controls.isMaximized().then((value) => {
+      if (!cancelled) setMaximized(value);
+    });
+    refresh();
+    window.addEventListener("resize", refresh);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("resize", refresh);
+    };
+  }, []);
   const [slideshow, setSlideshow] = useState(false);
   const [chromeVisible, setChromeVisible] = useState(true);
   const [zoomMenuOpen, setZoomMenuOpen] = useState(false);
@@ -533,10 +549,9 @@ export function ImageViewerWindow() {
 
   const toggleFullscreen = useCallback(async () => {
     if (!bridge) return;
-    const result = await bridge.toggleFullscreen();
-    // The leave/enter-full-screen event is authoritative; this only covers a
-    // missed event (e.g. the window was not yet ready).
-    window.setTimeout(() => setFullscreen((current) => (current === result ? current : result)), 400);
+    // The host answers with the settled state; the window events stay
+    // authoritative for every other change.
+    setFullscreen(await bridge.toggleFullscreen());
   }, [bridge]);
 
   const copyImage = useCallback(async () => {
@@ -739,7 +754,9 @@ export function ImageViewerWindow() {
     hideDelay: 450,
     pinned: { top: preferences.titlebarPinned && !immersive },
     hold: overlaysOpen,
-    blockers: { top: ".iv-float", bottom: ".iv-float" }
+    blockers: { top: ".iv-float", bottom: ".iv-float" },
+    // Revealed on a maximized window, the titlebar is a native drag region.
+    nativeRegion: { top: maximized && !fullscreen }
   });
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -951,11 +968,15 @@ export function ImageViewerWindow() {
     if (!contextMenu) setOpenSubmenu(null);
   }, [contextMenu]);
   const windowControls = getWindowControls();
+  /** The OS window covers the whole screen (fullscreen, whatever React thinks). */
+  const windowFillsScreen = () => window.innerWidth >= window.screen.width && window.innerHeight >= window.screen.height;
   const windowDrag = useRef<{ pointerId: number; x: number; y: number; started: boolean } | null>(null);
   const beginWindowDrag = (event: React.PointerEvent<HTMLElement>) => {
     if (event.button !== 0 || !windowControls) return;
-    // A pinned titlebar outside fullscreen is a native OS drag region.
-    if (preferences.titlebarPinned && !fullscreen) return;
+    // A pinned titlebar outside fullscreen, and a revealed one on a
+    // maximized window, are native OS drag regions.
+    if (preferences.titlebarPinned && !fullscreen && !windowFillsScreen()) return;
+    if (maximized && !fullscreen) return;
     if ((event.target as HTMLElement).closest("button, input, a, [data-no-drag]")) return;
     event.currentTarget.setPointerCapture(event.pointerId);
     windowDrag.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, started: false };
@@ -967,14 +988,28 @@ export function ImageViewerWindow() {
       // Like Windows: a press only becomes a drag past a small threshold.
       if (Math.hypot(event.clientX - drag.x, event.clientY - drag.y) < 4) return;
       drag.started = true;
-      if (fullscreen && bridge) {
+      if ((fullscreen || windowFillsScreen()) && bridge) {
         // Fullscreen cannot be dragged: the Desktop host leaves fullscreen
         // AND maximized in one step, restores the normal size centred under
         // the pointer, and arms the move — the same "drag a maximized
         // window" behaviour as the pinned titlebar.
         const ratio = drag.x / Math.max(1, window.innerWidth);
+        const startX = drag.x;
+        const startY = drag.y;
         void bridge.dragOutOfFullscreen({ pointerRatioX: ratio, titlebarOffsetY: Math.min(drag.y, 20) }).then((armed) => {
-          if (!armed) return;
+          if (!armed) {
+            // Not actually fullscreen (a maximized window filling a screen
+            // with no taskbar): the ordinary maximized-window drag applies.
+            if (!windowDrag.current?.started) return;
+            void windowControls.beginDrag({
+              clientX: startX,
+              screenX: event.screenX,
+              screenY: event.screenY,
+              titlebarOffsetY: startY,
+              viewportWidth: window.innerWidth
+            }).then(() => windowControls.moveDrag());
+            return;
+          }
           // Released before the window came out of fullscreen: disarm.
           if (windowDrag.current?.started) void windowControls.moveDrag();
           else void windowControls.endDrag();
@@ -1051,6 +1086,7 @@ export function ImageViewerWindow() {
         data-nav-left={chrome.shown("left") ? "shown" : "hidden"}
         data-nav-right={chrome.shown("right") ? "shown" : "hidden"}
         data-fullscreen={fullscreen ? "true" : "false"}
+        data-maximized={maximized && !fullscreen ? "true" : "false"}
         data-immersive={immersive ? "true" : "false"}
         data-panel-left={leftDocked ? "true" : "false"}
         data-panel-right={rightDocked ? "true" : "false"}
@@ -1228,14 +1264,15 @@ export function ImageViewerWindow() {
                   aria-label={effectiveRawSource === "embedded" ? "正在显示内嵌 JPEG，切换为 RAW 原图" : "正在显示 RAW 原图，切换为内嵌 JPEG"}
                   className="iv-raw-switch no-drag"
                   data-pointer-glow="off"
-                  aria-pressed={effectiveRawSource === "embedded"}
                   onClick={toggleRawSource}
                   title={`RAW 原图 / 相机内嵌 JPEG（${keyOf("toggleRawSource") ?? "J"}）`}
                   tone="control"
                   type="button"
                 >
-                  <span className="iv-raw-option" data-selected={effectiveRawSource === "developed" ? "true" : "false"}>RAW</span>
-                  <span className="iv-raw-option" data-selected={effectiveRawSource === "embedded" ? "true" : "false"}>JPEG</span>
+                  {/* One compact chip naming what is shown; a click switches. */}
+                  <span className="iv-raw-label" data-source={effectiveRawSource}>
+                    {effectiveRawSource === "embedded" ? "JPG" : "RAW"}
+                  </span>
                 </LiquidGlassButton>
               ) : null}
               {isAnimated ? (
@@ -1277,10 +1314,10 @@ export function ImageViewerWindow() {
         {preferences.showInfo && !slideshow ? (
           <FloatingPanel
             defaultCorner="top-left"
-            defaultSize={{ width: 300, height: 460 }}
+            defaultSize={{ width: 344, height: 640 }}
             icon={<icons.Info aria-hidden="true" size={14} />}
             bottomObstacle={bottomObstacle}
-            id="info-v3"
+            id="info-v4"
             onDockChange={(side) => reportDock("info", side)}
             insets={panelInsets}
             onClose={() => setPreferences({ showInfo: false })}

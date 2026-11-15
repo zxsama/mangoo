@@ -13,6 +13,7 @@ pub mod ffmpeg;
 pub mod formats;
 pub mod image_crate;
 pub mod psd;
+pub mod raw_finish;
 pub mod raw_preview;
 pub mod rawler;
 pub mod subprocess;

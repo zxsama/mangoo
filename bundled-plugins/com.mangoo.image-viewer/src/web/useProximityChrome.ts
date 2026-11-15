@@ -27,6 +27,13 @@ export interface ProximityOptions {
   hold: boolean;
   /** Elements that block a zone's reveal while the pointer is over them. */
   blockers?: Partial<Record<ChromeZone, string>>;
+  /**
+   * Zones that turn into a native OS drag region once shown (the titlebar of
+   * a maximized window). Over such a region the page gets a pointerleave and
+   * no further moves, so leaving through it must NOT hide the zone — it stays
+   * until the pointer is seen again in the page, away from it.
+   */
+  nativeRegion?: Partial<Record<ChromeZone, boolean>>;
 }
 
 export function zoneWanted(zone: ChromeZone, x: number, y: number, width: number, height: number, distance: number): boolean {
@@ -94,8 +101,16 @@ export function useProximityChrome(options: ProximityOptions) {
 
   useEffect(() => {
     const onMove = (event: PointerEvent) => evaluate(event.clientX, event.clientY);
-    const onLeave = () => {
-      for (const zone of ["top", "bottom", "left", "right"] as const) setZone(zone, false);
+    const onLeave = (event: PointerEvent) => {
+      const { nativeRegion, anchors } = optionsRef.current;
+      for (const zone of ["top", "bottom", "left", "right"] as const) {
+        if (nativeRegion?.[zone] && visibleRef.current[zone]) {
+          // Entered the zone's drag region (still inside its element): keep it.
+          const box = anchors?.[zone]?.()?.getBoundingClientRect();
+          if (box && event.clientX >= box.left - 2 && event.clientX <= box.right + 2 && event.clientY >= box.top - 2 && event.clientY <= box.bottom + 2) continue;
+        }
+        setZone(zone, false);
+      }
     };
     window.addEventListener("pointermove", onMove, { passive: true });
     document.documentElement.addEventListener("pointerleave", onLeave);

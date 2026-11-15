@@ -542,11 +542,12 @@ async fn builtin_webp_from(
     let ext = image.ext.clone();
     let generated = tokio::task::spawn_blocking(move || {
         let embedded = raw_source == RawSourceChoice::Embedded && formats::is_camera_raw(&ext);
-        let dimensions = if embedded {
-            None
-        } else {
-            probe_dimensions(&path, &ext)
-        };
+        // Both views of a RAW (developed / embedded JPEG) report the SAME
+        // display size — the developed one when known — so switching between
+        // them keeps the picture exactly where it is (the embedded JPEG is
+        // simply drawn into the same box). A tier's own pixel size must
+        // never be reported as the source size.
+        let dimensions = probe_dimensions(&path, &ext);
         let tier = if embedded {
             crate::thumbnails::generate_preview_webp_from(
                 crate::decode::rawler::decode_embedded_preview(&path)?,
@@ -559,7 +560,7 @@ async fn builtin_webp_from(
                 Ok(Some(preview)) => crate::thumbnails::generate_preview_webp_from(preview, max_px),
                 // No embedded preview: develop directly (the registry's
                 // Preview path would scan for a preview a second time).
-                _ => crate::decode::rawler::develop(&path).and_then(|developed| {
+                _ => crate::decode::rawler::develop_for_thumbnail(&path).and_then(|developed| {
                     crate::thumbnails::generate_preview_webp_from(developed, max_px)
                 }),
             }
@@ -567,9 +568,24 @@ async fn builtin_webp_from(
             crate::thumbnails::generate_preview_webp(&path, max_px)
         };
         tier.map(|tier| {
-            // The embedded JPEG's own size is what is shown.
-            let dimensions =
-                dimensions.or(Some((tier.width as u32, tier.height as u32)).filter(|_| embedded));
+            // The embedded JPEG may frame differently (crop modes): only
+            // reuse the developed size when the aspects agree, otherwise fit
+            // its own aspect inside the developed box so it is never
+            // stretched.
+            let dimensions = match (embedded, dimensions) {
+                (true, Some((dw, dh))) if tier.width > 0 && tier.height > 0 => {
+                    let (tw, th) = (tier.width as f64, tier.height as f64);
+                    let (dw64, dh64) = (dw as f64, dh as f64);
+                    if ((tw / th) - (dw64 / dh64)).abs() / (dw64 / dh64) <= 0.01 {
+                        Some((dw, dh))
+                    } else {
+                        let scale = (dw64 / tw).min(dh64 / th);
+                        Some(((tw * scale).round() as u32, (th * scale).round() as u32))
+                    }
+                }
+                (true, None) => Some((tier.width as u32, tier.height as u32)),
+                (_, dimensions) => dimensions,
+            };
             (tier, dimensions)
         })
     })

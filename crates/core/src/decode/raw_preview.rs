@@ -64,7 +64,7 @@ enum Header {
 /// a frame size seen earlier (progressive continuation).
 #[cfg(test)]
 thread_local! {
-    /// Segment hops performed by this thread's scans (complexity tests).
+    // Segment hops performed by this thread's scans (complexity tests).
     static HOPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 

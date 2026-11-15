@@ -34,7 +34,12 @@ impl MediaDecoder for RawlerDecoder {
                 return Ok(preview);
             }
         }
-        match develop(path) {
+        let developed = if request.purpose == DecodePurpose::Thumbnail {
+            develop_for_thumbnail(path)
+        } else {
+            develop(path)
+        };
+        match developed {
             Ok(developed) => Ok(developed),
             // A camera rawler cannot develop (unknown model, Nikon HE NEF,
             // ...) still shows its own embedded rendering rather than nothing.
@@ -62,10 +67,20 @@ fn contained<T>(path: &Path, run: impl FnOnce() -> anyhow::Result<T>) -> anyhow:
 
 /// Develop the sensor data into an sRGB picture, EXIF orientation applied.
 pub fn develop(path: &Path) -> anyhow::Result<DecodedImage> {
-    contained(path, || develop_inner(path))
+    develop_for(path, true)
 }
 
-fn develop_inner(path: &Path) -> anyhow::Result<DecodedImage> {
+/// Develop for a picture that is about to be heavily downscaled (thumbnails):
+/// identical tones, no capture sharpening (it would be averaged away).
+pub fn develop_for_thumbnail(path: &Path) -> anyhow::Result<DecodedImage> {
+    develop_for(path, false)
+}
+
+fn develop_for(path: &Path, sharpen: bool) -> anyhow::Result<DecodedImage> {
+    contained(path, || develop_inner(path, sharpen))
+}
+
+fn develop_inner(path: &Path, sharpen: bool) -> anyhow::Result<DecodedImage> {
     let source =
         RawSource::new(path).with_context(|| format!("open camera RAW {}", path.display()))?;
     let probe = rawler::decode_dummy(&source)
@@ -80,8 +95,55 @@ fn develop_inner(path: &Path) -> anyhow::Result<DecodedImage> {
         .with_context(|| format!("develop camera RAW {}", path.display()))?
         .to_dynamic_image()
         .ok_or_else(|| anyhow::anyhow!("camera RAW produced no image: {}", path.display()))?;
+    drop(raw);
+    // rawler's develop has no tone curve and no sharpening; finish it the way
+    // the camera did (curve fitted to its own embedded JPEG when it frames
+    // the same picture). Both are in sensor orientation here.
+    let reference = reference_preview(&source);
+    let finished = super::raw_finish::finish(developed, reference.as_ref(), sharpen);
+    drop(reference);
     // rawler leaves the developed raster in sensor orientation.
-    Ok(into_decoded(oriented(developed, raw_orientation(path))))
+    Ok(into_decoded(oriented(
+        image::DynamicImage::ImageRgb8(finished),
+        raw_orientation(path),
+    )))
+}
+
+/// The camera's embedded preview, unrotated (sensor orientation), used only
+/// to fit the tone curve. Best effort and isolated: decoded lazily (the
+/// medium preview first, the full-size one only if needed), and a panic in
+/// rawler's preview path (e.g. CR3 box parsing) yields None instead of
+/// failing the develop. Embedded previews are never larger than the sensor,
+/// which already passed the pixel budget; the size check here only rejects
+/// absurd dimensions after the fact.
+fn reference_preview(source: &RawSource) -> Option<image::DynamicImage> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let decoder = rawler::get_decoder(source).ok()?;
+        let params = RawDecodeParams::default();
+        let usable = |image: &image::DynamicImage| {
+            image.width().max(image.height()) >= 640
+                && ensure_decode_pixel_budget(
+                    "raw preview",
+                    image.width() as u64,
+                    image.height() as u64,
+                )
+                .is_ok()
+        };
+        decoder
+            .preview_image(source, &params)
+            .ok()
+            .flatten()
+            .filter(usable)
+            .or_else(|| {
+                decoder
+                    .full_image(source, &params)
+                    .ok()
+                    .flatten()
+                    .filter(usable)
+            })
+    }))
+    .ok()
+    .flatten()
 }
 
 /// The JPEG preview embedded in a camera RAW, orientation applied. `Ok(None)`
@@ -330,6 +392,17 @@ mod tests {
             let developed =
                 develop(&path).unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
             assert!(developed.width > 0 && developed.height > 0);
+            if let Ok(dir) = std::env::var("MANGOO_RAW_DUMP") {
+                let name = path.file_stem().unwrap().to_string_lossy().to_string();
+                image::RgbaImage::from_raw(
+                    developed.width,
+                    developed.height,
+                    developed.rgba.clone(),
+                )
+                .unwrap()
+                .save(format!("{dir}/{name}-developed.png"))
+                .unwrap();
+            }
             let preview = embedded_preview(&path)
                 .unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
             eprintln!(

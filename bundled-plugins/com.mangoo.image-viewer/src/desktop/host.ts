@@ -115,6 +115,8 @@ export function createImageViewerHost(electron: ElectronModule, options: ImageVi
   let formats: string[] = [];
   let viewerWindow: BrowserWindow | null = null;
   let settingsWindow: BrowserWindow | null = null;
+  /** Fullscreen state a window is transitioning to (rapid F11 presses). */
+  const fullscreenTarget = new Map<number, boolean>();
   let viewerReady = false;
   let pendingRequest: ImageViewerOpenRequest | null = null;
   let nextRequestId = 1;
@@ -242,6 +244,11 @@ export function createImageViewerHost(electron: ElectronModule, options: ImageVi
     };
     window.on("enter-full-screen", sendFullscreen);
     window.on("leave-full-screen", sendFullscreen);
+    // Maximize/restore/resize can also change it (and Windows sometimes
+    // reports the transition late): every geometry change re-sends the truth.
+    window.on("resize", sendFullscreen);
+    window.on("maximize", sendFullscreen);
+    window.on("unmaximize", sendFullscreen);
     window.on("close", () => persistWindow());
     window.on("closed", () => {
       clearTimeout(fallback);
@@ -619,11 +626,32 @@ export function createImageViewerHost(electron: ElectronModule, options: ImageVi
     clipboard.writeText(text);
   }));
 
-  handle(IMAGE_VIEWER_CHANNELS.toggleFullscreen, "viewer", (event) => {
+  handle(IMAGE_VIEWER_CHANNELS.toggleFullscreen, "viewer", async (event) => {
     const window = BrowserWindow.fromWebContents(event.sender);
     if (!window) return false;
-    window.setFullScreen(!window.isFullScreen());
-    return window.isFullScreen();
+    // A press during a running transition targets the opposite of where the
+    // window is HEADING, not of the stale current state.
+    const heading = fullscreenTarget.get(window.id);
+    const target = !(heading ?? window.isFullScreen());
+    fullscreenTarget.set(window.id, target);
+    // The transition is asynchronous: answer with the state it SETTLED in,
+    // never the value read right after the call (which is still the old one).
+    await new Promise<void>((resolve) => {
+      const settled = () => {
+        clearTimeout(timer);
+        if (!window.isDestroyed()) {
+          window.removeListener("enter-full-screen", settled);
+          window.removeListener("leave-full-screen", settled);
+        }
+        resolve();
+      };
+      const timer = setTimeout(settled, 900);
+      if (target) window.once("enter-full-screen", settled);
+      else window.once("leave-full-screen", settled);
+      window.setFullScreen(target);
+    });
+    if (fullscreenTarget.get(window.id) === target) fullscreenTarget.delete(window.id);
+    return window.isDestroyed() ? false : window.isFullScreen();
   });
 
   handle(IMAGE_VIEWER_CHANNELS.dragOutOfFullscreen, "viewer", async (event, input) => {
@@ -643,21 +671,36 @@ export function createImageViewerHost(electron: ElectronModule, options: ImageVi
       width: Math.max(520, Math.min(candidate.width, display.width)),
       height: Math.max(360, Math.min(candidate.height, display.height))
     };
-    await new Promise<void>((resolve) => {
-      const done = () => {
-        clearTimeout(timer);
-        window.removeListener("leave-full-screen", done);
-        resolve();
-      };
-      const timer = setTimeout(done, 600);
-      window.once("leave-full-screen", done);
-      window.setFullScreen(false);
-    });
-    if (window.isMaximized()) window.unmaximize();
-    const cursor = screen.getCursorScreenPoint();
-    const x = Math.round(cursor.x - normal.width * ratio);
-    const y = Math.round(cursor.y - offsetY);
-    window.setBounds({ x, y, width: normal.width, height: normal.height });
+    {
+      await new Promise<void>((resolve) => {
+        const done = () => {
+          clearTimeout(timer);
+          if (!window.isDestroyed()) window.removeListener("leave-full-screen", done);
+          resolve();
+        };
+        const timer = setTimeout(done, 600);
+        window.once("leave-full-screen", done);
+        window.setFullScreen(false);
+      });
+    }
+    // Leaving fullscreen, Windows restores the PRE-fullscreen placement
+    // (often maximized) asynchronously, after this handler returns. Undo the
+    // maximize and pin the normal size under the pointer until the OS has
+    // settled, so the restore cannot win and leave a screen-sized window.
+    const place = () => {
+      if (window.isDestroyed()) return;
+      if (window.isMaximized()) window.unmaximize();
+      const cursor = screen.getCursorScreenPoint();
+      const x = Math.round(cursor.x - normal.width * ratio);
+      const y = Math.round(cursor.y - offsetY);
+      window.setBounds({ x, y, width: normal.width, height: normal.height });
+    };
+    place();
+    for (const delay of [40, 80, 120, 200, 320]) {
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      const bounds = window.getBounds();
+      if (window.isMaximized() || Math.abs(bounds.width - normal.width) > 2 || Math.abs(bounds.height - normal.height) > 2) place();
+    }
     // Arm the shared Host window drag (main.ts) relative to the new bounds.
     return options.beginWindowDrag(window);
   });

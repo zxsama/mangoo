@@ -1868,6 +1868,19 @@ html:has(.iv-window) #root,
   -webkit-app-region: no-drag;
 }
 
+/* A REVEALED floating titlebar on a maximized window is a native drag
+ * region. Windows only lets a maximized frameless window be dragged out
+ * through its own caption handling: a pointer-driven restore is re-maximized
+ * while the button is held (measured within ~80 ms). Normal windows keep
+ * pointer-driven dragging, so the bar stays stable under a resting pointer. */
+.iv-window[data-titlebar="revealed"][data-maximized="true"] .iv-titlebar {
+  -webkit-app-region: drag;
+}
+
+.iv-window[data-titlebar="revealed"][data-maximized="true"] .iv-title-actions {
+  -webkit-app-region: no-drag;
+}
+
 
 /* Thin, stable surfaces: no shadow may land on the filmstrip. The toolbar's
  * and the panels' soft shadows used to paint (and be re-blurred) across its
@@ -2622,38 +2635,48 @@ html:has(.iv-settings-window) #root {
   height: 58px;
 }
 
-/* Item 4: RAW / JPEG source switch in the toolbar — a two-option segmented
- * pill; the selected half carries the fill. */
+/* RAW / embedded-JPEG source: one icon-sized chip in the toolbar naming the
+ * picture on screen. RAW reads as the original (accent text); JPG as the
+ * camera preview (muted). A click switches. */
 .iv-raw-switch {
-  display: inline-flex;
-  align-items: center;
-  gap: 0;
+  display: inline-grid;
+  place-items: center;
+  width: 38px;
   height: 28px;
-  margin: 0 2px;
-  padding: 2px;
+  margin: 0 1px;
+  padding: 0;
   border-radius: var(--radius-control);
 }
 
 .iv-raw-switch > .liquid-glass-content {
-  display: inline-flex;
-  gap: 2px;
-}
-
-.iv-raw-option {
   display: inline-grid;
   place-items: center;
-  min-width: 40px;
-  height: 22px;
-  padding: 0 6px;
-  color: var(--text-muted);
-  font-size: var(--iv-text-caption);
-  font-weight: 650;
-  letter-spacing: 0.02em;
-  border-radius: calc(var(--radius-control) - 2px);
-  transition: color 140ms ease, background-color 140ms ease;
 }
 
-.iv-raw-option[data-selected="true"] {
-  color: var(--text-primary);
-  background: rgba(255, 255, 255, 0.11);
+.iv-raw-label {
+  font-size: 10.5px;
+  font-weight: 750;
+  letter-spacing: 0.04em;
+  line-height: 1;
+}
+
+.iv-raw-label {
+  color: var(--text-soft);
+}
+
+/* Round 8 ---------------------------------------------------------------- */
+
+/* Fullscreen: Windows does not keep the acrylic backdrop stable for a
+ * fullscreen window — it alternates between the blurred desktop and the
+ * acrylic's solid fallback while the pointer moves (measured: the stage
+ * margin flipped between two colours every few frames). The translucent
+ * "follow the interface" stage let that flip show through as flicker, so in
+ * fullscreen the stage is opaque, painted in the colour it has windowed. */
+.iv-window[data-fullscreen="true"] .iv-stage[data-background="interface"] {
+  /* The interface stage fill over the same neutral the overlays use as
+   * their acrylic stand-in (--iv-acrylic-base), so fullscreen keeps the
+   * windowed tone for any theme. */
+  background:
+    linear-gradient(var(--glass-center-fill-strong, rgba(8, 12, 16, 0.5)), var(--glass-center-fill-strong, rgba(8, 12, 16, 0.5))),
+    color-mix(in srgb, var(--iv-acrylic-base, rgb(118, 119, 120)) 62%, #000);
 }
