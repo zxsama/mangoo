@@ -303,6 +303,8 @@ pub fn sharpen_luma(image: &mut RgbImage) {
 /// The finishing pipeline. `reference` is the camera's embedded preview in
 /// the same (sensor) orientation; `sharpen` is false when the output is about
 /// to be downscaled a lot (thumbnails), where acutance is lost anyway.
+/// Production callers use [`finish_at`]; this full-size form is for tests.
+#[cfg(test)]
 pub fn finish(
     developed: DynamicImage,
     reference: Option<&DynamicImage>,
@@ -311,7 +313,7 @@ pub fn finish(
     finish_at(developed, reference, sharpen, None)
 }
 
-/// [`finish`], but when the caller only needs `max_px` on the long side the
+/// The finishing pipeline, but when the caller only needs `max_px` on the long side the
 /// 16-bit develop is first reduced to it (area average), so toning and
 /// sharpening touch a few megapixels instead of the whole sensor. Sharpening
 /// then runs at the display size, where it is actually seen.
