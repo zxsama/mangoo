@@ -10,5 +10,8 @@ REM Pass a folder to auto-add on first launch:  start-desktop-prod.bat "D:\Photo
 
 if not "%~1"=="" set "MANGOO_AUTO_ADD_ROOT=%~1"
 
+call tools\dev\ensure-desktop-deps.cmd
+if errorlevel 1 exit /b %errorlevel%
+
 node tools\dev\run-prod.mjs
 exit /b %errorlevel%

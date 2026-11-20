@@ -2,4 +2,8 @@
 setlocal
 cd /d "%~dp0"
 
-npm run dev
+call tools\dev\ensure-desktop-deps.cmd
+if errorlevel 1 exit /b %errorlevel%
+
+call npm.cmd run dev
+exit /b %errorlevel%

@@ -20,6 +20,11 @@ Mangoo includes a persistent all-library notification center with aggregated tas
 
 ## Start Here
 
+Both Windows launchers require Node.js, npm, and the Rust MSVC toolchain with Visual Studio C++ Build Tools. On the first launch they run `npm ci --include=dev` from the repository root. Later launches reuse the installed dependencies.
+
+- `start-desktop.cmd` starts the development app with hot reload.
+- `start-desktop-prod.bat` builds and opens the packaged app. The first build also downloads the Electron runtime if it is missing.
+
 - [Docs index](docs/README.md)
 - [Final solution](docs/final-solution.md)
 - [Project structure](docs/project-structure.md)

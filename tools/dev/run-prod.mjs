@@ -74,6 +74,7 @@ const HASH_INPUTS = [
   "crates/core/host_migrations",
   "crates/fake-provider/src",
   "crates/fake-provider/tests",
+  "crates/explorer-thumbnails/src",
   "bundled-plugins",
   "packages/core-client/src",
   "packages/notification-contract/src"
@@ -83,6 +84,7 @@ const HASH_FILES = [
   "Cargo.lock",
   "crates/core/Cargo.toml",
   "crates/fake-provider/Cargo.toml",
+  "crates/explorer-thumbnails/Cargo.toml",
   "tsconfig.base.json",
   "apps/web/index.html",
   "apps/web/tsconfig.json",
@@ -109,6 +111,7 @@ const HASH_EXCLUDED_FILES = new Set([
 
 function hashInputs() {
   const hash = crypto.createHash("sha256");
+  const bundledPluginsDir = path.join(root, "bundled-plugins");
   for (const artifact of externalArtifacts.toSorted((a, b) => a.row.id.localeCompare(b.row.id))) {
     hash.update(JSON.stringify(artifact.row));
   }
@@ -116,8 +119,11 @@ function hashInputs() {
     if (!fs.existsSync(dir)) return;
     for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
       const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) walk(full);
-      else {
+      if (entry.isDirectory()) {
+        // Desktop prebuild generates each host plugin's dist directory.
+        if (entry.name === "dist" && path.dirname(dir) === bundledPluginsDir) continue;
+        walk(full);
+      } else {
         const relative = path.normalize(path.relative(root, full));
         if (HASH_EXCLUDED_FILES.has(relative)) continue;
         hash.update(full);
@@ -140,11 +146,13 @@ const requiredOutputs = [
   path.join(root, "apps", "web", "dist", "index.html"),
   path.join(root, "apps", "desktop", "dist", "main.js"),
   path.join(root, "target", "release", "mangoo-core.exe"),
+  path.join(root, "target", "release", "mangoo_explorer_thumbnails.dll"),
   packagedExecutable,
   path.join(root, ".data", "desktop-release", "win-unpacked", "resources", "app.asar"),
   path.join(root, ".data", "desktop-release", "win-unpacked", "resources", "icon.png"),
   path.join(root, ".data", "desktop-release", "win-unpacked", "resources", "web", "index.html"),
-  path.join(root, ".data", "desktop-release", "win-unpacked", "resources", "core", "mangoo-core.exe")
+  path.join(root, ".data", "desktop-release", "win-unpacked", "resources", "core", "mangoo-core.exe"),
+  path.join(root, ".data", "desktop-release", "win-unpacked", "resources", "core", "mangoo_explorer_thumbnails.dll")
 ];
 
 function missingOutputs() {
@@ -178,7 +186,7 @@ if (upToDate) {
   // work internally, so a partial change is still fast.
   // The selected artifact hashes also participate in the warm-launch cache key.
   run("node", ["tools/build/build-bundled-plugins.mjs", "--release-profile", ...externalPluginArgs], "build bundled Providers");
-  run(findCargoCommand(), ["build", "--release", "-p", "mangoo-core"], "build core (release)");
+  run(findCargoCommand(), ["build", "--release", "-p", "mangoo-core", "-p", "mangoo-explorer-thumbnails"], "build Core and Explorer thumbnail provider (release)");
   run("npm", ["--workspace", "@mangoo/web", "run", "build"], "build web");
   run("npm", ["--workspace", "@mangoo/desktop", "run", "build"], "build desktop");
   run("node", ["tools/build/package-desktop.mjs"], "package desktop");

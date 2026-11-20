@@ -1,6 +1,7 @@
 import { build as buildElectron, Platform } from "electron-builder";
 import { build as buildJavaScript } from "esbuild";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -12,11 +13,13 @@ const stageDir = path.join(root, ".data", "desktop-package-stage");
 const outputDir = path.join(root, ".data", "desktop-release");
 const iconIco = path.join(desktopDir, "build", "icon.ico");
 const iconPng = path.join(desktopDir, "build", "icon.png");
-const electronDist = path.join(root, "node_modules", "electron", "dist");
 
 if (process.platform !== "win32") {
   throw new Error("desktop packaging currently supports Windows only");
 }
+
+// Electron 43 downloads its runtime on first require, including on a clean production build.
+const electronDist = path.dirname(createRequire(import.meta.url)("electron"));
 
 function assertFile(filePath, label) {
   if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
