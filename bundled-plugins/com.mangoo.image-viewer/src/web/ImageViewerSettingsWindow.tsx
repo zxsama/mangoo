@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect } from "react";
 import {
   LiquidGlassLayer,
   LiquidGlassSurface,
   getWindowControls,
   icons,
   useOverlayScrollbars,
+  useSettingsNavigation,
   useSecondaryWindowInterfaceStyle
 } from "@mangoo/web/plugin-host";
 
@@ -23,9 +24,6 @@ const SECTION_ICONS: Record<ImageViewerSettingsSection, typeof icons.Image> = {
   system: icons.Settings
 };
 
-/** Pixels below the scroller's top edge where a section counts as "current". */
-const SPY_OFFSET = 28;
-
 function sectionFromHash(): ImageViewerSettingsSection {
   const tail = window.location.hash.slice(IMAGE_VIEWER_SETTINGS_ROUTE.length + 1);
   return (IMAGE_VIEWER_SETTINGS_SECTIONS as readonly string[]).includes(tail) ? (tail as ImageViewerSettingsSection) : "display";
@@ -43,73 +41,11 @@ export function ImageViewerSettingsWindow() {
   useSecondaryWindowInterfaceStyle();
   useOverlayScrollbars();
   const [preferences, setPreferences] = useViewerPreferences();
-  const [active, setActive] = useState<ImageViewerSettingsSection>(sectionFromHash);
-  const scrollRef = useRef<HTMLDivElement | null>(null);
-  // While a label-initiated smooth scroll runs, the spy must not fight it.
-  const spyLock = useRef<number | null>(null);
+  const { active, jumpTo, scrollRef } = useSettingsNavigation(IMAGE_VIEWER_SETTINGS_SECTIONS, sectionFromHash());
   const controls = getWindowControls();
-
-  const sectionElement = (id: ImageViewerSettingsSection) =>
-    scrollRef.current?.querySelector<HTMLElement>(`[data-section="${id}"]`) ?? null;
-
-  const jumpTo = useCallback((id: ImageViewerSettingsSection, smooth = true) => {
-    const scroller = scrollRef.current;
-    const target = sectionElement(id);
-    if (!scroller || !target) return;
-    setActive(id);
-    if (spyLock.current) window.clearTimeout(spyLock.current);
-    spyLock.current = window.setTimeout(() => {
-      spyLock.current = null;
-    }, smooth ? 700 : 50);
-    const top = target.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop - 12;
-    scroller.scrollTo({ top: Math.max(0, top), behavior: smooth ? "smooth" : "auto" });
-  }, []);
-
-  // Open at the requested section.
-  useLayoutEffect(() => {
-    const initial = sectionFromHash();
-    if (initial !== "display") jumpTo(initial, false);
-  }, [jumpTo]);
 
   // The viewer asked again while this window was already open.
   useEffect(() => settingsBridge()?.onSettingsSection((section) => jumpTo(section)), [jumpTo]);
-
-  // Scroll spy.
-  useEffect(() => {
-    const scroller = scrollRef.current;
-    if (!scroller) return;
-    const update = () => {
-      if (spyLock.current) return;
-      const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2;
-      const sections = [...scroller.querySelectorAll<HTMLElement>("[data-section]")];
-      if (sections.length === 0) return;
-      let current = sections[0].dataset.section as ImageViewerSettingsSection;
-      if (atBottom) current = sections[sections.length - 1].dataset.section as ImageViewerSettingsSection;
-      else {
-        const edge = scroller.getBoundingClientRect().top + SPY_OFFSET;
-        for (const section of sections) {
-          if (section.getBoundingClientRect().top <= edge) current = section.dataset.section as ImageViewerSettingsSection;
-        }
-      }
-      setActive((value) => (value === current ? value : current));
-    };
-    scroller.addEventListener("scroll", update, { passive: true });
-    // A wheel/drag by the user ends a label-initiated scroll lock at once.
-    const release = () => {
-      if (spyLock.current) {
-        window.clearTimeout(spyLock.current);
-        spyLock.current = null;
-      }
-    };
-    scroller.addEventListener("wheel", release, { passive: true });
-    scroller.addEventListener("pointerdown", release);
-    update();
-    return () => {
-      scroller.removeEventListener("scroll", update);
-      scroller.removeEventListener("wheel", release);
-      scroller.removeEventListener("pointerdown", release);
-    };
-  }, []);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -144,14 +80,14 @@ export function ImageViewerSettingsWindow() {
             <icons.X aria-hidden="true" size={15} />
           </button>
         </header>
-        <div className="iv-settings-window-body">
-          <nav aria-label="设置分类" className="iv-settings-nav">
+        <div className="iv-settings-window-body settings-layout-body">
+          <nav aria-label="设置分类" className="iv-settings-nav settings-layout-nav">
             {IMAGE_VIEWER_SETTINGS_SECTIONS.map((id) => {
               const Icon = SECTION_ICONS[id];
               return (
                 <button
                   aria-current={active === id ? "true" : undefined}
-                  className="iv-settings-nav-item"
+                  className="iv-settings-nav-item settings-layout-nav-item"
                   data-active={active === id ? "true" : "false"}
                   key={id}
                   onClick={() => jumpTo(id)}
@@ -163,7 +99,7 @@ export function ImageViewerSettingsWindow() {
               );
             })}
           </nav>
-          <div className="iv-settings-scroll" ref={scrollRef}>
+          <div className="iv-settings-scroll settings-layout-scroll" ref={scrollRef}>
             <ViewerSettingsForm onChange={setPreferences} preferences={preferences} showShortcuts />
           </div>
         </div>

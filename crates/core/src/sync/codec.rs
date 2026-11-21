@@ -55,8 +55,22 @@ fn sort_value(value: Value) -> Value {
 }
 
 pub fn canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
+    let mut bytes = Vec::new();
+    write_canonical(&mut bytes, value)?;
+    Ok(bytes)
+}
+
+pub fn write_canonical<T: Serialize>(
+    writer: impl std::io::Write,
+    value: &T,
+) -> Result<(), CodecError> {
     let value = serde_json::to_value(value).map_err(|e| CodecError::Serialize(e.to_string()))?;
-    serde_json::to_vec(&sort_value(value)).map_err(|e| CodecError::Serialize(e.to_string()))
+    write_canonical_value(writer, value)
+}
+
+pub fn write_canonical_value(writer: impl std::io::Write, value: Value) -> Result<(), CodecError> {
+    serde_json::to_writer(writer, &sort_value(value))
+        .map_err(|e| CodecError::Serialize(e.to_string()))
 }
 
 pub fn sha256(bytes: &[u8]) -> [u8; 32] {

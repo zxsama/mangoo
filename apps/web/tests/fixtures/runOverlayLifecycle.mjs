@@ -107,11 +107,16 @@ async function main() {
     }
   }
 
-  const output = result ?? {
-    ok: false,
-    error: "overlay lifecycle fixture timed out"
-  };
-  process.stdout.write(`OVERLAY_LIFECYCLE_RESULT:${JSON.stringify(output)}\n`, () => {
+  if (result === null) {
+    const context = await window.webContents.executeJavaScript(`({
+      progress: window.__overlayLifecycleProgress,
+      input: window.__overlayLifecycleInputRequest,
+      responseId: window.__overlayLifecycleInputResponseId,
+      focus: document.activeElement?.getAttribute("aria-label") || document.activeElement?.className
+    })`, true);
+    result = { ok: false, error: `overlay lifecycle fixture timed out: ${JSON.stringify(context)}` };
+  }
+  process.stdout.write(`OVERLAY_LIFECYCLE_RESULT:${JSON.stringify(result)}\n`, () => {
     window.destroy();
     app.exit(0);
   });

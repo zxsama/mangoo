@@ -1,0 +1,105 @@
+.notebook-tabstrip {
+  display: flex;
+  align-items: stretch;
+  flex: 0 0 auto;
+  min-width: 0;
+  min-height: 39px;
+  gap: 3px;
+  padding: 4px 8px 0;
+  border-bottom: 1px solid var(--nb-line);
+  background: color-mix(in srgb, var(--text-primary) 3%, transparent);
+}
+.notebook-tablist {
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  max-width: 100%;
+  gap: 3px;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: thin;
+}
+.notebook-tab {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  padding: 0 4px 0 2px;
+  border-radius: 6px 6px 0 0;
+  color: var(--text-soft);
+}
+.notebook-tab[data-drop-side]::after {
+  position: absolute;
+  inset-block: 5px;
+  width: 2px;
+  border-radius: 1px;
+  background: var(--accent);
+  pointer-events: none;
+  content: "";
+}
+.notebook-tab[data-drop-side="before"]::after { inset-inline-start: 0; }
+.notebook-tab[data-drop-side="after"]::after { inset-inline-end: 0; }
+.notebook-tab[data-active="true"] {
+  color: var(--text-primary);
+  background: var(--accent-muted);
+}
+.notebook-tab-select, .notebook-tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 5px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  border-radius: 4px;
+}
+.notebook-tabstrip .notebook-tab-select {
+  height: 31px;
+  font-size: 12px;
+  font-weight: 500;
+}
+.notebook-tab-select > svg { flex-shrink: 0; }
+.notebook-tab[data-active="true"] .notebook-tab-select > svg { color: var(--accent); }
+.notebook-tab-select > span {
+  max-width: clamp(80px, 15vw, 188px);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.notebook-tab-close { width: 22px; height: 24px; }
+.notebook-tab-close:focus-visible, .notebook-tab-select:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+.notebook-tab-dirty { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+.notebook-tab-dirty[data-warning="true"] { background: var(--status-warning); }
+.notebook-tabstrip > .nb-icon { align-self: center; flex: 0 0 29px; margin-bottom: 3px; }
+
+/* The host owns the acrylic surface. The tab list only paints the selected document. */
+.notebook-titlebar-tabs {
+  box-sizing: border-box;
+  align-self: stretch;
+}
+.notebook-titlebar-tabs .notebook-tabstrip {
+  flex: 1 1 auto;
+  align-items: center;
+  min-height: 0;
+  height: 100%;
+  gap: 5px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+.notebook-titlebar-tabs .notebook-tablist {
+  --scrollbar-edge-inset: 1px;
+  align-self: stretch;
+  align-items: center;
+  scrollbar-width: none;
+}
+.notebook-titlebar-tabs .notebook-tab {
+  border-radius: var(--radius-control, 6px);
+  height: var(--titlebar-control-size, 32px);
+}
+.notebook-titlebar-tabs .notebook-tab-select { height: 100%; }
+.notebook-titlebar-tabs .notebook-tabstrip > .nb-icon { margin: 0; }
+.notebook-titlebar-tabs button { position: relative; cursor: pointer; font-family: inherit; }
+.notebook-titlebar-tabs button:disabled { cursor: default; opacity: .43; }
+.notebook-titlebar-tabs button:focus-visible { outline: 1px solid var(--interactive-focus); outline-offset: -1px; }

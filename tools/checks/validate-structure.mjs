@@ -654,6 +654,7 @@ const requiredDirs = [
   "bundled-plugins/com.mangoo.image-viewer/src/desktop",
   "bundled-plugins/com.mangoo.image-viewer/src/web",
   "bundled-plugins/com.mangoo.image-viewer/src/shared",
+  "bundled-plugins/com.mangoo.notebook",
   "bundled-plugins/com.mangoo.todo-notes",
   "bundled-plugins/com.mangoo.todo-notes/src/desktop",
   "bundled-plugins/com.mangoo.todo-notes/src/web",
@@ -728,6 +729,7 @@ const requiredFiles = [
   "bundled-plugins/com.mangoo.image-viewer/src/web/ImageViewerWindow.tsx",
   "bundled-plugins/com.mangoo.image-viewer/src/shared/ipc.ts",
   "contracts/plugins/fixtures/valid-host-image-viewer-v2.json",
+  "bundled-plugins/com.mangoo.notebook/plugin.template.json",
   "bundled-plugins/com.mangoo.todo-notes/plugin.template.json",
   "bundled-plugins/com.mangoo.todo-notes/package.json",
   "bundled-plugins/com.mangoo.todo-notes/README.md",
@@ -743,6 +745,8 @@ const requiredFiles = [
   "crates/core/host_migrations/0023_host_plugin_records.sql",
   "bundled-plugins/com.mangoo.todo-notes/src/web/ItemCard.tsx",
   "crates/core/migrations/0040_plugin_records.sql",
+  "crates/core/migrations/0041_notebook_search.sql",
+  "crates/core/migrations/0042_notebook_search_parts.sql",
   "crates/core/src/api/image_viewer.rs",
   "crates/core/src/decode/exif.rs",
   "apps/web/src/plugin-host/index.ts",
@@ -764,7 +768,8 @@ const requiredFiles = [
   "crates/core/host_migrations/0014_sync_root_preflights.sql",
   "crates/core/host_migrations/0015_sync_root_recovery.sql",
   "crates/core/migrations/0032_sync_root_reconciliation.sql",
-  "crates/core/src/plugins/runtime/generated_trust.rs",
+  "crates/core/build.rs",
+  "crates/core/src/plugins/runtime/trust_inventory.rs",
   "crates/core/migrations/0021_notification_outbox.sql",
   "crates/core/migrations/0028_remove_catalog_plugins.sql",
   "crates/core/migrations/0030_sync_root_identity.sql",
@@ -910,9 +915,9 @@ for (const marker of [
   "cargo test --release -p mangoo-ppm-decoder --test process_conformance",
   "cargo test --release -p mangoo-core --test plugin_runtime_process",
   "MANGOO_PLUGINS_DIR=/opt/mangoo/plugins",
-  "GENERATED_PLUGIN_TRUST",
-  "Platform::LinuxX64",
-  "[u8; 32], [u8; 32]",
+  ".inventory.json",
+  "linuxX64",
+  "PLUGIN_HASH",
   "MANIFEST_HASH",
   "/opt/mangoo/plugins/com.mangoo.ppm-decoder/bin/mangoo-ppm-decoder"
 ]) {
@@ -929,8 +934,11 @@ if (compose.includes("MANGOO_PUBLIC_URL:")) {
 }
 const artifactBuilder = readText("tools/build/build-bundled-plugins.mjs");
 const artifactRules = readText("tools/build/plugin-artifacts.mjs");
-for (const marker of ["validateArtifact", "validateSelection", "stageArtifacts", "renderTrust"]) {
+for (const marker of ["validateArtifact", "validateSelection", "stageArtifacts"]) {
   if (!artifactBuilder.includes(marker)) fail(`bundled build missing explicit artifact boundary: ${marker}`);
+}
+for (const marker of ["cargo:rerun-if-changed", "OUT_DIR", "bundled-plugins/.inventory.json", "trust_inventory::entries"]) {
+  if (!readText("crates/core/build.rs").includes(marker)) fail(`Core must embed its profile's staged trust inventory: ${marker}`);
 }
 for (const marker of ["--external-plugin", "assertNoLinks", "manifestSha256", "assertSelectedInventory"]) {
   if (!artifactRules.includes(marker)) fail(`artifact validation missing ${marker}`);

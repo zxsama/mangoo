@@ -2295,6 +2295,7 @@ mod tests {
                     db.connection_for_fsops(),
                     Default::default(),
                     crate::sync::checkpoint::HostMetadataSnapshot {
+                        kind: Default::default(),
                         library_uuid: library.to_string(),
                         name: "Files".into(),
                         icon: None,

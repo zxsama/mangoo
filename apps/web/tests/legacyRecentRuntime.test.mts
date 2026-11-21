@@ -120,7 +120,7 @@ describe("legacy Recent runtime removal", () => {
 
   it("provides captured active-library context from both renderer windows", () => {
     assert.match(appSource, /activeLibraryName,/);
-    assert.match(appSource, /useActiveLibraryIdentity\(libraryPhase\)/);
+    assert.match(appSource, /useActiveLibraryIdentity\(libraryPhase, notebookEnabled\)/);
     assert.match(identitySource, /activeLibraryId: phase === "loading-media" \? null/);
     assert.match(settingsWindowSource, /listLibraries/);
     assert.match(settingsWindowSource, /subscribeLibraryPhase/);

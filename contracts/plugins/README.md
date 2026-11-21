@@ -107,8 +107,9 @@ for the corresponding local capture, compatibility and acceptance boundaries.
 
 `engine: "host"` declares a trusted bundled feature implemented by the Host itself
 (Core, Desktop and Web) from the plugin directory, e.g. the built-in image viewer
-`com.mangoo.image-viewer` and TODO notes `com.mangoo.todo-notes`. A Host manifest declares
-`host: { capabilities: [...] }` (`image-viewer.v1`, `todo-notes.v1`) and omits `entry`, `rpc`,
+`com.mangoo.image-viewer`, sticky notes `com.mangoo.todo-notes`, and notebook libraries
+`com.mangoo.notebook`. A Host manifest declares `host: { capabilities: [...] }`
+(`image-viewer.v1`, `todo-notes.v1`, `notebook.v1`) and omits `entry`, `rpc`,
 `integrity` and `contributions`. Its only activation events are `file-open-requested`,
 `diagnostics-requested` and `startup`, and its only permissions are the Host permissions:
 

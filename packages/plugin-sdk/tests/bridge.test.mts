@@ -5,17 +5,18 @@ import { createPluginBridge, createCoreClient, CoreApiError } from "../dist/inde
 function fixture(timeout = 1000) {
   const sent: unknown[] = [];
   let listener: ((event: MessageEvent) => void) | undefined;
+  const properties = new Map<string, string>();
   const parent = { postMessage: (message: unknown) => { sent.push(message); } };
-  const target = { parent, addEventListener: (_: string, next: (event: MessageEvent) => void) => { listener = next; }, removeEventListener: () => { listener = undefined; } };
+  const target = { parent, document: { documentElement: { style: { setProperty: (name: string, value: string) => properties.set(name, value) } } }, addEventListener: (_: string, next: (event: MessageEvent) => void) => { listener = next; }, removeEventListener: () => { listener = undefined; } };
   const bridge = createPluginBridge(target, timeout);
   const receive = (data: unknown, source: unknown = parent) => listener?.({ source, data } as MessageEvent);
-  const init = (context = {}) => receive({ type: "mangoo-plugin-ui:init", sessionId: "session-a", pluginId: "example.plugin", viewId: "main", context: { libraryUuid: null, rootUuid: null, ...context }, theme: { colorScheme: "light" } });
-  return { bridge, sent, receive, init };
+  const init = (context = {}, theme = { colorScheme: "light" } as Record<string, unknown>) => receive({ type: "mangoo-plugin-ui:init", sessionId: "session-a", pluginId: "example.plugin", viewId: "main", context: { libraryUuid: null, rootUuid: null, ...context }, theme });
+  return { bridge, sent, receive, init, properties };
 }
 test("bridge waits for exact parent init and correlates session/request without HTTP", async () => {
   const f = fixture();
   const response = f.bridge.call("core.getActiveLibrary");
-  assert.deepEqual(f.sent, [{ type: "mangoo-plugin-ui:ready" }]);
+  assert.deepEqual(f.sent, [{ type: "mangoo-plugin-ui:ready", handlesTheme: true }]);
   f.receive({ type: "mangoo-plugin-ui:init", sessionId: "forged" }, {});
   f.init();
   await f.bridge.ready;
@@ -25,6 +26,27 @@ test("bridge waits for exact parent init and correlates session/request without 
   f.receive({ type: "mangoo-plugin-ui:response", sessionId: "session-a", requestId: request.requestId, result: "bad" }, {});
   f.receive({ type: "mangoo-plugin-ui:response", sessionId: "session-a", requestId: request.requestId, result: { library: null } });
   assert.deepEqual(await response, { library: null });
+  f.bridge.dispose();
+});
+
+test("init and live theme messages apply only the current parent session's palette", async () => {
+  const f = fixture();
+  const theme = (color: string) => ({ colorScheme: "dark", colors: { "--accent-primary": color, "--status-success": "#22aa11", "--item-rating": "#eeee22", "--plugin-brand": "#112233" } });
+  f.init({}, theme("#abcd01"));
+  await f.bridge.ready;
+  assert.equal(f.properties.get("--accent-rgb"), "171 205 1");
+  assert.equal(f.properties.has("--plugin-brand"), false);
+  const change = { type: "mangoo-plugin-ui:theme", sessionId: "session-a", theme: theme("#bb0055") };
+  f.receive(change, {});
+  f.receive({ ...change, sessionId: "stale" });
+  f.receive({ ...change, theme: theme("inherit") });
+  assert.equal(f.properties.get("--accent"), "#abcd01");
+  f.receive(change);
+  assert.equal(f.bridge.readContext().theme.colors?.["--accent-primary"], "#bb0055");
+  assert.equal(f.properties.get("--accent"), "#bb0055");
+  assert.equal(f.properties.get("--accent-muted"), "rgb(var(--accent-rgb) / 0.16)");
+  assert.equal(f.properties.get("--status-success"), "#22aa11");
+  assert.equal(f.properties.get("--item-rating"), "#eeee22");
   f.bridge.dispose();
 });
 test("init accepts generic root IDs, defaults old hosts to null and rejects invalid IDs", async () => {

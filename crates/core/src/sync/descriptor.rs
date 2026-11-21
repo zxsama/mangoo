@@ -13,6 +13,112 @@ use super::provider::{validate_download, ObjectMetadata, SyncProvider, Transport
 pub const LEGACY_KEY: &str = "library-descriptor";
 pub const MAX_DESCRIPTOR_BYTES: u64 = 1024 * 1024;
 pub const MAX_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+// Notebook source and original attachments are catalog records. A logical
+// checkpoint can exceed a provider's single-object limit even for one file.
+pub const NOTEBOOK_PART_BYTES: usize = 4 * 1024 * 1024;
+pub const NOTEBOOK_PAGE_PARTS: usize = 256;
+const NOTEBOOK_PARTS_HEADER: &[u8] = b"Mangoo notebook checkpoint parts v1\n";
+const NOTEBOOK_PAGES_HEADER: &[u8] = b"Mangoo notebook checkpoint pages v2\n";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotebookCheckpointParts {
+    pub size: u64,
+    pub parts: Vec<String>,
+    pub sha256: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotebookCheckpointPages {
+    pub size: u64,
+    pub sha256: String,
+}
+
+pub fn encode_notebook_index<T: Serialize>(index: &T, paged: bool) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = if paged {
+        NOTEBOOK_PAGES_HEADER
+    } else {
+        NOTEBOOK_PARTS_HEADER
+    }
+    .to_vec();
+    serde_json::to_writer(&mut bytes, index)?;
+    Ok(bytes)
+}
+
+pub fn notebook_part_key(hash: &str) -> String {
+    format!("notebook-checkpoint-parts/{hash}")
+}
+
+pub fn notebook_page_key(hash: &str, page: u64) -> String {
+    format!("notebook-checkpoint-parts/{hash}-page-{page}")
+}
+
+pub async fn unpack_checkpoint_object(
+    provider: &dyn SyncProvider,
+    context: &TransportContext,
+    bytes: Vec<u8>,
+) -> anyhow::Result<(std::fs::File, [u8; 32])> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Seek, Write};
+    let mut file = tempfile::tempfile()?;
+    let (total, hash, flat) = if let Some(json) = bytes.strip_prefix(NOTEBOOK_PARTS_HEADER) {
+        let index: NotebookCheckpointParts = serde_json::from_slice(json)?;
+        if index.parts.len() as u64 != index.size.div_ceil(NOTEBOOK_PART_BYTES as u64) {
+            bail!("invalid notebook checkpoint size");
+        }
+        (index.size, index.sha256, Some(index.parts))
+    } else if let Some(json) = bytes.strip_prefix(NOTEBOOK_PAGES_HEADER) {
+        let index: NotebookCheckpointPages = serde_json::from_slice(json)?;
+        (index.size, index.sha256, None)
+    } else {
+        file.write_all(&bytes)?;
+        file.rewind()?;
+        return Ok((file, sha256(&bytes)));
+    };
+    if total <= NOTEBOOK_PART_BYTES as u64 {
+        bail!("invalid notebook checkpoint size");
+    }
+    let expected_hash = parse_hash(&hash)?;
+    let mut digest = Sha256::new();
+    let mut remaining = total;
+    let mut flat = flat;
+    let mut page = 0;
+    while remaining > 0 {
+        let parts = if let Some(parts) = flat.take() {
+            parts
+        } else {
+            let key = notebook_page_key(&hash, page);
+            let (_, bytes) = get_bytes(provider, context, &key, 64 * 1024).await?;
+            let parts: Vec<String> = serde_json::from_slice(&bytes)?;
+            let count = remaining
+                .div_ceil(NOTEBOOK_PART_BYTES as u64)
+                .min(NOTEBOOK_PAGE_PARTS as u64);
+            if parts.len() as u64 != count {
+                bail!("invalid notebook checkpoint page");
+            }
+            parts
+        };
+        for id in parts {
+            let part_hash = parse_hash(&id)?;
+            let size = remaining.min(NOTEBOOK_PART_BYTES as u64);
+            let (metadata, part) =
+                get_bytes(provider, context, &notebook_part_key(&id), size).await?;
+            if metadata.sha256 != part_hash || part.len() as u64 != size {
+                bail!("notebook checkpoint part mismatch");
+            }
+            file.write_all(&part)?;
+            digest.update(&part);
+            remaining -= size;
+        }
+        page += 1;
+    }
+    if <[u8; 32]>::from(digest.finalize()) != expected_hash {
+        bail!("notebook checkpoint content mismatch");
+    }
+    file.rewind()?;
+    Ok((file, expected_hash))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -38,6 +144,11 @@ pub struct SeedReference {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LibraryDescriptor {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::host_registry::LibraryKind::is_media"
+    )]
+    pub kind: crate::host_registry::LibraryKind,
     pub version: u32,
     pub library_uuid: String,
     pub name: String,
@@ -370,7 +481,12 @@ pub fn from_checkpoint(
         })
         .transpose()?;
     Ok(LibraryDescriptor {
-        version: 1,
+        kind: checkpoint.host_metadata.kind,
+        version: if checkpoint.host_metadata.kind.is_media() {
+            1
+        } else {
+            2
+        },
         library_uuid: checkpoint.library_uuid.to_string(),
         name: checkpoint.host_metadata.name.clone(),
         icon: checkpoint.host_metadata.icon.clone(),
@@ -421,25 +537,32 @@ async fn checkpoint_for(
     context: &TransportContext,
     document: &LibraryDescriptor,
 ) -> anyhow::Result<Checkpoint> {
-    if document.version != 1
-        || document.library_uuid != context.namespace
+    let expected_version = if document.kind.is_media() { 1 } else { 2 };
+    if document.version != expected_version {
+        bail!(
+            "unsupported-library-descriptor-version: {}",
+            document.version
+        );
+    }
+    if document.library_uuid != context.namespace
         || document.namespace != context.namespace
         || document.seed.object_key
             != format!("checkpoints/{}.checkpoint", document.seed.checkpoint_uuid)
     {
         bail!("descriptor identity is incompatible");
     }
-    let (metadata, bytes) = get_bytes(
+    let (_, bytes) = get_bytes(
         provider,
         context,
         &document.seed.object_key,
         MAX_CHECKPOINT_BYTES,
     )
     .await?;
-    if metadata.sha256 != parse_hash(&document.seed.sha256)? {
+    let (file, hash) = unpack_checkpoint_object(provider, context, bytes).await?;
+    if hash != parse_hash(&document.seed.sha256)? {
         bail!("descriptor checkpoint hash mismatch");
     }
-    let checkpoint: Checkpoint = serde_json::from_slice(&bytes)?;
+    let checkpoint: Checkpoint = serde_json::from_reader(std::io::BufReader::new(file))?;
     checkpoint.verify()?;
     verified_history(&checkpoint)?;
     portable_state(&checkpoint)?;
@@ -503,6 +626,21 @@ pub async fn download_candidate_reusing(
     Checkpoint,
     Vec<u8>,
 )> {
+    let downloaded = fetch_descriptor(provider, context, listed).await?;
+    validate_candidate(provider, context, listed, verified, downloaded).await
+}
+
+pub struct DownloadedDescriptor {
+    pub document: LibraryDescriptor,
+    metadata: ObjectMetadata,
+    bytes: Vec<u8>,
+}
+
+pub async fn fetch_descriptor(
+    provider: &dyn SyncProvider,
+    context: &TransportContext,
+    listed: &ObjectMetadata,
+) -> anyhow::Result<DownloadedDescriptor> {
     if !is_descriptor_key(&listed.key) {
         bail!("invalid descriptor object key");
     }
@@ -513,7 +651,44 @@ pub async fn download_candidate_reusing(
     if listed.key != LEGACY_KEY && snapshot_key(&bytes) != listed.key {
         bail!("descriptor key hash mismatch");
     }
-    let document: LibraryDescriptor = serde_json::from_slice(&bytes)?;
+    let document: LibraryDescriptor = serde_json::from_slice(&bytes).map_err(|error| {
+        #[derive(Deserialize)]
+        struct Header {
+            version: u32,
+        }
+        if let Ok(header) = serde_json::from_slice::<Header>(&bytes) {
+            if !(1..=2).contains(&header.version) {
+                return anyhow::anyhow!(
+                    "unsupported-library-descriptor-version: {}",
+                    header.version
+                );
+            }
+        }
+        anyhow::Error::new(error)
+    })?;
+    Ok(DownloadedDescriptor {
+        document,
+        metadata,
+        bytes,
+    })
+}
+
+pub async fn validate_candidate(
+    provider: &dyn SyncProvider,
+    context: &TransportContext,
+    listed: &ObjectMetadata,
+    verified: Option<&crate::host_registry::DiscoveredRemoteLibrary>,
+    downloaded: DownloadedDescriptor,
+) -> anyhow::Result<(
+    crate::host_registry::DiscoveredRemoteLibrary,
+    Checkpoint,
+    Vec<u8>,
+)> {
+    let DownloadedDescriptor {
+        document,
+        metadata,
+        bytes,
+    } = downloaded;
     let checkpoint = checkpoint_for(provider, context, &document).await?;
     let seed_sha256 = if listed.key == LEGACY_KEY {
         if document.snapshot.is_some() {
@@ -535,6 +710,9 @@ pub async fn download_candidate_reusing(
             bail!("descriptor seed lineage is not legacy");
         }
         let seed_checkpoint = checkpoint_for(provider, context, &legacy).await?;
+        if seed_checkpoint.host_metadata.kind != checkpoint.host_metadata.kind {
+            bail!("descriptor Library kind differs from seed");
+        }
         for field in ["name", "icon"] {
             if !checkpoint.host_metadata.events.iter().any(|event| matches!(&event.operation,super::types::Operation::SetField{field:event_field,..} if event_field==field)) {
                 let unchanged = if field=="name" {checkpoint.host_metadata.name==seed_checkpoint.host_metadata.name} else {checkpoint.host_metadata.icon==seed_checkpoint.host_metadata.icon};
@@ -584,6 +762,9 @@ pub async fn download_candidate_reusing(
             && candidate.metadata.etag == listed.etag
             && candidate.evidence.as_ref() == Some(&evidence)
     });
+    if document.kind != expected.kind {
+        bail!("descriptor Library kind differs from checkpoint");
+    }
     if listed.key != LEGACY_KEY
         && (document.snapshot.as_ref() != Some(&evidence)
             || document.name != expected.name
@@ -718,6 +899,7 @@ pub async fn download_candidate_reusing(
                 key: format!("{}/{}", context.namespace, listed.key),
                 ..metadata
             },
+            kind: expected.kind,
             name: Some(expected.name),
             icon: expected.icon,
             media_count: Some(expected.media_count),
@@ -739,6 +921,101 @@ mod tests {
     use super::*;
     use crate::sync::reducer::ProtocolState;
     use crate::sync::types::*;
+
+    #[tokio::test]
+    async fn notebook_checkpoint_rejects_incorrect_parts_before_installing_catalog() {
+        let provider = super::super::provider::InMemorySyncProvider::default();
+        let context = TransportContext {
+            namespace: uuid::Uuid::now_v7().to_string(),
+            binding_epoch: uuid::Uuid::now_v7().to_string(),
+            transport_generation: 1,
+        };
+        let claimed = hex_hash(&sha256(b"claimed bytes"));
+        let index = NotebookCheckpointParts {
+            size: NOTEBOOK_PART_BYTES as u64 + 1,
+            parts: vec![claimed.clone(), claimed.clone()],
+            sha256: claimed.clone(),
+        };
+        provider
+            .object_put_immutable(
+                &context,
+                &notebook_part_key(&claimed),
+                b"wrong",
+                sha256(b"wrong"),
+            )
+            .await
+            .unwrap();
+        assert!(unpack_checkpoint_object(
+            &provider,
+            &context,
+            encode_notebook_index(&index, false).unwrap()
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("part mismatch"));
+        let oversized = NotebookCheckpointParts {
+            size: u64::MAX,
+            ..index
+        };
+        assert!(unpack_checkpoint_object(
+            &provider,
+            &context,
+            encode_notebook_index(&oversized, false).unwrap()
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("size"));
+    }
+
+    #[tokio::test]
+    async fn notebook_checkpoint_paged_index_verifies_and_reassembles_to_disk() {
+        use std::io::Read;
+        let provider = super::super::provider::InMemorySyncProvider::default();
+        let context = TransportContext {
+            namespace: uuid::Uuid::now_v7().to_string(),
+            binding_epoch: uuid::Uuid::now_v7().to_string(),
+            transport_generation: 1,
+        };
+        let bytes = vec![13; NOTEBOOK_PART_BYTES + 71];
+        let digest = sha256(&bytes);
+        let index = NotebookCheckpointPages {
+            size: bytes.len() as u64,
+            sha256: hex_hash(&digest),
+        };
+        let mut parts = Vec::new();
+        for part in bytes.chunks(NOTEBOOK_PART_BYTES) {
+            let hash = sha256(part);
+            let id = hex_hash(&hash);
+            provider
+                .object_put_immutable(&context, &notebook_part_key(&id), part, hash)
+                .await
+                .unwrap();
+            parts.push(id);
+        }
+        let page = serde_json::to_vec(&parts).unwrap();
+        provider
+            .object_put_immutable(
+                &context,
+                &notebook_page_key(&index.sha256, 0),
+                &page,
+                sha256(&page),
+            )
+            .await
+            .unwrap();
+        let (mut file, verified) = unpack_checkpoint_object(
+            &provider,
+            &context,
+            encode_notebook_index(&index, true).unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut restored = Vec::new();
+        file.read_to_end(&mut restored).unwrap();
+        assert_eq!(verified, digest);
+        assert_eq!(restored, bytes);
+    }
 
     fn event(library: LibraryUuid, actor: &ActorId, sequence: u64, value: &str) -> EventEnvelope {
         crate::sync::codec::seal_event(EventEnvelope {
@@ -781,6 +1058,7 @@ mod tests {
             vector,
             StreamVector::new(),
             crate::sync::checkpoint::HostMetadataSnapshot {
+                kind: Default::default(),
                 library_uuid: library.to_string(),
                 name: "Library".into(),
                 icon: None,

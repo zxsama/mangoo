@@ -10,7 +10,7 @@ import {
   Trash2
 } from "../design/icons";
 import { Image as ImageIcon } from "../design/icons";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FolderRecord, MediaRecord, RootRecord } from "@mangoo/core-client";
 import type { MediaFocusCommand, NotificationWindowIntent } from "@mangoo/notification-contract";
 import { AppShell } from "../app-shell/AppShell";
@@ -127,11 +127,14 @@ const DEFAULT_PREVIEW_VIEW_STATE: PreviewViewState = {
 };
 const LIBRARY_LAYOUT_STORAGE_KEY = "mangoo.library.layout-mode";
 
+const NotebookWorkspace = lazy(() => import("@mangoo/plugin-notebook/web").then((module) => ({ default: module.NotebookWorkspace })));
+
 export function App() {
   useOverlayScrollbars();
   const rootContributions = usePluginContributionViews("root-menu");
   // Host-engine image viewer: Library images can open in its standalone window.
   const imageViewerAvailable = useHostCapability("image-viewer.v1");
+  const notebookEnabled = useHostCapability("notebook.v1");
   const pluginView = usePluginViewLauncher();
   const overlays = useOverlayStack();
   useEffect(() => {
@@ -159,6 +162,10 @@ export function App() {
   // Latest preview index requested outside the loaded window; selected on arrival.
   const pendingPreviewSelectionRef = useRef<PendingPreviewSelection | null>(null);
   const [sidebarsHidden, setSidebarsHidden] = useState(false);
+  const [notebookTitlebarTarget, setNotebookTitlebarTarget] = useState<HTMLDivElement | null>(null);
+  const [notebookSidebarTarget, setNotebookSidebarTarget] = useState<HTMLDivElement | null>(null);
+  const [notebookSidebarOpen, setNotebookSidebarOpen] = useState(true);
+  const [notebookLocateRequest, setNotebookLocateRequest] = useState(0);
   const [locateRequest, setLocateRequest] =
     useState<LibrarySidebarLocateRequest | undefined>(undefined);
   const locateRequestIdRef = useRef(0);
@@ -181,7 +188,7 @@ export function App() {
   const [librarySwitcherSource, setLibrarySwitcherSource] =
     useState<HTMLButtonElement | null>(null);
   const [librarySwitcherAutoFocus, setLibrarySwitcherAutoFocus] = useState(false);
-  const { activeLibraryId, activeLibraryName, activeLibraryIcon, activeLibraryColor } = useActiveLibraryIdentity(libraryPhase);
+  const { activeContextRevision, activeLibraryKind, activeLibraryId, activeLibraryName, activeLibraryIcon, activeLibraryColor } = useActiveLibraryIdentity(libraryPhase, notebookEnabled);
   const [folderAppearance, setFolderAppearance] = useState<{
     folder: Pick<FolderRecord, "id" | "name" | "icon" | "color">; x: number; y: number; apply: LibraryState["updateFolderAppearance"];
   } | null>(null);
@@ -787,7 +794,10 @@ export function App() {
     [library.selectedMediaId]
   );
 
+  const notebookActive = activeLibraryKind === "notes";
+  const shellSidebarsHidden = notebookActive ? !notebookSidebarOpen : sidebarsHidden;
   useShortcuts({
+    enabled: !notebookActive,
     fileOperationRestoreFocusRef: contextMenuReturnFocusRef,
     fileOps,
     library,
@@ -1006,9 +1016,14 @@ export function App() {
         onOpenLibrarySwitcher={openLibrarySwitcher}
         onOpenPlugins={handleOpenPlugins}
         onOpenSettings={handleOpenSettings}
-        onLocateFolder={locateCurrentFolder}
-        onToggleSidebars={toggleSidebars}
-        sidebarsHidden={sidebarsHidden}
+        locateLabel={notebookActive ? "在目录中定位当前笔记" : undefined}
+        onLocateFolder={notebookActive ? () => {
+          setNotebookSidebarOpen(true);
+          setNotebookLocateRequest(request => request + 1);
+        } : locateCurrentFolder}
+        onToggleSidebars={notebookActive ? () => setNotebookSidebarOpen(false) : toggleSidebars}
+        sidebarsHidden={shellSidebarsHidden}
+        sidebarToggleLabel={notebookActive ? "收起笔记目录" : undefined}
       />
     );
   }
@@ -1032,6 +1047,14 @@ export function App() {
     if (library.switching) {
       return null;
     }
+    if (notebookActive) return notebookEnabled && activeLibraryId ? (
+      <Suspense fallback={<p role="status">正在打开笔记库…</p>}>
+        <NotebookWorkspace key={`${activeLibraryId}:${activeContextRevision}`} libraryId={activeLibraryId}
+          contextRevision={activeContextRevision} titlebarTarget={notebookTitlebarTarget}
+          sidebarTarget={notebookSidebarTarget} sidebarOpen={notebookSidebarOpen}
+          onSidebarOpenChange={setNotebookSidebarOpen} locateRequest={notebookLocateRequest} />
+      </Suspense>
+    ) : <p role="status">笔记库已关闭，可从左上角切换资源库。</p>;
     return library.roots.length === 0 && !library.loading ? (
       <OnboardingHero
         rootCount={library.roots.length}
@@ -1094,6 +1117,7 @@ export function App() {
           onOpenNotificationCenter={handleOpenNotificationCenter}
         />
         <LibrarySwitcher
+          notebookEnabled={notebookEnabled}
           anchor={librarySwitcherAnchor}
           autoFocus={librarySwitcherAutoFocus}
           library={library}
@@ -1122,11 +1146,20 @@ export function App() {
     <LiquidGlassLayer>
       <AppShell
         layout="library"
-        sidebarsHidden={sidebarsHidden}
-        titlebarLeft={sidebarsHidden ? null : renderPrimaryTitlebarActions()}
-        titlebarCenter={renderCenterTitlebar()}
-        titlebarRight={sidebarsHidden ? null : shellRightActions}
-        sidebar={renderSidebar()}
+        sidebarsHidden={shellSidebarsHidden}
+        inspectorHidden={notebookActive}
+        titlebarLeft={shellSidebarsHidden ? null : renderPrimaryTitlebarActions()}
+        titlebarCenter={notebookActive ? (
+          <div className="notebook-shell-toolbar">
+            {!notebookSidebarOpen && <ShellSidebarToggle sidebarsHidden label="展开笔记目录"
+              onToggleSidebars={() => setNotebookSidebarOpen(true)} />}
+            <div className="notebook-titlebar-tabs" ref={setNotebookTitlebarTarget} />
+            <div className="notebook-titlebar-drag-space" aria-hidden="true" />
+            {shellRightActions}
+          </div>
+        ) : renderCenterTitlebar()}
+        titlebarRight={notebookActive || sidebarsHidden ? null : shellRightActions}
+        sidebar={notebookActive ? <div className="notebook-sidebar-host" ref={setNotebookSidebarTarget} /> : renderSidebar()}
         centerPane={
           <>
             {renderCenterPane()}
@@ -1137,7 +1170,7 @@ export function App() {
             />
           </>
         }
-        rightPane={renderRightPane()}
+        rightPane={notebookActive ? null : renderRightPane()}
         overlays={<>{renderOverlays()}{pluginView.view}</>}
       />
     </LiquidGlassLayer>

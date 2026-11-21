@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { LiquidGlassButton, icons } from "@mangoo/web/plugin-host";
+import { DisclosureSummary, LiquidGlassButton, icons } from "@mangoo/web/plugin-host";
 
 import type { ImageViewerAssociationStatus, ImageViewerExplorerThumbnailStatus } from "../shared/ipc.ts";
 import { explorerThumbnailBridge, viewerHostBridge } from "./bridge.ts";
@@ -36,10 +36,10 @@ export function AssociationControls() {
   }, [load]);
 
   if (!bridge) {
-    return <p className="iv-setting-description">关联系统图片仅在桌面版中可用。</p>;
+    return <p className="iv-setting-description settings-control-description">关联系统图片仅在桌面版中可用。</p>;
   }
   if (!status) {
-    return <p className="iv-setting-description">正在读取系统设置…</p>;
+    return <p className="iv-setting-description settings-control-description">正在读取系统设置…</p>;
   }
 
   async function toggle(next: boolean) {
@@ -68,23 +68,23 @@ export function AssociationControls() {
 
   return (
     <div className="iv-assoc">
-      <div className="iv-setting-row">
-        <div className="iv-setting-text">
-          <span className="iv-setting-title">用 Mangoo 打开图片</span>
-          <p className="iv-setting-description">
+      <div className="iv-setting-row settings-control-row">
+        <div className="iv-setting-text settings-control-copy">
+          <span className="iv-setting-title settings-control-label">用 Mangoo 打开图片</span>
+          <p className="iv-setting-description settings-control-description">
             {unsupportedReason
               ?? (status.registered
                 ? "Mangoo 已出现在图片的“打开方式”中，双击图片即可用独立窗口查看。"
                 : "让 Mangoo 出现在图片的“打开方式”中，并可设为默认看图应用。")}
           </p>
         </div>
-        <div className="iv-setting-control">
+        <div className="iv-setting-control settings-control-value">
           <span className="iv-assoc-state" data-on={status.registered ? "true" : "false"}>
             {busy ? "正在应用…" : status.registered ? "已开启" : "未开启"}
           </span>
           <label
             aria-busy={busy || undefined}
-            className={`plugin-toggle iv-switch${(busy ? pendingTarget : status.registered) ? " on" : ""}${!actionable ? " disabled" : ""}${busy ? " busy" : ""}`}
+            className={`plugin-toggle iv-switch settings-control-switch${(busy ? pendingTarget : status.registered) ? " on" : ""}${!actionable ? " disabled" : ""}${busy ? " busy" : ""}`}
           >
             <input
               aria-label="用 Mangoo 打开图片"
@@ -124,7 +124,7 @@ export function AssociationControls() {
 
       {formats.length ? (
         <details className="iv-assoc-formats">
-          <summary data-pointer-glow="off">支持 {formats.length} 种图片格式</summary>
+          <DisclosureSummary label={`支持 ${formats.length} 种图片格式`} />
           <p>{formats.join("、")}</p>
         </details>
       ) : null}
@@ -183,18 +183,18 @@ export function ExplorerThumbnailControls() {
 
   return (
     <div className="iv-assoc">
-      <div className="iv-setting-row">
-        <div className="iv-setting-text">
-          <span className="iv-setting-title">在文件资源管理器中显示缩略图</span>
-          <p className="iv-setting-description">{status.detail}</p>
+      <div className="iv-setting-row settings-control-row">
+        <div className="iv-setting-text settings-control-copy">
+          <span className="iv-setting-title settings-control-label">在文件资源管理器中显示缩略图</span>
+          <p className="iv-setting-description settings-control-description">{status.detail}</p>
         </div>
-        <div className="iv-setting-control">
+        <div className="iv-setting-control settings-control-value">
           <span className="iv-assoc-state" data-on={status.registered ? "true" : "false"}>
             {busy ? "正在应用…" : status.registered ? "已开启" : "未开启"}
           </span>
           <label
             aria-busy={busy || undefined}
-            className={`plugin-toggle iv-switch${on ? " on" : ""}${!actionable ? " disabled" : ""}${busy ? " busy" : ""}`}
+            className={`plugin-toggle iv-switch settings-control-switch${on ? " on" : ""}${!actionable ? " disabled" : ""}${busy ? " busy" : ""}`}
           >
             <input
               aria-label="在文件资源管理器中显示缩略图"
@@ -215,7 +215,7 @@ export function ExplorerThumbnailControls() {
       </div>
       {error ? <p className="iv-assoc-error" role="alert">{error}</p> : null}
       <details className="iv-assoc-formats">
-        <summary data-pointer-glow="off">新增 {formats.length} 种格式的缩略图</summary>
+        <DisclosureSummary label={`新增 ${formats.length} 种格式的缩略图`} />
         <p>{formats.join("、")}</p>
       </details>
     </div>

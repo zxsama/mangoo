@@ -955,6 +955,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let marker = crate::library_path::LibraryMarker {
+            kind: Default::default(),
             format_version: 2,
             library_uuid: uuid::Uuid::now_v7().to_string(),
             root_uuid: uuid::Uuid::now_v7().to_string(),

@@ -17,9 +17,10 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
-import { assertSelectedInventory, parsePluginArgs, readInventory, validateArtifact } from "../build/plugin-artifacts.mjs";
+import { assertCoreTrust, assertSelectedInventory, parsePluginArgs, readInventory, validateArtifact } from "../build/plugin-artifacts.mjs";
 
 const root = path.resolve(import.meta.dirname, "..", "..");
+const releaseDir = path.resolve(root, process.env.CARGO_TARGET_DIR ?? "target", "release");
 const dataDir = path.join(root, ".data");
 const hostDir = path.join(dataDir, "mangoo", "host");
 const hashFile = path.join(root, ".data", ".prod-build-hash");
@@ -85,6 +86,7 @@ const HASH_FILES = [
   "crates/core/Cargo.toml",
   "crates/fake-provider/Cargo.toml",
   "crates/explorer-thumbnails/Cargo.toml",
+  "crates/core/build.rs",
   "tsconfig.base.json",
   "apps/web/index.html",
   "apps/web/tsconfig.json",
@@ -105,9 +107,6 @@ const HASH_FILES = [
   "tools/build/package-desktop.mjs",
   "tools/build/generate-desktop-icon.mjs"
 ];
-const HASH_EXCLUDED_FILES = new Set([
-  path.normalize("crates/core/src/plugins/runtime/generated_trust.rs")
-]);
 
 function hashInputs() {
   const hash = crypto.createHash("sha256");
@@ -124,8 +123,6 @@ function hashInputs() {
         if (entry.name === "dist" && path.dirname(dir) === bundledPluginsDir) continue;
         walk(full);
       } else {
-        const relative = path.normalize(path.relative(root, full));
-        if (HASH_EXCLUDED_FILES.has(relative)) continue;
         hash.update(full);
         hash.update(fs.readFileSync(full));
       }
@@ -145,8 +142,8 @@ function hashInputs() {
 const requiredOutputs = [
   path.join(root, "apps", "web", "dist", "index.html"),
   path.join(root, "apps", "desktop", "dist", "main.js"),
-  path.join(root, "target", "release", "mangoo-core.exe"),
-  path.join(root, "target", "release", "mangoo_explorer_thumbnails.dll"),
+  path.join(releaseDir, "mangoo-core.exe"),
+  path.join(releaseDir, "mangoo_explorer_thumbnails.dll"),
   packagedExecutable,
   path.join(root, ".data", "desktop-release", "win-unpacked", "resources", "app.asar"),
   path.join(root, ".data", "desktop-release", "win-unpacked", "resources", "icon.png"),
@@ -158,8 +155,11 @@ const requiredOutputs = [
 function missingOutputs() {
   const missing = requiredOutputs.filter((output) => !fs.existsSync(output) || !fs.statSync(output).isFile());
   try {
-    const built = readInventory(path.join(root, "target", "release", "bundled-plugins"));
-    const packaged = readInventory(path.join(root, ".data", "desktop-release", "win-unpacked", "resources", "core", "bundled-plugins"));
+    const built = readInventory(path.join(releaseDir, "bundled-plugins"));
+    const packagedCore = path.join(root, ".data", "desktop-release", "win-unpacked", "resources", "core");
+    const packaged = readInventory(path.join(packagedCore, "bundled-plugins"));
+    assertCoreTrust(path.join(releaseDir, "mangoo-core.exe"), built);
+    assertCoreTrust(path.join(packagedCore, "mangoo-core.exe"), packaged);
     assertSelectedInventory(built, externalArtifacts);
     if (JSON.stringify(built) !== JSON.stringify(packaged)) throw new Error("packaged plugin inventory differs from release build");
   } catch (error) {

@@ -179,12 +179,16 @@ const lifecycleWindow = window as Omit<Window, "__overlayLifecycleInputRequest">
   __overlayLifecycleInputRequest?: NativeInputRequest;
   __overlayLifecycleInputResponseId?: number;
   __overlayLifecycleResult?: LibrarySwitcherLifecycleResult;
+  __overlayLifecycleProgress?: { scenario: string; step: string };
 };
+
+const progress = lifecycleWindow.__overlayLifecycleProgress = { scenario: "Library switcher", step: "starting" };
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
   .IS_REACT_ACT_ENVIRONMENT = true;
 
 const ACTIVE_LIBRARY: LibrarySummary = {
+  kind: "media",
   active: true,
   availability: "available",
   bindingState: "local-only",
@@ -197,6 +201,7 @@ const ACTIVE_LIBRARY: LibrarySummary = {
 };
 
 const INACTIVE_LIBRARY: LibrarySummary = {
+  kind: "media",
   active: false,
   availability: "available",
   bindingState: "local-only",
@@ -321,6 +326,7 @@ async function settle(milliseconds = 0): Promise<void> {
 }
 
 async function waitFor(condition: () => boolean, message: string): Promise<void> {
+  progress.step = message;
   for (let attempt = 0; attempt < 80; attempt += 1) {
     if (condition()) return;
     await settle(10);
@@ -346,7 +352,8 @@ const requestNativeKey = (keyCode: string) =>
 const requestNativePoint = (x: number, y: number) =>
   requestNativeInput({ type: "mouse-click", x, y });
 
-const requestNativeClick = async (element: HTMLElement) => {
+const requestNativeClick = async (element: HTMLElement, description?: string) => {
+  progress.step = description ?? `click ${element.dataset.icon ?? element.getAttribute("aria-label") ?? element.className}`;
   element.scrollIntoView({ behavior: "instant", block: "nearest", inline: "nearest" });
   let bounds = element.getBoundingClientRect();
   let stable = 0;
@@ -504,7 +511,7 @@ function ProductionLibrarySwitcherScenario({
           sidebarsHidden={false}
         />
       )}
-      <LibrarySwitcher
+      <LibrarySwitcher notebookEnabled={false}
         anchor={loading ? null : anchor}
         autoFocus={openSource.autoFocus}
         library={library}
@@ -1773,12 +1780,13 @@ async function runFollowupScenario(): Promise<string[]> {
       Math.abs(markRect.top + markRect.height / 2 - swatchRect.top - swatchRect.height / 2) <= 1,
     "Selected swatch check is centered and visibly sized");
     const beforeChoices = patches.length;
-    for (const button of appearanceSurface!.querySelectorAll<HTMLButtonElement>('[role="radio"]')) {
-      button.scrollIntoView({ block: "nearest" });
-      await settle(20);
-      await requestNativeClick(button);
-      check(button.getAttribute('aria-checked') === 'true' && patches.length === beforeChoices,
-        `Draft choice ${button.dataset.icon ?? button.dataset.color} selects without a request`);
+    const draftChoices = appearanceSurface!.querySelectorAll<HTMLButtonElement>('[role="radio"]');
+    for (const [index, button] of draftChoices.entries()) {
+      const choice = button.dataset.icon ?? button.dataset.color;
+      // requestNativeClick scrolls and verifies two stable, unobscured hit tests.
+      await requestNativeClick(button, `draft choice ${index + 1}/${draftChoices.length} (${choice})`);
+      await waitFor(() => button.getAttribute('aria-checked') === 'true', `draft selection of ${choice}`);
+      check(patches.length === beforeChoices, `Draft choice ${choice} selects without a request`);
     }
     check(getComputedStyle(appearanceSurface!.querySelector('.library-appearance-preview svg')!).color === "rgb(229, 231, 235)", "Live preview follows the final rapid draft choice");
     await requestNativeKey("Escape");
@@ -1963,19 +1971,36 @@ async function runEntryScenario(): Promise<string[]> {
   return checks;
 }
 
-function SettingsRegistryScenario() {
+function SettingsRegistryScenario({ library }: { library: LibraryState }) {
   const interfaceStyle = useInterfaceStyle();
-  return <div className="settings-window-body" style={{ position: "fixed", inset: 0 }}><SettingsPanels gridPreferences={DEFAULT_LIBRARY_GRID_PREFERENCES} interfaceStyle={interfaceStyle} library={createLibraryState()} onGridPreferencesChange={() => {}} onPreviewPreferencesChange={() => {}} previewPreferences={DEFAULT_PREVIEW_PREFERENCES} /></div>;
+  return (
+    // Start with the thumbnail statistics below the fold so the test can distinguish
+    // a visible-panel refresh from an eager request during mounting.
+    <div className="settings-window-body" style={{ position: "fixed", inset: 0, maxHeight: 360 }}>
+      <SettingsPanels
+        gridPreferences={DEFAULT_LIBRARY_GRID_PREFERENCES}
+        interfaceStyle={interfaceStyle}
+        library={library}
+        onGridPreferencesChange={() => {}}
+        onPreviewPreferencesChange={() => {}}
+        previewPreferences={DEFAULT_PREVIEW_PREFERENCES}
+      />
+    </div>
+  );
 }
 
 async function runSettingsRegistryScenario(): Promise<string[]> {
   const checks: string[] = [];
   const check = (condition: unknown, label: string) => { if (!condition) throw new Error(label); checks.push(label); };
   let libraries = [ACTIVE_LIBRARY, INACTIVE_LIBRARY];
+  let notebookEnabled = false;
   let hold = false;
   let calls = 0;
   const pending: Deferred<LibrarySummary[]>[] = [];
-  installBridge({ listLibraries: () => {
+  installBridge({ coreRequest: (url) => url.pathname === "/api/plugins" ? jsonResponse({ items: [{
+    pluginId: "com.mangoo.notebook", enabledIntent: notebookEnabled, runtimeState: notebookEnabled ? "ready" : "disabled",
+    capabilities: ["notebook.v1"],
+  }] }) : null, listLibraries: () => {
     calls += 1;
     if (!hold) return libraries;
     const request = deferred<LibrarySummary[]>();
@@ -1985,10 +2010,80 @@ async function runSettingsRegistryScenario(): Promise<string[]> {
   const phases: LibraryLoadPhase[] = [];
   const unsubscribe = subscribeLibraryPhase((phase) => phases.push(phase));
   const publisher = new BroadcastChannel(`mangoo-library-context:${fixtureCoreUrl}`);
-  let mounted: MountedScenario | null = await mountScenario(<OverlayProvider><SettingsRegistryScenario /></OverlayProvider>);
+  const pluginPublisher = new BroadcastChannel("mangoo-plugin-state");
+  const toggleNotebook = (enabled: boolean) => {
+    notebookEnabled = enabled;
+    pluginPublisher.postMessage({ kind: "changed", source: "fixture-plugin-window" });
+  };
+  let thumbnailStatsReads = 0;
+  const library = createLibraryState({
+    refreshThumbnailCacheStats: async () => { thumbnailStatsReads++; return null; }
+  });
+  let mounted: MountedScenario | null = await mountScenario(<OverlayProvider><SettingsRegistryScenario library={library} /></OverlayProvider>);
   try {
-    await requestNativeClick(await findButton("资源库"));
-    await waitFor(() => document.querySelectorAll('.settings-library-row').length === 2, "Settings library rows").catch((cause) => { throw new Error(`${String(cause)}: ${JSON.stringify({ calls, text: document.body.innerText, activeTab: document.querySelector('[role="tab"][aria-selected="true"]')?.textContent })}`); });
+    const scroller = await findElement(".settings-layout-scroll");
+    const general = await findElement("#settings-general", scroller);
+    const nav = await findElement(".settings-layout-nav");
+    const sections = Array.from(scroller.querySelectorAll<HTMLElement>(".host-settings-category"));
+    const navTargets = Array.from(nav.querySelectorAll("button"), button => button.getAttribute("aria-controls"));
+    const currentCategory = () => document.querySelector('.settings-layout-nav [aria-current]')?.textContent;
+    const atAnchor = (section: HTMLElement) => Math.abs(section.getBoundingClientRect().top - scroller.getBoundingClientRect().top - 12) < 2;
+    check(currentCategory() === "常用" && navTargets.length === 6 && sections.map(section => section.id).join() === navTargets.join() && thumbnailStatsReads === 0,
+      "Opening Settings mounts all available categories in navigation order without querying thumbnail statistics");
+    await requestNativeClick(await findButton("查看生成状况", general));
+    const thumbnails = await findElement("#settings-thumbnails", scroller);
+    await waitFor(() => currentCategory() === "缩略图" && atAnchor(thumbnails) && thumbnailStatsReads > 0, "opening thumbnail statistics");
+    check(thumbnailStatsReads === 1 && thumbnails.querySelectorAll(".settings-stat-grid dt").length === 5 && thumbnails.querySelectorAll('[role="radiogroup"] [role="radio"]').length === 3,
+      "The thumbnail shortcut opens the generation modes and grouped statistics with one query");
+    const shortcuts = await findElement("#settings-shortcuts", scroller);
+    await requestNativeClick(await findButton("快捷键", nav));
+    await waitFor(() => atAnchor(shortcuts), "shortcut anchor comes into view");
+    const capture = await findElement("[data-shortcut-capture]", shortcuts);
+    await requestNativeClick(capture);
+    await waitFor(() => capture.textContent === "请按下快捷键", "shortcut records while its control is visible");
+    scroller.dispatchEvent(new WheelEvent("wheel", { deltaY: -scroller.scrollHeight }));
+    scroller.scrollTop = 0;
+    await waitFor(() => currentCategory() === "常用" && capture.textContent !== "请按下快捷键", "scroll back to General discards offscreen capture");
+    check(general.isConnected && thumbnails.isConnected && scroller.scrollTop === 0,
+      "Manual scrolling updates the active category and cancels offscreen shortcut capture without unmounting controls");
+    const readsBeforeOverlap = thumbnailStatsReads;
+    scroller.scrollTop += thumbnails.getBoundingClientRect().top - scroller.getBoundingClientRect().top - 64;
+    const statsGroup = await findElement(".host-settings-cache", thumbnails);
+    await waitFor(() => currentCategory() === "资源库" && thumbnailStatsReads > readsBeforeOverlap, "statistics visible below the active Library heading");
+    check(statsGroup.getBoundingClientRect().top < scroller.getBoundingClientRect().bottom,
+      "Visible generation statistics refresh while the preceding Library category remains active");
+    toggleNotebook(true);
+    const notebook = await findElement("#settings-notebook [data-notebook-settings]", scroller);
+    await requestNativeClick(await findButton("笔记", nav));
+    const frame = await findElement(".settings-window-body");
+    frame.style.maxWidth = "440px";
+    frame.style.maxHeight = "435px";
+    await waitFor(() => currentCategory() === "笔记" && atAnchor(notebook.closest("section")!), "notebook anchor comes into view");
+    frame.style.maxWidth = "";
+    frame.style.maxHeight = "";
+    await settle();
+    check(currentCategory() === "笔记" && atAnchor(notebook.closest("section")!),
+      "Resizing during a long anchor jump keeps the active heading in reading position");
+    scroller.dispatchEvent(new WheelEvent("wheel", { deltaY: scroller.scrollHeight }));
+    scroller.scrollTop = scroller.scrollHeight;
+    await settle();
+    toggleNotebook(false);
+    const diagnostics = await findElement("#settings-diagnostics", scroller);
+    await waitFor(() => !notebook.isConnected && !nav.querySelector('[aria-controls="settings-notebook"]') && currentCategory() === "诊断",
+      "disabling the current notebook returns scroll navigation to Diagnostics");
+    const diagnosticOffset = () => diagnostics.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+    const readingPosition = diagnosticOffset();
+    toggleNotebook(true);
+    await findElement("#settings-notebook [data-notebook-settings]", scroller);
+    await settle();
+    check(currentCategory() === "诊断" && Math.abs(readingPosition - diagnosticOffset()) < 2 && Math.abs(readingPosition) < 32 &&
+      Boolean(nav.querySelector('[aria-controls="settings-notebook"]')),
+      "Re-enabling Notebook restores its anchor without taking the reader away from Diagnostics");
+    const librarySection = await findElement("#settings-libraries", scroller);
+    await requestNativeClick(await findButton("资源库", nav));
+    await waitFor(() => currentCategory() === "资源库" && atAnchor(librarySection) && document.querySelectorAll('.settings-library-row').length === 2, "Settings library rows");
+    check(general.isConnected && thumbnails.isConnected,
+      "Sidebar anchors align category headings while retaining the other settings sections");
     await settle(30);
     const phasesBefore = phases.length;
     libraries = [ACTIVE_LIBRARY];
@@ -2020,6 +2115,7 @@ async function runSettingsRegistryScenario(): Promise<string[]> {
     if (mounted) await unmountScenario(mounted);
     unsubscribe();
     publisher.close();
+    pluginPublisher.close();
   }
 }
 
@@ -2243,13 +2339,15 @@ async function runAppearanceDraftScenario(): Promise<string[]> {
     checkMatches('book', category.value);
     await setInput(search, '');
     await act(async () => { category.value = 'all'; category.dispatchEvent(new Event('change', { bubbles: true })); });
-    const hex = surface.querySelector<HTMLInputElement>('input[aria-label="HEX 颜色"]')!;
+    await requestNativeClick(await findElement('.color-picker-trigger', surface));
+    const picker = await findElement('.color-picker-popup:not([aria-hidden="true"])');
+    const hex = picker.querySelector<HTMLInputElement>('input[aria-label="HEX 颜色"]')!;
     await setInput(hex, '#abc');
-    check(surface.querySelector('[data-color="#abc"][aria-checked="true"]') && calls === 0, 'Valid custom HEX updates only the draft');
+    check(getComputedStyle(surface.querySelector('.library-appearance-preview svg')!).color === 'rgb(170, 187, 204)' && calls === 0, 'Valid custom HEX previews the draft');
     await setInput(hex, '#ab');
-    check(hex.value === '#ab' && hex.getAttribute('aria-invalid') === 'true' && surface.querySelector<HTMLButtonElement>('.library-appearance-apply')!.disabled, 'Partial custom HEX remains editable and disables Apply');
-    await act(async () => surface.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })));
-    check(calls === 0, 'Invalid HEX cannot submit the previous valid color');
+    check(hex.value === '#ab' && hex.getAttribute('aria-invalid') === 'true' && picker.querySelector<HTMLButtonElement>('.color-picker-confirm')!.disabled, 'Partial custom HEX remains editable and disables confirmation');
+    await requestNativeClick(await findElement('.color-picker-close', picker));
+    check(!surface.querySelector('[data-color="#aabbcc"]') && calls === 0, 'Closing the picker discards its draft');
     await requestNativeClick(await findElement('[data-color="#f06595"]', surface));
     await requestNativeClick(await findElement('.library-appearance-apply', surface));
     check(submitted[0]?.icon === 'unknown-saved-key' && submitted[0]?.color === '#f06595', 'Changing color preserves an unknown saved icon key');
@@ -2284,7 +2382,17 @@ async function runAppearanceDraftScenario(): Promise<string[]> {
 async function run(): Promise<void> {
   try {
     if (new URLSearchParams(location.search).has("followup")) {
-      lifecycleWindow.__overlayLifecycleResult = { followup: [...await runAppearanceDraftScenario(), ...await runShortcutOwnershipScenario(), ...await runFollowupScenario(), ...await runEntryScenario(), ...await runWhiteCreationScenario(), ...await runForgetCountScenario(), ...await runSettingsRegistryScenario()], ok: true };
+      const followup: string[] = [];
+      const scenarios = new URLSearchParams(location.search).get("followup") === "settings" ? [runSettingsRegistryScenario] : [
+        runAppearanceDraftScenario, runShortcutOwnershipScenario, runFollowupScenario,
+        runEntryScenario, runWhiteCreationScenario, runForgetCountScenario, runSettingsRegistryScenario
+      ];
+      for (const scenario of scenarios) {
+        progress.scenario = scenario.name;
+        progress.step = "starting";
+        followup.push(...await scenario());
+      }
+      lifecycleWindow.__overlayLifecycleResult = { followup, ok: true };
       return;
     }
     lifecycleWindow.__overlayLifecycleResult = {

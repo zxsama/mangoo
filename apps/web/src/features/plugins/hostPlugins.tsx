@@ -1,9 +1,10 @@
 import { Suspense, lazy, type ComponentType } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { HostPluginProjection, PluginCapability, PluginPermission } from "@mangoo/core-client";
 
 import { createCoreClient } from "../../core/client";
 import { PLUGINS_QUERY_KEY } from "./usePluginAuth";
+import { usePluginQuerySync } from "./pluginQuerySync";
 
 /**
  * Host-engine plugins (`engine: "host"`) are implemented inside the Host from
@@ -17,6 +18,9 @@ interface HostPluginPanelProps {
 }
 
 const HOST_PLUGIN_PANELS: Record<string, ComponentType<HostPluginPanelProps>> = {
+  "com.mangoo.notebook": lazy(() =>
+    import("@mangoo/plugin-notebook/panel").then((module) => ({ default: module.NotebookPanel }))
+  ),
   "com.mangoo.image-viewer": lazy(() =>
     import("@mangoo/plugin-image-viewer/web").then((module) => ({ default: module.ImageViewerPluginPanel }))
   ),
@@ -46,6 +50,7 @@ export function HostPluginPanel({ plugin }: { plugin: HostPluginProjection }) {
  * the plugin manager) refresh it without polling.
  */
 export function useHostCapability(capability: PluginCapability): boolean {
+  usePluginQuerySync(useQueryClient());
   const query = useQuery({
     queryKey: PLUGINS_QUERY_KEY,
     queryFn: () => createCoreClient().listPlugins(),

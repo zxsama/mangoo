@@ -780,29 +780,32 @@ try {
 
 async function waitForOverlayBlurSettled(client, expectedSigma) {
   const expected = Number(expectedSigma);
-  await waitFor(
-    client,
-    `(async () => {
+  const deadline = Date.now() + 10000;
+  let last;
+  while (Date.now() < deadline) {
+    last = await evaluate(client, `(async () => {
       const surface = document.querySelector('#appearance-blur-popover');
-      if (!(surface instanceof HTMLElement) || surface.getAttribute('data-overlay-state') !== 'open') return false;
-      const imagesReady = [...document.querySelectorAll('[data-appearance-blur-sample="image"]')]
-        .every((image) => image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0 && image.naturalHeight > 0);
-      if (!imagesReady) return false;
+      const images = [...document.querySelectorAll('[data-appearance-blur-sample="image"]')];
+      const ready = images.filter((image) => image instanceof HTMLImageElement &&
+        image.complete && image.naturalWidth > 0 && image.naturalHeight > 0).length;
       const read = () => {
-        const rect = surface.getBoundingClientRect();
+        const rect = surface?.getBoundingClientRect();
+        if (!rect) return null;
         return [rect.left, rect.top, rect.width, rect.height].map((value) => Math.round(value * 100) / 100);
       };
       const first = read();
-      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const painted = await new Promise(resolve => {
+        const timeout = setTimeout(() => resolve(false), 900);
+        requestAnimationFrame(() => requestAnimationFrame(() => { clearTimeout(timeout); resolve(true); }));
+      });
       const second = read();
-      if (JSON.stringify(first) !== JSON.stringify(second)) return false;
       const root = document.querySelector('#root');
       const filter = document.querySelector('filter[data-overlay-regional-blur-target="app-root"]');
       const gaussian = filter?.querySelector('feGaussianBlur[in="SourceGraphic"]') ?? null;
-      if (${expected} === 0) {
-        return root?.getAttribute('data-overlay-regional-blur') !== 'active' && !filter && !gaussian;
-      }
-      return root?.getAttribute('data-overlay-regional-blur') === 'active' &&
+      const rootActive = root?.getAttribute('data-overlay-regional-blur') === 'active';
+      const phase = surface?.getAttribute('data-overlay-state') ?? null;
+      const cssBlur = getComputedStyle(document.documentElement).getPropertyValue('--glass-dialog-blur').trim();
+      const graphMatches = ${expected} === 0 ? !rootActive && !filter && !gaussian : rootActive &&
         filter?.getAttribute('filterUnits') === 'userSpaceOnUse' &&
         filter?.getAttribute('primitiveUnits') === 'userSpaceOnUse' &&
         filter?.getAttribute('data-overlay-regional-full-target') === 'false' &&
@@ -810,13 +813,29 @@ async function waitForOverlayBlurSettled(client, expectedSigma) {
         gaussian?.getAttribute('in') === 'SourceGraphic' &&
         gaussian?.getAttribute('edgeMode') === 'duplicate' &&
         Math.abs(Number(gaussian?.getAttribute('stdDeviation')) - ${expected}) <= 0.01;
-    })()`,
-    10000,
-    `overlay regional blur settled at sigma ${expected}`
-  );
+      return {
+        settled: painted && surface?.isConnected && phase === 'open' && ready > 0 && ready === images.length &&
+          JSON.stringify(first) === JSON.stringify(second) && graphMatches &&
+          Math.abs(parseFloat(cssBlur) - ${expected}) <= 0.01,
+        scale: devicePixelRatio, phase, focused: document.hasFocus(), visibility: document.visibilityState,
+        expanded: document.querySelector('[data-appearance-blur-trigger="true"]')?.getAttribute('aria-expanded'),
+        ready, imageCount: images.length, first, second, painted, cssBlur, rootActive,
+        filter: filter?.outerHTML.slice(0, 1500) ?? null, sigma: gaussian?.getAttribute('stdDeviation') ?? null
+      };
+    })()`);
+    if (last.settled) return;
+    await delay(200);
+  }
+  throw new Error(`Timed out waiting for overlay regional blur at sigma ${expected}; last=${JSON.stringify(last)}`);
 }
 
 async function captureOverlayBlurEvidence(client, name, expectedSigma) {
+  await client.send("Page.bringToFront");
+  await evaluate(client, "window.focus(); true");
+  const trigger = '[data-appearance-blur-trigger="true"]';
+  if (await evaluate(client, `document.querySelector('${trigger}')?.getAttribute('aria-expanded') === 'false'`)) {
+    await clickSelector(client, trigger);
+  }
   await waitForOverlayBlurSettled(client, expectedSigma);
   await evaluate(client, `document.body.setAttribute("data-overlay-blur-sampling", "true")`);
   await delay(80);
@@ -2992,6 +3011,9 @@ async function compactPopoverDismissalEvidence(client) {
       const notificationClient = new CdpClient(notificationTarget.webSocketDebuggerUrl);
       await notificationClient.ready;
       await notificationClient.send("Runtime.enable");
+      await waitFor(notificationClient,
+        `document.readyState === "complete" && document.querySelector('.secondary-window[data-secondary-content-visible="true"]') !== null`,
+        10000, "notification center ready before dismissal");
       await evaluate(
         notificationClient,
         `(async () => (await window.mangooDesktop?.closeNotificationsWindow?.()) ?? false)()`
@@ -3826,6 +3848,15 @@ async function notificationWindowFixtureEvidence(client) {
 }
 
 async function syncOrchestrationFixtureEvidence(client) {
+  // Some checkouts keep the provider and its UI outside the Host repository.
+  // Preserve the missing evidence for the final assertions and continue
+  // exercising the remaining Host windows instead of waiting on Vite's fallback.
+  try {
+    await readFile(path.join(root, "apps/web/tests/fixtures/sync-orchestration.html"), "utf8");
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    return { screenshots: {}, evidence: {}, unavailable: "apps/web/tests/fixtures/sync-orchestration.html" };
+  }
   const states = ["lifecycle", "restore", "conflict", "error", "unbind", "reconnect"];
   const fixtureUrl = `${webUrl}/tests/fixtures/sync-orchestration.html?state=lifecycle`;
   const opened = await evaluate(
@@ -4369,39 +4400,31 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
     },
     "center-opacity": {
       required: [
-        "center.centerSurface",
-        "center.fieldControl",
-        "center.selectControl",
-        "center.readableInner",
-        "center.selectedFill",
-        "center.selectedNotificationTab"
+        "center.centerSurface.effects.backdrop.backgroundColor",
+        "center.fieldControl.effects.backgroundColor",
+        "center.selectControl.effects.backgroundColor",
+        "center.readableInner.effects.backgroundColor"
       ],
       allowed: [
         "center.centerSurface",
         "center.fieldControl",
         "center.selectControl",
-        "center.readableInner",
-        "center.selectedFill",
-        "center.selectedNotificationTab"
+        "center.readableInner"
       ],
       stableGroups: ["side", "dialog", "shared", "unaffected"]
     },
     "center-overlay-strength": {
       required: [
-        "center.centerSurface",
-        "center.fieldControl",
-        "center.selectControl",
-        "center.readableInner",
-        "center.selectedFill",
-        "center.selectedNotificationTab"
+        "center.centerSurface.effects.backdrop.backgroundColor",
+        "center.fieldControl.effects.backgroundColor",
+        "center.selectControl.effects.backgroundColor",
+        "center.readableInner.effects.backgroundColor"
       ],
       allowed: [
         "center.centerSurface",
         "center.fieldControl",
         "center.selectControl",
-        "center.readableInner",
-        "center.selectedFill",
-        "center.selectedNotificationTab"
+        "center.readableInner"
       ],
       stableGroups: ["side", "dialog", "shared", "unaffected"]
     },
@@ -4424,14 +4447,12 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
     "center-stroke-opacity": {
       required: [
         "center.centerSurface.mapped.glassBorderCurrent",
-        "center.fieldControl.effects.borderTopColor",
-        "center.selectControl.effects.borderTopColor"
+        "center.fieldControl.effects.borderTopColor"
       ],
       allowed: [
         "center.centerSurface.mapped.glassBorderCurrent",
         "center.centerSurface.effects.backdrop.borderTopColor",
-        "center.fieldControl.effects.borderTopColor",
-        "center.selectControl.effects.borderTopColor"
+        "center.fieldControl.effects.borderTopColor"
       ],
       stableGroups: ["side", "dialog", "shared", "unaffected"]
     },
@@ -4658,6 +4679,31 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
 
   try {
     const initial = await readState();
+    // Prove the selected menu item and notification tab consume the accent
+    // before testing that their fill survives center-material adjustments.
+    const selectedAccent = await evaluate(appearanceClient, `(() => {
+      const root = document.documentElement;
+      const previous = root.style.getPropertyValue("--accent-muted");
+      const priority = root.style.getPropertyPriority("--accent-muted");
+      const reference = document.createElement("span");
+      reference.hidden = true;
+      reference.style.backgroundColor = "var(--accent-muted)";
+      root.append(reference);
+      const read = () => ({
+        expected: getComputedStyle(reference).backgroundColor,
+        menu: getComputedStyle(document.querySelector('[data-appearance-surface="selected-fill"]')).backgroundColor,
+        tab: getComputedStyle(document.querySelector(".notification-window-tab.active")).backgroundColor
+      });
+      try {
+        const before = read();
+        root.style.setProperty("--accent-muted", before.expected === "rgb(19, 45, 71)" ? "#dd7722" : "#132d47");
+        return { before, changed: read() };
+      } finally {
+        if (previous) root.style.setProperty("--accent-muted", previous, priority);
+        else root.style.removeProperty("--accent-muted");
+        reference.remove();
+      }
+    })()`);
     const solidFallback = await controlledSolidFallbackEvidence(appearanceClient);
     const requiredSurfaces = Object.fromEntries(requiredSurfacePaths.map((surfacePath) => [
       surfacePath,
@@ -4698,15 +4744,6 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
           surfaceOutlinePixels = await captureOverlaySurfaceOutlineEvidence(
             appearanceClient,
             baselineDimensions
-          );
-          await clickSelector(appearanceClient, '[data-appearance-blur-trigger="true"]');
-          await waitFor(
-            appearanceClient,
-            `Boolean(document.querySelector("#appearance-blur-popover")) &&
-              [...document.querySelectorAll('[data-appearance-blur-sample="image"]')]
-                .every((image) => image.complete && image.naturalWidth > 0 && image.naturalHeight > 0)`,
-            5000,
-            "registered independent-image blur probe"
           );
           const scaleTriplets = {};
           try {
@@ -4948,6 +4985,7 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
     return {
       groups,
       requiredSurfaces,
+      selectedAccent,
       relationships: initial.production.relationships,
       fixtureDiagnostics: {
         consoleErrors: appearanceFixture.consoleErrors,
@@ -4965,6 +5003,32 @@ async function settingsAppearanceMatrix(settingsClient, mainClient) {
   }
 }
 
+function settingsParameterRowGeometry() {
+  const rows = [...document.querySelectorAll(".host-settings-parameter")]
+    .filter(row => !row.closest("details:not([open])") && row.getBoundingClientRect().width > 0);
+  const invalid = [];
+  for (const row of rows) {
+    const label = row.querySelector("label")?.getBoundingClientRect();
+    const capsule = row.querySelector(".settings-style-slider-control")?.getBoundingClientRect();
+    const input = row.querySelector('input[type="range"]');
+    const field = row.querySelector("label.host-settings-parameter-value");
+    const number = field?.querySelector('input[type="number"]');
+    const value = field?.getBoundingClientRect();
+    const bounds = row.getBoundingClientRect();
+    const center = box => box.top + box.height / 2;
+    if (!label || !capsule || !value || !input || !number || number.id !== input.id + "-value" ||
+        number.readOnly || number.disabled !== input.disabled || number.getBoundingClientRect().width <= 0 ||
+        input.getBoundingClientRect().width <= 14 ||
+        label.width <= 0 || value.width <= 0 || label.left < bounds.left - 1 ||
+        label.right > capsule.left || capsule.right > value.left || value.left - capsule.right > 5 ||
+        value.right > bounds.right + 1 ||
+        Math.abs(center(label) - center(capsule)) > 1 || Math.abs(center(value) - center(capsule)) > 1) {
+      invalid.push(input?.id ?? "missing range input");
+    }
+  }
+  return { width: window.innerWidth, rows: rows.length, invalid };
+}
+
 async function settingsInterfaceStyleEvidence(client) {
   const materialBefore = await glassMaterialEvidence(client);
   await clickSelector(client, `[data-titlebar-control="open-settings"]`);
@@ -4979,23 +5043,22 @@ async function settingsInterfaceStyleEvidence(client) {
   try {
     await waitFor(
       settingsClient,
-      `Boolean(document.querySelector(".settings-window"))`,
+      `Boolean(document.querySelector('.settings-window[data-secondary-content-visible="true"] .settings-dialog-nav-item'))`,
       10000,
-      "Settings secondary window"
+      "Settings secondary window ready for input"
     );
-    await evaluate(
-      settingsClient,
-      `(() => {
-        const tab = [...document.querySelectorAll('.settings-dialog-nav-item')]
-          .find((node) => node.textContent?.trim() === '外观');
-        if (!(tab instanceof HTMLButtonElement)) return false;
-        tab.click();
-        return true;
-      })()`
-    );
+    await clickSelector(settingsClient, '.settings-dialog-nav-item[aria-controls="settings-appearance"]');
     await waitFor(
       settingsClient,
-      `Boolean(document.querySelector('#side-blur'))`,
+      `(() => {
+        const section = document.querySelector('#settings-appearance');
+        const scroll = section?.closest('.settings-dialog-content');
+        if (!scroll || !section.querySelector('#side-blur')) return false;
+        const top = section.getBoundingClientRect().top;
+        const viewport = scroll.getBoundingClientRect();
+        return document.querySelector('[aria-controls="settings-appearance"]')?.getAttribute('aria-current') === 'location' &&
+          top >= viewport.top - 1 && top < viewport.bottom;
+      })()`,
       10000,
       "Settings appearance controls"
     );
@@ -5029,8 +5092,8 @@ async function settingsInterfaceStyleEvidence(client) {
           settingsClient,
           `(() => {
             const root = getComputedStyle(document.documentElement);
-            const panel = document.querySelector(".settings-group-body");
-            const control = document.querySelector(".settings-window .liquid-glass-button");
+            const panel = document.querySelector('[data-section="appearance"] .settings-control-rows');
+            const control = document.querySelector('[data-section="appearance"] .liquid-glass-button');
             return root.getPropertyValue("--radius-panel").trim() === ${JSON.stringify(`${radius}px`)} &&
               root.getPropertyValue("--radius-control").trim() === ${JSON.stringify(`${radius}px`)} &&
               panel && getComputedStyle(panel).borderRadius === ${JSON.stringify(`${radius}px`)} &&
@@ -5043,8 +5106,8 @@ async function settingsInterfaceStyleEvidence(client) {
           settingsClient,
           `(() => {
             const root = getComputedStyle(document.documentElement);
-            const panel = document.querySelector(".settings-group-body");
-            const control = document.querySelector(".settings-window .liquid-glass-button");
+            const panel = document.querySelector('[data-section="appearance"] .settings-control-rows');
+            const control = document.querySelector('[data-section="appearance"] .liquid-glass-button');
             return {
               panelVariable: root.getPropertyValue("--radius-panel").trim(),
               controlVariable: root.getPropertyValue("--radius-control").trim(),
@@ -5080,6 +5143,15 @@ async function settingsInterfaceStyleEvidence(client) {
       5000,
       "Settings window focus before pointer probe"
     );
+    await evaluate(settingsClient, `(async () => {
+      const section = document.querySelector("#side-blur").closest("details");
+      if (section && !section.open) section.querySelector("summary").click();
+      const frame = () => new Promise(resolve => requestAnimationFrame(resolve));
+      await frame();
+      document.querySelector("#side-blur").scrollIntoView({ block: "center", behavior: "instant" });
+      await frame();
+      await frame();
+    })()`);
     const pointSettingsSlider = await moveToSelector(
       settingsClient,
       '[data-settings-slider-control="side-blur"]',
@@ -5103,7 +5175,32 @@ async function settingsInterfaceStyleEvidence(client) {
       5000,
       "Settings slider production pointer driver"
     );
-    const pointerSettingsSlider = await evaluate(settingsClient, pointerEvidenceExpression());
+    const hoveredSlider = await evaluate(settingsClient, `(() => {
+      const input = document.querySelector('#side-blur');
+      const capsule = input.closest('.settings-style-slider-control');
+      const style = getComputedStyle(capsule);
+      const rect = capsule.getBoundingClientRect();
+      return {
+        isNativeRange: input.matches('input[type="range"]'),
+        inputHasGlow: input.hasAttribute('data-interactive-pointer-target'),
+        capsuleHasGlow: capsule.getAttribute('data-interactive-pointer-target') === 'true',
+        height: rect.height,
+        inset: style.paddingLeft,
+        fill: style.backgroundColor,
+        radius: parseFloat(style.borderTopLeftRadius),
+      };
+    })()`);
+    const measureParameterRows = () => evaluate(settingsClient, `(${settingsParameterRowGeometry})()`);
+    const parameterRows = { normal: await measureParameterRows() };
+    try {
+      await settingsClient.send("Emulation.setDeviceMetricsOverride", {
+        width: 480, height: 720, deviceScaleFactor: 0, mobile: false
+      });
+      await waitFor(settingsClient, "window.innerWidth === 480", 5000, "narrow settings viewport");
+      parameterRows.narrow = await measureParameterRows();
+    } finally {
+      await settingsClient.send("Emulation.clearDeviceMetricsOverride");
+    }
     const appearanceMatrix = await settingsAppearanceMatrix(settingsClient, client);
     await settingsClient.send("Page.bringToFront");
     await waitFor(
@@ -5137,6 +5234,19 @@ async function settingsInterfaceStyleEvidence(client) {
     );
     const evidenceAfter = await evaluate(settingsClient, settingsInterfaceStyleEvidenceExpression());
     const materialAfter = await glassMaterialEvidence(client);
+    // Leave side-blur at its edited value while resetting a neighbouring parameter.
+    const saturationSelector = "#side-saturation";
+    await evaluate(settingsClient, `document.querySelector("#side-saturation").scrollIntoView({ block: "center", behavior: "instant" })`);
+    const saturationPoint = await clickSelector(settingsClient, saturationSelector, 0.2, 0.5);
+    const saturation = `document.querySelector("#side-saturation").valueAsNumber`;
+    await waitFor(settingsClient, `${saturation} !== 1.55`, 3000, "single click adjusts saturation");
+    await doubleClickPoint(settingsClient, saturationPoint);
+    await waitFor(settingsClient, `${saturation} === 1.55`, 3000, "double-click restores saturation default");
+    await pressKey(settingsClient, "ArrowRight", "ArrowRight", 39);
+    await waitFor(settingsClient, `${saturation} === 1.6`, 3000, "arrow key steps saturation");
+    await pressKey(settingsClient, "Enter", "Enter", 13);
+    await waitFor(settingsClient, `${saturation} === 1.55`, 3000, "Enter restores saturation default");
+    await waitFor(settingsClient, `document.querySelector("#side-blur").value === ${JSON.stringify(sliderChange.after)}`, 3000, "single-slider reset preserves edited side blur");
     await evaluate(
       settingsClient,
       `(() => {
@@ -5155,8 +5265,8 @@ async function settingsInterfaceStyleEvidence(client) {
         ...evidenceAfter,
         before: evidenceBefore,
         after: evidenceAfter,
-        pointerPoint: pointSettingsSlider,
-        pointerSlider: pointerSettingsSlider,
+        hoveredSlider,
+        parameterRows,
         radiusSamples,
         sliderChange,
         materialBefore,
@@ -5805,7 +5915,7 @@ function centralPreviewEvidenceExpression() {
 
 function settingsInterfaceStyleEvidenceExpression() {
   return `(() => {
-    const section = document.querySelector(".settings-dialog-content");
+    const section = document.querySelector('.settings-dialog-content [data-section="appearance"]');
     const rangeIds = [
       "window-corner-radius",
       "panel-control-corner-radius",
@@ -5851,8 +5961,8 @@ function settingsInterfaceStyleEvidenceExpression() {
       const input = section?.querySelector("#" + CSS.escape(id));
       return [id, {
         present: Boolean(input),
-        type: input?.getAttribute("type") ?? null,
-        value: input?.value ?? null
+        popup: input?.getAttribute("aria-haspopup") ?? null,
+        value: section?.querySelector('output[for="' + id + '"]')?.value ?? null
       }];
     }));
     const resetButton = [...(section?.querySelectorAll("button") ?? [])].find((button) =>
@@ -5861,7 +5971,7 @@ function settingsInterfaceStyleEvidenceExpression() {
     return {
       present: Boolean(section),
       rangeSliderCount: section?.querySelectorAll('input[type="range"]').length ?? 0,
-      colorInputCount: section?.querySelectorAll('input[type="color"]').length ?? 0,
+      colorPickerCount: section?.querySelectorAll('button.color-picker-trigger[aria-haspopup="dialog"]').length ?? 0,
       sliders,
       colors,
       resetButtonPresent: Boolean(resetButton),
@@ -6297,8 +6407,6 @@ function pointerEvidenceExpression() {
       treeLabelButton: affordanceState(".tree-item .tree-label"),
       treeDisclosureButton: affordanceState(".tree-item .tree-disclosure"),
       tileThumb: affordanceState(".tile-thumb"),
-      settingsSliderControl: affordanceState('[data-settings-slider-control="side-blur"]'),
-      settingsSliderInput: affordanceState("#side-blur"),
       haloBrightness: getComputedStyle(document.documentElement)
         .getPropertyValue("--glass-halo-brightness")
         .trim(),
@@ -6323,7 +6431,8 @@ function startupWarningsAndErrors() {
 
 function startupDiagnostics() {
   const parsed = parseStartupDiagnostics(startupOutput, {
-    ignoreRuntimeLine: (line) => line.includes("[desktop-ui-regression] npm run dev exited")
+    ignoreRuntimeLine: (line) => line.includes("[desktop-ui-regression] npm run dev exited") ||
+      line.trim() === "(Use `node --trace-deprecation ...` to show where the warning was created)"
   });
   const decorate = (problem) => ({ ...problem, known: isKnownStartupProblem(problem.line) });
   return {
@@ -6603,7 +6712,8 @@ let scenarioFailures = [];
 
 try {
 try {
-  const target = await waitForTarget();
+  // The first target follows the Core, plugin and desktop builds in npm run dev.
+  const target = await waitForTarget(undefined, 180000);
   client = new CdpClient(target.webSocketDebuggerUrl);
   await client.ready;
 
@@ -6906,7 +7016,7 @@ try {
   const pointerWindowOuterEdgeScreenshot = await screenshot(client, "ui-window-outer-edge-highlight.png");
   const pointNearEdge = await moveToSelector(client, ".inspector-panel", 0.5, 0.985);
   const pointerNearEdge = await evaluate(client, pointerEvidenceExpression());
-  const pointTreeItem = await moveToSelector(client, ".tree-item", 0.35, 0.6);
+  const pointTreeItem = await moveToSelector(client, ".tree-item > .tree-label", 0.35, 0.6);
   const pointerTreeItem = await evaluate(client, pointerEvidenceExpression());
   const pointTileThumb = await moveToSelector(client, ".tile-thumb", 0.35, 0.72);
   const pointerTileThumb = await evaluate(client, pointerEvidenceExpression());
@@ -7270,7 +7380,7 @@ try {
   if (
     !summary.evidence.settingsInterfaceStyle.present ||
     summary.evidence.settingsInterfaceStyle.rangeSliderCount < 28 ||
-    summary.evidence.settingsInterfaceStyle.colorInputCount < 2 ||
+    summary.evidence.settingsInterfaceStyle.colorPickerCount < 2 ||
     !summary.evidence.settingsInterfaceStyle.sliders?.["window-corner-radius"]?.present ||
     !summary.evidence.settingsInterfaceStyle.sliders?.["panel-control-corner-radius"]?.present ||
     !summary.evidence.settingsInterfaceStyle.sliders?.["content-corner-radius"]?.present ||
@@ -7303,13 +7413,13 @@ try {
     summary.evidence.settingsInterfaceStyle.sliders?.["side-blur"]?.type !== "range" ||
     summary.evidence.settingsInterfaceStyle.sliders?.["side-opacity"]?.type !== "range" ||
     summary.evidence.settingsInterfaceStyle.sliders?.["side-overlay-strength"]?.type !== "range" ||
-    summary.evidence.settingsInterfaceStyle.colors?.["side-overlay-color"]?.type !== "color" ||
+    summary.evidence.settingsInterfaceStyle.colors?.["side-overlay-color"]?.popup !== "dialog" ||
     summary.evidence.settingsInterfaceStyle.sliders?.["side-saturation"]?.type !== "range" ||
     summary.evidence.settingsInterfaceStyle.sliders?.["side-stroke-opacity"]?.type !== "range" ||
     summary.evidence.settingsInterfaceStyle.sliders?.["center-blur"]?.type !== "range" ||
     summary.evidence.settingsInterfaceStyle.sliders?.["center-opacity"]?.type !== "range" ||
     summary.evidence.settingsInterfaceStyle.sliders?.["center-overlay-strength"]?.type !== "range" ||
-    summary.evidence.settingsInterfaceStyle.colors?.["center-overlay-color"]?.type !== "color" ||
+    summary.evidence.settingsInterfaceStyle.colors?.["center-overlay-color"]?.popup !== "dialog" ||
     summary.evidence.settingsInterfaceStyle.sliders?.["center-saturation"]?.type !== "range" ||
     summary.evidence.settingsInterfaceStyle.sliders?.["center-stroke-opacity"]?.type !== "range" ||
     summary.evidence.settingsInterfaceStyle.sliders?.["dither-opacity"]?.type !== "range" ||
@@ -7539,6 +7649,27 @@ try {
   ) {
     hardFailures.push("real 100% left/right titlebar popups did not prove exact four-edge regional mask containment and mutation sensitivity");
   }
+  const selection = appearanceMatrix?.selectedAccent;
+  if (!selection || transparent(selection.before.expected) ||
+      selection.before.expected === selection.changed.expected ||
+      [selection.before, selection.changed].some(sample => sample.menu !== sample.expected || sample.tab !== sample.expected)) {
+    hardFailures.push("Selected menu and notification tab did not follow the active accent fill");
+  }
+  for (const id of ["center-opacity", "center-overlay-strength"]) {
+    const samples = appearanceMatrix?.matrix?.center?.[id]?.production;
+    if (["min", "default", "max"].some(level => {
+      const center = samples?.[level]?.center;
+      return !center || !selection || center.selectedFill.effects.backgroundColor !== selection.before.expected ||
+        center.selectedNotificationTab.effects.backgroundColor !== selection.before.expected;
+    })) hardFailures.push(`Settings ${id} changed the accent fill on a selected menu item or notification tab`);
+  }
+  const stroke = appearanceMatrix?.matrix?.center?.["center-stroke-opacity"]?.production;
+  if (["min", "default", "max"].some(level => {
+    const center = stroke?.[level]?.center;
+    return !center || center.fieldControl.effects.borderTopWidth !== "1px" ||
+      [center.selectControl, center.selectElement].some(surface => !surface.present ||
+        surface.effects.borderTopWidth !== "0px" || surface.effects.boxShadow !== "none");
+  })) hardFailures.push("Settings center stroke must retain the field boundary and keep the single-dropdown control borderless");
   for (const [group, ids] of Object.entries(appearanceMatrix?.groups ?? {})) {
     for (const id of ids) {
       const initial = appearanceMatrix.initial?.sliders?.[id];
@@ -7881,7 +8012,8 @@ try {
     syncFixture.reconnect?.dialogVisible !== true ||
     !syncFixture.reconnect?.dialogText?.includes("三方预览")
   ) {
-    hardFailures.push("sync orchestration visual fixtures are incomplete");
+    const missing = summary.evidence.syncOrchestrationFixture?.unavailable;
+    hardFailures.push(missing ? `sync orchestration fixture missing: ${missing}` : "sync orchestration visual fixtures are incomplete");
   }
   const fullWindowFixture = summary.evidence.notificationWindowFixture;
   if (
@@ -8069,20 +8201,17 @@ try {
   ) {
     hardFailures.push("unified pointer highlight leaked onto structural glass surfaces");
   }
-  if (
-    pointerTreeItem.treeItem.targetAttr !== "true" ||
-    !(pointerTreeItem.treeItem.interactiveOpacity > 0)
-  ) {
-    hardFailures.push("folder tree items do not participate in the unified pointer highlight");
+  const { treeItem, treeLabelButton, treeDisclosureButton } = pointerTreeItem;
+  if (treeLabelButton.targetAttr !== "true" || !(treeLabelButton.interactiveOpacity > 0)) {
+    hardFailures.push("folder tree content button is missing its unified pointer highlight");
   }
-  if (!pointerTracksPoint(pointerTreeItem.treeItem, summary.evidence.pointerPoints.treeItem)) {
-    hardFailures.push("folder tree item pointer glow does not follow the real cursor in local pixel space");
+  if (!pointerTracksPoint(treeLabelButton, summary.evidence.pointerPoints.treeItem)) {
+    hardFailures.push("folder tree content glow does not track the cursor in the label's local pixel space");
   }
-  if (
-    pointerTreeItem.treeLabelButton.targetAttr === "true" ||
-    pointerTreeItem.treeDisclosureButton.targetAttr === "true"
-  ) {
-    hardFailures.push("folder tree inner buttons are drawing their own local edge highlight instead of the tree item owning the stroke");
+  if (treeItem.targetAttr === "true" || treeDisclosureButton.targetAttr === "true"
+    || !treeLabelButton.rect || !treeDisclosureButton.rect
+    || treeDisclosureButton.rect.left + treeDisclosureButton.rect.width > treeLabelButton.rect.left + 1) {
+    hardFailures.push("folder tree pointer highlight must stay on the content button and exclude the disclosure slot");
   }
   if (
     pointerTileThumb.tileThumb.targetAttr !== "true" ||
@@ -8104,19 +8233,19 @@ try {
   ) {
     hardFailures.push("interactive pointer fill and masked border are not rendered around the real cursor");
   }
-  const pointerSettingsSlider = summary.evidence.settingsInterfaceStyle.pointerSlider;
+  const hoveredSlider = summary.evidence.settingsInterfaceStyle.hoveredSlider;
   if (
-    pointerSettingsSlider?.settingsSliderControl?.targetAttr !== "true" ||
-    !(pointerSettingsSlider?.settingsSliderControl?.interactiveOpacity > 0) ||
-    pointerSettingsSlider?.settingsSliderInput?.targetAttr === "true"
+    !hoveredSlider?.isNativeRange || hoveredSlider.inputHasGlow || !hoveredSlider.capsuleHasGlow ||
+    hoveredSlider.height !== 28 || hoveredSlider.inset !== "10px" || hoveredSlider.radius < 14 ||
+    hoveredSlider.fill === "rgba(0, 0, 0, 0)"
   ) {
-    hardFailures.push("settings range sliders do not expose exactly one unified pointer-highlight owner");
+    hardFailures.push("settings sliders must retain the original capsule and its pointer highlight");
   }
-  if (!pointerTracksPoint(
-    pointerSettingsSlider?.settingsSliderControl,
-    summary.evidence.settingsInterfaceStyle.pointerPoint
-  )) {
-    hardFailures.push("settings range slider pointer glow does not follow the real cursor in local pixel space");
+  for (const viewport of ["normal", "narrow"]) {
+    const result = summary.evidence.settingsInterfaceStyle.parameterRows?.[viewport];
+    if (!result?.rows || result.invalid.length || (viewport === "narrow" && result.width !== 480)) {
+      hardFailures.push(`settings parameter labels, sliders, and values must fit on one centered row at the ${viewport} width: ${JSON.stringify(result)}`);
+    }
   }
   if (summary.evidence.previewApiResponses.length === 0) {
     hardFailures.push("preview route was not requested");

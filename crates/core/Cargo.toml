@@ -5,10 +5,16 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[build-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
 axum-extra = { version = "0.9", features = ["query"] }
+http-body-util = "0.1"
+futures-util = { version = "0.3", default-features = false }
 base64 = "0.22"
 filetime = "0.2"
 aes-gcm = "0.10"

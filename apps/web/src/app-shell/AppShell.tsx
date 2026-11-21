@@ -30,6 +30,7 @@ type ShellResizeSide = "left" | "right";
 interface AppShellProps {
   layout: "library" | "simple";
   sidebarsHidden?: boolean;
+  inspectorHidden?: boolean;
   titlebarLeft: ReactNode;
   titlebarCenter: ReactNode;
   titlebarRight: ReactNode;
@@ -42,6 +43,7 @@ interface AppShellProps {
 export function AppShell({
   layout,
   sidebarsHidden = false,
+  inspectorHidden = false,
   titlebarLeft,
   titlebarCenter,
   titlebarRight,
@@ -83,7 +85,7 @@ export function AppShell({
         side,
         width,
         shellRef.current?.getBoundingClientRect().width ?? null,
-        side === "left" ? rightWidth : leftWidth
+        side === "left" ? (inspectorHidden ? 0 : rightWidth) : leftWidth
       );
       if (side === "left") {
         setLeftWidth(constrainedWidth);
@@ -93,7 +95,7 @@ export function AppShell({
         writeStoredShellColumnWidth(SHELL_RIGHT_WIDTH_STORAGE_KEY, constrainedWidth);
       }
     },
-    [leftWidth, rightWidth]
+    [inspectorHidden, leftWidth, rightWidth]
   );
 
   const resizeColumnAtPointer = useCallback(
@@ -161,6 +163,7 @@ export function AppShell({
       className="app-shell"
       data-layout={layout}
       data-sidebars-hidden={sidebarsHidden ? "true" : "false"}
+      data-inspector-hidden={inspectorHidden || undefined}
       style={shellStyle}
     >
       <div className="shell-backdrop-canvas" aria-hidden="true" />
@@ -198,7 +201,7 @@ export function AppShell({
             role="separator"
             tabIndex={0}
           />
-          <div
+          {!inspectorHidden && <div
             aria-label="Resize right sidebar"
             aria-orientation="vertical"
             aria-valuemax={SHELL_RIGHT_MAX_WIDTH}
@@ -213,7 +216,7 @@ export function AppShell({
             onPointerUp={handleColumnResizePointerEnd}
             role="separator"
             tabIndex={0}
-          />
+          />}
         </>
       )}
       <LiquidGlassSurface
@@ -252,7 +255,7 @@ export function AppShell({
           {centerPane}
         </section>
       </LiquidGlassSurface>
-      <LiquidGlassSurface
+      {!inspectorHidden && <LiquidGlassSurface
         as="section"
         className="workbench-column workbench-column-right"
         aria-label="Inspector shell"
@@ -269,7 +272,7 @@ export function AppShell({
         <section className="workbench-column-body workbench-column-body-right">
           {rightPane}
         </section>
-      </LiquidGlassSurface>
+      </LiquidGlassSurface>}
       {overlays}
     </main>
   );

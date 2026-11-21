@@ -1,0 +1,35 @@
+[data-notebook-settings] {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: inherit;
+}
+
+.nb-element-color {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.nb-element-color small {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.nb-style-sample {
+  max-width: 100%;
+  min-width: 0;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  padding: 8px 10px;
+  border-radius: var(--radius-control);
+  background: var(--glass-center-fill);
+  color: var(--text-primary);
+}
+
+[data-notebook-settings] textarea {
+  width: 100%;
+  min-height: 4.6em;
+  resize: vertical;
+  font-family: Consolas, monospace;
+}

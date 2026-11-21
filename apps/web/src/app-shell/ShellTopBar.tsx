@@ -8,12 +8,13 @@ import {
   Minimize2,
   PanelLeftClose,
   PanelLeftOpen,
-  Package,
+  Puzzle,
   Settings
 } from "../design/icons";
 import type * as React from "react";
 import type { ComponentProps, ReactNode, RefCallback } from "react";
 import { LiquidGlassButton } from "../design/liquid-glass";
+import { titlebarIcon } from "../design/tokens";
 import { FilterMenu } from "../features/library/FilterMenu";
 import { FolderLocationIcon } from "../features/library/FolderLocationIcon";
 import { LayoutMenu } from "../features/library/LayoutMenu";
@@ -92,31 +93,35 @@ interface ShellRightActionsProps {
 
 export function ShellSidebarToggle({
   sidebarsHidden,
+  label,
   onToggleSidebars
 }: {
   sidebarsHidden: boolean;
+  label?: string;
   onToggleSidebars: () => void;
 }) {
   const Icon = sidebarsHidden ? PanelLeftOpen : PanelLeftClose;
-  const label = sidebarsHidden ? "Show sidebars" : "Hide sidebars";
+  const accessibleLabel = label ?? (sidebarsHidden ? "Show sidebars" : "Hide sidebars");
 
   return (
     <LiquidGlassButton
-      aria-label={label}
+      aria-label={accessibleLabel}
       aria-pressed={sidebarsHidden}
       className="titlebar-icon-button shell-titlebar-utility-button shell-sidebar-toggle no-drag"
       data-titlebar-control="toggle-sidebars"
       onClick={onToggleSidebars}
-      title={`${label} (Tab)`}
+      title={label ?? `${accessibleLabel} (Tab)`}
       tone="control"
       type="button"
     >
-      <Icon aria-hidden="true" size={16} />
+      <Icon {...titlebarIcon.sidebar} />
     </LiquidGlassButton>
   );
 }
 
 export function ShellTitlebarPrimaryActions({
+  locateLabel = "Locate current folder",
+  sidebarToggleLabel,
   activeLibraryColor,
   activeLibraryIcon,
   activeLibraryName,
@@ -129,6 +134,8 @@ export function ShellTitlebarPrimaryActions({
   onLocateFolder,
   onToggleSidebars
 }: {
+  locateLabel?: string;
+  sidebarToggleLabel?: string;
   activeLibraryColor?: string;
   activeLibraryIcon?: string;
   activeLibraryName: string;
@@ -162,7 +169,7 @@ export function ShellTitlebarPrimaryActions({
       >
         <LibraryGlyph icon={activeLibraryIcon} color={activeLibraryColor} size={16} />
         <span className="shell-library-switcher-name">{activeLibraryName}</span>
-        <ChevronsUpDown aria-hidden="true" size={14} />
+        <ChevronsUpDown {...titlebarIcon.switchLibrary} />
       </LiquidGlassButton>
       <div
         aria-label="Application utilities"
@@ -178,7 +185,7 @@ export function ShellTitlebarPrimaryActions({
           tone="control"
           type="button"
         >
-          <Package aria-hidden="true" size={16} />
+          <Puzzle {...titlebarIcon.plugins} />
         </LiquidGlassButton>
         <LiquidGlassButton
           aria-label="Open settings"
@@ -189,24 +196,25 @@ export function ShellTitlebarPrimaryActions({
           tone="control"
           type="button"
         >
-          <Settings aria-hidden="true" size={16} />
+          <Settings {...titlebarIcon.settings} />
         </LiquidGlassButton>
         <div
           aria-hidden="true"
           className="shell-titlebar-utility-separator"
         />
         <LiquidGlassButton
-          aria-label="Locate current folder"
+          aria-label={locateLabel}
           className="titlebar-icon-button shell-titlebar-utility-button shell-locate-folder-button no-drag"
           data-titlebar-control="locate-folder"
           onClick={onLocateFolder}
-          title="Locate current folder"
+          title={locateLabel}
           tone="control"
           type="button"
         >
-          <FolderLocationIcon aria-hidden="true" size={16} />
+          <FolderLocationIcon {...titlebarIcon.locate} />
         </LiquidGlassButton>
         <ShellSidebarToggle
+          label={sidebarToggleLabel}
           sidebarsHidden={sidebarsHidden}
           onToggleSidebars={onToggleSidebars}
         />
@@ -451,7 +459,7 @@ export function ShellRightActions({
         tone="control"
         type="button"
       >
-        <Bell aria-hidden="true" size={15} />
+        <Bell {...titlebarIcon.notifications} />
         {notificationIndicator !== "idle" ? (
           <span
             aria-hidden="true"

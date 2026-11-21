@@ -12,6 +12,7 @@ import {
   OverlayMenuList
 } from "../../design/overlays";
 import { LiquidGlassButton } from "../../design/liquid-glass";
+import { titlebarIcon } from "../../design/tokens";
 import {
   LIBRARY_LAYOUT_MODES,
   type LibraryLayoutMode
@@ -72,7 +73,7 @@ export function LayoutMenu({
         tone="control"
         type="button"
       >
-        <TriggerIcon aria-hidden="true" size={14} weight={open ? "fill" : "regular"} />
+        <TriggerIcon {...(open ? { size: 14, weight: "fill" as const, "aria-hidden": true } : titlebarIcon.layout[value])} />
         {iconOnly ? null : <span>{selectedLabel}</span>}
       </LiquidGlassButton>
 

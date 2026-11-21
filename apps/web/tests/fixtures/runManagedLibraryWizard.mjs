@@ -104,7 +104,8 @@ try {
     await check("document.querySelector('.managed-library-wizard-body').scrollHeight <= document.querySelector('.managed-library-wizard-body').clientHeight", "Initial 726x516 body fits without scrolling");
     await check("!document.querySelector('.library-icon-picker-cell')", "Appearance choices stay out of the main form");
     await check("document.querySelector('.managed-library-database-toggle').getAttribute('aria-expanded') === 'false' && document.querySelector('#managed-library-database-editor').hidden", "Desktop starts with the secondary Database editor collapsed");
-    await expandDatabase();
+    await nativeClick(".managed-library-database-toggle");
+    await check("!document.querySelector('#managed-library-database-editor').hidden", "Clicking the empty middle of the disclosure opens the Database editor");
     await settled('window.wizardFixture.pauseResolution(true)');
     await setName("Earlier");
     await setName("Latest");
@@ -140,7 +141,7 @@ try {
     await key("Tab");
     await check("document.activeElement.matches('.library-icon-picker-swatch')", "Tab skips unselected icons to color group");
     await key("Tab");
-    await check("document.activeElement.matches('input[type=color]')", "Tab leaves radio groups for custom color selection");
+    await check("document.activeElement.matches('.color-picker-trigger')", "Tab leaves radio groups for custom color selection");
     await key("Tab", ["shift"]);
     await check("document.activeElement.matches('.library-icon-picker-swatch')", "Child Shift Tab wraps to selected color");
     await key("ArrowRight");
@@ -268,11 +269,33 @@ try {
     assert.equal(await run("document.querySelector('.managed-library-database-row input').title"), longPath, "Full path remains available in tooltip");
     assert.equal(await run("document.querySelector('.managed-library-database-row input').value"), longPath, "Full path remains available to accessibility APIs");
     await click('.managed-library-database-toggle');
-    await check(`(() => { const toggle=document.querySelector('.managed-library-database-toggle'); const summary=toggle.querySelector('.managed-library-database-summary'); const label=toggle.firstElementChild.getBoundingClientRect(); const arrow=toggle.lastElementChild.getBoundingClientRect(); const text=summary.getBoundingClientRect(); const row=toggle.getBoundingClientRect(); const section=toggle.parentElement.getBoundingClientRect(); const css=getComputedStyle(summary); return Math.abs(row.width-section.width)<=1 && label.right+7<=text.left && text.right+7<=arrow.left && arrow.right<=row.right && Math.abs(label.top-text.top)<=1 && summary.scrollWidth>summary.clientWidth && css.whiteSpace==='nowrap' && css.textOverflow==='ellipsis' && css.overflow==='hidden'; })()`, "Narrow collapsed path ellipsizes between a stable label and right chevron in one full-width row");
+    await check(`(() => {
+      const toggle = document.querySelector('.managed-library-database-toggle');
+      const summary = toggle.querySelector('.managed-library-database-summary');
+      const label = toggle.querySelector('.section-disclosure-label').getBoundingClientRect();
+      const arrow = toggle.querySelector('.section-disclosure-chevron').getBoundingClientRect();
+      const text = summary.getBoundingClientRect();
+      const row = toggle.getBoundingClientRect();
+      const section = toggle.parentElement.getBoundingClientRect();
+      const css = getComputedStyle(summary);
+      const gap = label.left - arrow.right;
+      return Math.abs(row.width - section.width) <= 1 && gap >= 0 && gap <= 6
+        && text.left > label.right && Math.abs(label.top - text.top) <= 1
+        && summary.scrollWidth > summary.clientWidth && css.whiteSpace === 'nowrap'
+        && css.textOverflow === 'ellipsis' && css.overflow === 'hidden'
+        && getComputedStyle(toggle).borderTopWidth === '0px' && toggle.dataset.pointerGlow === 'off';
+    })()`, "Narrow disclosure keeps the chevron beside its label and ellipsizes the path in a full-width borderless row");
     assert.equal(await run("document.querySelector('.managed-library-database-summary').title"), longPath, "Collapsed tooltip retains full long path");
     await check("document.querySelector('.managed-library-wizard-body').scrollWidth <= document.querySelector('.managed-library-wizard-body').clientWidth && document.querySelector('.managed-library-create').getBoundingClientRect().right <= innerWidth", "Collapsed long path cannot push actions out of a narrow viewport");
     await capture("summary-narrow-collapsed");
-    await expandDatabase();
+    await settled("document.querySelector('.managed-library-database-toggle').focus()");
+    await key("Enter");
+    await check(`(() => {
+      const toggle = document.querySelector('.managed-library-database-toggle');
+      return toggle.getAttribute('aria-expanded') === 'true'
+        && !document.getElementById(toggle.getAttribute('aria-controls')).hidden
+        && getComputedStyle(toggle.querySelector('.section-disclosure-label')).textDecorationLine === 'underline';
+    })()`, "Enter opens the controlled Database editor and keeps keyboard focus visible on its label");
     await capture("summary-narrow-expanded");
     window.setContentSize(726, 280);
     await delay(220);

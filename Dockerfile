@@ -17,7 +17,10 @@ RUN cargo test --release -p mangoo-fake-provider --test process_conformance \
     && cargo test --release -p mangoo-ppm-decoder --test process_conformance \
     && cargo build --release -p mangoo-fake-provider -p mangoo-ppm-decoder \
     && strip target/release/mangoo-fake-provider target/release/mangoo-ppm-decoder \
-    && printf '// Generated during Docker build.\nuse crate::plugins::manifest::Platform;\npub const GENERATED_PLUGIN_TRUST: &[(&str, &str, Platform, [u8; 32], [u8; 32])] = &[\n' > crates/core/src/plugins/runtime/generated_trust.rs \
+    && mkdir -p target/release/bundled-plugins \
+    && INVENTORY=target/release/bundled-plugins/.inventory.json \
+    && printf '{"schemaVersion":1,"plugins":[' > "$INVENTORY" \
+    && SEP='' \
     && for plugin in 'com.mangoo.fake-sync:mangoo-fake-provider:1.0.0' 'com.mangoo.ppm-decoder:mangoo-ppm-decoder:0.1.0'; do \
         PLUGIN_ID=${plugin%%:*}; PLUGIN_REST=${plugin#*:}; PLUGIN_BIN=${PLUGIN_REST%%:*}; PLUGIN_VERSION=${PLUGIN_REST#*:}; \
         PLUGIN_DIR=target/release/bundled-plugins/$PLUGIN_ID; \
@@ -26,12 +29,19 @@ RUN cargo test --release -p mangoo-fake-provider --test process_conformance \
         && PLUGIN_HASH=$(sha256sum "$PLUGIN_DIR/bin/$PLUGIN_BIN" | cut -d' ' -f1) \
         && sed "s/__SHA256__/$PLUGIN_HASH/g" "bundled-plugins/$PLUGIN_ID/plugin.template.json" > "$PLUGIN_DIR/plugin.json" \
         && MANIFEST_HASH=$(sha256sum "$PLUGIN_DIR/plugin.json" | cut -d' ' -f1) \
-        && PLUGIN_BYTES=$(echo "$PLUGIN_HASH" | sed 's/../0x&,/g') \
-        && MANIFEST_BYTES=$(echo "$MANIFEST_HASH" | sed 's/../0x&,/g') \
-        && printf '    ("%s", "%s", Platform::LinuxX64, [%s], [%s]),\n' "$PLUGIN_ID" "$PLUGIN_VERSION" "$PLUGIN_BYTES" "$MANIFEST_BYTES" >> crates/core/src/plugins/runtime/generated_trust.rs \
+        && printf '%s{"id":"%s","version":"%s","platform":"linuxX64","entry":"bin/%s","sha256":"%s","manifestSha256":"%s"}' "$SEP" "$PLUGIN_ID" "$PLUGIN_VERSION" "$PLUGIN_BIN" "$PLUGIN_HASH" "$MANIFEST_HASH" >> "$INVENTORY" \
+        && SEP=',' \
         || exit 1; \
     done \
-    && printf '];\n' >> crates/core/src/plugins/runtime/generated_trust.rs \
+    && for PLUGIN_ID in com.mangoo.image-viewer com.mangoo.notebook com.mangoo.todo-notes; do \
+        PLUGIN_DIR=target/release/bundled-plugins/$PLUGIN_ID; \
+        mkdir -p "$PLUGIN_DIR" && cp "bundled-plugins/$PLUGIN_ID/plugin.template.json" "$PLUGIN_DIR/plugin.json" \
+        && MANIFEST_HASH=$(sha256sum "$PLUGIN_DIR/plugin.json" | cut -d' ' -f1) \
+        && PLUGIN_VERSION=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$PLUGIN_DIR/plugin.json" | head -1) \
+        && test -n "$PLUGIN_VERSION" \
+        && printf ',{"id":"%s","version":"%s","platform":"linuxX64","engine":"host","manifestSha256":"%s"}' "$PLUGIN_ID" "$PLUGIN_VERSION" "$MANIFEST_HASH" >> "$INVENTORY" || exit 1; \
+    done \
+    && printf ']}\n' >> "$INVENTORY" \
     && cargo build --release -p mangoo-core \
     && cargo test --release -p mangoo-core --test plugin_runtime_process \
     && strip target/release/mangoo-core
@@ -49,8 +59,10 @@ WORKDIR /web
 
 COPY package.json package-lock.json tsconfig.base.json ./
 COPY apps/web ./apps/web
+COPY bundled-plugins ./bundled-plugins
 COPY packages/core-client ./packages/core-client
 COPY packages/notification-contract ./packages/notification-contract
+COPY packages/plugin-sdk ./packages/plugin-sdk
 COPY contracts ./contracts
 
 RUN npm ci --no-audit --no-fund

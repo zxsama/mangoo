@@ -191,7 +191,7 @@ export function InspectorMetadata({
               onClick={() => void onUpdate(fileId, { rating: null })}
               type="button"
             >
-              clear
+              <span data-button-content>clear</span>
             </button>
           ) : null}
         </div>
@@ -287,7 +287,7 @@ export function InspectorMetadata({
                         style={{ background: tag.color }}
                       />
                     ) : null}
-                    {tag.name}
+                    <span data-button-content>{tag.name}</span>
                   </button>
                 );
               })}

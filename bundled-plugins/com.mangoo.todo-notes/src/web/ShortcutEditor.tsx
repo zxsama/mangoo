@@ -20,7 +20,9 @@ import {
 import { acceleratorLabel, normalizeAccelerator } from "../shared/ipc.ts";
 
 function Keycaps({ chord }: { chord: string }) {
-  return <>{chordParts(chord).map((part, index) => <kbd className="todo-keycap" key={index}>{part}</kbd>)}</>;
+  return <>{chordParts(chord).map((part, index) => (
+    <kbd className="todo-keycap" key={index}><span data-button-content>{part}</span></kbd>
+  ))}</>;
 }
 
 /**
@@ -82,7 +84,7 @@ export function ShortcutEditor({ overrides, onChange }: { overrides: ShortcutOve
         <p className="todo-shortcut-hint" data-tone={!recording && notice?.tone === "warning" ? "warning" : "info"} role="status">
           {recording ? "请按下新的快捷键…（Esc 取消，Backspace 删除）" : notice?.text ?? "点击快捷键修改，点击 + 添加。"}
           {!recording && notice?.undo ? (
-            <button className="todo-link-button" onClick={() => { onChange(notice.undo ?? {}); setNotice({ text: "已撤销。", tone: "info" }); }} type="button">撤销</button>
+            <button className="todo-link-button" onClick={() => { onChange(notice.undo ?? {}); setNotice({ text: "已撤销。", tone: "info" }); }} type="button"><span data-button-content>撤销</span></button>
           ) : null}
         </p>
         <button
@@ -96,7 +98,7 @@ export function ShortcutEditor({ overrides, onChange }: { overrides: ShortcutOve
           type="button"
         >
           <icons.RotateCcw aria-hidden="true" size={13} />
-          全部恢复默认
+          <span data-button-content>全部恢复默认</span>
         </button>
       </div>
       {SHORTCUT_GROUPS.map((group) => (
@@ -123,7 +125,7 @@ export function ShortcutEditor({ overrides, onChange }: { overrides: ShortcutOve
                           onClick={() => setRecording(active ? null : { action: action.id, index })}
                           type="button"
                         >
-                          {active ? "按下快捷键…" : <Keycaps chord={chord} />}
+                          {active ? <span data-button-content>按下快捷键…</span> : <Keycaps chord={chord} />}
                         </button>
                         </span>
                       );
@@ -139,7 +141,7 @@ export function ShortcutEditor({ overrides, onChange }: { overrides: ShortcutOve
                         title="添加快捷键"
                         type="button"
                       >
-                        {recording?.action === action.id && recording.index === null ? "按下快捷键…" : <icons.Plus aria-hidden="true" size={12} />}
+                        {recording?.action === action.id && recording.index === null ? <span data-button-content>按下快捷键…</span> : <icons.Plus aria-hidden="true" size={12} />}
                       </button>
                     ) : null}
                     <button
@@ -209,7 +211,7 @@ export function AcceleratorRecorder({ value, taken, disabled, onChange }: { valu
         }}
         type="button"
       >
-        {recording ? "按下快捷键…" : value ? <Keycaps chord={acceleratorLabel(value).replace("空格", "Space")} /> : <span className="todo-chord-none">点击设置</span>}
+        {recording ? <span data-button-content>按下快捷键…</span> : value ? <Keycaps chord={acceleratorLabel(value).replace("空格", "Space")} /> : <span data-button-content className="todo-chord-none">点击设置</span>}
       </button>
       {value ? (
         <button aria-label="不使用全局快捷键" className="todo-icon-button" data-pointer-glow="off" disabled={disabled} onClick={() => onChange(null)} title="不使用" type="button">

@@ -80,6 +80,8 @@ pub enum HostCapability {
     /// records live in the active Library (`/api/plugin-data`).
     #[serde(rename = "todo-notes.v1")]
     TodoNotesV1,
+    #[serde(rename = "notebook.v1")]
+    NotebookV1,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

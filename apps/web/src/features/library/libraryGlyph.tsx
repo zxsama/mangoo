@@ -1,6 +1,8 @@
 import { Check } from "../../design/icons";
+import { ColorPicker } from "../../design/ColorPicker";
+import { relativeLuminance } from "../../design/themeColors";
 import { OverlaySelect } from "../../design/overlays";
-import { useEffect, useId, useRef, useState, type KeyboardEvent, type RefObject } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent, type RefObject } from "react";
 import { IDENTITY_ICONS, IDENTITY_CATEGORIES, IdentityArtwork, matchesIdentityIcon, resolveIdentityIcon } from "./identityArtwork";
 
 export const LIBRARY_ICONS = IDENTITY_ICONS;
@@ -40,8 +42,7 @@ export interface LibraryIconPickerProps {
   disabled?: boolean;
   icon?: string;
   searchRef?: RefObject<HTMLInputElement>;
-  onNativeColorOpen?: () => void;
-  onColorValidityChange?: (valid: boolean) => void;
+  onColorPreview?: (value: string | null) => void;
   onPick: (icon: string, color: string) => void;
 }
 
@@ -67,25 +68,17 @@ export function libraryColorCheckColor(color: string): string {
     }
   }
   if (!rgb) return "#18202b";
-  const linear = rgb.map((channel) => {
-    const value = channel / 255;
-    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
-  });
-  const luminance = linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722;
+  const luminance = relativeLuminance(rgb);
   // Relative luminance of #18202b is 0.0141. Choose the greater contrast.
   return 1.05 / (luminance + 0.05) > (luminance + 0.05) / 0.0641 ? "#ffffff" : "#18202b";
 }
 
-export function LibraryIconPicker({ icon, color, disabled = false, onPick, onColorValidityChange, onNativeColorOpen, searchRef, kind = "library" }: LibraryIconPickerProps) {
+export function LibraryIconPicker({ icon, color, disabled = false, onPick, onColorPreview, searchRef, kind = "library" }: LibraryIconPickerProps) {
   const currentIcon = icon ?? (kind === "folder" ? "folder" : DEFAULT_LIBRARY_ICON);
   const identityLabel = kind === "folder" ? "文件夹" : "资源库";
   const currentColor = color ?? DEFAULT_LIBRARY_COLOR;
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState("all");
-  const [colorText, setColorText] = useState(currentColor);
-  const [colorEdited, setColorEdited] = useState(false);
-  const colorErrorId = useId();
-  const colorValid = !colorEdited || /^#([\da-f]{3}|[\da-f]{6})$/i.test(colorText.trim());
   const selectedColorRef = useRef<HTMLSpanElement>(null);
   const [checkColor, setCheckColor] = useState(() => libraryColorCheckColor(currentColor));
   useEffect(() => {
@@ -102,20 +95,8 @@ export function LibraryIconPicker({ icon, color, disabled = false, onPick, onCol
   const icons = groups.flatMap((entry) => entry.icons);
   const tabIcon = icons.some((entry) => entry.key === currentIcon) ? currentIcon : icons[0]?.key;
   function selectColor(value: string) {
-    setColorText(value);
-    setColorEdited(false);
-    onColorValidityChange?.(true);
     onPick(currentIcon, value);
   }
-  function editColor(value: string) {
-    setColorText(value);
-    setColorEdited(true);
-    const valid = /^#([\da-f]{3}|[\da-f]{6})$/i.test(value.trim());
-    onColorValidityChange?.(valid);
-    if (valid) onPick(currentIcon, value.trim());
-  }
-  const nativeColor = /^#[\da-f]{6}$/i.test(currentColor) ? currentColor
-    : /^#[\da-f]{3}$/i.test(currentColor) ? `#${[...currentColor.slice(1)].map((part) => part + part).join("")}` : DEFAULT_LIBRARY_COLOR;
   const tabColor = LIBRARY_COLORS.includes(currentColor) ? currentColor : null;
 
   function navigate(event: KeyboardEvent<HTMLDivElement>) {
@@ -135,8 +116,7 @@ export function LibraryIconPicker({ icon, color, disabled = false, onPick, onCol
         const rect = button.getBoundingClientRect();
         const cell = { index, top: rect.top, center: rect.left + rect.width / 2 };
         const row = rows[rows.length - 1];
-        // Shared pointer feedback can lift a hovered cell by one pixel. Treat
-        // vertically overlapping cells as one row, including at enlarged zoom.
+        // Treat vertically overlapping cells as one row, including at enlarged zoom.
         if (row && Math.abs(row[0].top - rect.top) < rect.height / 2) row.push(cell);
         else rows.push([cell]);
       });
@@ -179,11 +159,8 @@ export function LibraryIconPicker({ icon, color, disabled = false, onPick, onCol
       ><span className="library-icon-picker-color" ref={value === currentColor ? selectedColorRef : undefined} style={{ backgroundColor: value }} />{value === currentColor ? <Check aria-hidden="true" className="library-icon-picker-check" size={14} style={{ color: checkColor }} /> : null}</button>)}
     </div>
     <div className="library-custom-color">
-      <label className="library-custom-color-native">自定义
-        <input aria-label="自定义颜色" disabled={disabled} onClick={onNativeColorOpen} onChange={(event) => selectColor(event.target.value)} type="color" value={nativeColor} />
-      </label>
-      <input aria-describedby={!colorValid ? colorErrorId : undefined} aria-invalid={!colorValid || undefined} aria-label="HEX 颜色" className="library-custom-color-hex" disabled={disabled} onChange={(event) => editColor(event.target.value)} placeholder="#RRGGBB" spellCheck={false} type="text" value={colorText} />
-      {!colorValid ? <span className="library-custom-color-error" id={colorErrorId} role="alert">请输入 #RGB 或 #RRGGBB 颜色</span> : null}
+      <span>自定义颜色</span>
+      <ColorPicker label="自定义颜色" disabled={disabled} value={currentColor} onPreview={onColorPreview} onChange={selectColor} />
     </div>
   </div>;
 }

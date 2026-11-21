@@ -1208,7 +1208,7 @@ export function ImageViewerWindow() {
                 title={`${effectiveRawSource === "embedded" ? "正在显示相机内嵌的 JPEG 预览" : "正在显示 RAW 原图"}，点击切换（${keyOf("toggleRawSource") ?? "J"}）`}
                 type="button"
               >
-                {effectiveRawSource === "embedded" ? "内嵌 JPEG" : "RAW"}
+                <span data-button-content>{effectiveRawSource === "embedded" ? "内嵌 JPEG" : "RAW"}</span>
               </button>
             ) : null}
             {channel ? (
@@ -1220,7 +1220,7 @@ export function ImageViewerWindow() {
                 title="点击恢复全部通道"
                 type="button"
               >
-                {channel[0].toUpperCase()} 通道{preferences.channelPremultiply && channel !== "alpha" ? " · 预乘" : ""}
+                <span data-button-content>{channel[0].toUpperCase()} 通道{preferences.channelPremultiply && channel !== "alpha" ? " · 预乘" : ""}</span>
               </button>
             ) : null}
           </div>
@@ -1404,7 +1404,7 @@ export function ImageViewerWindow() {
               <div className="iv-toast" role="status">
                 <span>{toast.message}</span>
                 {toast.action ? (
-                  <button className="iv-toast-action" onClick={() => { toast.action?.run(); setToast(null); }} type="button">{toast.action.label}</button>
+                  <button className="iv-toast-action" onClick={() => { toast.action?.run(); setToast(null); }} type="button"><span data-button-content>{toast.action.label}</span></button>
                 ) : null}
               </div>
             ) : null}

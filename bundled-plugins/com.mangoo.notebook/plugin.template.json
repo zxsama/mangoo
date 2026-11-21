@@ -1,0 +1,10 @@
+{
+  "manifestVersion": 2,
+  "id": "com.mangoo.notebook",
+  "name": "笔记库",
+  "version": "1.0.0",
+  "engine": "host",
+  "host": { "capabilities": ["notebook.v1"] },
+  "activationEvents": ["startup"],
+  "requestedPermissions": [{ "kind": "library-data", "access": "plugin-records" }]
+}

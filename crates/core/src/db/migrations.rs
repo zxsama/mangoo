@@ -75,3 +75,7 @@ pub const FOLDER_APPEARANCE_MIGRATION: &str =
 pub const DIRECTORY_PREFERENCES_MIGRATION: &str =
     include_str!("../../migrations/0039_directory_preferences.sql");
 pub const PLUGIN_RECORDS_MIGRATION: &str = include_str!("../../migrations/0040_plugin_records.sql");
+pub const NOTEBOOK_SEARCH_MIGRATION: &str =
+    include_str!("../../migrations/0041_notebook_search.sql");
+pub const NOTEBOOK_SEARCH_PARTS_MIGRATION: &str =
+    include_str!("../../migrations/0042_notebook_search_parts.sql");

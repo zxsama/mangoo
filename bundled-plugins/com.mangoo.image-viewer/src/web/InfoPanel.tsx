@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { createCoreClient, icons } from "@mangoo/web/plugin-host";
+import { createCoreClient, DisclosureButton, icons } from "@mangoo/web/plugin-host";
 import type { ImageViewerMetadata } from "@mangoo/core-client";
 
 import { formatBytes, type ImageEntry } from "../shared/navigation.ts";
@@ -50,10 +50,11 @@ function Fold({ id, title, icon, children }: { id: string; title: string; icon: 
   });
   return (
     <section className="iv-info-section" data-open={open ? "true" : "false"}>
-      <button
+      <DisclosureButton
         aria-expanded={open}
         className="iv-info-fold"
-        data-pointer-glow="off"
+        icon={icon}
+        label={title}
         onClick={() => {
           setOpen((value) => {
             try {
@@ -64,12 +65,7 @@ function Fold({ id, title, icon, children }: { id: string; title: string; icon: 
             return !value;
           });
         }}
-        type="button"
-      >
-        <icons.ChevronRight aria-hidden="true" className="iv-info-fold-chevron" size={12} />
-        {icon}
-        <span>{title}</span>
-      </button>
+      />
       {open ? <div className="iv-info-fold-body">{children}</div> : null}
     </section>
   );
@@ -194,7 +190,7 @@ function HistogramView({ image }: { image: LoadedImage | null }) {
               role="radio"
               type="button"
             >
-              {value === "rgb" ? "RGB" : "亮度"}
+              <span data-button-content>{value === "rgb" ? "RGB" : "亮度"}</span>
             </button>
           ))}
         </span>

@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use super::codec::{canonical_bytes, sha256, CodecError, REDUCER_VERSION};
+use super::codec::{write_canonical, write_canonical_value, CodecError, REDUCER_VERSION};
 use super::reducer::ProtocolState;
 use super::types::*;
+use sha2::{Digest, Sha256};
 
 pub type StreamVector = BTreeMap<ActorId, u64>;
 
@@ -48,6 +49,11 @@ pub struct MediaIndexShardRef {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HostMetadataSnapshot {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::host_registry::LibraryKind::is_media"
+    )]
+    pub kind: crate::host_registry::LibraryKind,
     pub library_uuid: String,
     pub name: String,
     pub icon: Option<String>,
@@ -228,13 +234,18 @@ impl Checkpoint {
 }
 
 fn checkpoint_digest(checkpoint: &Checkpoint) -> Result<[u8; 32], CodecError> {
-    let mut material = checkpoint.clone();
-    material.digest = [0; 32];
-    Ok(sha256(&canonical_bytes(&material)?))
+    let mut value =
+        serde_json::to_value(checkpoint).map_err(|e| CodecError::Serialize(e.to_string()))?;
+    value["digest"] = serde_json::to_value([0u8; 32]).expect("fixed digest can be serialized");
+    let mut digest = Sha256::new();
+    write_canonical_value(&mut digest, value)?;
+    Ok(digest.finalize().into())
 }
 
 pub fn state_digest(state: &ProtocolState) -> Result<[u8; 32], CodecError> {
-    Ok(sha256(&canonical_bytes(state)?))
+    let mut digest = Sha256::new();
+    write_canonical(&mut digest, state)?;
+    Ok(digest.finalize().into())
 }
 
 pub fn vector_covers(left: &StreamVector, right: &StreamVector) -> bool {

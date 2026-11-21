@@ -40,6 +40,7 @@ const HOST_MIGRATION_0021: &str =
     include_str!("../host_migrations/0021_library_registration_visibility.sql");
 const HOST_MIGRATION_0022: &str =
     include_str!("../host_migrations/0022_separated_library_storage.sql");
+const HOST_MIGRATION_0024: &str = include_str!("../host_migrations/0024_notebook_libraries.sql");
 const HOST_MIGRATION_0023: &str = include_str!("../host_migrations/0023_host_plugin_records.sql");
 
 #[cfg(test)]
@@ -110,8 +111,8 @@ fn cache_remote_descriptor(
     let (_, descriptor_key) = crate::sync::descriptor::split_root_key(&metadata.key)?;
     let now = unix_timestamp_millis();
     transaction.execute(
-        "INSERT INTO provider_remote_libraries(account_uuid,library_uuid,descriptor_size,descriptor_sha256,descriptor_etag,account_generation,updated_at,name,icon,media_count,logical_bytes,last_synced_at,compatible,descriptor_error_code,descriptor_key,checkpoint_key,checkpoint_sha256) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17) ON CONFLICT(account_uuid,library_uuid) DO UPDATE SET descriptor_size=excluded.descriptor_size,descriptor_sha256=excluded.descriptor_sha256,descriptor_etag=excluded.descriptor_etag,account_generation=excluded.account_generation,updated_at=excluded.updated_at,name=excluded.name,icon=excluded.icon,media_count=excluded.media_count,logical_bytes=excluded.logical_bytes,last_synced_at=excluded.last_synced_at,compatible=excluded.compatible,descriptor_error_code=excluded.descriptor_error_code,descriptor_key=excluded.descriptor_key,checkpoint_key=excluded.checkpoint_key,checkpoint_sha256=excluded.checkpoint_sha256",
-        params![account_uuid,library_uuid,i64::try_from(metadata.size)?,metadata.sha256.as_slice(),metadata.etag,account_generation,now,selected.name,selected.icon,selected.media_count.map(i64::try_from).transpose()?,selected.logical_bytes.map(i64::try_from).transpose()?,selected.last_synced_at,selected.compatible as i64,selected.error_code,descriptor_key,selected.evidence.as_ref().map(|v|&v.checkpoint_key),selected.evidence.as_ref().map(|v|&v.checkpoint_sha256)],
+        "INSERT INTO provider_remote_libraries(account_uuid,library_uuid,descriptor_size,descriptor_sha256,descriptor_etag,account_generation,updated_at,name,icon,media_count,logical_bytes,last_synced_at,compatible,descriptor_error_code,descriptor_key,checkpoint_key,checkpoint_sha256,kind) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18) ON CONFLICT(account_uuid,library_uuid) DO UPDATE SET kind=excluded.kind,descriptor_size=excluded.descriptor_size,descriptor_sha256=excluded.descriptor_sha256,descriptor_etag=excluded.descriptor_etag,account_generation=excluded.account_generation,updated_at=excluded.updated_at,name=excluded.name,icon=excluded.icon,media_count=excluded.media_count,logical_bytes=excluded.logical_bytes,last_synced_at=excluded.last_synced_at,compatible=excluded.compatible,descriptor_error_code=excluded.descriptor_error_code,descriptor_key=excluded.descriptor_key,checkpoint_key=excluded.checkpoint_key,checkpoint_sha256=excluded.checkpoint_sha256",
+        params![account_uuid,library_uuid,i64::try_from(metadata.size)?,metadata.sha256.as_slice(),metadata.etag,account_generation,now,selected.name,selected.icon,selected.media_count.map(i64::try_from).transpose()?,selected.logical_bytes.map(i64::try_from).transpose()?,selected.last_synced_at,selected.compatible as i64,selected.error_code,descriptor_key,selected.evidence.as_ref().map(|v|&v.checkpoint_key),selected.evidence.as_ref().map(|v|&v.checkpoint_sha256),selected.kind],
     )?;
     transaction.execute(
         "DELETE FROM provider_remote_sync_roots WHERE account_uuid=?1 AND library_uuid=?2",
@@ -218,6 +219,7 @@ pub struct SyncStatusSnapshot {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteLibrarySummary {
+    pub kind: LibraryKind,
     pub account_uuid: String,
     pub library_uuid: String,
     pub name: String,
@@ -234,6 +236,8 @@ pub struct RemoteLibrarySummary {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DiscoveredRemoteLibrary {
+    #[serde(default)]
+    pub kind: LibraryKind,
     pub metadata: super::sync::provider::ObjectMetadata,
     pub name: Option<String>,
     pub icon: Option<String>,
@@ -463,8 +467,52 @@ pub struct SyncBindingRecovery {
     pub choice: Option<String>,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LibraryKind {
+    #[default]
+    Media,
+    Notes,
+}
+
+impl LibraryKind {
+    /// Version 3 prevents older media-only Hosts from admitting a notebook.
+    /// The catalog directory layout and creation journal still use storage v2.
+    pub fn marker_version(self) -> u32 {
+        match self {
+            Self::Media => crate::library_path::STORAGE_FORMAT_VERSION,
+            Self::Notes => 3,
+        }
+    }
+
+    pub fn is_media(&self) -> bool {
+        *self == Self::Media
+    }
+}
+
+impl rusqlite::types::ToSql for LibraryKind {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(match self {
+            Self::Media => "media",
+            Self::Notes => "notes",
+        }
+        .into())
+    }
+}
+
+impl rusqlite::types::FromSql for LibraryKind {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        match value.as_str()? {
+            "media" => Ok(Self::Media),
+            "notes" => Ok(Self::Notes),
+            _ => Err(rusqlite::types::FromSqlError::InvalidType),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LibraryDescriptor {
+    pub kind: LibraryKind,
     pub library_uuid: String,
     pub root_uuid: String,
     pub name: String,
@@ -503,6 +551,7 @@ pub struct CreationIntent {
 
 #[derive(Debug, Clone)]
 pub struct CreationRecovery {
+    pub kind: LibraryKind,
     pub txn_uuid: String,
     pub library_uuid: String,
     pub root_uuid: String,
@@ -1661,18 +1710,20 @@ impl HostRegistry {
         )?;
         let mut recorded = Vec::with_capacity(plans.len());
         for plan in &plans {
-            let remote: Option<(Vec<u8>, String)> = transaction
+            let remote: Option<(Vec<u8>, String, LibraryKind)> = transaction
                 .query_row(
-                    "SELECT descriptor_sha256,name FROM provider_remote_libraries WHERE account_uuid=?1 AND library_uuid=?2 AND compatible=1",
+                    "SELECT descriptor_sha256,name,kind FROM provider_remote_libraries WHERE account_uuid=?1 AND library_uuid=?2 AND compatible=1",
                     params![plan.account_uuid, plan.library_uuid],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
-            let (descriptor_sha256, name) =
+            let (descriptor_sha256, name, kind) =
                 remote.ok_or_else(|| anyhow::anyhow!("remote-library-not-restorable"))?;
             let restore_uuid = uuid::Uuid::now_v7().to_string();
             let database_path = plan.managed_root.join("Database");
-            let content_paths: Vec<String> = if plan.restore_mode == "legacy-library" {
+            let content_paths: Vec<String> = if kind == LibraryKind::Notes {
+                Vec::new()
+            } else if plan.restore_mode == "legacy-library" {
                 vec![plan
                     .managed_root
                     .join("Files")
@@ -1692,7 +1743,7 @@ impl HostRegistry {
                 "INSERT INTO sync_restore_plans(restore_uuid,operation_uuid,account_uuid,library_uuid,name,managed_root,descriptor_sha256,state,phase,restore_mode,inventory_fence,request_hash,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'restoring','operation-and-plans-recorded',?8,?9,?10,?11,?11)",
                 params![restore_uuid,operation_uuid,plan.account_uuid,plan.library_uuid,name,plan.managed_root.to_string_lossy(),descriptor_sha256,plan.restore_mode,plan.inventory_fence,request_hash,now],
             )?;
-            transaction.execute("UPDATE sync_restore_plans SET database_path=?2,placement_base=?3,content_paths_json=?4 WHERE restore_uuid=?1", params![restore_uuid,database_path.to_string_lossy(),plan.managed_root.to_string_lossy(),serde_json::to_string(&content_paths)?])?;
+            transaction.execute("UPDATE sync_restore_plans SET database_path=?2,placement_base=?3,content_paths_json=?4,kind=?5 WHERE restore_uuid=?1", params![restore_uuid,database_path.to_string_lossy(),plan.managed_root.to_string_lossy(),serde_json::to_string(&content_paths)?,kind])?;
             for root in &plan.roots {
                 let binding = root.selected_binding.as_ref();
                 transaction.execute(
@@ -5992,6 +6043,26 @@ impl HostRegistry {
         Ok(())
     }
 
+    pub fn notebook_enabled(&self) -> anyhow::Result<bool> {
+        self.host_plugin_permission_enabled(crate::plugins::NOTEBOOK_PLUGIN_ID, "library-data")
+    }
+
+    pub fn ensure_kind_available(&self, kind: LibraryKind) -> anyhow::Result<()> {
+        if kind == LibraryKind::Notes && !self.notebook_enabled()? {
+            bail!("notebook-plugin-disabled");
+        }
+        Ok(())
+    }
+
+    pub fn restore_plan_kind(&self, restore_uuid: &str) -> anyhow::Result<LibraryKind> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(connection.query_row(
+            "SELECT kind FROM sync_restore_plans WHERE restore_uuid=?1",
+            [restore_uuid],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Whether an enabled, granted and trusted Host-engine plugin currently
     /// provides `capability`. Core consults this before serving any Host
     /// service that the capability gates.
@@ -6805,6 +6876,39 @@ impl HostRegistry {
         ).optional().map_err(Into::into)
     }
 
+    /// Remember the start of the first account page that contained a notebook
+    /// we could not inspect. Media discovery continues on the ordinary cursor.
+    pub fn defer_notebook_discovery(
+        &self,
+        transport: &ProviderRootTransport,
+    ) -> anyhow::Result<()> {
+        let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        connection.execute(
+            "INSERT OR IGNORE INTO provider_account_root_cursors(account_uuid,scope,cursor,page_token,generation,updated_at)
+             SELECT account_uuid,'deferred-notebooks',?2,?3,generation,?5 FROM plugin_accounts WHERE account_uuid=?1 AND generation=?4",
+            params![transport.account_uuid, transport.cursor, transport.page_token, transport.account_generation, unix_timestamp_millis()],
+        )?;
+        Ok(())
+    }
+
+    pub fn resume_notebook_discovery(&self) -> anyhow::Result<()> {
+        let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
+        let tx = connection.transaction()?;
+        tx.execute(
+            "INSERT INTO provider_account_root_cursors(account_uuid,scope,cursor,page_token,generation,updated_at)
+             SELECT d.account_uuid,'root',d.cursor,d.page_token,d.generation,?1 FROM provider_account_root_cursors d
+             JOIN plugin_accounts a ON a.account_uuid=d.account_uuid AND a.generation=d.generation WHERE d.scope='deferred-notebooks'
+             ON CONFLICT(account_uuid,scope) DO UPDATE SET cursor=excluded.cursor,page_token=excluded.page_token,generation=excluded.generation,updated_at=excluded.updated_at",
+            [unix_timestamp_millis()],
+        )?;
+        tx.execute(
+            "DELETE FROM provider_account_root_cursors WHERE scope='deferred-notebooks'",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn provider_root_transports(&self) -> anyhow::Result<Vec<ProviderRootTransport>> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let mut statement = connection.prepare(
@@ -7188,7 +7292,7 @@ impl HostRegistry {
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
         let descriptor = transaction.query_row(
-            "SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','capturing','seed_ready','publishing') THEN 'synchronizing' WHEN b.state IN ('active','paused') THEN 'synchronized' ELSE l.binding_state END,l.availability,l.marker_identity FROM libraries l LEFT JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid WHERE l.library_uuid=?1",
+            "SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','capturing','seed_ready','publishing') THEN 'synchronizing' WHEN b.state IN ('active','paused') THEN 'synchronized' ELSE l.binding_state END,l.availability,l.marker_identity,l.kind FROM libraries l LEFT JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid WHERE l.library_uuid=?1",
             [library_uuid],
             descriptor_from_row,
         ).optional()?.ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
@@ -7232,6 +7336,7 @@ impl HostRegistry {
         Ok((
             vector,
             crate::sync::checkpoint::HostMetadataSnapshot {
+                kind: descriptor.kind,
                 library_uuid: descriptor.library_uuid,
                 name: descriptor.name,
                 icon: descriptor.icon,
@@ -7251,12 +7356,12 @@ impl HostRegistry {
             "UPDATE libraries SET
                 name=CASE WHEN EXISTS(SELECT 1 FROM host_sync_field_versions WHERE library_uuid=?1 AND field='name' AND is_winner=1) THEN name ELSE ?2 END,
                 icon=CASE WHEN EXISTS(SELECT 1 FROM host_sync_field_versions WHERE library_uuid=?1 AND field='icon' AND is_winner=1) THEN icon ELSE ?3 END,
-                updated_at=?4 WHERE library_uuid=?1",
+                updated_at=?4 WHERE library_uuid=?1 AND kind=?5",
             params![
                 metadata.library_uuid,
                 metadata.name,
                 metadata.icon,
-                unix_timestamp_millis()
+                unix_timestamp_millis(), metadata.kind
             ],
         )?;
         if changed != 1 {
@@ -7284,11 +7389,12 @@ impl HostRegistry {
         Ok(())
     }
     pub fn sync_bound_libraries(&self) -> anyhow::Result<Vec<LibraryDescriptor>> {
+        let notebook_enabled = self.notebook_enabled()?;
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let now = unix_timestamp_millis();
-        let mut statement=connection.prepare("SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','capturing','seed_ready','publishing','restoring') THEN 'synchronizing' ELSE 'synchronized' END,l.availability,l.marker_identity FROM libraries l JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid WHERE l.marker_version=2 AND l.availability='available' AND b.state IN ('preparing','capturing','seed_ready','publishing','active','restoring','error') AND COALESCE(b.retry_after,b.poll_after,0)<=?1 ORDER BY l.library_uuid")?;
+        let mut statement=connection.prepare("SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','capturing','seed_ready','publishing','restoring') THEN 'synchronizing' ELSE 'synchronized' END,l.availability,l.marker_identity,l.kind FROM libraries l JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid WHERE (l.kind='media' OR ?2) AND ((l.kind='media' AND l.marker_version=2) OR (l.kind='notes' AND l.marker_version=3)) AND l.availability='available' AND b.state IN ('preparing','capturing','seed_ready','publishing','active','restoring','error') AND COALESCE(b.retry_after,b.poll_after,0)<=?1 ORDER BY l.library_uuid")?;
         let libraries = statement
-            .query_map([now], descriptor_from_row)?
+            .query_map(params![now, notebook_enabled], descriptor_from_row)?
             .collect::<Result<_, _>>()?;
         Ok(libraries)
     }
@@ -7451,6 +7557,9 @@ impl HostRegistry {
         }
         if schema_version < 23 {
             connection.execute_batch(HOST_MIGRATION_0023)?;
+        }
+        if schema_version < 24 {
+            connection.execute_batch(HOST_MIGRATION_0024)?;
         }
         // A stopped Host has no surviving child. Complete a crashed stop locally.
         connection.execute(
@@ -7724,6 +7833,7 @@ impl HostRegistry {
     }
 
     pub fn sync_status_snapshot(&self) -> anyhow::Result<SyncStatusSnapshot> {
+        let notebook_enabled = self.notebook_enabled()?;
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let revision = connection.query_row(
             "SELECT sync_status_revision FROM host_meta WHERE singleton=1",
@@ -7756,10 +7866,10 @@ impl HostRegistry {
             rows
         };
         let mut statement = connection.prepare(
-            "SELECT l.library_uuid,l.name,COALESCE(b.plugin_id,u.plugin_id),COALESCE(b.account_uuid,u.account_uuid),COALESCE(b.remote_namespace,u.remote_namespace),CASE WHEN u.state IN ('cutover','reconciling') THEN 'unbinding' WHEN b.state IS NULL AND u.state='complete' THEN 'detached' ELSE b.state END,b.last_success_at,COALESCE(u.last_error_code,b.last_error_code),COALESCE(u.next_retry_at,b.retry_after),b.poll_after,b.published_through_seq,COALESCE(b.pending_upload_items,0),MAX(COALESCE((SELECT MAX(updated_at) FROM sync_orchestration_operations op WHERE op.library_uuid=l.library_uuid),0),COALESCE((SELECT MAX(updated_at) FROM sync_restore_plans rp WHERE rp.library_uuid=l.library_uuid),0),COALESCE(u.updated_at,0)),COALESCE(b.pending_download_items,0),COALESCE(b.pending_download_bytes,0),COALESCE(b.conflict_count,0),COALESCE((SELECT catalog_ready FROM sync_restore_plans latest_restore WHERE latest_restore.library_uuid=l.library_uuid ORDER BY created_at DESC LIMIT 1),0),COALESCE(b.pending_upload_bytes,0),(SELECT restore_uuid FROM sync_restore_plans latest_restore WHERE latest_restore.library_uuid=l.library_uuid ORDER BY created_at DESC LIMIT 1),(SELECT media_items_done FROM sync_restore_plans latest_restore WHERE latest_restore.library_uuid=l.library_uuid ORDER BY created_at DESC LIMIT 1),(SELECT media_items_total FROM sync_restore_plans latest_restore WHERE latest_restore.library_uuid=l.library_uuid ORDER BY created_at DESC LIMIT 1),(SELECT media_bytes_done FROM sync_restore_plans latest_restore WHERE latest_restore.library_uuid=l.library_uuid ORDER BY created_at DESC LIMIT 1),(SELECT media_bytes_total FROM sync_restore_plans latest_restore WHERE latest_restore.library_uuid=l.library_uuid ORDER BY created_at DESC LIMIT 1) FROM libraries l LEFT JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid LEFT JOIN sync_unbind_plans u ON u.plan_uuid=(SELECT latest_unbind.plan_uuid FROM sync_unbind_plans latest_unbind WHERE latest_unbind.library_uuid=l.library_uuid AND latest_unbind.state IN ('cutover','reconciling','complete') ORDER BY latest_unbind.updated_at DESC LIMIT 1) ORDER BY COALESCE(l.last_opened_at,l.created_at) DESC,l.library_uuid",
+            "SELECT l.library_uuid,l.name,COALESCE(b.plugin_id,u.plugin_id),COALESCE(b.account_uuid,u.account_uuid),COALESCE(b.remote_namespace,u.remote_namespace),CASE WHEN u.state IN ('cutover','reconciling') THEN 'unbinding' WHEN b.state IS NULL AND u.state='complete' THEN 'detached' ELSE b.state END,b.last_success_at,COALESCE(u.last_error_code,b.last_error_code),COALESCE(u.next_retry_at,b.retry_after),b.poll_after,b.published_through_seq,COALESCE(b.pending_upload_items,0),MAX(COALESCE((SELECT MAX(updated_at) FROM sync_orchestration_operations op WHERE op.library_uuid=l.library_uuid),0),COALESCE((SELECT MAX(updated_at) FROM sync_restore_plans rp WHERE rp.library_uuid=l.library_uuid),0),COALESCE(u.updated_at,0)),COALESCE(b.pending_download_items,0),COALESCE(b.pending_download_bytes,0),COALESCE(b.conflict_count,0),COALESCE((SELECT catalog_ready FROM sync_restore_plans latest_restore WHERE latest_restore.library_uuid=l.library_uuid ORDER BY created_at DESC LIMIT 1),0),COALESCE(b.pending_upload_bytes,0),(SELECT restore_uuid FROM sync_restore_plans latest_restore WHERE latest_restore.library_uuid=l.library_uuid ORDER BY created_at DESC LIMIT 1),(SELECT media_items_done FROM sync_restore_plans latest_restore WHERE latest_restore.library_uuid=l.library_uuid ORDER BY created_at DESC LIMIT 1),(SELECT media_items_total FROM sync_restore_plans latest_restore WHERE latest_restore.library_uuid=l.library_uuid ORDER BY created_at DESC LIMIT 1),(SELECT media_bytes_done FROM sync_restore_plans latest_restore WHERE latest_restore.library_uuid=l.library_uuid ORDER BY created_at DESC LIMIT 1),(SELECT media_bytes_total FROM sync_restore_plans latest_restore WHERE latest_restore.library_uuid=l.library_uuid ORDER BY created_at DESC LIMIT 1) FROM libraries l LEFT JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid LEFT JOIN sync_unbind_plans u ON u.plan_uuid=(SELECT latest_unbind.plan_uuid FROM sync_unbind_plans latest_unbind WHERE latest_unbind.library_uuid=l.library_uuid AND latest_unbind.state IN ('cutover','reconciling','complete') ORDER BY latest_unbind.updated_at DESC LIMIT 1) WHERE (l.kind='media' OR ?1) ORDER BY COALESCE(l.last_opened_at,l.created_at) DESC,l.library_uuid",
         )?;
         let libraries = statement
-            .query_map([], |row| {
+            .query_map([notebook_enabled], |row| {
                 let state: Option<String> = row.get(5)?;
                 let (lifecycle, mut phase, mut readiness, mut actions) =
                     sync_public_state(state.as_deref());
@@ -7880,12 +7990,13 @@ impl HostRegistry {
     pub fn list_remote_libraries(&self) -> anyhow::Result<Vec<RemoteLibrarySummary>> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let mut statement = connection.prepare(
-            "SELECT r.account_uuid,r.library_uuid,r.name,r.icon,r.media_count,r.logical_bytes,r.last_synced_at,r.descriptor_size,r.updated_at,r.compatible,r.descriptor_error_code,EXISTS(SELECT 1 FROM library_sync_bindings b WHERE b.account_uuid=r.account_uuid AND COALESCE(b.remote_namespace,b.library_uuid)=r.library_uuid) FROM provider_remote_libraries r JOIN plugin_accounts a ON a.account_uuid=r.account_uuid WHERE r.account_generation=a.generation ORDER BY r.updated_at DESC,r.library_uuid",
+            "SELECT r.account_uuid,r.library_uuid,r.name,r.icon,r.media_count,r.logical_bytes,r.last_synced_at,r.descriptor_size,r.updated_at,r.compatible,r.descriptor_error_code,EXISTS(SELECT 1 FROM library_sync_bindings b WHERE b.account_uuid=r.account_uuid AND COALESCE(b.remote_namespace,b.library_uuid)=r.library_uuid),r.kind FROM provider_remote_libraries r JOIN plugin_accounts a ON a.account_uuid=r.account_uuid WHERE r.account_generation=a.generation ORDER BY r.updated_at DESC,r.library_uuid",
         )?;
         let rows = statement
             .query_map([], |row| {
                 let library_uuid: String = row.get(1)?;
                 Ok(RemoteLibrarySummary {
+                    kind: row.get(12)?,
                     account_uuid: row.get(0)?,
                     name: row.get::<_, Option<String>>(2)?.unwrap_or_else(|| {
                         format!("Remote {}", &library_uuid[..8.min(library_uuid.len())])
@@ -8550,18 +8661,29 @@ impl HostRegistry {
         let now = unix_timestamp_millis();
         let mut connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let transaction = connection.transaction()?;
-        let remote: Option<(Vec<u8>, String)> = transaction
+        let remote: Option<(Vec<u8>, String, LibraryKind)> = transaction
             .query_row(
-                "SELECT descriptor_sha256,name FROM provider_remote_libraries WHERE account_uuid=?1 AND library_uuid=?2 AND compatible=1",
+                "SELECT descriptor_sha256,name,kind FROM provider_remote_libraries WHERE account_uuid=?1 AND library_uuid=?2 AND compatible=1",
                 params![request.account_uuid, request.library_uuid],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let (hash, remote_name) =
+        let (hash, remote_name, kind) =
             remote.ok_or_else(|| anyhow::anyhow!("remote-library-not-restorable"))?;
         let restore_uuid = uuid::Uuid::now_v7().to_string();
         transaction.execute("INSERT INTO sync_restore_plans(restore_uuid,operation_uuid,account_uuid,library_uuid,name,managed_root,descriptor_sha256,state,phase,restore_mode,inventory_fence,request_hash,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'restoring','operation-and-plans-recorded',?8,?9,?10,?11,?11)",params![restore_uuid,request.operation_uuid,request.account_uuid,request.library_uuid,remote_name,request.managed_root.to_string_lossy(),hash,request.restore_mode,request.inventory_fence,request.request_hash,now])?;
-        transaction.execute("UPDATE sync_restore_plans SET database_path=?2,placement_base=?3,content_paths_json=?4 WHERE restore_uuid=?1", params![restore_uuid, request.managed_root.join("Database").to_string_lossy(), request.managed_root.to_string_lossy(), serde_json::to_string(&vec![request.managed_root.join("Files").to_string_lossy().into_owned()])?])?;
+        let content_paths: Vec<_> = kind
+            .is_media()
+            .then(|| {
+                request
+                    .managed_root
+                    .join("Files")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .into_iter()
+            .collect();
+        transaction.execute("UPDATE sync_restore_plans SET database_path=?2,placement_base=?3,content_paths_json=?4,kind=?5 WHERE restore_uuid=?1", params![restore_uuid, request.managed_root.join("Database").to_string_lossy(), request.managed_root.to_string_lossy(), serde_json::to_string(&content_paths)?,kind])?;
         Self::bump_sync_status_revision(&transaction)?;
         transaction.commit()?;
         Ok(SyncRestorePlan {
@@ -8576,11 +8698,7 @@ impl HostRegistry {
                 .to_string_lossy()
                 .into_owned(),
             placement_base: request.managed_root.to_string_lossy().into_owned(),
-            content_paths: vec![request
-                .managed_root
-                .join("Files")
-                .to_string_lossy()
-                .into_owned()],
+            content_paths,
             state: "restoring".into(),
             phase: "catalog-restore".into(),
             catalog_ready: false,
@@ -9166,7 +9284,7 @@ impl HostRegistry {
             |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
         )?;
         let mut statement = connection.prepare(
-            "SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','capturing','seed_ready','publishing') THEN 'synchronizing' WHEN b.state IN ('active','paused') THEN 'synchronized' ELSE l.binding_state END,l.availability,l.marker_identity FROM libraries l LEFT JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid WHERE (?1=0 OR NOT EXISTS(SELECT 1 FROM library_list_visibility v WHERE v.library_uuid=l.library_uuid AND v.hidden=1)) ORDER BY COALESCE(l.last_opened_at,l.created_at) DESC,l.created_at DESC",
+            "SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','capturing','seed_ready','publishing') THEN 'synchronizing' WHEN b.state IN ('active','paused') THEN 'synchronized' ELSE l.binding_state END,l.availability,l.marker_identity,l.kind FROM libraries l LEFT JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid WHERE (?1=0 OR NOT EXISTS(SELECT 1 FROM library_list_visibility v WHERE v.library_uuid=l.library_uuid AND v.hidden=1)) ORDER BY COALESCE(l.last_opened_at,l.created_at) DESC,l.created_at DESC",
         )?;
         let libraries = statement
             .query_map([listed_only as i64], descriptor_from_row)?
@@ -9184,7 +9302,11 @@ impl HostRegistry {
     }
 
     pub fn listed_snapshot(&self) -> anyhow::Result<HostSnapshot> {
-        self.snapshot_with_visibility(true)
+        let mut snapshot = self.snapshot_with_visibility(true)?;
+        if !self.notebook_enabled()? {
+            snapshot.libraries.retain(|library| library.kind.is_media());
+        }
+        Ok(snapshot)
     }
 
     pub fn show_library(&self, library_uuid: &str) -> anyhow::Result<()> {
@@ -9234,17 +9356,18 @@ impl HostRegistry {
     pub fn begin_library_open(&self, intent: &LibraryOpenIntent) -> anyhow::Result<()> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         let d = &intent.descriptor;
-        connection.execute("INSERT INTO library_open_journal(library_uuid,root_uuid,name,managed_root,local_data_dir,marker_identity,root_identity,phase,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'requested',?8)", params![d.library_uuid,d.root_uuid,d.name,d.managed_root.to_string_lossy(),d.local_data_dir.to_string_lossy(),d.marker_identity,intent.root_identity,unix_timestamp_millis()])?;
+        connection.execute("INSERT INTO library_open_journal(library_uuid,root_uuid,name,managed_root,local_data_dir,marker_identity,root_identity,phase,created_at,kind) VALUES (?1,?2,?3,?4,?5,?6,?7,'requested',?8,?9)", params![d.library_uuid,d.root_uuid,d.name,d.managed_root.to_string_lossy(),d.local_data_dir.to_string_lossy(),d.marker_identity,intent.root_identity,unix_timestamp_millis(),d.kind])?;
         Ok(())
     }
 
     pub fn library_open_intents(&self) -> anyhow::Result<Vec<LibraryOpenIntent>> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
-        let mut statement = connection.prepare("SELECT library_uuid,root_uuid,name,local_data_dir,managed_root,marker_identity,root_identity,local_identity,catalog_identity FROM library_open_journal WHERE phase<>'committed'")?;
+        let mut statement = connection.prepare("SELECT library_uuid,root_uuid,name,local_data_dir,managed_root,marker_identity,root_identity,local_identity,catalog_identity,kind FROM library_open_journal WHERE phase<>'committed'")?;
         let intents = statement
             .query_map([], |row| {
                 Ok(LibraryOpenIntent {
                     descriptor: LibraryDescriptor {
+                        kind: row.get(9)?,
                         library_uuid: row.get(0)?,
                         root_uuid: row.get(1)?,
                         name: row.get(2)?,
@@ -9292,7 +9415,7 @@ impl HostRegistry {
         let d = descriptor;
         if !transaction.query_row("SELECT EXISTS(SELECT 1 FROM library_open_journal WHERE library_uuid=?1 AND root_uuid=?2 AND managed_root=?3 AND local_data_dir=?4 AND marker_identity=?5 AND local_identity IS NOT NULL AND catalog_identity IS NOT NULL AND phase='building')", params![d.library_uuid,d.root_uuid,d.managed_root.to_string_lossy(),d.local_data_dir.to_string_lossy(),d.marker_identity], |row| row.get::<_,bool>(0))? { bail!("library-open-state-changed"); }
         let now = unix_timestamp_millis();
-        transaction.execute("INSERT INTO libraries(library_uuid,root_uuid,name,local_data_dir,managed_root,lifecycle_state,binding_state,availability,marker_version,marker_identity,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,'ready','local-only','available',2,?6,?7,?7)", params![d.library_uuid,d.root_uuid,d.name,d.local_data_dir.to_string_lossy(),d.managed_root.to_string_lossy(),d.marker_identity,now])?;
+        transaction.execute("INSERT INTO libraries(library_uuid,root_uuid,name,local_data_dir,managed_root,lifecycle_state,binding_state,availability,marker_version,marker_identity,created_at,updated_at,kind) VALUES (?1,?2,?3,?4,?5,'ready','local-only','available',?9,?6,?7,?7,?8)", params![d.library_uuid,d.root_uuid,d.name,d.local_data_dir.to_string_lossy(),d.managed_root.to_string_lossy(),d.marker_identity,now,d.kind,d.kind.marker_version()])?;
         transaction.execute(
             "UPDATE library_open_journal SET phase='committed' WHERE library_uuid=?1",
             [&d.library_uuid],
@@ -9305,7 +9428,7 @@ impl HostRegistry {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
         connection
             .query_row(
-                "SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','capturing','seed_ready','publishing') THEN 'synchronizing' WHEN b.state IN ('active','paused') THEN 'synchronized' ELSE l.binding_state END,l.availability,l.marker_identity FROM libraries l LEFT JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid WHERE l.library_uuid=?1",
+                "SELECT l.library_uuid,l.root_uuid,l.name,l.icon,l.color,l.local_data_dir,l.managed_root,l.lifecycle_state,CASE WHEN b.state IN ('preparing','capturing','seed_ready','publishing') THEN 'synchronizing' WHEN b.state IN ('active','paused') THEN 'synchronized' ELSE l.binding_state END,l.availability,l.marker_identity,l.kind FROM libraries l LEFT JOIN library_sync_bindings b ON b.library_uuid=l.library_uuid WHERE l.library_uuid=?1",
                 [library_uuid],
                 descriptor_from_row,
             )
@@ -9385,7 +9508,7 @@ impl HostRegistry {
         }
         let now = unix_timestamp_millis();
         transaction.execute(
-            "INSERT INTO library_creation_journal(txn_uuid, library_uuid, root_uuid, name, icon, color, requested_root, resolved_root, local_staging_dir, phase, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'intent', ?10, ?10)",
+            "INSERT INTO library_creation_journal(txn_uuid, library_uuid, root_uuid, name, icon, color, requested_root, resolved_root, local_staging_dir, phase, created_at, updated_at, kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'intent', ?10, ?10, ?11)",
             params![
                 intent.txn_uuid,
                 intent.descriptor.library_uuid,
@@ -9396,7 +9519,7 @@ impl HostRegistry {
                 intent.requested_root.to_string_lossy(),
                 intent.descriptor.managed_root.to_string_lossy(),
                 intent.staging_dir.to_string_lossy(),
-                now,
+                now, intent.descriptor.kind,
             ],
         )?;
         transaction.commit()?;
@@ -9487,10 +9610,11 @@ impl HostRegistry {
 
     pub fn pending_creation_recovery(&self) -> anyhow::Result<Vec<CreationRecovery>> {
         let connection = self.connection.lock().unwrap_or_else(|p| p.into_inner());
-        let mut statement = connection.prepare("SELECT txn_uuid, library_uuid, root_uuid, name, icon, color, resolved_root, local_staging_dir, phase, created_root, created_marker, root_identity, staging_identity, layout_version, final_storage_path, content_roots_json, owned_artifacts_json FROM library_creation_journal WHERE phase NOT IN ('created','rolled-back') ORDER BY created_at")?;
+        let mut statement = connection.prepare("SELECT txn_uuid, library_uuid, root_uuid, name, icon, color, resolved_root, local_staging_dir, phase, created_root, created_marker, root_identity, staging_identity, layout_version, final_storage_path, content_roots_json, owned_artifacts_json, kind FROM library_creation_journal WHERE phase NOT IN ('created','rolled-back') ORDER BY created_at")?;
         let rows = statement
             .query_map([], |row| {
                 Ok(CreationRecovery {
+                    kind: row.get(17)?,
                     txn_uuid: row.get(0)?,
                     library_uuid: row.get(1)?,
                     root_uuid: row.get(2)?,
@@ -9614,8 +9738,8 @@ impl HostRegistry {
         }
         let now = unix_timestamp_millis();
         transaction.execute(
-            "INSERT INTO libraries(library_uuid, root_uuid, name, icon, color, local_data_dir, managed_root, lifecycle_state, binding_state, availability, marker_version, marker_identity, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ready', 'local-only', 'available', 2, ?8, ?9, ?9) ON CONFLICT(library_uuid) DO UPDATE SET name=excluded.name, icon=excluded.icon, color=excluded.color, local_data_dir=excluded.local_data_dir, managed_root=excluded.managed_root, lifecycle_state='ready', binding_state='local-only', availability='available', marker_version=2, marker_identity=excluded.marker_identity, updated_at=excluded.updated_at",
-            params![descriptor.library_uuid, descriptor.root_uuid, descriptor.name, descriptor.icon, descriptor.color, descriptor.local_data_dir.to_string_lossy(), descriptor.managed_root.to_string_lossy(), descriptor.marker_identity, now],
+            "INSERT INTO libraries(library_uuid, root_uuid, name, icon, color, local_data_dir, managed_root, lifecycle_state, binding_state, availability, marker_version, marker_identity, created_at, updated_at, kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ready', 'local-only', 'available', ?11, ?8, ?9, ?9, ?10) ON CONFLICT(library_uuid) DO UPDATE SET name=excluded.name, icon=excluded.icon, color=excluded.color, local_data_dir=excluded.local_data_dir, managed_root=excluded.managed_root, lifecycle_state='ready', binding_state='local-only', availability='available', marker_version=excluded.marker_version, marker_identity=excluded.marker_identity, updated_at=excluded.updated_at",
+            params![descriptor.library_uuid, descriptor.root_uuid, descriptor.name, descriptor.icon, descriptor.color, descriptor.local_data_dir.to_string_lossy(), descriptor.managed_root.to_string_lossy(), descriptor.marker_identity, now, descriptor.kind, descriptor.kind.marker_version()],
         )?;
         transaction.execute(
             "UPDATE library_creation_journal SET phase='created', updated_at=?2 WHERE txn_uuid=?1",
@@ -9948,6 +10072,7 @@ fn materialize_host_field_version(
 
 fn descriptor_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryDescriptor> {
     Ok(LibraryDescriptor {
+        kind: row.get(11)?,
         library_uuid: row.get(0)?,
         root_uuid: row.get(1)?,
         name: row.get(2)?,
@@ -10453,7 +10578,7 @@ mod tests {
                     |row| row.get::<_, i64>(0)
                 )
                 .unwrap(),
-            23
+            24
         );
         for table in [
             "provider_remote_descriptor_heads",
@@ -11384,6 +11509,7 @@ mod tests {
 
     fn register_test_library(registry: &HostRegistry, library_uuid: &str) {
         let descriptor = LibraryDescriptor {
+            kind: Default::default(),
             library_uuid: library_uuid.into(),
             root_uuid: uuid::Uuid::now_v7().to_string(),
             name: "Test Library".into(),
@@ -13260,6 +13386,7 @@ mod tests {
             etag: Some("etag-one".into()),
         };
         let discovered = DiscoveredRemoteLibrary {
+            kind: Default::default(),
             evidence: None,
             history: BTreeMap::new(),
             metadata,

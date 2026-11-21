@@ -21,21 +21,30 @@ pub struct TrustEntry {
 pub fn embedded_trust_registry() -> &'static [TrustEntry] {
     static REGISTRY: std::sync::OnceLock<Vec<TrustEntry>> = std::sync::OnceLock::new();
     REGISTRY.get_or_init(|| {
-        super::generated_trust::GENERATED_PLUGIN_TRUST
-            .iter()
-            // A zero binary digest is the Host-engine marker (no executable);
-            // it can never match a real executable, and the exact manifest
-            // digest still pins every Host plugin.
-            .filter(|(_, _, _, _, manifest_hash)| *manifest_hash != [0; 32])
-            .map(
-                |(plugin_id, version, platform, binary_sha256, manifest_sha256)| TrustEntry {
-                    plugin_id: (*plugin_id).into(),
-                    version: (*version).into(),
-                    platform: *platform,
-                    binary_sha256: *binary_sha256,
-                    manifest_sha256: *manifest_sha256,
+        use super::trust_inventory::{entries, PREFIX, SUFFIX};
+        // Keep the whole envelope addressable, including in optimized builds;
+        // the packager verifies these bytes in the actual linked executable.
+        let blob: &[u8] = std::hint::black_box(
+            include_bytes!(concat!(env!("OUT_DIR"), "/bundled-trust.bin")).as_slice(),
+        );
+        let json = blob
+            .strip_prefix(PREFIX)
+            .and_then(|body| body.strip_suffix(SUFFIX))
+            .expect("compiled trust envelope");
+        entries(json)
+            .expect("validated build-time plugin inventory")
+            .into_iter()
+            .map(|row| TrustEntry {
+                plugin_id: row.id,
+                version: row.version,
+                platform: if row.windows {
+                    Platform::WindowsX64
+                } else {
+                    Platform::LinuxX64
                 },
-            )
+                binary_sha256: row.executable,
+                manifest_sha256: row.manifest,
+            })
             .collect()
     })
 }

@@ -73,28 +73,29 @@ export function SubfolderStrip({
     >
       <header className="subfolder-strip-header">
         <button
+          aria-expanded={!collapsed}
           aria-label={collapsed ? "Expand child folders" : "Collapse child folders"}
           className="subfolder-strip-header-button subfolder-strip-heading-button"
           data-pointer-glow="off"
           onClick={onToggleCollapsed}
           type="button"
         >
-          <span className="subfolder-strip-title">{title}</span>
-          <span className="subfolder-strip-heading-icon" aria-hidden="true">
+          <span data-button-content className="subfolder-strip-title">{title}</span>
+          <span data-button-content className="subfolder-strip-heading-icon" aria-hidden="true">
             {collapsed ? <ChevronDown size={15} /> : <ChevronUp size={15} />}
           </span>
         </button>
 
-        <label className="subfolder-strip-header-button library-browser-content-toggle">
+        <label className="subfolder-strip-header-button library-browser-content-toggle" data-button-feedback>
           <input
             checked={showChildContents}
             onChange={() => onToggleShowChildContents()}
             type="checkbox"
           />
           <span className="library-browser-content-toggle-indicator" aria-hidden="true">
-            <Check size={12} />
+            <Check data-button-content size={12} />
           </span>
-          <span className="library-browser-content-toggle-label">显示子文件夹内容</span>
+          <span className="library-browser-content-toggle-label" data-button-content>显示子文件夹内容</span>
         </label>
       </header>
     </section>
@@ -166,7 +167,7 @@ export function SubfolderCard({
           <span className="subfolder-card-pointer-surface" />
           <span className="library-thumbnail-interaction-ring" />
         </span>
-        <span className="subfolder-card-copy">
+        <span data-button-content className="subfolder-card-copy">
           <span className="subfolder-card-name" title={folder.name}>
             {folder.name}
           </span>

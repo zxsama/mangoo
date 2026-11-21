@@ -72,7 +72,7 @@ pub(super) fn is_ungated_path(path: &str) -> bool {
         && (path.ends_with("/changes") || path.contains("/shared/"))
 }
 
-fn require_plugin(state: &AppState, plugin_id: &str) -> Result<(), CoreError> {
+pub(super) fn require_plugin(state: &AppState, plugin_id: &str) -> Result<(), CoreError> {
     let enabled = state
         .library_manager
         .as_ref()
@@ -114,6 +114,20 @@ fn map_record_error(error: PluginRecordError) -> CoreError {
     }
 }
 
+// This built-in exposes validated, version-checked documents and owned
+// attachments. Its internal Catalog records are a private transport format.
+fn require_generic_records(state: &AppState, plugin_id: &str) -> Result<(), CoreError> {
+    require_plugin(state, plugin_id)?;
+    if plugin_id == crate::db::notebook::PLUGIN {
+        return Err(CoreError::coded(
+            StatusCode::FORBIDDEN,
+            "notebook_api_required",
+            "Use the notebook document and attachment API".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ListQuery {
@@ -150,7 +164,7 @@ async fn list_records(
             error.body_text(),
         )
     })?;
-    require_plugin(&state, &plugin_id)?;
+    require_generic_records(&state, &plugin_id)?;
     let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
     if !(1..=MAX_LIST_LIMIT).contains(&limit) {
         return Err(CoreError::coded(
@@ -179,7 +193,7 @@ async fn get_record(
     State(state): State<AppState>,
     Path((plugin_id, record_id)): Path<(String, String)>,
 ) -> Result<Json<PluginRecord>, CoreError> {
-    require_plugin(&state, &plugin_id)?;
+    require_generic_records(&state, &plugin_id)?;
     let record = run_read_database(state, move |database| {
         database
             .get_plugin_record(&plugin_id, &record_id)
@@ -215,7 +229,7 @@ async fn apply_batch(
             error.body_text(),
         )
     })?;
-    require_plugin(&state, &plugin_id)?;
+    require_generic_records(&state, &plugin_id)?;
     if payload.operations.is_empty() || payload.operations.len() > MAX_BATCH_OPERATIONS {
         return Err(CoreError::coded(
             StatusCode::BAD_REQUEST,

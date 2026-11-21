@@ -63,10 +63,10 @@ export function PluginCard({
         type="button"
         title={plugin.name}
       >
-        <span className="plugin-card-icon" data-direct-contact-content>
+        <span data-button-content className="plugin-card-icon" data-direct-contact-content>
           <PluginIcon aria-hidden="true" size={16} weight="regular" />
         </span>
-        <span className="plugin-card-identity" data-direct-contact-content>
+        <span data-button-content className="plugin-card-identity" data-direct-contact-content>
           <span className="plugin-card-name">{plugin.name}</span>
           <span className="plugin-card-version">v{plugin.selectedVersion}</span>
         </span>

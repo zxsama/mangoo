@@ -6,6 +6,12 @@ Await `pluginBridge().ready` before rendering. The returned context contains the
 
 `context.rootId` identifies an ordinary Core browsing root and defaults to `null` when older Hosts omit it. `rootUuid` remains available for native plugin-view intents. The SDK validates identity shape only; translating a browsing root into feature-specific records belongs to the plugin.
 
+## Interface colors
+
+The bridge applies the current interface colors to the iframe document on initialization and when the user changes them. Use `var(--accent)` for accent text and icons, `var(--accent-fill)` with `var(--on-accent)` for filled controls, and `var(--accent-muted)` for a translucent selection. The status roles are `--status-success`, `--status-warning`, `--status-danger`, and `--status-info`. Item markers use `--item-favorite` and `--item-rating`. Media and document content can keep their own colors.
+
+`getPluginContext().theme.colors` exposes the current hex values for controls drawn outside CSS. Older hosts may supply only `theme.colorScheme`, so include stylesheet fallbacks. Open plugin views update in place and retain the current editing session.
+
 `@mangoo/plugin-sdk/design` and `/design.css` are built from Host's canonical generic glass, dialog and scrollbar sources; the SDK contains no sync workflow or plugin feature composition. Core DTO declarations are built from the canonical client contracts.
 
 ## Shared control root

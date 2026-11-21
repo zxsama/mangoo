@@ -119,7 +119,7 @@ export function Segmented<T extends string>({ value, options, label, onChange, d
             title={option.title}
             type="button"
           >
-            {option.label}
+            <span data-button-content>{option.label}</span>
           </button>
         );
       })}
@@ -307,13 +307,13 @@ function BackupRows() {
       <SettingRow description="清单、便笺、子事项和图片保存为一个文件。" title="导出备份">
         <button className="todo-button" disabled={!bridge || busy !== null} onClick={() => void run("export")} type="button">
           <icons.Download aria-hidden="true" size={13} />
-          {busy === "export" ? "正在导出…" : "导出…"}
+          <span data-button-content>{busy === "export" ? "正在导出…" : "导出…"}</span>
         </button>
       </SettingRow>
       <SettingRow description="备份里的便笺回到备份时的内容，之后新建的便笺保留。" title="从备份恢复">
         <button className="todo-button" disabled={!bridge || busy !== null} onClick={() => void run("import")} type="button">
           <icons.FolderOpen aria-hidden="true" size={13} />
-          {busy === "import" ? "正在恢复…" : "选择文件…"}
+          <span data-button-content>{busy === "import" ? "正在恢复…" : "选择文件…"}</span>
         </button>
       </SettingRow>
       {message ? (

@@ -89,6 +89,14 @@ pub const PHASE1_ROUTE_GROUPS: &[RouteGroup] = &[
 
 #[allow(dead_code)]
 pub const PHASE1_API_PATHS: &[&str] = &[
+    "/api/notebooks/{libraryId}/tree",
+    "/api/notebooks/{libraryId}/folders",
+    "/api/notebooks/{libraryId}/folders/{notebookFolderId}",
+    "/api/notebooks/{libraryId}/notes/{noteId}/folder",
+    "/api/notebooks/{libraryId}/notes",
+    "/api/notebooks/{libraryId}/notes/{noteId}",
+    "/api/notebooks/{libraryId}/notes/{noteId}/attachments",
+    "/api/notebooks/{libraryId}/notes/{noteId}/attachments/{attachmentId}",
     "/api/health",
     "/api/libraries",
     "/api/libraries/active",
@@ -1092,6 +1100,8 @@ pub fn router(state: AppState) -> Router {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LibraryPreflightRequest {
+    #[serde(default)]
+    kind: crate::host_registry::LibraryKind,
     name: String,
     database_path: String,
     content_roots: Vec<crate::library_path::LibraryContentRootInput>,
@@ -1113,6 +1123,8 @@ struct LibraryPreflightResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateLibraryRequest {
+    #[serde(default)]
+    kind: crate::host_registry::LibraryKind,
     name: String,
     database_path: String,
     content_roots: Vec<crate::library_path::LibraryContentRootInput>,
@@ -1132,6 +1144,7 @@ struct OpenLibraryRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LibrarySummaryResponse {
+    kind: crate::host_registry::LibraryKind,
     library_uuid: String,
     root_uuid: String,
     name: String,
@@ -5132,6 +5145,7 @@ fn library_summary(
     context_revision: u64,
 ) -> LibrarySummaryResponse {
     LibrarySummaryResponse {
+        kind: descriptor.kind,
         active: active_library_uuid == Some(descriptor.library_uuid.as_str()),
         library_uuid: descriptor.library_uuid,
         root_uuid: descriptor.root_uuid,
@@ -5199,11 +5213,14 @@ async fn preflight_library(
 ) -> ApiResult<Json<LibraryPreflightResponse>> {
     let manager = library_manager(&state)?;
     let _admission = manager.path_admission().await;
-    let result = manager.preflight_plan(
-        &request.name,
-        FilePath::new(&request.database_path),
-        &request.content_roots,
-    )?;
+    let result = manager
+        .preflight_kind(
+            request.kind,
+            &request.name,
+            FilePath::new(&request.database_path),
+            &request.content_roots,
+        )
+        .map_err(map_library_error)?;
     Ok(Json(LibraryPreflightResponse {
         ok: result.ok,
         reason: result.reason.as_str().to_string(),
@@ -5229,7 +5246,8 @@ async fn create_library(
     }
     let manager = library_manager(&state)?;
     let (descriptor, activated, activation_error) = manager
-        .create_library_with_content(
+        .create_library_of_kind(
+            request.kind,
             request.name,
             request.icon,
             request.color,
@@ -5436,10 +5454,15 @@ async fn wake_sync(State(state): State<AppState>) -> StatusCode {
 async fn list_remote_libraries(
     State(state): State<AppState>,
 ) -> ApiResult<Json<ListResponse<crate::host_registry::RemoteLibrarySummary>>> {
+    let manager = library_manager(&state)?;
+    let enabled = manager.registry().notebook_enabled()?;
     Ok(Json(ListResponse {
-        items: library_manager(&state)?
+        items: manager
             .registry()
-            .list_remote_libraries()?,
+            .list_remote_libraries()?
+            .into_iter()
+            .filter(|library| library.kind.is_media() || enabled)
+            .collect(),
         next_cursor: None,
         total_count: None,
     }))
@@ -6139,7 +6162,19 @@ fn validate_restore_items(
             return Err(CoreError::bad_request("duplicate-restore-library".into()));
         }
         let database_path = FilePath::new(managed_root).join("Database");
+        let kind = remote_inventory
+            .iter()
+            .find(|remote| {
+                &remote.account_uuid == account_uuid && &remote.library_uuid == library_uuid
+            })
+            .map(|remote| remote.kind)
+            .unwrap_or_default();
+        manager
+            .registry()
+            .ensure_kind_available(kind)
+            .map_err(map_library_error)?;
         let content_roots = match item {
+            RestoreStartItem::Legacy(_) if !kind.is_media() => Vec::new(),
             RestoreStartItem::Legacy(_) => vec![crate::library_path::LibraryContentRootInput {
                 path: FilePath::new(managed_root)
                     .join("Files")
@@ -6888,7 +6923,9 @@ async fn export_sync_diagnostics(
 
 fn map_library_error(error: anyhow::Error) -> CoreError {
     let message = error.to_string();
-    let status = if message.contains("not-found") {
+    let status = if message == "notebook-plugin-disabled" {
+        StatusCode::FORBIDDEN
+    } else if message.contains("not-found") {
         StatusCode::NOT_FOUND
     } else if message.contains("invalid") || message.contains("not-empty") {
         StatusCode::BAD_REQUEST
@@ -6949,7 +6986,7 @@ where
         .map_err(|error| CoreError::from(anyhow::anyhow!("database task failed: {error}")))?
 }
 
-async fn run_shared_database<T, F>(state: AppState, operation: F) -> ApiResult<T>
+pub(super) async fn run_shared_database<T, F>(state: AppState, operation: F) -> ApiResult<T>
 where
     T: Send + 'static,
     F: FnOnce(&Database) -> ApiResult<T> + Send + 'static,
@@ -7037,6 +7074,17 @@ async fn add_root(
     Json(payload): Json<AddRootRequest>,
 ) -> ApiResult<(StatusCode, Json<AcceptedResponse>)> {
     let canonical_path = if let Some(manager) = state.library_manager.as_ref() {
+        if let Some(uuid) = manager.active_snapshot().library_uuid {
+            if manager
+                .registry()
+                .library(&uuid)?
+                .is_some_and(|library| !library.kind.is_media())
+            {
+                return Err(CoreError::bad_request(
+                    "invalid-notebook-content-roots".into(),
+                ));
+            }
+        }
         manager
             .admit_content_path(FilePath::new(&payload.path), false)
             .map_err(map_library_error)?
@@ -8525,6 +8573,7 @@ async fn list_file_operations(
 
 async fn list_notification_outbox(
     State(state): State<AppState>,
+    admitted: Option<axum::Extension<crate::library_manager::ActiveSnapshot>>,
     query: Result<Query<ListNotificationOutboxQuery>, QueryRejection>,
 ) -> ApiResult<Json<NotificationOutboxResponse>> {
     let Query(query) =
@@ -8553,7 +8602,14 @@ async fn list_notification_outbox(
         ));
     }
 
-    let items = read_notification_outbox(&state, after_sequence, limit).await?;
+    let runtime = match admitted {
+        Some(axum::Extension(snapshot)) => snapshot
+            .runtime
+            .ok_or_else(|| CoreError::conflict("no-active-library".into()))?,
+        None => state.resources()?,
+    };
+    let cancellation = runtime.cancellation_token();
+    let items = read_notification_outbox(&state, &runtime, after_sequence, limit).await?;
     if !items.is_empty() || wait_ms == 0 {
         return Ok(Json(notification_outbox_response(items, after_sequence)?));
     }
@@ -8561,13 +8617,10 @@ async fn list_notification_outbox(
     // `notify_waiters` does not retain a permit. Register first, then repeat the
     // read to close the commit window between the initial empty query and this
     // waiter becoming visible to producers.
-    let notification_outbox_wake = state
-        .notification_outbox_wake()
-        .expect("active library outbox wake");
-    let notified = notification_outbox_wake.notified();
+    let notified = runtime.notification_outbox_wake.notified();
     tokio::pin!(notified);
     notified.as_mut().enable();
-    let items = read_notification_outbox(&state, after_sequence, limit).await?;
+    let items = read_notification_outbox(&state, &runtime, after_sequence, limit).await?;
     if !items.is_empty() {
         return Ok(Json(notification_outbox_response(items, after_sequence)?));
     }
@@ -8577,21 +8630,33 @@ async fn list_notification_outbox(
         .notification_outbox_test_probe
         .as_ref()
         .map(|probe| probe.begin_waiter());
-    let _ = tokio::time::timeout(Duration::from_millis(wait_ms as u64), notified.as_mut()).await;
+    tokio::select! {
+        _ = cancellation.cancelled() => return Ok(Json(notification_outbox_response(Vec::new(), after_sequence)?)),
+        _ = tokio::time::timeout(Duration::from_millis(wait_ms as u64), notified.as_mut()) => {}
+    }
     #[cfg(test)]
     drop(waiter_activity);
-    let items = read_notification_outbox(&state, after_sequence, limit).await?;
+    let items = read_notification_outbox(&state, &runtime, after_sequence, limit).await?;
     Ok(Json(notification_outbox_response(items, after_sequence)?))
 }
 
 async fn read_notification_outbox(
     state: &AppState,
+    runtime: &Arc<crate::library_manager::LibraryRuntimeResources>,
     after_sequence: i64,
     limit: i64,
 ) -> ApiResult<Vec<NotificationOutboxEvent>> {
-    let read_permit = state
-        .notification_outbox_read_gate()
-        .expect("active library outbox gate")
+    let _gate = state.request_gate().read_owned().await;
+    if !state
+        .resources()
+        .is_ok_and(|current| Arc::ptr_eq(&current, runtime))
+        || runtime.cancellation_token().is_cancelled()
+    {
+        return Ok(Vec::new());
+    }
+    let read_permit = runtime
+        .notification_outbox_read_gate
+        .clone()
         .acquire_owned()
         .await
         .map_err(|_| {
@@ -8810,6 +8875,12 @@ async fn disable_plugin(
         .close_plugin(&plugin_id, registry.plugin_lifecycle_epoch(&plugin_id)?);
     cancel_owned_auth_worker(&state, &plugin_id, None, true).await?;
     manager.finish_disable_plugin(&plugin_id).await?;
+    if plugin_id == crate::plugins::NOTEBOOK_PLUGIN_ID {
+        // Library controls acquire the operation lock before plugin lifecycle.
+        drop(_begin_guard);
+        drop(_lifecycle);
+        manager.close_unavailable_notebook().await?;
+    }
     let updated = registry
         .host_plugin(&plugin_id)?
         .ok_or_else(|| not_found_plugin(&plugin_id))?;
@@ -8841,6 +8912,11 @@ async fn delete_plugin(
                 not_found_plugin(&plugin_id)
             }
         })?;
+    if plugin_id == crate::plugins::NOTEBOOK_PLUGIN_ID {
+        library_manager(&state)?
+            .close_unavailable_notebook()
+            .await?;
+    }
     Ok(Json(PluginCommandResponse { accepted: true }))
 }
 
@@ -8881,6 +8957,10 @@ async fn update_plugin_grants(
         .close_plugin(&id, registry.plugin_lifecycle_epoch(&id)?);
     manager.fence_plugin_bindings(&id, fences).await?;
     finish_plugin_restart(&state, &id).await?;
+    if id == crate::plugins::NOTEBOOK_PLUGIN_ID {
+        drop(_lifecycle);
+        manager.close_unavailable_notebook().await?;
+    }
     Ok(Json(
         registry
             .host_plugin(&id)?
@@ -11220,6 +11300,7 @@ mod tests {
                     &transport.runtime_session_id,
                     None,
                     &[DiscoveredRemoteLibrary {
+                        kind: Default::default(),
                         metadata: crate::sync::provider::ObjectMetadata {
                             key: format!("{library}/library-descriptor"),
                             size: 42,
@@ -11659,6 +11740,7 @@ mod tests {
                     .unwrap();
                 let restore = &plans[0].restore_uuid;
                 let mut existing = crate::host_registry::LibraryDescriptor {
+                    kind: Default::default(),
                     library_uuid: id.clone(),
                     root_uuid: uuid::Uuid::now_v7().to_string(),
                     name: "Existing".into(),
@@ -11685,6 +11767,7 @@ mod tests {
                 fs::write(
                     existing.managed_root.join(MARKER_FILE_NAME),
                     serde_json::to_vec(&crate::library_path::LibraryMarker {
+                        kind: Default::default(),
                         format_version: 2,
                         library_uuid: id.clone(),
                         root_uuid: existing.root_uuid.clone(),
@@ -11923,6 +12006,7 @@ mod tests {
                     requested_root: PathBuf::from(&plans[0].database_path),
                     staging_dir: staging.clone(),
                     descriptor: LibraryDescriptor {
+                        kind: Default::default(),
                         library_uuid: id.clone(),
                         root_uuid: root.clone(),
                         name: "Remote fixture".into(),
@@ -11953,6 +12037,7 @@ mod tests {
                     )
                     .unwrap();
                 let marker = LibraryMarker {
+                    kind: Default::default(),
                     format_version: 1,
                     library_uuid: id.clone(),
                     root_uuid: root,
@@ -15714,6 +15799,88 @@ mod tests {
         if let Some(runtime) = manager.active_snapshot().runtime {
             runtime.shutdown().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn notification_outbox_long_poll_retires_with_its_library_without_blocking_switch() {
+        use crate::api::{ApiConfig, NotificationOutboxTestProbe};
+        use std::time::Duration;
+
+        let base = tempfile::tempdir().unwrap();
+        let mut state = AppState::new_host(
+            base.path().join("host.sqlite"),
+            base.path().join("libraries"),
+        )
+        .await
+        .unwrap();
+        let (probe, _, mut waiter_registered) = NotificationOutboxTestProbe::new(false);
+        state.notification_outbox_test_probe = Some(probe);
+        let manager = state.library_manager.clone().unwrap();
+        let (first, _, _) = manager
+            .create_library(
+                "First".into(),
+                None,
+                None,
+                base.path().join("first"),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        let (next, _, _) = manager
+            .create_library(
+                "Next".into(),
+                None,
+                None,
+                base.path().join("next"),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let revision = manager.active_snapshot().context_revision.to_string();
+        let app = crate::api::router_with_state(state, ApiConfig::default());
+        let poll = tokio::spawn(
+            app.oneshot(
+                Request::builder()
+                    .uri("/api/notifications/outbox?afterSequence=9007199254740991&waitMs=30000")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        tokio::time::timeout(Duration::from_secs(2), waiter_registered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(4), manager.activate(&next.library_uuid))
+            .await
+            .expect("Library switch must not wait for a long poll")
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), poll)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["x-mangoo-library-id"],
+            first.library_uuid.as_str()
+        );
+        assert_eq!(
+            response.headers()["x-mangoo-context-revision"],
+            revision.as_str()
+        );
+        let body = response_json(response).await;
+        assert!(body["items"].as_array().unwrap().is_empty());
+        assert_eq!(body["maxSequence"], 9007199254740991_i64);
+        manager.shutdown_sync_coordinator().await.unwrap();
+        manager
+            .active_snapshot()
+            .runtime
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

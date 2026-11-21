@@ -8,6 +8,7 @@ import {
   type KeyboardEvent,
   type ReactNode
 } from "react";
+import { ChevronRight } from "../icons";
 import { useOverlayFamilyFocus, useOverlayStack } from "./OverlayProvider";
 import {
   findOverlayMenuTypeaheadMatch,
@@ -365,13 +366,13 @@ export function OverlayMenuItem({
       tabIndex={isDisabled ? -1 : tabIndex}
       type={type}
     >
-      {icon ? <span className="overlay-menu-item-icon" aria-hidden="true">{icon}</span> : null}
-      <span className="overlay-menu-item-content">
+      {icon ? <span data-button-content className="overlay-menu-item-icon" aria-hidden="true">{icon}</span> : null}
+      <span data-button-content className="overlay-menu-item-content">
         <span className="overlay-menu-item-label">{children}</span>
         {secondary ? <span className="overlay-menu-item-secondary">{secondary}</span> : null}
       </span>
-      {shortcut ? <span className="overlay-menu-item-shortcut">{shortcut}</span> : null}
-      {submenu ? <span className="overlay-menu-item-submenu" aria-hidden="true">{"\u203a"}</span> : null}
+      {shortcut ? <span data-button-content className="overlay-menu-item-shortcut">{shortcut}</span> : null}
+      {submenu ? <span data-button-content className="overlay-menu-item-submenu" aria-hidden="true"><ChevronRight size="0.7em" /></span> : null}
     </button>
   );
 }

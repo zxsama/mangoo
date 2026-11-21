@@ -1,0 +1,356 @@
+.secondary-window.settings-window {
+  /* The form scrolls independently. Focusing an off-screen control must keep
+     the native titlebar and close button in place. */
+  overflow: clip;
+}
+
+.host-settings.settings-layout-scroll {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  padding: 0;
+  container-type: size;
+  overflow-anchor: none;
+}
+
+.host-settings-columns { min-height: 100%; }
+
+/* A common scroll ancestor lets the wheel work over the fixed navigation as well as the form. */
+.host-settings-columns > nav {
+  position: sticky;
+  top: 0;
+  align-self: start;
+  height: 100cqh;
+}
+
+.host-settings-columns > main {
+  min-width: 0;
+  padding: 18px 22px 28px;
+}
+
+.host-settings-page {
+  container-type: inline-size;
+  max-width: 960px;
+  margin-inline: auto;
+  gap: 26px;
+}
+
+.host-settings-category {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  gap: 8px;
+}
+
+/* Let the final heading reach the same reading position as earlier anchors. */
+.host-settings-category:last-child {
+  min-block-size: 100cqh;
+}
+
+.host-settings-heading,
+.host-settings-toolbar,
+.host-settings-library-footer,
+.host-settings-jumps {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.host-settings-heading .settings-control-heading {
+  margin: 0;
+}
+
+.host-settings-sheet {
+  --settings-rule: rgb(255 255 255 / 0.06);
+  min-width: 0;
+  align-content: start;
+}
+
+/* The category owns the outline. Subgroups organize rows inside that surface. */
+.host-settings-sheet .settings-group-body {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.host-settings-sheet > .host-settings-group ~ .host-settings-group,
+.host-settings-sheet > .host-settings-materials,
+.host-settings-sheet > .host-settings-jumps,
+.host-settings-sheet [data-notebook-settings] > section + section {
+  border-top: 1px solid var(--settings-rule);
+}
+
+.host-settings-sheet [data-notebook-settings] { gap: 0; }
+
+.host-settings-toolbar,
+.host-settings-library-footer,
+.host-settings-jumps {
+  flex-wrap: wrap;
+  padding: 9px 14px;
+}
+
+.host-settings-toolbar p,
+.host-settings-library-footer > span,
+.host-settings-jumps > span {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+
+.host-settings-sheet .settings-control-heading,
+.host-settings-sheet .host-settings-materials > h3 {
+  margin: 0;
+  padding: 11px 14px 1px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.host-settings-jumps .settings-action-row { gap: 4px; }
+.host-settings-jumps button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--text-soft);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12.5px;
+}
+
+.host-settings-jumps button > svg { flex: none; color: var(--accent); }
+.host-settings-jumps button:focus-visible { outline: 1px solid var(--interactive-focus); outline-offset: -1px; }
+
+.host-settings-materials {
+  display: grid;
+}
+
+.host-settings-materials > details { display: block; }
+.host-settings-materials > details + details { border-top: 1px solid var(--settings-rule); }
+
+.host-settings-materials > details[open] { padding-bottom: 10px; }
+
+.host-settings-materials .section-disclosure {
+  min-height: 38px;
+  padding-inline: 14px;
+  font-size: 13px;
+}
+
+.host-settings-field {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
+.host-settings-role-colors > .section-disclosure {
+  min-height: 40px;
+  padding-inline: 14px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.host-settings-parameters > .settings-control-rows {
+  --parameter-columns: minmax(max-content, min(25%, 100px)) minmax(0, 1fr) max-content;
+  grid-template-columns: var(--parameter-columns);
+  column-gap: 4px;
+  padding-inline: 16px;
+}
+
+.host-settings-parameters .settings-control-row {
+  grid-column: 1 / -1;
+  padding-inline: 0;
+}
+
+.host-settings-parameters .host-settings-parameter {
+  grid-template-columns: subgrid;
+  align-items: center;
+  gap: 3px 4px;
+  padding-block: 8px;
+}
+
+.host-settings-parameter-value {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 2px;
+  box-sizing: border-box;
+  width: 46px;
+  height: 28px;
+  padding-inline: 5px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: rgba(0, 0, 0, 0.18);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  cursor: text;
+}
+
+.host-settings-parameter-value[data-unit="MB"] { width: 72px; }
+.host-settings-parameter-value:focus-within { border-color: var(--interactive-focus); }
+
+.host-settings-parameter-value input {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  text-align: left;
+  appearance: textfield;
+}
+
+.host-settings-parameter-value input:focus-visible { outline: none; }
+.host-settings-parameter-value input::-webkit-inner-spin-button,
+.host-settings-parameter-value input::-webkit-outer-spin-button {
+  margin: 0;
+  appearance: none;
+}
+
+.host-settings-parameter > p {
+  grid-column: 1 / -1;
+}
+
+.host-settings-parameter .settings-style-slider-control:focus-within {
+  border-color: var(--interactive-focus);
+}
+
+.host-settings-cache-status {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 14px;
+}
+
+.settings-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0;
+  padding: 10px 14px;
+  border-top: 1px solid var(--line);
+}
+
+.settings-stat-cell {
+  display: grid;
+  align-content: start;
+  gap: 3px;
+  min-width: 0;
+}
+
+.settings-stat-cell dt { color: var(--text-muted); font-size: 11.5px; }
+.settings-stat-cell dd {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 15px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.host-settings-actions .settings-control-value {
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+@container (max-width: 480px) {
+  .host-settings-actions .settings-control-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+  .host-settings-actions .settings-control-value {
+    justify-content: flex-start;
+  }
+}
+
+@container (max-width: 375px) {
+  .settings-stat-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+.host-settings .settings-path {
+  max-width: 58cqi;
+  user-select: text;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+#settings-shortcuts .host-settings-toolbar { border-bottom: 1px solid var(--settings-rule); }
+#settings-shortcuts .settings-control-row {
+  min-height: 40px;
+  padding-block: 6px;
+}
+.host-settings-keys, .host-settings-keys > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.host-settings-keys kbd { font: inherit; }
+.host-settings-keys small { color: var(--text-muted); }
+
+@container (max-width: 380px) {
+  .host-settings-paths .settings-control-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 5px;
+  }
+  .host-settings-paths .settings-control-value { justify-content: flex-start; }
+  .host-settings-paths .settings-path { max-width: 100%; }
+  .host-settings-library-footer, .host-settings-jumps, .host-settings-toolbar { gap: 6px; }
+  .host-settings-sheet .settings-library-main {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 4px 8px;
+  }
+  .settings-library-main > .settings-library-actions { grid-column: 2; }
+  .host-settings .settings-library-delete-confirm-row { flex-wrap: wrap; }
+  .host-settings .settings-library-delete-confirm-row input { flex-basis: 100%; }
+}
+
+.host-settings-contributions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--line);
+}
+
+.host-settings-contributions:empty {
+  display: none;
+}
+
+@container (min-width: 460px) {
+  .host-settings-palette {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .host-settings-palette .settings-control-row:nth-child(2) { border-top: 0; }
+  .host-settings-palette .settings-control-row { gap: 6px; }
+}
+
+@container (min-width: 660px) {
+  .host-settings-parameters > .settings-control-rows {
+    --parameter-columns: minmax(max-content, min(12%, 100px)) minmax(0, 1fr) max-content;
+    /* Both parameter columns align their own labels and fields around a shared gutter. */
+    grid-template-columns: var(--parameter-columns) 16px var(--parameter-columns);
+  }
+  .host-settings-parameters .settings-control-row:nth-child(odd) { grid-column: 1 / 4; }
+  .host-settings-parameters .settings-control-row:nth-child(even) { grid-column: 5 / 8; }
+  .host-settings-parameters .settings-control-row:nth-child(2) { border-top: 0; }
+}
+
+@container (max-width: 560px) {
+  .host-settings-columns { grid-template-columns: 106px minmax(0, 1fr); }
+  .host-settings-columns > nav { padding-inline: 5px; }
+  .host-settings-columns > main { padding-inline: 12px; }
+}

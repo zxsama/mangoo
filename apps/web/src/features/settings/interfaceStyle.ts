@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { broadcastPreference, subscribePreference } from "../../core/preferenceSync.ts";
+import { themeAccentColors } from "../../design/themeColors.ts";
 
 export const INTERFACE_STYLE_STORAGE_KEY = "mangoo.interfaceStyle";
 
@@ -10,7 +12,29 @@ export const INTERFACE_STYLE_STORAGE_KEY = "mangoo.interfaceStyle";
 //   - glow radius (visible halo, ≤ sensing):     sensing * pointerResponseRadius
 export const POINTER_SENSING_DISTANCE_BASE_PX = 80;
 
+export const INTERFACE_COLOR_ROLES = [
+  { role: "success", label: "成功", token: "--status-success", defaultColor: "#8fd3a2" },
+  { role: "warning", label: "警告", token: "--status-warning", defaultColor: "#e7b66b" },
+  { role: "danger", label: "错误", token: "--status-danger", defaultColor: "#ef8d7f" },
+  { role: "info", label: "信息", token: "--status-info", defaultColor: "#9bc4f1" },
+  { role: "favorite", label: "收藏", token: "--item-favorite", defaultColor: "#ff6384" },
+  { role: "rating", label: "评分", token: "--item-rating", defaultColor: "#ffc857" }
+] as const;
+
+type InterfaceRoleColors = Record<(typeof INTERFACE_COLOR_ROLES)[number]["role"], string>;
+type InterfaceColorField = "accentColor" | "sideOverlayColor" | "centerOverlayColor" | keyof InterfaceRoleColors;
+type ColorPreview = { id: string; field: InterfaceColorField; color: string | null };
+
+function normalizeRoleColors(input: unknown): InterfaceRoleColors {
+  const source = isRecord(input) ? input : {};
+  return Object.fromEntries(INTERFACE_COLOR_ROLES.map(({ role, defaultColor }) => [
+    role, normalizeColor(source[role], defaultColor)
+  ])) as InterfaceRoleColors;
+}
+
 export interface InterfaceStylePreference {
+  accentColor: string;
+  roleColors: InterfaceRoleColors;
   windowCornerRadius: number;
   panelControlCornerRadius: number;
   contentCornerRadius: number;
@@ -40,6 +64,8 @@ export interface InterfaceStylePreference {
 }
 
 export const DEFAULT_INTERFACE_STYLE: InterfaceStylePreference = {
+  accentColor: "#97dbe2",
+  roleColors: normalizeRoleColors(undefined),
   // Match the Windows 11 native frameless window corner (DWM rounds top-level
   // windows at 8px). The CSS content clip must equal the native radius, else a
   // larger CSS radius curves inside the native corner and shows a double corner.
@@ -98,18 +124,23 @@ export const INTERFACE_STYLE_LIMITS = {
   dialogBackdropDim: { min: 0, max: 0.85, step: 0.01 }
 } as const;
 
-export type InterfaceStylePatch = Partial<InterfaceStylePreference>;
+export type InterfaceStylePatch = Partial<Omit<InterfaceStylePreference, "roleColors">> & {
+  roleColors?: Partial<InterfaceRoleColors>;
+};
 
 export interface InterfaceStyleController {
   value: InterfaceStylePreference;
   limits: typeof INTERFACE_STYLE_LIMITS;
   setInterfaceStyle: (patch: InterfaceStylePatch) => void;
+  previewInterfaceColor: (field: InterfaceColorField, color: string | null) => void;
   resetInterfaceStyle: () => void;
 }
 
 export function normalizeInterfaceStyle(input: unknown): InterfaceStylePreference {
   const source = isRecord(input) ? input : {};
   return {
+    accentColor: normalizeColor(source.accentColor, DEFAULT_INTERFACE_STYLE.accentColor),
+    roleColors: normalizeRoleColors(source.roleColors),
     windowCornerRadius: clampNumber(
       legacyValue(source, "windowCornerRadius", "windowRadius"),
       INTERFACE_STYLE_LIMITS.windowCornerRadius,
@@ -260,6 +291,7 @@ export function interfaceStyleToCssVariables(
   value: InterfaceStylePreference
 ): Record<string, string> {
   const normalized = normalizeInterfaceStyle(value);
+  const accent = themeAccentColors(normalized.accentColor);
   const tightRadius = clampRounded(
     normalized.panelControlCornerRadius - 4,
     0,
@@ -326,13 +358,13 @@ export function interfaceStyleToCssVariables(
   // across the circle and emit explicit stops; CSS interpolates linearly between
   // them, approximating the curve.
   const pointerFillGradient = pointerFalloffGradient(
-    (t) => `rgba(205, 240, 255, ${roundCssNumber(pointerFillOpacity * 3.4 * t)})`,
+    (t) => `rgb(from var(--glass-pointer-color) r g b / ${roundCssNumber(pointerFillOpacity * 3.4 * t)})`,
     pointerGlowRadius,
     normalized.pointerFalloff,
     "transparent"
   );
   const pointerBorderGradient = pointerFalloffGradient(
-    (t) => `rgba(200, 244, 252, ${roundCssNumber(t)})`,
+    (t) => `rgb(from var(--glass-pointer-color) r g b / ${roundCssNumber(t)})`,
     pointerGlowRadius,
     normalized.pointerFalloff,
     "transparent"
@@ -361,6 +393,13 @@ export function interfaceStyleToCssVariables(
   );
   const ditherOpacity = 0.055 * normalized.ditherOpacity;
   return {
+    ...Object.fromEntries(INTERFACE_COLOR_ROLES.map(({ role, token }) => [
+      token, themeAccentColors(normalized.roleColors[role]).foreground
+    ])),
+    "--accent-fill": accent.fill,
+    "--accent-primary": accent.foreground,
+    "--accent-rgb": accent.channels,
+    "--on-accent": accent.onFill,
     "--radius-window": `${roundCssNumber(normalized.windowCornerRadius)}px`,
     "--radius-overlay": `${roundCssNumber(normalized.panelControlCornerRadius)}px`,
     "--radius-panel": `${roundCssNumber(normalized.panelControlCornerRadius)}px`,
@@ -414,21 +453,82 @@ export function applyInterfaceStyleVariables(
   target: HTMLElement = document.documentElement
 ) {
   const variables = interfaceStyleToCssVariables(value);
+  const paletteChanged = target.style.getPropertyValue("--accent-fill") !== variables["--accent-fill"] ||
+    INTERFACE_COLOR_ROLES.some(({ token }) => target.style.getPropertyValue(token) !== variables[token]);
   for (const [name, cssValue] of Object.entries(variables)) {
     target.style.setProperty(name, cssValue);
+  }
+  if (paletteChanged && target === target.ownerDocument?.documentElement) {
+    target.ownerDocument.dispatchEvent(new CustomEvent("mangoo-accent-changed", { detail: variables["--accent-fill"] }));
   }
 }
 
 export function useInterfaceStyle(): InterfaceStyleController {
   const [value, setValue] = useState<InterfaceStylePreference>(() => readInterfaceStyle());
+  const committed = useRef(value);
+  const preview = useRef<ColorPreview | null>(null);
+  const outgoing = useRef<ColorPreview | null>(null);
+
+  const paint = useCallback(() => {
+    const draft = preview.current;
+    const base = committed.current;
+    if (!draft?.color) {
+      applyInterfaceStyleVariables(base);
+    } else if (Object.hasOwn(base.roleColors, draft.field)) {
+      applyInterfaceStyleVariables({ ...base, roleColors: { ...base.roleColors, [draft.field]: draft.color } });
+    } else {
+      applyInterfaceStyleVariables({ ...base, [draft.field]: draft.color });
+    }
+  }, []);
+
+  const receivePreview = useCallback((message: unknown) => {
+    if (!isRecord(message) || typeof message.id !== "string" || typeof message.field !== "string") return;
+    const { id, field, color } = message;
+    if (color === null) {
+      if (preview.current?.id !== id) return;
+      preview.current = null;
+    } else {
+      if (!["accentColor", "sideOverlayColor", "centerOverlayColor"].includes(field) && !Object.hasOwn(committed.current.roleColors, field)) return;
+      if (typeof color !== "string" || !/^#[0-9a-f]{6}$/i.test(color)) return;
+      preview.current = { id, field: field as InterfaceColorField, color };
+    }
+    paint();
+  }, [paint]);
+
+  const previewInterfaceColor = useCallback((field: InterfaceColorField, color: string | null) => {
+    if (color === null && outgoing.current?.field !== field) return;
+    const id = outgoing.current?.id ?? (crypto.randomUUID?.() ?? Math.random().toString(36).slice(2));
+    const message = { id, field, color };
+    outgoing.current = color === null ? null : message;
+    receivePreview(message);
+    broadcastPreference("interfaceColorPreview", message);
+  }, [receivePreview]);
 
   useEffect(() => {
-    applyInterfaceStyleVariables(value);
+    const unsubscribe = subscribePreference("interfaceColorPreview", receivePreview);
+    const endPreview = () => {
+      if (outgoing.current) previewInterfaceColor(outgoing.current.field, null);
+    };
+    window.addEventListener("pagehide", endPreview);
+    return () => {
+      unsubscribe();
+      window.removeEventListener("pagehide", endPreview);
+      endPreview();
+    };
+  }, [previewInterfaceColor, receivePreview]);
+
+  useEffect(() => {
+    committed.current = value;
+    paint();
     writeInterfaceStyle(value);
-  }, [value]);
+  }, [value, paint]);
 
   const setInterfaceStyle = useCallback((patch: InterfaceStylePatch) => {
-    setValue((current) => normalizeInterfaceStyle({ ...current, ...patch }));
+    setValue((current) => normalizeInterfaceStyle({
+      ...current,
+      ...patch,
+      roleColors: { ...current.roleColors, ...patch.roleColors }
+    }));
   }, []);
 
   const resetInterfaceStyle = useCallback(() => {
@@ -436,8 +536,8 @@ export function useInterfaceStyle(): InterfaceStyleController {
   }, []);
 
   return useMemo(
-    () => ({ value, limits: INTERFACE_STYLE_LIMITS, setInterfaceStyle, resetInterfaceStyle }),
-    [resetInterfaceStyle, setInterfaceStyle, value]
+    () => ({ value, limits: INTERFACE_STYLE_LIMITS, setInterfaceStyle, previewInterfaceColor, resetInterfaceStyle }),
+    [previewInterfaceColor, resetInterfaceStyle, setInterfaceStyle, value]
   );
 }
 

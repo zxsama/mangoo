@@ -23,6 +23,220 @@ servers:
 security:
   - sessionToken: []
 paths:
+  /notebooks/{libraryId}/tree:
+    parameters:
+      - $ref: "#/components/parameters/notebookId"
+    get:
+      operationId: getNotebookTree
+      parameters:
+        - $ref: "#/components/parameters/notebookReadRevision"
+      responses:
+        "200":
+          description: Effective folder hierarchy and note placements. Missing parents and concurrently created cycles are resolved deterministically at the root.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NotebookTree" }
+        "403": { description: Notebook plugin disabled. }
+        "409": { description: Stale Library context. }
+  /notebooks/{libraryId}/folders:
+    parameters:
+      - $ref: "#/components/parameters/notebookId"
+    post:
+      operationId: createNotebookFolder
+      parameters:
+        - $ref: "#/components/parameters/contextRevision"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NotebookFolderInput" }
+      responses:
+        "201":
+          description: Created folder. Sibling names use trimmed, NFC-normalized, case-insensitive comparison.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NotebookFolder" }
+        "400": { description: Invalid name. }
+        "403": { description: Notebook plugin disabled. }
+        "404": { description: Parent folder does not exist. }
+        "409": { description: Stale Library context or a sibling folder already uses this name (notebook_duplicate_folder_name). }
+  /notebooks/{libraryId}/folders/{notebookFolderId}:
+    parameters:
+      - $ref: "#/components/parameters/notebookId"
+      - { name: notebookFolderId, in: path, required: true, schema: { type: string, format: uuid } }
+    put:
+      operationId: updateNotebookFolder
+      parameters:
+        - $ref: "#/components/parameters/contextRevision"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateNotebookFolderRequest" }
+      responses:
+        "200":
+          description: Updated folder.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NotebookFolder" }
+        "400": { description: Invalid name or cyclic move. }
+        "403": { description: Notebook plugin disabled. }
+        "404": { description: Folder does not exist. }
+        "409": { description: Folder or Library context changed, or a sibling folder already uses this name (notebook_duplicate_folder_name). }
+    delete:
+      operationId: deleteNotebookFolder
+      parameters:
+        - $ref: "#/components/parameters/contextRevision"
+        - { name: expectedRevision, in: query, required: true, schema: { type: integer, minimum: 1 } }
+      responses:
+        "204": { description: Empty folder deleted. }
+        "403": { description: Notebook plugin disabled. }
+        "404": { description: Folder does not exist. }
+        "409": { description: Folder is nonempty or folder or Library context changed. }
+  /notebooks/{libraryId}/notes/{noteId}/folder:
+    parameters:
+      - $ref: "#/components/parameters/notebookId"
+      - $ref: "#/components/parameters/noteId"
+    put:
+      operationId: moveNotebookNote
+      parameters:
+        - $ref: "#/components/parameters/contextRevision"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MoveNotebookNoteRequest" }
+      responses:
+        "204": { description: Note moved without changing its document revision. }
+        "403": { description: Notebook plugin disabled. }
+        "404": { description: Note or destination folder does not exist. }
+        "409": { description: Previous parent or Library context changed. }
+  /notebooks/{libraryId}/notes:
+    parameters:
+      - $ref: "#/components/parameters/notebookId"
+    get:
+      operationId: listNotes
+      parameters:
+        - $ref: "#/components/parameters/notebookReadRevision"
+        - name: query
+          in: query
+          schema: { type: string, maxLength: 512 }
+          description: Case-insensitive literal substring of the title or editable source. Omit to list all notes.
+      responses:
+        "200":
+          description: Live notes in the active notebook, newest edits first.
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/NoteSummary" } }
+        "403": { description: Notebook plugin disabled. }
+        "409": { description: Notebook is not active. }
+    post:
+      operationId: createNote
+      parameters:
+        - $ref: "#/components/parameters/contextRevision"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateNoteRequest" }
+      responses:
+        "201":
+          description: Created note.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NotebookNote" }
+        "400": { description: Invalid note. }
+        "403": { description: Notebook plugin disabled. }
+        "409": { description: Stale Library context. }
+  /notebooks/{libraryId}/notes/{noteId}:
+    parameters:
+      - $ref: "#/components/parameters/notebookId"
+      - $ref: "#/components/parameters/noteId"
+    get:
+      operationId: getNote
+      parameters:
+        - $ref: "#/components/parameters/notebookReadRevision"
+      responses:
+        "200":
+          description: Current source, styles and collected attachments.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NotebookNote" }
+        "403": { description: Notebook plugin disabled. }
+        "404": { description: Note was deleted or does not exist. }
+        "409": { description: Stale context or source is still synchronizing. }
+    put:
+      operationId: updateNote
+      parameters:
+        - $ref: "#/components/parameters/contextRevision"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateNoteRequest" }
+      responses:
+        "200":
+          description: Saved note with its new revision.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NotebookNote" }
+        "400": { description: Invalid note. }
+        "403": { description: Notebook plugin disabled. }
+        "404": { description: Note was deleted or does not exist. }
+        "409": { description: Note revision or Library context changed. }
+    delete:
+      operationId: deleteNote
+      parameters:
+        - $ref: "#/components/parameters/contextRevision"
+        - { name: expectedRevision, in: query, required: true, schema: { type: integer, minimum: 1 } }
+      responses:
+        "204": { description: Note deleted. }
+        "403": { description: Notebook plugin disabled. }
+        "404": { description: Note was deleted or does not exist. }
+        "409": { description: Note revision or Library context changed. }
+  /notebooks/{libraryId}/notes/{noteId}/attachments:
+    parameters:
+      - $ref: "#/components/parameters/notebookId"
+      - $ref: "#/components/parameters/noteId"
+    post:
+      operationId: uploadNoteAttachment
+      parameters:
+        - $ref: "#/components/parameters/contextRevision"
+        - { name: name, in: query, required: true, schema: { type: string, maxLength: 255 } }
+        - { name: mimeType, in: query, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "201":
+          description: Collected attachment, referenced as mangoo-attachment followed by a colon and its ID.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NoteAttachment" }
+        "400": { description: Invalid attachment name or media type. }
+        "403": { description: Notebook plugin disabled. }
+        "404": { description: Note was deleted or does not exist. }
+        "409": { description: Stale Library context. }
+  /notebooks/{libraryId}/notes/{noteId}/attachments/{attachmentId}:
+    parameters:
+      - $ref: "#/components/parameters/notebookId"
+      - $ref: "#/components/parameters/noteId"
+      - { name: attachmentId, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      operationId: getNoteAttachment
+      parameters:
+        - $ref: "#/components/parameters/notebookReadRevision"
+      responses:
+        "200":
+          description: Original bytes with their collected media type.
+          content:
+            "*/*":
+              schema: { type: string, format: binary }
+        "403": { description: Notebook plugin disabled. }
+        "404": { description: Note or its attachment does not exist. }
+        "409": { description: Stale context or content is still synchronizing. }
   /health:
     get:
       operationId: getHealth
@@ -2930,6 +3144,21 @@ components:
       schema:
         type: integer
         minimum: 0
+    notebookId:
+      name: libraryId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    notebookReadRevision:
+      name: X-Mangoo-Context-Revision
+      in: header
+      description: Reject a read from an earlier activation of the same notebook.
+      schema: { type: integer, minimum: 0 }
+    noteId:
+      name: noteId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
     rootIdQuery:
       name: rootId
       in: query
@@ -2988,6 +3217,93 @@ components:
       description: Unexpected persistence or runtime failure.
       content: { application/json: { schema: { $ref: "#/components/schemas/SyncFolderErrorResponse" } } }
   schemas:
+    NotebookFolderInput:
+      type: object
+      required: [name, parentId]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        parentId: { type: [string, "null"], format: uuid }
+    UpdateNotebookFolderRequest:
+      allOf:
+        - $ref: "#/components/schemas/NotebookFolderInput"
+        - type: object
+          required: [expectedRevision]
+          properties:
+            expectedRevision: { type: integer, minimum: 1 }
+    NotebookFolder:
+      allOf:
+        - $ref: "#/components/schemas/NotebookFolderInput"
+        - type: object
+          required: [id, revision]
+          properties:
+            id: { type: string, format: uuid }
+            revision: { type: integer }
+    NotebookTree:
+      type: object
+      required: [folders, noteParents]
+      properties:
+        folders: { type: array, items: { $ref: "#/components/schemas/NotebookFolder" } }
+        noteParents: { type: object, additionalProperties: { type: string, format: uuid }, description: Maps note IDs to live folders. Unlisted notes belong to the root. }
+    MoveNotebookNoteRequest:
+      type: object
+      required: [parentId, expectedParentId]
+      properties:
+        parentId: { type: [string, "null"], format: uuid }
+        expectedParentId: { type: [string, "null"], format: uuid }
+    CreateNoteRequest:
+      allOf:
+        - $ref: "#/components/schemas/NoteInput"
+        - type: object
+          properties:
+            folderId: { type: [string, "null"], format: uuid, description: Create directly in this folder. Defaults to the root. }
+    NoteFormat:
+      type: string
+      enum: [markdown, html, document]
+    NoteStyles:
+      type: object
+      additionalProperties: true
+    NoteSummary:
+      type: object
+      required: [id, title, format, revision, createdAt, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        format: { $ref: "#/components/schemas/NoteFormat" }
+        revision: { type: integer }
+        createdAt: { type: integer, description: Unix milliseconds. }
+        updatedAt: { type: integer, description: Unix milliseconds. }
+    NoteAttachment:
+      type: object
+      required: [id, name, mimeType, size]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        mimeType: { type: string }
+        size: { type: integer, minimum: 0 }
+    NoteInput:
+      type: object
+      required: [title, markdown, styles]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 512 }
+        markdown: { type: string, description: UTF-8 source. Document notes use Markdown containing the collected file reference and annotations. }
+        styles: { $ref: "#/components/schemas/NoteStyles" }
+        format: { $ref: "#/components/schemas/NoteFormat", default: markdown }
+    UpdateNoteRequest:
+      allOf:
+        - $ref: "#/components/schemas/NoteInput"
+        - type: object
+          required: [expectedRevision]
+          properties:
+            expectedRevision: { type: integer, minimum: 1 }
+    NotebookNote:
+      allOf:
+        - $ref: "#/components/schemas/NoteSummary"
+        - type: object
+          required: [markdown, styles, attachments]
+          properties:
+            markdown: { type: string }
+            styles: { $ref: "#/components/schemas/NoteStyles" }
+            attachments: { type: array, items: { $ref: "#/components/schemas/NoteAttachment" } }
     PluginRecord:
       type: object
       additionalProperties: false
@@ -3180,10 +3496,14 @@ components:
         createIfMissing:
           type: boolean
           description: Permits creation of a missing content folder; does not establish cleanup ownership.
+    LibraryKind:
+      type: string
+      enum: [media, notes]
     LibrarySummary:
       type: object
-      required: [libraryUuid, rootUuid, name, databasePath, active, availability, lifecycleState, bindingState, contextRevision]
+      required: [kind, libraryUuid, rootUuid, name, databasePath, active, availability, lifecycleState, bindingState, contextRevision]
       properties:
+        kind: { $ref: "#/components/schemas/LibraryKind" }
         libraryUuid:
           type: string
           format: uuid
@@ -3243,7 +3563,12 @@ components:
       type: object
       additionalProperties: false
       required: [name, databasePath, contentRoots]
+      allOf:
+        - if: { required: [kind], properties: { kind: { const: notes } } }
+          then: { properties: { contentRoots: { maxItems: 0 } } }
+          else: { properties: { contentRoots: { minItems: 1 } } }
       properties:
+        kind: { $ref: "#/components/schemas/LibraryKind" }
         name:
           type: string
           minLength: 1
@@ -3252,7 +3577,6 @@ components:
           minLength: 1
         contentRoots:
           type: array
-          minItems: 1
           items:
             $ref: "#/components/schemas/LibraryContentRootInput"
     LibraryPreflightResponse:
@@ -3300,7 +3624,6 @@ components:
         normalizedContentRoots:
           anyOf:
             - type: array
-              minItems: 1
               items:
                 $ref: "#/components/schemas/LibraryContentRootInput"
             - type: "null"
@@ -3317,7 +3640,12 @@ components:
       type: object
       additionalProperties: false
       required: [name, databasePath, contentRoots, initialMode]
+      allOf:
+        - if: { required: [kind], properties: { kind: { const: notes } } }
+          then: { properties: { contentRoots: { maxItems: 0 } } }
+          else: { properties: { contentRoots: { minItems: 1 } } }
       properties:
+        kind: { $ref: "#/components/schemas/LibraryKind" }
         name:
           type: string
           minLength: 1
@@ -3326,7 +3654,6 @@ components:
           minLength: 1
         contentRoots:
           type: array
-          minItems: 1
           items:
             $ref: "#/components/schemas/LibraryContentRootInput"
         icon:
@@ -4032,8 +4359,9 @@ components:
         choice: { type: string, enum: [merge-local-fork, publish-new-remote] }
     RemoteLibrarySummary:
       type: object
-      required: [accountUuid, libraryUuid, name, icon, mediaCount, logicalBytes, lastSyncedAt, descriptorSize, updatedAt, compatible, boundLocally, errorCode]
+      required: [kind, accountUuid, libraryUuid, name, icon, mediaCount, logicalBytes, lastSyncedAt, descriptorSize, updatedAt, compatible, boundLocally, errorCode]
       properties:
+        kind: { $ref: "#/components/schemas/LibraryKind" }
         accountUuid: { type: string }
         libraryUuid: { type: string, format: uuid }
         name: { type: string }
@@ -5217,7 +5545,7 @@ components:
           type: boolean
     PluginCapability:
       type: string
-      enum: [sync-provider.v1, file-decoder.v1, image-viewer.v1, todo-notes.v1]
+      enum: [sync-provider.v1, file-decoder.v1, image-viewer.v1, todo-notes.v1, notebook.v1]
     PluginRuntimeState:
       type: string
       enum: [disabled, stopping, permission-required, starting, ready, degraded, crashed-backoff, incompatible, configuration-required]

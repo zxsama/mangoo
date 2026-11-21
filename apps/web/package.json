@@ -13,14 +13,15 @@
   "dependencies": {
     "@mangoo/core-client": "*",
     "@mangoo/notification-contract": "*",
+    "@mangoo/plugin-image-viewer": "*",
+    "@mangoo/plugin-notebook": "*",
+    "@mangoo/plugin-todo-notes": "*",
     "@phosphor-icons/react": "2.1.10",
     "@tanstack/react-query": "^5.60.0",
     "@tanstack/react-virtual": "^3.10.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "zustand": "^5.0.0",
-    "@mangoo/plugin-image-viewer": "*",
-    "@mangoo/plugin-todo-notes": "*"
+    "zustand": "^5.0.0"
   },
   "devDependencies": {
     "@types/react": "^18.3.0",

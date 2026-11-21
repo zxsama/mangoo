@@ -1,11 +1,10 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import Ajv2020 from "ajv/dist/2020.js";
-import { assertSelectedInventory, currentPlatform, FAKE_PLUGIN_ID, IMAGE_VIEWER_PLUGIN_ID, PPM_PLUGIN_ID, TODO_NOTES_PLUGIN_ID, INVENTORY_FILE, MAX_UI_DOCUMENT_BYTES, parsePluginArgs, readInventory, renderTrust, sha256, stageArtifacts, validateArtifact, validateSelection } from "./plugin-artifacts.mjs";
+import { assertCoreTrust, assertSelectedInventory, currentPlatform, FAKE_PLUGIN_ID, IMAGE_VIEWER_PLUGIN_ID, NOTEBOOK_PLUGIN_ID, PPM_PLUGIN_ID, TODO_NOTES_PLUGIN_ID, INVENTORY_FILE, MAX_UI_DOCUMENT_BYTES, parsePluginArgs, readInventory, renderTrust, sha256, stageArtifacts, validateArtifact, validateSelection } from "./plugin-artifacts.mjs";
 
 const platform = currentPlatform();
 const entry = platform === "windowsX64" ? "bin/provider.exe" : "bin/provider";
@@ -42,27 +41,28 @@ function decoderFields() {
   return { rpc, activationEvents, requestedPermissions };
 }
 
-test("default selection stages fake, viewer and decoder and removes stale generated artifacts", (t) => {
+test("default selection stages all built-in plugins and removes stale generated artifacts", (t) => {
   const root = fixture(t);
   const fake = validateArtifact(artifact(root, FAKE_PLUGIN_ID));
   const ppm = validateArtifact(artifact(root, PPM_PLUGIN_ID, decoderFields()));
   const viewer = validateArtifact(hostArtifact(root));
+  const notebook = validateArtifact(hostArtifact(root, {}, NOTEBOOK_PLUGIN_ID));
   const todo = validateArtifact(hostArtifact(root, {}, TODO_NOTES_PLUGIN_ID));
   const external = validateArtifact(artifact(root));
   const targetRoot = path.join(root, "target");
-  stageArtifacts({ targetRoot, profile: "debug", artifacts: [fake, viewer, ppm, todo, external] });
+  stageArtifacts({ targetRoot, profile: "debug", artifacts: [fake, viewer, notebook, ppm, todo, external] });
   const stale = path.join(targetRoot, "debug", "bundled-plugins", external.row.id);
   assert.equal(fs.existsSync(stale), true);
-  stageArtifacts({ targetRoot, profile: "debug", artifacts: [fake, viewer, ppm, todo] });
+  stageArtifacts({ targetRoot, profile: "debug", artifacts: [fake, viewer, notebook, ppm, todo] });
   assert.equal(fs.existsSync(stale), false);
   const inventory = readInventory(path.join(targetRoot, "debug", "bundled-plugins"));
-  assert.deepEqual(inventory.plugins.map((row) => row.id), [FAKE_PLUGIN_ID, IMAGE_VIEWER_PLUGIN_ID, PPM_PLUGIN_ID, TODO_NOTES_PLUGIN_ID]);
+  assert.deepEqual(inventory.plugins.map((row) => row.id), [FAKE_PLUGIN_ID, IMAGE_VIEWER_PLUGIN_ID, NOTEBOOK_PLUGIN_ID, PPM_PLUGIN_ID, TODO_NOTES_PLUGIN_ID]);
   assertSelectedInventory(inventory, []);
   assert.throws(() => assertSelectedInventory(inventory, [external]), /explicitly selected/);
   assert.equal(fs.existsSync(path.join(external.root, entry)), true);
   const backup = fs.readdirSync(path.join(targetRoot, "debug")).find((name) => name.startsWith(".bundled-plugins-backup-"));
   const previous = readInventory(path.join(targetRoot, "debug", backup, "previous"));
-  assert.deepEqual(previous.plugins.map((row) => row.id).sort(), [external.row.id, FAKE_PLUGIN_ID, IMAGE_VIEWER_PLUGIN_ID, PPM_PLUGIN_ID, TODO_NOTES_PLUGIN_ID].sort());
+  assert.deepEqual(previous.plugins.map((row) => row.id).sort(), [external.row.id, FAKE_PLUGIN_ID, IMAGE_VIEWER_PLUGIN_ID, NOTEBOOK_PLUGIN_ID, PPM_PLUGIN_ID, TODO_NOTES_PLUGIN_ID].sort());
 });
 
 test("host-engine artifacts are exactly a schema-valid manifest pinned with the no-executable marker", (t) => {
@@ -75,7 +75,8 @@ test("host-engine artifacts are exactly a schema-valid manifest pinned with the 
   assert.deepEqual(fs.readdirSync(path.join(output, IMAGE_VIEWER_PLUGIN_ID)), ["plugin.json"]);
   const trust = renderTrust([viewer.row]);
   assert.match(trust, /"com.mangoo.image-viewer"/);
-  assert.equal((trust.match(/0x00/g) ?? []).length >= 32, true);
+  assert.match(trust, /"engine": "host"/);
+  assert.ok(!trust.includes('"sha256"'));
   // Extra files, process fields and contributions are rejected.
   fs.writeFileSync(path.join(viewer.root, "extra.js"), "x");
   assert.throws(() => validateArtifact(viewer.root), /outside the current inventory/);
@@ -94,18 +95,22 @@ test("explicit artifact selection preserves exact identity, platform, executable
   const ppm = validateArtifact(artifact(root, PPM_PLUGIN_ID, decoderFields()));
   const external = validateArtifact(artifact(root));
   const viewer = validateArtifact(hostArtifact(root));
+  const notebook = validateArtifact(hostArtifact(root, {}, NOTEBOOK_PLUGIN_ID));
   const todo = validateArtifact(hostArtifact(root, {}, TODO_NOTES_PLUGIN_ID));
-  const inventory = stageArtifacts({ targetRoot: path.join(root, "target"), profile: "release", artifacts: [external, fake, viewer, ppm, todo] });
+  const inventory = stageArtifacts({ targetRoot: path.join(root, "target"), profile: "release", artifacts: [external, fake, viewer, notebook, ppm, todo] });
   const loaded = readInventory(path.join(root, "target", "release", "bundled-plugins"));
   assert.deepEqual(loaded, inventory);
   assertSelectedInventory(loaded, [external]);
   const trust = renderTrust(loaded.plugins);
-  assert.match(trust, /GENERATED_PLUGIN_TRUST/);
+  assert.ok(trust.startsWith("MANGOO-BUNDLED-TRUST-V1\0"));
   assert.match(trust, /"com.example.storage"/);
   assert.match(trust, /"1.2.3"/);
-  assert.ok(trust.includes(platform === "windowsX64" ? "Platform::WindowsX64" : "Platform::LinuxX64"));
-  // Five plugins x two 32-byte digests.
-  assert.equal((trust.match(/0x[0-9a-f]{2}/g) ?? []).length, 320);
+  assert.ok(trust.includes(platform));
+  for (const row of loaded.plugins) {
+    assert.match(row.manifestSha256, /^[a-f0-9]{64}$/);
+    assert.ok(trust.includes(row.manifestSha256));
+    if (row.engine !== "host") assert.ok(trust.includes(row.sha256));
+  }
   const changed = { ...external, row: { ...external.row, manifestSha256: "0".repeat(64) } };
   assert.throws(() => assertSelectedInventory(loaded, [changed]), /selected artifact changed/);
   assert.throws(() => assertSelectedInventory(loaded, []), /explicitly selected/);
@@ -204,6 +209,51 @@ test("staging rejects contained inputs and unknown existing output without chang
   assert.equal(fs.readFileSync(path.join(output, INVENTORY_FILE), "utf8"), `${JSON.stringify(inventory, null, 2)}\n`);
 });
 
+test("an identical fully validated inventory reuses its directory and exact trust bytes", (t) => {
+  const root = fixture(t);
+  const fake = validateArtifact(artifact(root, FAKE_PLUGIN_ID));
+  const targetRoot = path.join(root, "target");
+  const output = path.join(targetRoot, "debug", "bundled-plugins");
+  const stage = () => stageArtifacts({ targetRoot, profile: "debug", artifacts: [fake] });
+  const expected = stage();
+  const temporary = t.mock.method(fs, "mkdtempSync", () => { throw Error("unexpected generation"); });
+  assert.deepEqual(stage(), expected);
+  assert.equal(temporary.mock.callCount(), 0);
+  temporary.mock.restore();
+  // The Cargo trust envelope contains the JSON file byte-for-byte.
+  fs.writeFileSync(path.join(output, INVENTORY_FILE), JSON.stringify(expected));
+  stage();
+  assert.equal(fs.readFileSync(path.join(output, INVENTORY_FILE), "utf8"), JSON.stringify(expected, null, 2) + "\n");
+});
+
+test("transient rename contention during backup, publication and rollback is retried", (t) => {
+  const root = fixture(t);
+  const fake = validateArtifact(artifact(root, FAKE_PLUGIN_ID));
+  const external = validateArtifact(artifact(root));
+  const targetRoot = path.join(root, "target");
+  const output = path.join(targetRoot, "debug", "bundled-plugins");
+  const stage = artifacts => stageArtifacts({ targetRoot, profile: "debug", artifacts });
+  stage([fake]);
+  const rename = fs.renameSync;
+  const blocked = new Set();
+  let rejectPublication = false;
+  t.mock.method(fs, "renameSync", (from, to) => {
+    if (rejectPublication && String(from).includes(".bundled-plugins-stage-")) throw Error("unrecoverable publish failure");
+    if (!blocked.has(from)) {
+      blocked.add(from);
+      throw Object.assign(Error("temporary handle"), { code: process.platform === "win32" ? "EPERM" : "EBUSY" });
+    }
+    return rename(from, to);
+  });
+  const published = stage([fake, external]);
+  assert.deepEqual(readInventory(output), published);
+  assert.equal(blocked.size, 2);
+  rejectPublication = true;
+  assert.throws(() => stage([fake]), /unrecoverable publish failure/);
+  assert.deepEqual(readInventory(output), published);
+  assert.equal(blocked.size, 3);
+});
+
 test("write and swap failures preserve the last usable generated inventory", (t) => {
   const root = fixture(t);
   const fake = validateArtifact(artifact(root, FAKE_PLUGIN_ID));
@@ -237,16 +287,25 @@ test("Linux manifests cannot be staged under a normalized path different from th
   assert.throws(() => validateArtifact(source, "unsupported"), /unsupported plugin platform/);
 });
 
-test("generated trust is accepted unchanged by rustfmt for one and multiple plugins", (t) => {
+test("interleaved debug and release staging bind each Core to the inventory in its own target profile", (t) => {
   const root = fixture(t);
   const fake = validateArtifact(artifact(root, FAKE_PLUGIN_ID));
   const external = validateArtifact(artifact(root));
-  for (const rows of [[fake.row], [fake.row, external.row]]) {
-    const generated = renderTrust(rows);
-    const result = spawnSync("rustfmt", ["--emit", "stdout"], { input: generated, encoding: "utf8", windowsHide: true });
-    assert.equal(result.status, 0, result.error?.message ?? result.stderr);
-    assert.equal(result.stdout.replaceAll("\r\n", "\n"), generated);
-  }
+  const targetRoot = path.join(root, "custom target");
+  const stage = (profile, artifacts) => stageArtifacts({ targetRoot, profile, artifacts });
+  const debug = stage("debug", [fake]);
+  const release = stage("release", [fake, external]);
+  const fakeCore = path.join(root, "fixture-core");
+  // Use the staged bytes in the same envelope layout as the Cargo build script.
+  const compiled = profile => Buffer.concat([Buffer.from("binary-MANGOO-BUNDLED-TRUST-V1\0"),
+    fs.readFileSync(path.join(targetRoot, profile, "bundled-plugins", INVENTORY_FILE)), Buffer.from("\0END-MANGOO-BUNDLED-TRUST-tail")]);
+  fs.writeFileSync(fakeCore, compiled("release"));
+  assert.doesNotThrow(() => assertCoreTrust(fakeCore, release));
+  assert.throws(() => assertCoreTrust(fakeCore, debug), /does not contain/);
+  stage("debug", [external]);
+  assert.doesNotThrow(() => assertCoreTrust(fakeCore, readInventory(path.join(targetRoot, "release/bundled-plugins"))));
+  fs.writeFileSync(fakeCore, compiled("debug"));
+  assert.throws(() => assertCoreTrust(fakeCore, release), /does not contain/);
 });
 
 function uiArtifact(root, bytes = Buffer.from("<!doctype html><script>window.fixture = true</script>"), changeUi = {}, change = {}) {

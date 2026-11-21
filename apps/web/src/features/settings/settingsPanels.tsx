@@ -1,20 +1,17 @@
 import {
   Check,
-  CheckCircle2,
-  Database,
-  FolderCog,
   Gauge,
   Images,
   Keyboard,
   Library,
+  Notepad,
   Palette,
   Pencil,
   RefreshCw,
   Settings2,
-  Trash2,
-  XCircle
+  Trash2
 } from "../../design/icons";
-import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { lazy, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import {
   deleteLibraryFile,
   listLibraries,
@@ -26,18 +23,26 @@ import {
 } from "../../core/desktop";
 import type { LibrarySummary } from "../../core/libraryTypes";
 import type { LibraryState } from "../../core/useLibraryData";
-import { LiquidGlassButton, type InterfaceStyleController } from "../../design/liquid-glass";
+import { DEFAULT_INTERFACE_STYLE, LiquidGlassButton, type InterfaceStyleController } from "../../design/liquid-glass";
+import { ColorPicker } from "../../design/ColorPicker";
+import { ParameterSlider } from "../../design/ParameterSlider";
+import { DisclosureSummary } from "../../design/SectionDisclosure";
+import { SettingRow, SettingsSegmented, useSettingsNavigation } from "../../design/SettingsControls";
 import { useOverlayStack } from "../../design/overlays";
+import { INTERFACE_COLOR_ROLES } from "./interfaceStyle";
 import { thumbnailFailureLogIntentForLibrary } from "../notifications/notificationModel";
 import { LibraryGlyph } from "../library/libraryGlyph";
 import { LibraryAppearanceEditor } from "../library/LibraryAppearanceEditor";
 import { ManagedLibraryWizard } from "../library/ManagedLibraryWizard";
+import { useHostCapability } from "../plugins/hostPlugins";
 import { PluginContributionsSlot } from "../plugins/PluginContributionsSlot";
 import {
+  DEFAULT_LIBRARY_GRID_PREFERENCES,
   LIBRARY_GRID_PREFERENCE_LIMITS,
   type LibraryGridPreferences
 } from "../media-grid/gridPreferences";
 import {
+  DEFAULT_PREVIEW_PREFERENCES,
   PREVIEW_PREFERENCE_LIMITS,
   type PreviewPreferences
 } from "../preview/previewPreferences";
@@ -47,19 +52,25 @@ import {
   type ShortcutActionId
 } from "../shortcuts/shortcutBindings";
 
+import "./hostSettings.css";
+
 // Localized labels for the shortcut actions. The binding ids are stable; only
 // the display copy is translated so the settings UI is fully in Chinese.
-const SHORTCUT_ACTION_LABELS: Record<string, string> = {
-  focusSearch: "聚焦搜索",
-  renameSelected: "重命名所选文件",
-  recycleDelete: "移到回收站",
-  permanentDelete: "永久删除",
-  closeOrReturn: "关闭 / 返回",
-  previewNext: "下一张预览",
-  previewPrevious: "上一张预览",
-  zoomIn: "放大",
-  zoomOut: "缩小",
-  toggleSidebars: "切换侧栏"
+const SHORTCUT_GROUPS = ["导航", "文件操作", "预览"] as const;
+const KEY_LABELS: Readonly<Record<string, string>> = {
+  ArrowLeft: "←", ArrowRight: "→", ArrowUp: "↑", ArrowDown: "↓", Escape: "Esc"
+};
+const SHORTCUT_ACTIONS: Record<ShortcutActionId, { label: string; group: typeof SHORTCUT_GROUPS[number] }> = {
+  focusSearch: { label: "聚焦搜索", group: "导航" },
+  renameSelected: { label: "重命名所选文件", group: "文件操作" },
+  recycleDelete: { label: "移到回收站", group: "文件操作" },
+  permanentDelete: { label: "永久删除", group: "文件操作" },
+  closeOrReturn: { label: "关闭 / 返回", group: "导航" },
+  previewNext: { label: "下一张预览", group: "预览" },
+  previewPrevious: { label: "上一张预览", group: "预览" },
+  zoomIn: { label: "放大", group: "预览" },
+  zoomOut: { label: "缩小", group: "预览" },
+  toggleSidebars: { label: "切换侧栏", group: "导航" }
 };
 
 interface SettingsPanelsProps {
@@ -71,22 +82,20 @@ interface SettingsPanelsProps {
   previewPreferences: PreviewPreferences;
 }
 
-type SettingsTabId =
-  | "general"
-  | "libraries"
-  | "thumbnails"
-  | "appearance"
-  | "shortcuts"
-  | "diagnostics";
-
-const TABS: Array<{ id: SettingsTabId; label: string; icon: typeof Settings2 }> = [
+const TABS = [
   { id: "general", label: "常用", icon: Settings2 },
   { id: "libraries", label: "资源库", icon: Library },
   { id: "thumbnails", label: "缩略图", icon: Images },
   { id: "appearance", label: "外观", icon: Palette },
   { id: "shortcuts", label: "快捷键", icon: Keyboard },
   { id: "diagnostics", label: "诊断", icon: Gauge }
-];
+] as const;
+
+const TABS_WITH_NOTEBOOK = [...TABS, { id: "notebook", label: "笔记", icon: Notepad }] as const;
+type SectionId = (typeof TABS_WITH_NOTEBOOK)[number]["id"];
+const NotebookSettings = lazy(() => import("@mangoo/plugin-notebook/settings").then(
+  ({ NotebookSettings }) => ({ default: NotebookSettings })
+));
 
 export function SettingsPanels({
   gridPreferences,
@@ -96,123 +105,170 @@ export function SettingsPanels({
   onPreviewPreferencesChange,
   previewPreferences
 }: SettingsPanelsProps) {
-  const [activeTab, setActiveTab] = useState<SettingsTabId>("general");
-
+  const notebookEnabled = useHostCapability("notebook.v1");
+  const tabs = notebookEnabled ? TABS_WITH_NOTEBOOK : TABS;
+  const sectionIds = useMemo(() => tabs.map(({ id }) => id), [tabs]);
+  const { active, jumpTo, scrollRef } = useSettingsNavigation(sectionIds);
+  const content: Record<SectionId, ReactNode> = {
+    general: <GeneralTab onNavigate={jumpTo} onPreviewPreferencesChange={onPreviewPreferencesChange} previewPreferences={previewPreferences} />,
+    libraries: <LibrariesTab />,
+    thumbnails: (
+      <ThumbnailsTab
+        current={active === "thumbnails"}
+        library={library}
+        onPreviewPreferencesChange={onPreviewPreferencesChange}
+        previewPreferences={previewPreferences}
+      />
+    ),
+    appearance: (
+      <AppearanceTab
+        gridPreferences={gridPreferences}
+        interfaceStyle={interfaceStyle}
+        onGridPreferencesChange={onGridPreferencesChange}
+      />
+    ),
+    shortcuts: <ShortcutsTab />,
+    diagnostics: <DiagnosticsTab library={library} />,
+    notebook: (
+      <Suspense fallback={<p role="status">正在载入笔记设置…</p>}>
+        <NotebookSettings />
+      </Suspense>
+    )
+  };
 
   return (
-    <div className="settings-dialog-layout">
-      <aside className="settings-dialog-nav" aria-label="设置分类">
-        <div className="settings-dialog-nav-title" id="settings-dialog-title">
-          偏好设置
-        </div>
-        <nav className="settings-dialog-nav-list" role="tablist" aria-orientation="vertical">
-          {TABS.map((tab) => {
-            const Icon = tab.icon;
-            const active = tab.id === activeTab;
-            return (
-              <button
-                key={tab.id}
-                aria-selected={active}
-                className={active ? "settings-dialog-nav-item active" : "settings-dialog-nav-item"}
-                onClick={() => setActiveTab(tab.id)}
-                role="tab"
-                type="button"
-              >
-                <Icon aria-hidden="true" size={16} />
-                <span>{tab.label}</span>
-              </button>
-            );
-          })}
+    <div aria-label="偏好设置" className="settings-layout-scroll host-settings" ref={scrollRef} role="region" tabIndex={0}>
+      <div className="settings-layout-body host-settings-columns">
+        <nav className="settings-layout-nav settings-dialog-nav" aria-label="设置分类">
+          {tabs.map(({ id, label, icon: Icon }) => (
+            <button
+              aria-controls={`settings-${id}`}
+              aria-current={active === id ? "location" : undefined}
+              className="settings-layout-nav-item settings-dialog-nav-item"
+              data-active={active === id}
+              key={id}
+              onClick={() => jumpTo(id)}
+              type="button"
+            >
+              <Icon aria-hidden="true" size={15} />
+              <span>{label}</span>
+            </button>
+          ))}
         </nav>
-      </aside>
-      <div className="settings-dialog-main">
-        <div className="settings-dialog-content" role="tabpanel">
-          {activeTab === "general" ? (
-            <GeneralTab
-              onPreviewPreferencesChange={onPreviewPreferencesChange}
-              previewPreferences={previewPreferences}
-            />
-          ) : null}
-          {activeTab === "libraries" ? <LibrariesTab /> : null}
-          {activeTab === "thumbnails" ? (
-            <ThumbnailsTab
-              library={library}
-              onPreviewPreferencesChange={onPreviewPreferencesChange}
-              previewPreferences={previewPreferences}
-            />
-          ) : null}
-          {activeTab === "appearance" ? (
-            <AppearanceTab
-              interfaceStyle={interfaceStyle}
-              gridPreferences={gridPreferences}
-              onGridPreferencesChange={onGridPreferencesChange}
-            />
-          ) : null}
-          {activeTab === "shortcuts" ? <ShortcutsTab /> : null}
-          {activeTab === "diagnostics" ? <DiagnosticsTab library={library} /> : null}
-        </div>
+        <main className="settings-dialog-content settings-dialog-main">
+          <div className="settings-layout-form host-settings-page">
+            {tabs.map(({ id, label, icon: Icon }) => (
+              <section aria-labelledby={`settings-heading-${id}`} className="host-settings-category" data-section={id} id={`settings-${id}`} key={id}>
+                <header className="host-settings-heading">
+                  <h2 className="settings-control-heading" id={`settings-heading-${id}`}>
+                    <Icon aria-hidden="true" size={14} /><span>{label}</span>
+                  </h2>
+                  {id === "appearance" && (
+                    <LiquidGlassButton onClick={interfaceStyle.resetInterfaceStyle} type="button">恢复默认外观</LiquidGlassButton>
+                  )}
+                </header>
+                <div className="settings-control-rows host-settings-sheet">{content[id]}</div>
+              </section>
+            ))}
+          </div>
+        </main>
       </div>
     </div>
   );
 }
 
-function SettingsGroup({ title, children }: { title: string; children: ReactNode }) {
+function SettingsGroup({ title, children, className = "", collapsible = false, groupRef }: {
+  title?: string;
+  children: ReactNode;
+  className?: string;
+  collapsible?: boolean;
+  groupRef?: (element: HTMLElement | null) => void;
+}) {
+  const classes = `settings-control-section host-settings-group ${className}`.trimEnd();
+  const body = <div className="settings-control-rows settings-group-body">{children}</div>;
+  if (collapsible && title) {
+    return (
+      <details className={classes} ref={groupRef}>
+        <DisclosureSummary label={title} />
+        {body}
+      </details>
+    );
+  }
+  if (!title) return <div className={classes} ref={groupRef}>{body}</div>;
   return (
-    <section className="settings-group">
-      <h3 className="settings-group-title">{title}</h3>
-      <div className="settings-group-body">{children}</div>
+    <section className={classes} ref={groupRef}>
+      <h3 className="settings-control-heading">{title}</h3>
+      {body}
     </section>
   );
 }
 
-// ---- General tab: browsing + grid spacing + memory buffers -----------------
+// ---- General tab: common tasks and memory buffers -------------------------
 
 function GeneralTab({
+  onNavigate,
   onPreviewPreferencesChange,
   previewPreferences
 }: {
+  onNavigate: (id: SectionId) => void;
   onPreviewPreferencesChange: (patch: Partial<PreviewPreferences>) => void;
   previewPreferences: PreviewPreferences;
 }) {
   return (
     <>
-      <SettingsGroup title="浏览缓存 (内存)">
-        <p className="settings-note">
-          控制浏览时 Mangoo 在内存中保留的原图与缩略图数据量。持久缩略图缓存存储在 SQLite
-          中，可在重启后复用（见“缩略图”标签页）。
-        </p>
+      <SettingsGroup className="host-settings-parameters" title="浏览缓存（内存）">
         <StyleSlider
           id="preview-buffer-limit"
           label="预览缓冲区"
+          description="浏览时可在内存中保留的原图数据量。"
           max={PREVIEW_PREFERENCE_LIMITS.previewBufferLimitMb.max}
           min={PREVIEW_PREFERENCE_LIMITS.previewBufferLimitMb.min}
           onChange={(previewBufferLimitMb) => onPreviewPreferencesChange({ previewBufferLimitMb })}
           step={PREVIEW_PREFERENCE_LIMITS.previewBufferLimitMb.step}
           unit="MB"
+          resetValue={DEFAULT_PREVIEW_PREFERENCES.previewBufferLimitMb}
           value={previewPreferences.previewBufferLimitMb}
         />
         <StyleSlider
           id="thumbnail-cache-limit"
-          label="缩略图缓存 (内存)"
+          label="缩略图缓存"
+          description="本次会话内可在内存中保留的缩略图数据量。"
           max={PREVIEW_PREFERENCE_LIMITS.thumbnailCacheLimitMb.max}
           min={PREVIEW_PREFERENCE_LIMITS.thumbnailCacheLimitMb.min}
           onChange={(thumbnailCacheLimitMb) => onPreviewPreferencesChange({ thumbnailCacheLimitMb })}
           step={PREVIEW_PREFERENCE_LIMITS.thumbnailCacheLimitMb.step}
           unit="MB"
+          resetValue={DEFAULT_PREVIEW_PREFERENCES.thumbnailCacheLimitMb}
           value={previewPreferences.thumbnailCacheLimitMb}
         />
       </SettingsGroup>
+      <div className="host-settings-jumps" role="group" aria-label="常用操作">
+        <span>快速前往</span>
+        <div className="settings-action-row">
+          <button onClick={() => onNavigate("libraries")} type="button"><Library aria-hidden="true" size={15} /><span data-button-content>管理资源库</span></button>
+          <button onClick={() => onNavigate("thumbnails")} type="button"><Images aria-hidden="true" size={15} /><span data-button-content>查看生成状况</span></button>
+          <button onClick={() => onNavigate("appearance")} type="button"><Palette aria-hidden="true" size={15} /><span data-button-content>调整外观</span></button>
+        </div>
+      </div>
     </>
   );
 }
 
 // ---- Thumbnails tab: live generation status + generation mode --------------
 
+const thumbnailModes = [
+  { value: "renderedOnly", label: "浏览时入库", title: "默认仅已刷新缩略图入库，跳过尚未浏览的媒体。" },
+  { value: "allPersist", label: "全库入库", title: "打开资源库后自动后台生成全部缩略图并入库，优先处理正在浏览的内容。" },
+  { value: "cacheOnly", label: "仅本次缓存", title: "只缓存不入库，关闭应用后释放本次浏览的缩略图。" }
+] as const;
+
 function ThumbnailsTab({
+  current,
   library,
   onPreviewPreferencesChange,
   previewPreferences
 }: {
+  current: boolean;
   library: LibraryState;
   onPreviewPreferencesChange: (patch: Partial<PreviewPreferences>) => void;
   previewPreferences: PreviewPreferences;
@@ -223,20 +279,20 @@ function ThumbnailsTab({
   const refreshThumbnailCacheStats = library.refreshThumbnailCacheStats;
   // Poll faster only while a bulk generation is active; otherwise slowly.
   const statsPollActive = activeBulk > 0 || busy;
-
-  // The stats aggregate scans the whole library, so it must NOT be polled
-  // aggressively — the numbers are a reference, not live. Poll on a fixed timer.
-  //
-  // CRITICAL: depend ONLY on the stable `refreshThumbnailCacheStats` callback and
-  // the boolean `statsPollActive` — NOT on `library` (a fresh object every
-  // render) or `stats` (which this effect's own polling updates). Depending on
-  // those re-ran the effect on every render, and since each run kicks off an
-  // immediate whole-library stats query, opening the thumbnail tab spun a
-  // positive-feedback loop: poll -> setStats -> re-render -> effect re-runs ->
-  // poll again. On a 650k-file library that piled up dozens of concurrent
-  // multi-second whole-library scans, exhausting the blocking-thread pool
-  // (thumbnails stopped refreshing) and ballooning Core memory.
+  const [statsGroup, setStatsGroup] = useState<HTMLElement | null>(null);
+  const [statsVisible, setStatsVisible] = useState(false);
   useEffect(() => {
+    if (!statsGroup) return;
+    const observer = new IntersectionObserver(([entry]) => setStatsVisible(entry.isIntersecting));
+    observer.observe(statsGroup);
+    return () => observer.disconnect();
+  }, [statsGroup]);
+
+  // A reader at the end of Libraries can see these numbers before the active
+  // heading changes to Thumbnails. Keep one query interval across that boundary.
+  const pollStats = current || statsVisible;
+  useEffect(() => {
+    if (!pollStats) return;
     void refreshThumbnailCacheStats();
     const interval = window.setInterval(
       () => {
@@ -245,7 +301,7 @@ function ThumbnailsTab({
       statsPollActive ? 8000 : 20000
     );
     return () => window.clearInterval(interval);
-  }, [refreshThumbnailCacheStats, statsPollActive]);
+  }, [pollStats, refreshThumbnailCacheStats, statsPollActive]);
 
   // Progress estimate: cached / (cached + missing + stale). failed excluded from
   // the "done" fraction but shown separately.
@@ -253,66 +309,58 @@ function ThumbnailsTab({
   const remaining = stats ? stats.missingCount + stats.staleCount : 0;
   const failed = stats?.failedCount ?? 0;
   const total = cached + remaining;
-  const percent = total > 0 ? Math.min(100, Math.round((cached / total) * 100)) : stats ? 100 : 0;
+  const percent = total > 0 ? Math.min(100, Math.round((cached / total) * 100)) : 0;
+  let progressCaption = "读取中…";
+  if (activeBulk > 0) progressCaption = `正在后台生成 · ${activeBulk.toLocaleString()} 个任务进行中`;
+  else if (remaining > 0) progressCaption = `待生成 ${remaining.toLocaleString()} 项`;
+  else if (failed > 0) progressCaption = `有 ${failed.toLocaleString()} 项生成失败`;
+  else if (stats) progressCaption = total > 0 ? "全部缩略图已就绪" : "当前资源库没有可生成缩略图的媒体";
 
   const generationMode = previewPreferences.thumbnailGenerationMode;
   const currentFolderDisabled = library.selectedFolderId === null || busy;
 
   return (
     <>
-      <SettingsGroup title="生成模式">
-        <p className="settings-note">
-          默认仅将你实际看到并已生成的缩略图入库，后台写入压力最小；也可以让后台自动生成整个库的全部缩略图，或只在本次会话缓存而不写入数据库。
-        </p>
-        <RadioOption
-          checked={generationMode === "renderedOnly"}
-          description="只有已经在界面上生成并显示出来的缩略图才会入库（推荐，默认）。"
-          label="仅已刷新缩略图入库"
-          name="thumbnail-generate-mode"
-          onSelect={() => onPreviewPreferencesChange({ thumbnailGenerationMode: "renderedOnly" })}
-        />
-        <RadioOption
-          checked={generationMode === "allPersist"}
-          description="打开库后在后台自动生成全部缩略图并入库（低优先级，浏览时让路）。"
-          label="自动后台生成全部缩略图"
-          name="thumbnail-generate-mode"
-          onSelect={() => onPreviewPreferencesChange({ thumbnailGenerationMode: "allPersist" })}
-        />
-        <RadioOption
-          checked={generationMode === "cacheOnly"}
-          description="缩略图仅在本次会话内存缓存中显示，不写入数据库，库文件不会变大。"
-          label="只缓存不入库"
-          name="thumbnail-generate-mode"
-          onSelect={() => onPreviewPreferencesChange({ thumbnailGenerationMode: "cacheOnly" })}
-        />
+      <SettingsGroup>
+        <SettingRow title="生成模式" description={thumbnailModes.find(mode => mode.value === generationMode)?.title}>
+          <SettingsSegmented
+            label="缩略图生成模式"
+            onChange={thumbnailGenerationMode => onPreviewPreferencesChange({ thumbnailGenerationMode })}
+            options={thumbnailModes}
+            value={generationMode}
+          />
+        </SettingRow>
       </SettingsGroup>
 
-      <SettingsGroup title="生成状况">
-        <div className="settings-progress">
-          <div className="settings-progress-head">
-            <span className="settings-progress-label">
-              已入库 {cached.toLocaleString()} / {total.toLocaleString()}
-            </span>
-            <span className="settings-progress-percent">{percent}%</span>
+      <SettingsGroup className="host-settings-cache" title="生成状况" groupRef={setStatsGroup}>
+        <div className="host-settings-cache-status">
+          <div className="settings-progress">
+            <div className="settings-progress-head">
+              <span className="settings-progress-label">
+                已入库 {cached.toLocaleString()} / {total.toLocaleString()}
+              </span>
+              <span className="settings-progress-percent">{percent}%</span>
+            </div>
+            <div
+              aria-label="缩略图生成进度"
+              aria-valuemax={100}
+              aria-valuemin={0}
+              aria-valuenow={percent}
+              className="settings-progress-track"
+              role="progressbar"
+            >
+              <div className="settings-progress-fill" style={{ width: `${percent}%` }} />
+            </div>
+            <div className="settings-progress-caption">{progressCaption}</div>
           </div>
-          <div
-            aria-valuemax={100}
-            aria-valuemin={0}
-            aria-valuenow={percent}
-            className="settings-progress-track"
-            role="progressbar"
+          <LiquidGlassButton
+            disabled={library.thumbnailCacheStatsLoading}
+            onClick={() => void library.refreshThumbnailCacheStats()}
+            type="button"
           >
-            <div className="settings-progress-fill" style={{ width: `${percent}%` }} />
-          </div>
-          <div className="settings-progress-caption">
-            {activeBulk > 0
-              ? `正在后台生成 · ${activeBulk.toLocaleString()} 个任务进行中`
-              : remaining > 0
-                ? `待生成 ${remaining.toLocaleString()} 项`
-                : stats
-                  ? "全部缩略图已就绪"
-                  : "读取中…"}
-          </div>
+            <RefreshCw aria-hidden="true" size={13} />
+            <span>{library.thumbnailCacheStatsLoading ? "刷新中…" : "刷新统计"}</span>
+          </LiquidGlassButton>
         </div>
         <dl className="settings-stat-grid">
           <StatCell label="已缓存" value={stats ? cached.toLocaleString() : "-"} />
@@ -341,18 +389,10 @@ function ThumbnailsTab({
             value={stats ? formatCacheBytes(stats.totalBlobBytes) : "-"}
           />
         </dl>
-        <LiquidGlassButton
-          disabled={library.thumbnailCacheStatsLoading}
-          onClick={() => void library.refreshThumbnailCacheStats()}
-          type="button"
-        >
-          <RefreshCw aria-hidden="true" size={13} />
-          <span>{library.thumbnailCacheStatsLoading ? "刷新中…" : "刷新统计"}</span>
-        </LiquidGlassButton>
       </SettingsGroup>
 
-      <SettingsGroup title="手动生成">
-        <div className="settings-action-row">
+      <SettingsGroup className="host-settings-actions" title="缓存操作">
+        <SettingRow title="手动生成" description={library.selectedFolderId === null ? "选择文件夹后可按目录生成。" : undefined}>
           <LiquidGlassButton
             disabled={currentFolderDisabled}
             onClick={() => void library.generateCurrentFolderThumbnailCache()}
@@ -374,6 +414,8 @@ function ThumbnailsTab({
           >
             {busy ? "生成中…" : "生成全部缩略图"}
           </LiquidGlassButton>
+        </SettingRow>
+        <SettingRow title="维护缓存">
           <LiquidGlassButton
             disabled={busy}
             onClick={() => void library.retryThumbnailCacheFailures()}
@@ -390,33 +432,9 @@ function ThumbnailsTab({
             <Trash2 aria-hidden="true" size={13} />
             <span>清空持久缓存</span>
           </LiquidGlassButton>
-        </div>
+        </SettingRow>
       </SettingsGroup>
     </>
-  );
-}
-
-function RadioOption({
-  checked,
-  description,
-  label,
-  name,
-  onSelect
-}: {
-  checked: boolean;
-  description: string;
-  label: string;
-  name: string;
-  onSelect: () => void;
-}) {
-  return (
-    <label className={checked ? "settings-radio checked" : "settings-radio"}>
-      <input checked={checked} name={name} onChange={onSelect} type="radio" />
-      <span className="settings-radio-body">
-        <span className="settings-radio-label">{label}</span>
-        <span className="settings-radio-description">{description}</span>
-      </span>
-    </label>
   );
 }
 
@@ -434,7 +452,7 @@ function StatCell({
       <dt>{label}</dt>
       <dd>
         {onActivate ? (
-          <LiquidGlassButton onClick={onActivate} type="button">
+          <LiquidGlassButton aria-label={`查看 ${value} 项失败记录`} onClick={onActivate} type="button">
             {value}
           </LiquidGlassButton>
         ) : value}
@@ -454,16 +472,35 @@ function AppearanceTab({
   gridPreferences: LibraryGridPreferences;
   onGridPreferencesChange: (patch: Partial<LibraryGridPreferences>) => void;
 }) {
-  const { limits, value, resetInterfaceStyle, setInterfaceStyle } = interfaceStyle;
+  const { limits, value, setInterfaceStyle, previewInterfaceColor } = interfaceStyle;
   return (
     <>
-      <div className="settings-group-heading-row">
-        <p className="settings-note">调整液态玻璃外观：圆角、材质模糊 / 透明度、颜色与交互高光。</p>
-        <LiquidGlassButton onClick={resetInterfaceStyle} type="button">
-          恢复默认外观
-        </LiquidGlassButton>
-      </div>
-      <SettingsGroup title="网格">
+      <SettingsGroup>
+        <ColorField
+          id="theme-accent-color"
+          label="主题色"
+          description="用于主界面和插件的选中状态、焦点与交互高光。"
+          onChange={(accentColor) => setInterfaceStyle({ accentColor })}
+          onPreview={(color) => previewInterfaceColor("accentColor", color)}
+          value={value.accentColor}
+        />
+        <details className="settings-control-group host-settings-role-colors">
+          <DisclosureSummary label="状态与标记颜色" />
+          <div className="host-settings-palette">
+            {INTERFACE_COLOR_ROLES.map(({ role, label }) => (
+              <ColorField
+                key={role}
+                id={`theme-role-${role}`}
+                label={label}
+                onChange={(color) => setInterfaceStyle({ roleColors: { [role]: color } })}
+                onPreview={(color) => previewInterfaceColor(role, color)}
+                value={value.roleColors[role]}
+              />
+            ))}
+          </div>
+        </details>
+      </SettingsGroup>
+      <SettingsGroup className="host-settings-parameters" title="网格">
         <StyleSlider
           id="library-grid-gap"
           label="缩略图间距"
@@ -472,6 +509,7 @@ function AppearanceTab({
           onChange={(tileGap) => onGridPreferencesChange({ tileGap })}
           step={LIBRARY_GRID_PREFERENCE_LIMITS.tileGap.step}
           unit="px"
+          resetValue={DEFAULT_LIBRARY_GRID_PREFERENCES.tileGap}
           value={gridPreferences.tileGap}
         />
         <StyleSlider
@@ -482,6 +520,7 @@ function AppearanceTab({
           onChange={(labelLineHeight) => onGridPreferencesChange({ labelLineHeight })}
           step={LIBRARY_GRID_PREFERENCE_LIMITS.labelLineHeight.step}
           unit="px"
+          resetValue={DEFAULT_LIBRARY_GRID_PREFERENCES.labelLineHeight}
           value={gridPreferences.labelLineHeight}
         />
         <StyleSlider
@@ -492,6 +531,7 @@ function AppearanceTab({
           onChange={(labelGap) => onGridPreferencesChange({ labelGap })}
           step={LIBRARY_GRID_PREFERENCE_LIMITS.labelGap.step}
           unit="px"
+          resetValue={DEFAULT_LIBRARY_GRID_PREFERENCES.labelGap}
           value={gridPreferences.labelGap}
         />
         <StyleSlider
@@ -502,10 +542,11 @@ function AppearanceTab({
           onChange={(folderEdgeShadowAlpha) => onGridPreferencesChange({ folderEdgeShadowAlpha })}
           step={LIBRARY_GRID_PREFERENCE_LIMITS.folderEdgeShadowAlpha.step}
           unit="%"
+          resetValue={DEFAULT_LIBRARY_GRID_PREFERENCES.folderEdgeShadowAlpha}
           value={gridPreferences.folderEdgeShadowAlpha}
         />
       </SettingsGroup>
-      <SettingsGroup title="圆角">
+      <SettingsGroup className="host-settings-parameters" title="圆角">
         <StyleSlider
           id="window-corner-radius"
           label="窗口圆角"
@@ -514,6 +555,7 @@ function AppearanceTab({
           onChange={(windowCornerRadius) => setInterfaceStyle({ windowCornerRadius })}
           step={limits.windowCornerRadius.step}
           unit="px"
+          resetValue={DEFAULT_INTERFACE_STYLE.windowCornerRadius}
           value={value.windowCornerRadius}
         />
         <StyleSlider
@@ -524,6 +566,7 @@ function AppearanceTab({
           onChange={(panelControlCornerRadius) => setInterfaceStyle({ panelControlCornerRadius })}
           step={limits.panelControlCornerRadius.step}
           unit="px"
+          resetValue={DEFAULT_INTERFACE_STYLE.panelControlCornerRadius}
           value={value.panelControlCornerRadius}
         />
         <StyleSlider
@@ -534,42 +577,46 @@ function AppearanceTab({
           onChange={(contentCornerRadius) => setInterfaceStyle({ contentCornerRadius })}
           step={limits.contentCornerRadius.step}
           unit="px"
+          resetValue={DEFAULT_INTERFACE_STYLE.contentCornerRadius}
           value={value.contentCornerRadius}
         />
       </SettingsGroup>
-      <SettingsGroup title="侧栏材质">
-        <StyleSlider id="side-blur" label="模糊" max={limits.sideBlur.max} min={limits.sideBlur.min} onChange={(sideBlur) => setInterfaceStyle({ sideBlur })} step={limits.sideBlur.step} value={value.sideBlur} />
-        <StyleSlider id="side-opacity" label="不透明度" max={limits.sideOpacity.max} min={limits.sideOpacity.min} onChange={(sideOpacity) => setInterfaceStyle({ sideOpacity })} step={limits.sideOpacity.step} value={value.sideOpacity} />
-        <StyleSlider id="side-overlay-strength" label="叠加强度" max={limits.sideOverlayStrength.max} min={limits.sideOverlayStrength.min} onChange={(sideOverlayStrength) => setInterfaceStyle({ sideOverlayStrength })} step={limits.sideOverlayStrength.step} value={value.sideOverlayStrength} />
-        <ColorField id="side-overlay-color" label="叠加颜色" onChange={(sideOverlayColor) => setInterfaceStyle({ sideOverlayColor })} value={value.sideOverlayColor} />
-        <StyleSlider id="side-saturation" label="饱和度" max={limits.sideSaturation.max} min={limits.sideSaturation.min} onChange={(sideSaturation) => setInterfaceStyle({ sideSaturation })} step={limits.sideSaturation.step} value={value.sideSaturation} />
-        <StyleSlider id="side-stroke-opacity" label="描边不透明度" max={limits.sideStrokeOpacity.max} min={limits.sideStrokeOpacity.min} onChange={(sideStrokeOpacity) => setInterfaceStyle({ sideStrokeOpacity })} step={limits.sideStrokeOpacity.step} value={value.sideStrokeOpacity} />
-      </SettingsGroup>
-      <SettingsGroup title="中央工作区材质">
-        <StyleSlider id="center-blur" label="模糊" max={limits.centerBlur.max} min={limits.centerBlur.min} onChange={(centerBlur) => setInterfaceStyle({ centerBlur })} step={limits.centerBlur.step} value={value.centerBlur} />
-        <StyleSlider id="center-opacity" label="不透明度" max={limits.centerOpacity.max} min={limits.centerOpacity.min} onChange={(centerOpacity) => setInterfaceStyle({ centerOpacity })} step={limits.centerOpacity.step} value={value.centerOpacity} />
-        <StyleSlider id="center-overlay-strength" label="叠加强度" max={limits.centerOverlayStrength.max} min={limits.centerOverlayStrength.min} onChange={(centerOverlayStrength) => setInterfaceStyle({ centerOverlayStrength })} step={limits.centerOverlayStrength.step} value={value.centerOverlayStrength} />
-        <ColorField id="center-overlay-color" label="叠加颜色" onChange={(centerOverlayColor) => setInterfaceStyle({ centerOverlayColor })} value={value.centerOverlayColor} />
-        <StyleSlider id="center-saturation" label="饱和度" max={limits.centerSaturation.max} min={limits.centerSaturation.min} onChange={(centerSaturation) => setInterfaceStyle({ centerSaturation })} step={limits.centerSaturation.step} value={value.centerSaturation} />
-        <StyleSlider id="center-stroke-opacity" label="描边不透明度" max={limits.centerStrokeOpacity.max} min={limits.centerStrokeOpacity.min} onChange={(centerStrokeOpacity) => setInterfaceStyle({ centerStrokeOpacity })} step={limits.centerStrokeOpacity.step} value={value.centerStrokeOpacity} />
-      </SettingsGroup>
-      <SettingsGroup title="玻璃平滑度">
-        <StyleSlider id="dither-opacity" label="抖动强度" max={limits.ditherOpacity.max} min={limits.ditherOpacity.min} onChange={(ditherOpacity) => setInterfaceStyle({ ditherOpacity })} step={limits.ditherOpacity.step} value={value.ditherOpacity} />
-        <StyleSlider id="backdrop-gradient-strength" label="背景渐变强度" max={limits.backdropGradientStrength.max} min={limits.backdropGradientStrength.min} onChange={(backdropGradientStrength) => setInterfaceStyle({ backdropGradientStrength })} step={limits.backdropGradientStrength.step} value={value.backdropGradientStrength} />
-      </SettingsGroup>
-      <SettingsGroup title="交互高光">
-        <StyleSlider id="edge-highlight-brightness" label="边缘高光亮度" max={limits.edgeHighlightBrightness.max} min={limits.edgeHighlightBrightness.min} onChange={(edgeHighlightBrightness) => setInterfaceStyle({ edgeHighlightBrightness })} step={limits.edgeHighlightBrightness.step} value={value.edgeHighlightBrightness} />
-        <StyleSlider id="halo-brightness" label="光晕亮度" max={limits.haloBrightness.max} min={limits.haloBrightness.min} onChange={(haloBrightness) => setInterfaceStyle({ haloBrightness })} step={limits.haloBrightness.step} value={value.haloBrightness} />
-        <StyleSlider id="pointer-response-radius" label="指针响应半径" max={limits.pointerResponseRadius.max} min={limits.pointerResponseRadius.min} onChange={(pointerResponseRadius) => setInterfaceStyle({ pointerResponseRadius })} step={limits.pointerResponseRadius.step} value={value.pointerResponseRadius} />
-        <StyleSlider id="pointer-sensing-distance" label="感应距离" max={limits.pointerSensingDistance.max} min={limits.pointerSensingDistance.min} onChange={(pointerSensingDistance) => setInterfaceStyle({ pointerSensingDistance })} step={limits.pointerSensingDistance.step} value={value.pointerSensingDistance} />
-        <StyleSlider id="pointer-falloff" label="衰减曲线" max={limits.pointerFalloff.max} min={limits.pointerFalloff.min} onChange={(pointerFalloff) => setInterfaceStyle({ pointerFalloff })} step={limits.pointerFalloff.step} value={value.pointerFalloff} />
-      </SettingsGroup>
-      <SettingsGroup title="对话框材质">
-        <StyleSlider id="dialog-blur" label="对话框模糊" max={limits.dialogBlur.max} min={limits.dialogBlur.min} onChange={(dialogBlur) => setInterfaceStyle({ dialogBlur })} step={limits.dialogBlur.step} value={value.dialogBlur} />
-        <StyleSlider id="dialog-opacity" label="对话框不透明度" max={limits.dialogOpacity.max} min={limits.dialogOpacity.min} onChange={(dialogOpacity) => setInterfaceStyle({ dialogOpacity })} step={limits.dialogOpacity.step} value={value.dialogOpacity} />
-        <StyleSlider id="dialog-overlay-strength" label="对话框叠加强度" max={limits.dialogOverlayStrength.max} min={limits.dialogOverlayStrength.min} onChange={(dialogOverlayStrength) => setInterfaceStyle({ dialogOverlayStrength })} step={limits.dialogOverlayStrength.step} value={value.dialogOverlayStrength} />
-        <StyleSlider id="dialog-backdrop-dim" label="对话框背景变暗" max={limits.dialogBackdropDim.max} min={limits.dialogBackdropDim.min} onChange={(dialogBackdropDim) => setInterfaceStyle({ dialogBackdropDim })} step={limits.dialogBackdropDim.step} value={value.dialogBackdropDim} />
-      </SettingsGroup>
+      <div className="host-settings-materials">
+        <h3>材质与交互</h3>
+        <SettingsGroup className="host-settings-parameters" title="侧栏材质" collapsible>
+          <StyleSlider id="side-blur" label="模糊" max={limits.sideBlur.max} min={limits.sideBlur.min} onChange={(sideBlur) => setInterfaceStyle({ sideBlur })} step={limits.sideBlur.step} resetValue={DEFAULT_INTERFACE_STYLE.sideBlur} value={value.sideBlur} />
+          <StyleSlider id="side-opacity" label="不透明度" max={limits.sideOpacity.max} min={limits.sideOpacity.min} onChange={(sideOpacity) => setInterfaceStyle({ sideOpacity })} step={limits.sideOpacity.step} resetValue={DEFAULT_INTERFACE_STYLE.sideOpacity} value={value.sideOpacity} />
+          <StyleSlider id="side-overlay-strength" label="叠加强度" max={limits.sideOverlayStrength.max} min={limits.sideOverlayStrength.min} onChange={(sideOverlayStrength) => setInterfaceStyle({ sideOverlayStrength })} step={limits.sideOverlayStrength.step} resetValue={DEFAULT_INTERFACE_STYLE.sideOverlayStrength} value={value.sideOverlayStrength} />
+          <ColorField id="side-overlay-color" label="叠加颜色" onChange={(sideOverlayColor) => setInterfaceStyle({ sideOverlayColor })} onPreview={(color) => previewInterfaceColor("sideOverlayColor", color)} value={value.sideOverlayColor} />
+          <StyleSlider id="side-saturation" label="饱和度" max={limits.sideSaturation.max} min={limits.sideSaturation.min} onChange={(sideSaturation) => setInterfaceStyle({ sideSaturation })} step={limits.sideSaturation.step} resetValue={DEFAULT_INTERFACE_STYLE.sideSaturation} value={value.sideSaturation} />
+          <StyleSlider id="side-stroke-opacity" label="描边不透明度" max={limits.sideStrokeOpacity.max} min={limits.sideStrokeOpacity.min} onChange={(sideStrokeOpacity) => setInterfaceStyle({ sideStrokeOpacity })} step={limits.sideStrokeOpacity.step} resetValue={DEFAULT_INTERFACE_STYLE.sideStrokeOpacity} value={value.sideStrokeOpacity} />
+        </SettingsGroup>
+        <SettingsGroup className="host-settings-parameters" title="中央工作区材质" collapsible>
+          <StyleSlider id="center-blur" label="模糊" max={limits.centerBlur.max} min={limits.centerBlur.min} onChange={(centerBlur) => setInterfaceStyle({ centerBlur })} step={limits.centerBlur.step} resetValue={DEFAULT_INTERFACE_STYLE.centerBlur} value={value.centerBlur} />
+          <StyleSlider id="center-opacity" label="不透明度" max={limits.centerOpacity.max} min={limits.centerOpacity.min} onChange={(centerOpacity) => setInterfaceStyle({ centerOpacity })} step={limits.centerOpacity.step} resetValue={DEFAULT_INTERFACE_STYLE.centerOpacity} value={value.centerOpacity} />
+          <StyleSlider id="center-overlay-strength" label="叠加强度" max={limits.centerOverlayStrength.max} min={limits.centerOverlayStrength.min} onChange={(centerOverlayStrength) => setInterfaceStyle({ centerOverlayStrength })} step={limits.centerOverlayStrength.step} resetValue={DEFAULT_INTERFACE_STYLE.centerOverlayStrength} value={value.centerOverlayStrength} />
+          <ColorField id="center-overlay-color" label="叠加颜色" onChange={(centerOverlayColor) => setInterfaceStyle({ centerOverlayColor })} onPreview={(color) => previewInterfaceColor("centerOverlayColor", color)} value={value.centerOverlayColor} />
+          <StyleSlider id="center-saturation" label="饱和度" max={limits.centerSaturation.max} min={limits.centerSaturation.min} onChange={(centerSaturation) => setInterfaceStyle({ centerSaturation })} step={limits.centerSaturation.step} resetValue={DEFAULT_INTERFACE_STYLE.centerSaturation} value={value.centerSaturation} />
+          <StyleSlider id="center-stroke-opacity" label="描边不透明度" max={limits.centerStrokeOpacity.max} min={limits.centerStrokeOpacity.min} onChange={(centerStrokeOpacity) => setInterfaceStyle({ centerStrokeOpacity })} step={limits.centerStrokeOpacity.step} resetValue={DEFAULT_INTERFACE_STYLE.centerStrokeOpacity} value={value.centerStrokeOpacity} />
+        </SettingsGroup>
+        <SettingsGroup className="host-settings-parameters" title="玻璃平滑度" collapsible>
+          <StyleSlider id="dither-opacity" label="抖动强度" max={limits.ditherOpacity.max} min={limits.ditherOpacity.min} onChange={(ditherOpacity) => setInterfaceStyle({ ditherOpacity })} step={limits.ditherOpacity.step} resetValue={DEFAULT_INTERFACE_STYLE.ditherOpacity} value={value.ditherOpacity} />
+          <StyleSlider id="backdrop-gradient-strength" label="背景渐变强度" max={limits.backdropGradientStrength.max} min={limits.backdropGradientStrength.min} onChange={(backdropGradientStrength) => setInterfaceStyle({ backdropGradientStrength })} step={limits.backdropGradientStrength.step} resetValue={DEFAULT_INTERFACE_STYLE.backdropGradientStrength} value={value.backdropGradientStrength} />
+        </SettingsGroup>
+        <SettingsGroup className="host-settings-parameters" title="交互高光" collapsible>
+          <StyleSlider id="edge-highlight-brightness" label="边缘高光亮度" max={limits.edgeHighlightBrightness.max} min={limits.edgeHighlightBrightness.min} onChange={(edgeHighlightBrightness) => setInterfaceStyle({ edgeHighlightBrightness })} step={limits.edgeHighlightBrightness.step} resetValue={DEFAULT_INTERFACE_STYLE.edgeHighlightBrightness} value={value.edgeHighlightBrightness} />
+          <StyleSlider id="halo-brightness" label="光晕亮度" max={limits.haloBrightness.max} min={limits.haloBrightness.min} onChange={(haloBrightness) => setInterfaceStyle({ haloBrightness })} step={limits.haloBrightness.step} resetValue={DEFAULT_INTERFACE_STYLE.haloBrightness} value={value.haloBrightness} />
+          <StyleSlider id="pointer-response-radius" label="指针响应半径" max={limits.pointerResponseRadius.max} min={limits.pointerResponseRadius.min} onChange={(pointerResponseRadius) => setInterfaceStyle({ pointerResponseRadius })} step={limits.pointerResponseRadius.step} resetValue={DEFAULT_INTERFACE_STYLE.pointerResponseRadius} value={value.pointerResponseRadius} />
+          <StyleSlider id="pointer-sensing-distance" label="感应距离" max={limits.pointerSensingDistance.max} min={limits.pointerSensingDistance.min} onChange={(pointerSensingDistance) => setInterfaceStyle({ pointerSensingDistance })} step={limits.pointerSensingDistance.step} resetValue={DEFAULT_INTERFACE_STYLE.pointerSensingDistance} value={value.pointerSensingDistance} />
+          <StyleSlider id="pointer-falloff" label="衰减曲线" max={limits.pointerFalloff.max} min={limits.pointerFalloff.min} onChange={(pointerFalloff) => setInterfaceStyle({ pointerFalloff })} step={limits.pointerFalloff.step} resetValue={DEFAULT_INTERFACE_STYLE.pointerFalloff} value={value.pointerFalloff} />
+        </SettingsGroup>
+        <SettingsGroup className="host-settings-parameters" title="对话框材质" collapsible>
+          <StyleSlider id="dialog-blur" label="对话框模糊" max={limits.dialogBlur.max} min={limits.dialogBlur.min} onChange={(dialogBlur) => setInterfaceStyle({ dialogBlur })} step={limits.dialogBlur.step} resetValue={DEFAULT_INTERFACE_STYLE.dialogBlur} value={value.dialogBlur} />
+          <StyleSlider id="dialog-opacity" label="对话框不透明度" max={limits.dialogOpacity.max} min={limits.dialogOpacity.min} onChange={(dialogOpacity) => setInterfaceStyle({ dialogOpacity })} step={limits.dialogOpacity.step} resetValue={DEFAULT_INTERFACE_STYLE.dialogOpacity} value={value.dialogOpacity} />
+          <StyleSlider id="dialog-overlay-strength" label="对话框叠加强度" max={limits.dialogOverlayStrength.max} min={limits.dialogOverlayStrength.min} onChange={(dialogOverlayStrength) => setInterfaceStyle({ dialogOverlayStrength })} step={limits.dialogOverlayStrength.step} resetValue={DEFAULT_INTERFACE_STYLE.dialogOverlayStrength} value={value.dialogOverlayStrength} />
+          <StyleSlider id="dialog-backdrop-dim" label="对话框背景变暗" max={limits.dialogBackdropDim.max} min={limits.dialogBackdropDim.min} onChange={(dialogBackdropDim) => setInterfaceStyle({ dialogBackdropDim })} step={limits.dialogBackdropDim.step} resetValue={DEFAULT_INTERFACE_STYLE.dialogBackdropDim} value={value.dialogBackdropDim} />
+        </SettingsGroup>
+      </div>
     </>
   );
 }
@@ -579,7 +626,18 @@ function AppearanceTab({
 function ShortcutsTab() {
   const { actions, bindings, conflicts, onReset, setBinding } = useShortcutBindings();
   const [capturing, setCapturing] = useState<ShortcutActionId | null>(null);
-  const labelFor = (id: string) => SHORTCUT_ACTION_LABELS[id] ?? id;
+  const captureButton = useRef<HTMLButtonElement>(null);
+  const labelFor = (id: ShortcutActionId) => SHORTCUT_ACTIONS[id].label;
+
+  useEffect(() => {
+    if (!capturing || !captureButton.current) return;
+    // A wheel scroll can take the focused capture button out of view without a blur.
+    const observer = new IntersectionObserver(([entry]) => {
+      if (!entry.isIntersecting) setCapturing(null);
+    });
+    observer.observe(captureButton.current);
+    return () => observer.disconnect();
+  }, [capturing]);
 
   function handleCaptureKeyDown(
     event: KeyboardEvent<HTMLButtonElement>,
@@ -594,45 +652,54 @@ function ShortcutsTab() {
     setCapturing(null);
   }
 
+  function renderBinding(action: typeof actions[number]) {
+    const actionConflicts = conflicts[action.id] ?? [];
+    return (
+      <SettingRow
+        key={action.id}
+        title={labelFor(action.id)}
+        description={actionConflicts.length ? <span className="shortcut-binding-conflict">
+          与 {actionConflicts.map(labelFor).join("、")} 冲突
+        </span> : undefined}
+      >
+        <LiquidGlassButton
+          active={capturing === action.id}
+          className="shortcut-binding-capture"
+          aria-label={`${labelFor(action.id)}：${capturing === action.id ? "请按下快捷键" : bindings[action.id]}`}
+          data-shortcut-capture="true"
+          onBlur={() => {
+            if (capturing === action.id) setCapturing(null);
+          }}
+          onClick={() => setCapturing(action.id)}
+          onKeyDown={(event) => handleCaptureKeyDown(event, action.id)}
+          ref={capturing === action.id ? captureButton : undefined}
+          type="button"
+        >
+          {capturing === action.id ? "请按下快捷键" : (
+            <span className="host-settings-keys" aria-hidden="true">
+              {bindings[action.id].split("+").map((key, index) => (
+                <span key={index}>{index > 0 && <small>+</small>}<kbd>{KEY_LABELS[key] ?? key}</kbd></span>
+              ))}
+            </span>
+          )}
+        </LiquidGlassButton>
+      </SettingRow>
+    );
+  }
+
   return (
     <>
-      <div className="settings-group-heading-row">
-        <p className="settings-note">点击右侧按钮后按下新的组合键即可重新绑定。</p>
+      <div className="host-settings-toolbar">
+        <p>点击按键，再按下新的组合键。</p>
         <LiquidGlassButton onClick={onReset} type="button">
           恢复默认快捷键
         </LiquidGlassButton>
       </div>
-      <div className="shortcut-bindings-list">
-        {actions.map((action) => {
-          const actionConflicts = conflicts[action.id] ?? [];
-          return (
-            <div className="shortcut-binding-row" key={action.id}>
-              <div className="shortcut-binding-label">{labelFor(action.id)}</div>
-              <button
-                className={
-                  capturing === action.id
-                    ? "shortcut-binding-capture active"
-                    : "shortcut-binding-capture"
-                }
-                data-shortcut-capture="true"
-                onBlur={() => {
-                  if (capturing === action.id) setCapturing(null);
-                }}
-                onClick={() => setCapturing(action.id)}
-                onKeyDown={(event) => handleCaptureKeyDown(event, action.id)}
-                type="button"
-              >
-                {capturing === action.id ? "请按下快捷键" : bindings[action.id]}
-              </button>
-              {actionConflicts.length > 0 ? (
-                <div className="shortcut-binding-conflict">
-                  与 {actionConflicts.map((id) => labelFor(id)).join("、")} 冲突
-                </div>
-              ) : null}
-            </div>
-          );
-        })}
-      </div>
+      {SHORTCUT_GROUPS.map((group) => (
+        <SettingsGroup key={group} title={group}>
+          {actions.filter((action) => SHORTCUT_ACTIONS[action.id].group === group).map(renderBinding)}
+        </SettingsGroup>
+      ))}
     </>
   );
 }
@@ -728,7 +795,7 @@ function LibrariesTab() {
         onClose={() => setAppearanceTarget(null)} open restoreFocusRef={appearanceRestoreFocusRef} rootId="library"
       /> : null}
       {error ? <div className="settings-inline-error">{error}</div> : null}
-      <SettingsGroup title="资源库列表">
+      <SettingsGroup>
         <ul className="settings-library-list">
           {libs.map((l) => (
             <li
@@ -753,6 +820,7 @@ function LibrariesTab() {
                 <div className="settings-library-info">
                   {renamingId === l.libraryUuid ? (
                     <input
+                      aria-label="资源库名称"
                       className="settings-library-rename"
                       autoFocus
                       value={renameValue}
@@ -765,7 +833,7 @@ function LibrariesTab() {
                     />
                   ) : (
                     <div className="settings-library-name">
-                      <span>{l.name}</span>
+                      <span title={l.name}>{l.name}</span>
                       {l.active ? (
                         <span className="settings-library-badge active">
                           <Check size={12} aria-hidden="true" /> 当前
@@ -823,6 +891,7 @@ function LibrariesTab() {
                   <div className="settings-library-delete-confirm-row">
                     <input
                       autoFocus
+                      aria-label="输入库名以确认删除"
                       value={deleteConfirmText}
                       placeholder={l.name}
                       onChange={(event) => setDeleteConfirmText(event.target.value)}
@@ -850,13 +919,14 @@ function LibrariesTab() {
             </li>
           ))}
         </ul>
-        <div className="settings-library-footer">
+        <div className="host-settings-library-footer">
+          <span>{libs.length ? `已登记 ${libs.length} 个资源库` : "本机资源库"}</span>
           <LiquidGlassButton type="button" onClick={(event) => openManagedLibraryWizard(event.currentTarget)}>
             创建资源库…
           </LiquidGlassButton>
         </div>
       </SettingsGroup>
-      <PluginContributionsSlot slot="library-settings" />
+      <div className="host-settings-contributions"><PluginContributionsSlot slot="library-settings" /></div>
       <ManagedLibraryWizard
         onClose={closeManagedLibraryWizard}
         onCreated={reload}
@@ -878,119 +948,146 @@ function DiagnosticsTab({ library }: { library: LibraryState }) {
   const pluginsDir = diagnostics?.pluginsDir ?? null;
 
   return (
-    <SettingsGroup title="诊断信息">
-      <dl className="settings-diagnostics-grid">
-        <div className="settings-diagnostics-row">
-          <dt>
-            <span className="settings-diagnostics-icon" aria-hidden="true">
-              {ffmpegAvailable ? <CheckCircle2 size={16} /> : <XCircle size={16} />}
-            </span>
-            FFmpeg
-          </dt>
-          <dd>
-            {!probed ? (
-              <span className="settings-badge settings-badge-pending">检测中…</span>
-            ) : ffmpegAvailable ? (
-              <span className="settings-badge settings-badge-ok">可用</span>
-            ) : (
-              <span className="settings-badge settings-badge-missing" title="ffmpeg 不在 PATH 中">
-                缺失
-              </span>
-            )}
-          </dd>
-        </div>
-        <div className="settings-diagnostics-row">
-          <dt>
-            <span className="settings-diagnostics-icon" aria-hidden="true">
-              <Database size={16} />
-            </span>
-            数据库
-          </dt>
-          <dd>
-            <PathDisplay probed={probed} value={dbPath} />
-          </dd>
-        </div>
-        <div className="settings-diagnostics-row">
-          <dt>
-            <span className="settings-diagnostics-icon" aria-hidden="true">
-              <FolderCog size={16} />
-            </span>
-            插件目录
-          </dt>
-          <dd>
-            <PathDisplay probed={probed} value={pluginsDir} />
-          </dd>
-        </div>
-      </dl>
-    </SettingsGroup>
+    <>
+      <SettingsGroup>
+        <SettingRow title="FFmpeg" description="视频缩略图与媒体处理工具。">
+          {ffmpegAvailable == null ? (
+            <span className="settings-badge settings-badge-pending">{probed ? "未取得检测结果" : "检测中…"}</span>
+          ) : ffmpegAvailable ? (
+            <span className="settings-badge settings-badge-ok">可用</span>
+          ) : (
+            <span className="settings-badge settings-badge-missing" title="ffmpeg 不在 PATH 中">缺失</span>
+          )}
+        </SettingRow>
+      </SettingsGroup>
+      <SettingsGroup className="host-settings-paths" title="本机路径">
+        <SettingRow title="数据库"><PathDisplay probed={probed} value={dbPath} /></SettingRow>
+        <SettingRow title="插件目录"><PathDisplay probed={probed} value={pluginsDir} /></SettingRow>
+      </SettingsGroup>
+    </>
   );
 }
 
 // ---- Shared controls -------------------------------------------------------
 
 function ColorField({
+  description,
   id,
   label,
   onChange,
+  onPreview,
   value
 }: {
+  description?: string;
   id: string;
   label: string;
   onChange: (value: string) => void;
+  onPreview: (value: string | null) => void;
   value: string;
 }) {
   return (
-    <label className="settings-style-slider settings-style-color no-drag" htmlFor={id}>
-      <span>{label}</span>
-      <input
-        id={id}
-        onChange={(event) => onChange(event.currentTarget.value)}
-        type="color"
-        value={value}
-      />
-      <output htmlFor={id}>{value.toUpperCase()}</output>
-    </label>
+    <SettingRow htmlFor={id} title={label} description={description}>
+      <div className="host-settings-field no-drag">
+        <ColorPicker id={id} label={label} value={value} onChange={onChange} onPreview={onPreview} showValue zh />
+      </div>
+    </SettingRow>
   );
 }
 
 function StyleSlider({
+  description,
   disabled = false,
   id,
   label,
   max,
   min,
   onChange,
+  resetValue,
   step,
   unit = "x",
   value
 }: {
+  description?: string;
   disabled?: boolean;
   id: string;
   label: string;
   max: number;
   min: number;
   onChange: (value: number) => void;
+  resetValue: number;
   step: number;
   unit?: "%" | "MB" | "px" | "x";
   value: number;
 }) {
+  const numberInput = useRef<HTMLInputElement>(null);
+
+  // Let the native editor keep partial decimals until the preference changes or editing ends.
+  useLayoutEffect(() => {
+    if (numberInput.current) numberInput.current.value = String(value);
+  }, [value, disabled]);
+
+  function commitNumber(input: HTMLInputElement) {
+    const entered = input.valueAsNumber;
+    if (disabled || !Number.isFinite(entered) || entered === value) {
+      input.value = String(value);
+      return;
+    }
+
+    // Use the slider's native rounding, including fractional steps and an off-step maximum.
+    const range = document.createElement("input");
+    range.type = "range";
+    range.min = input.min;
+    range.max = input.max;
+    range.step = input.step;
+    range.valueAsNumber = entered;
+    const next = range.valueAsNumber;
+    input.value = String(next);
+    if (next !== value) onChange(next);
+  }
+
   return (
-    <label className="settings-style-slider no-drag" htmlFor={id}>
-      <span>{label}</span>
+    <div className="settings-control-row host-settings-parameter no-drag">
+      <label className="settings-control-label" htmlFor={id}>{label}</label>
       <span className="settings-style-slider-control" data-settings-slider-control={id}>
-        <input
-          id={id}
+        <ParameterSlider
+          aria-describedby={description ? `${id}-description` : undefined}
+          aria-valuetext={formatStyleValue(value, unit)}
           disabled={disabled}
+          id={id}
           max={max}
           min={min}
-          onChange={(event) => onChange(Number(event.currentTarget.value))}
+          onChange={onChange}
+          resetLabel={formatStyleValue(resetValue, unit)}
+          resetValue={resetValue}
           step={step}
-          type="range"
           value={value}
         />
       </span>
-      <output htmlFor={id}>{formatStyleValue(value, unit)}</output>
-    </label>
+      <label className="host-settings-parameter-value" data-unit={unit} htmlFor={`${id}-value`}>
+        <input
+          aria-describedby={description ? `${id}-description` : undefined}
+          aria-label={`${label}数值（${unit === "x" ? "倍" : unit}）`}
+          defaultValue={value}
+          disabled={disabled}
+          id={`${id}-value`}
+          max={max}
+          min={min}
+          onBlur={(event) => commitNumber(event.currentTarget)}
+          onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing || (event.key !== "Enter" && event.key !== "Escape")) return;
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.key === "Enter") commitNumber(event.currentTarget);
+            else event.currentTarget.value = String(value);
+          }}
+          ref={numberInput}
+          step={step}
+          type="number"
+        />
+        <span aria-hidden="true">{unit}</span>
+      </label>
+      {description && <p className="settings-control-description" id={`${id}-description`}>{description}</p>}
+    </div>
   );
 }
 
@@ -999,7 +1096,7 @@ function PathDisplay({ value, probed }: { value: string | null; probed: boolean 
     return <span className="settings-path-pending">检测中…</span>;
   }
   if (!value) {
-    return <span className="settings-path-pending">在桌面应用中运行以查看</span>;
+    return <span className="settings-path-pending">未提供路径</span>;
   }
   return (
     <code className="settings-path" title={value}>

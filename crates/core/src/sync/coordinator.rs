@@ -52,6 +52,7 @@ impl SyncSchedulerHandle {
 
 #[derive(Clone)]
 pub struct SyncCoordinator {
+    notebook_work: std::sync::Arc<tokio::sync::RwLock<()>>,
     registry: std::sync::Arc<HostRegistry>,
     leases: RuntimeLeases,
     providers: super::provider::ProviderManager,
@@ -64,6 +65,19 @@ pub struct SyncCoordinator {
             std::collections::HashMap<uuid::Uuid, super::media::worker::MediaWorkerSet>,
         >,
     >,
+}
+
+/// A notebook synchronization turn belongs to both the provider and the editor plugin.
+#[derive(Clone)]
+struct LibrarySyncWork {
+    provider: super::provider::ProviderWork,
+    _notebook: Option<std::sync::Arc<tokio::sync::OwnedRwLockReadGuard<()>>>,
+}
+
+impl LibrarySyncWork {
+    fn check_current(&self) -> anyhow::Result<()> {
+        self.provider.check_current()
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -103,6 +117,7 @@ impl SyncCoordinator {
                 PRODUCTION_SYNC_MEDIA_CONCURRENCY,
             )),
             media_workers: Default::default(),
+            notebook_work: Default::default(),
         }
     }
 
@@ -126,15 +141,28 @@ impl SyncCoordinator {
                 PRODUCTION_SYNC_MEDIA_CONCURRENCY,
             )),
             media_workers: Default::default(),
+            notebook_work: Default::default(),
         }
     }
 
-    fn begin_library_work(
-        &self,
-        library_uuid: &str,
-    ) -> anyhow::Result<Option<super::provider::ProviderWork>> {
+    pub async fn drain_notebook_work(&self) {
+        drop(self.notebook_work.write().await);
+    }
+
+    fn begin_library_work(&self, library_uuid: &str) -> anyhow::Result<Option<LibrarySyncWork>> {
         let Some(descriptor) = self.registry.library(library_uuid)? else {
             return Ok(None);
+        };
+        let notebook = if descriptor.kind.is_media() {
+            None
+        } else {
+            let Ok(guard) = self.notebook_work.clone().try_read_owned() else {
+                return Ok(None);
+            };
+            if !self.registry.notebook_enabled()? {
+                return Ok(None);
+            }
+            Some(std::sync::Arc::new(guard))
         };
         if crate::library_manager::verify_descriptor_identity(&descriptor).is_err() {
             self.registry.isolate_unavailable_library(library_uuid)?;
@@ -156,7 +184,14 @@ impl SyncCoordinator {
         {
             return Ok(None);
         }
-        Ok(self.providers.begin_work(&binding.plugin_id).ok())
+        Ok(self
+            .providers
+            .begin_work(&binding.plugin_id)
+            .ok()
+            .map(|provider| LibrarySyncWork {
+                provider,
+                _notebook: notebook,
+            }))
     }
 
     pub fn provider_manager(&self) -> super::provider::ProviderManager {
@@ -740,12 +775,15 @@ impl SyncCoordinator {
         }
     }
 
-    async fn run_root_discovery_turns(&self) -> anyhow::Result<()> {
+    pub(crate) async fn run_root_discovery_turns(&self) -> anyhow::Result<()> {
         let _metadata_permit = self
             .metadata_budget
             .acquire()
             .await
             .map_err(|_| anyhow::anyhow!("sync metadata budget closed"))?;
+        if self.registry.notebook_enabled()? {
+            self.registry.resume_notebook_discovery()?;
+        }
         for transport in self.registry.provider_root_transports()? {
             let Ok(work) = self.providers.begin_work(&transport.plugin_id) else {
                 continue;
@@ -816,10 +854,25 @@ impl SyncCoordinator {
                         discovered.push(candidate);
                         continue;
                     }
-                    let (candidate, _, _) = super::descriptor::download_candidate(
+                    let downloaded =
+                        super::descriptor::fetch_descriptor(provider.as_ref(), &context, &relative)
+                            .await?;
+                    let _notebook_work = if downloaded.document.kind.is_media() {
+                        None
+                    } else {
+                        let guard = self.notebook_work.clone().try_read_owned().ok();
+                        if guard.is_none() || !self.registry.notebook_enabled()? {
+                            self.registry.defer_notebook_discovery(&transport)?;
+                            continue;
+                        }
+                        guard
+                    };
+                    let (candidate, _, _) = super::descriptor::validate_candidate(
                         provider.as_ref(),
                         &context,
                         &relative,
+                        None,
+                        downloaded,
                     )
                     .await?;
                     discovered.push(candidate);
@@ -1008,7 +1061,8 @@ impl SyncCoordinator {
         };
         let staging = catalog_path.with_extension("sqlite.sync-staging");
         let host_bindings = self.registry.local_root_bindings(library_uuid)?;
-        if self.registry.is_root_aware_restore(library_uuid)?
+        if !descriptor.kind.is_media()
+            || self.registry.is_root_aware_restore(library_uuid)?
             || checkpoint.projection.roots.len() > 1
             || !host_bindings.is_empty()
         {
@@ -1809,7 +1863,11 @@ impl SyncCoordinator {
                     continue;
                 }
                 let object_limit = if metadata.key.starts_with("checkpoints/") {
-                    64 * 1024 * 1024
+                    super::descriptor::MAX_CHECKPOINT_BYTES
+                } else if metadata.key.starts_with("segments/") {
+                    // A sealed segment can contain several smaller apply batches.
+                    // Its wrapper adds the fixed actor header and digests to the events.
+                    (super::codec::MAX_SEGMENT_DECODED_BYTES + 4096) as u64
                 } else if metadata.key.starts_with("indexes/") {
                     super::media::MAX_INDEX_SHARD_BYTES as u64
                 } else {
@@ -1851,9 +1909,16 @@ impl SyncCoordinator {
                         directory.join(format!("{}.json", hex_hash(&metadata.sha256)));
                     atomic_write(&destination, &object_bytes)?;
                 } else if metadata.key.starts_with("checkpoints/") {
+                    let (mut file, _) = super::descriptor::unpack_checkpoint_object(
+                        provider.as_ref(),
+                        &context,
+                        object_bytes,
+                    )
+                    .await?;
                     let checkpoint: super::checkpoint::Checkpoint =
-                        serde_json::from_slice(&object_bytes)?;
+                        serde_json::from_reader(std::io::BufReader::new(&file))?;
                     checkpoint.verify()?;
+                    std::io::Seek::rewind(&mut file)?;
                     let directory = spool.join("checkpoints");
                     std::fs::create_dir_all(&directory)?;
                     let destination = directory.join(
@@ -1861,7 +1926,7 @@ impl SyncCoordinator {
                             .file_name()
                             .ok_or_else(|| anyhow::anyhow!("invalid checkpoint object key"))?,
                     );
-                    atomic_write(&destination, &object_bytes)?;
+                    atomic_copy(&destination, file)?;
                 } else if metadata.key.starts_with("indexes/") {
                     super::media::format::IndexShardV1::decode(&object_bytes)?;
                     let directory = spool.join("indexes");
@@ -1992,12 +2057,14 @@ impl SyncCoordinator {
                 "SELECT spool_path,payload_hash,created_at FROM sync_checkpoints WHERE checkpoint_uuid=?1 AND state='ready'",
                 [checkpoint_uuid.as_bytes().as_slice()], |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
             drop(connection);
-            let checkpoint = std::fs::read(&checkpoint_path)?;
-            let checkpoint_hash = super::codec::sha256(&checkpoint);
+            let checkpoint_path = Path::new(&checkpoint_path);
+            let (_, checkpoint_hash) = super::provider::file_size_and_sha256(checkpoint_path)?;
             if expected_hash.as_slice() != checkpoint_hash {
                 anyhow::bail!("checkpoint payload hash mismatch");
             }
-            let payload: super::checkpoint::Checkpoint = serde_json::from_slice(&checkpoint)?;
+            let payload: super::checkpoint::Checkpoint = serde_json::from_reader(
+                std::io::BufReader::new(std::fs::File::open(checkpoint_path)?),
+            )?;
             payload.verify()?;
             if !payload.recovery.portable_complete {
                 return Ok(published);
@@ -2023,13 +2090,15 @@ impl SyncCoordinator {
                     {
                         anyhow::bail!("existing seed does not match the binding capture");
                     }
-                    self.publish_protocol_object(
+                    self.publish_checkpoint_object(
                         provider,
                         &context,
                         library_uuid,
                         binding,
                         &checkpoint_key,
-                        &checkpoint,
+                        checkpoint_path,
+                        checkpoint_hash,
+                        payload.host_metadata.kind,
                     )
                     .await?;
                     self.publish_protocol_object(
@@ -2158,13 +2227,15 @@ impl SyncCoordinator {
                     anyhow::bail!("checkpoint media dependency mismatch");
                 }
             }
-            self.publish_protocol_object(
+            self.publish_checkpoint_object(
                 provider,
                 &context,
                 library_uuid,
                 binding,
                 &checkpoint_key,
-                &checkpoint,
+                checkpoint_path,
+                checkpoint_hash,
+                payload.host_metadata.kind,
             )
             .await?;
             for shard in &payload.media_index_shards {
@@ -2200,6 +2271,87 @@ impl SyncCoordinator {
             }
         }
         Ok(published)
+    }
+
+    async fn publish_checkpoint_object(
+        &self,
+        provider: &dyn super::provider::SyncProvider,
+        context: &super::provider::TransportContext,
+        library_uuid: &str,
+        binding: &crate::host_registry::BindingTransport,
+        key: &str,
+        path: &Path,
+        checkpoint_hash: [u8; 32],
+        kind: crate::host_registry::LibraryKind,
+    ) -> anyhow::Result<()> {
+        use super::descriptor::{self, NOTEBOOK_PAGE_PARTS, NOTEBOOK_PART_BYTES};
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)?;
+        let size = file.metadata()?.len();
+        if kind.is_media() || size <= NOTEBOOK_PART_BYTES as u64 {
+            return self
+                .publish_protocol_object(
+                    provider,
+                    context,
+                    library_uuid,
+                    binding,
+                    key,
+                    &std::fs::read(path)?,
+                )
+                .await;
+        }
+        let sha256 = hex_hash(&checkpoint_hash);
+        let count = size.div_ceil(NOTEBOOK_PART_BYTES as u64);
+        let paged = count > NOTEBOOK_PAGE_PARTS as u64;
+        let mut parts = Vec::new();
+        let mut buffer = vec![0; NOTEBOOK_PART_BYTES];
+        for index in 0..count {
+            let used = (size - index * NOTEBOOK_PART_BYTES as u64).min(NOTEBOOK_PART_BYTES as u64)
+                as usize;
+            let chunk = &mut buffer[..used];
+            file.read_exact(chunk)?;
+            let hash = hex_hash(&super::codec::sha256(chunk));
+            self.publish_protocol_object(
+                provider,
+                context,
+                library_uuid,
+                binding,
+                &descriptor::notebook_part_key(&hash),
+                chunk,
+            )
+            .await?;
+            parts.push(hash);
+            if paged && (parts.len() == NOTEBOOK_PAGE_PARTS || index + 1 == count) {
+                let page = index / NOTEBOOK_PAGE_PARTS as u64;
+                self.publish_protocol_object(
+                    provider,
+                    context,
+                    library_uuid,
+                    binding,
+                    &descriptor::notebook_page_key(&sha256, page),
+                    &serde_json::to_vec(&parts)?,
+                )
+                .await?;
+                parts.clear();
+            }
+        }
+        let index = if paged {
+            descriptor::encode_notebook_index(
+                &descriptor::NotebookCheckpointPages { size, sha256 },
+                true,
+            )?
+        } else {
+            descriptor::encode_notebook_index(
+                &descriptor::NotebookCheckpointParts {
+                    size,
+                    parts,
+                    sha256,
+                },
+                false,
+            )?
+        };
+        self.publish_protocol_object(provider, context, library_uuid, binding, key, &index)
+            .await
     }
 
     async fn publish_protocol_object(
@@ -2382,6 +2534,7 @@ fn perform_turn(
         *generation == local_generation
             && covers
             && checkpoint.host_vector == host_vector
+            && checkpoint.host_metadata.kind == host_metadata.kind
             && checkpoint.host_metadata.name == host_metadata.name
             && checkpoint.host_metadata.icon == host_metadata.icon
             && (pending || checkpoint.recovery.portable_complete)
@@ -2609,20 +2762,18 @@ fn hex_hash(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    atomic_copy(path, bytes)
+}
+
+fn atomic_copy(path: &Path, mut reader: impl std::io::Read) -> anyhow::Result<()> {
     if path.exists() {
         return Ok(());
     }
-    let temp = path.with_extension(format!("{}.tmp", uuid::Uuid::now_v7().simple()));
-    {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    std::fs::rename(temp, path)?;
+    let mut temp =
+        tempfile::NamedTempFile::new_in(path.parent().context("invalid spool destination")?)?;
+    std::io::copy(&mut reader, temp.as_file_mut())?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)?;
     Ok(())
 }
 
@@ -2747,6 +2898,7 @@ mod tests {
             crate::library_path::atomic_write_marker_guarded(
                 &crate::library_path::SafeDirectory::open(path).unwrap(),
                 &crate::library_path::LibraryMarker {
+                    kind: Default::default(),
                     format_version: crate::library_path::STORAGE_FORMAT_VERSION,
                     library_uuid: library.to_string(),
                     root_uuid: root.to_string(),
@@ -2769,6 +2921,7 @@ mod tests {
             .commit_creation(
                 "create",
                 &LibraryDescriptor {
+                    kind: Default::default(),
                     library_uuid: library.to_string(),
                     root_uuid: library_root.to_string(),
                     name: "Library".into(),
@@ -3216,6 +3369,7 @@ mod tests {
             .commit_creation(
                 "restore-create",
                 &LibraryDescriptor {
+                    kind: Default::default(),
                     library_uuid: library.to_string(),
                     root_uuid: library_root.to_string(),
                     name: "Library".into(),
@@ -3844,6 +3998,7 @@ mod tests {
             .commit_creation(
                 "test-create",
                 &LibraryDescriptor {
+                    kind: Default::default(),
                     library_uuid: "library".into(),
                     root_uuid: "root".into(),
                     name: "Library".into(),
@@ -4273,6 +4428,7 @@ mod tests {
             std::fs::create_dir_all(&library_dir).unwrap();
             let path = library_dir.join("catalog.sqlite");
             let descriptor = LibraryDescriptor {
+                kind: Default::default(),
                 library_uuid: library.to_string(),
                 root_uuid: uuid::Uuid::from_u128(200 + index as u128).to_string(),
                 name: format!("Dormant {index}"),
@@ -4440,6 +4596,7 @@ mod tests {
         let path = base.join("production.sqlite");
         let library_uuid = uuid::Uuid::from_u128(1).to_string();
         let descriptor = LibraryDescriptor {
+            kind: Default::default(),
             library_uuid: library_uuid.clone(),
             root_uuid: uuid::Uuid::from_u128(10).to_string(),
             name: "Sync benchmark".into(),
@@ -5123,6 +5280,7 @@ mod tests {
             }
             "checkpoint" => {
                 let host = crate::sync::checkpoint::HostMetadataSnapshot {
+                    kind: Default::default(),
                     library_uuid: uuid::Uuid::from_u128(1).to_string(),
                     name: "Fault".into(),
                     icon: None,

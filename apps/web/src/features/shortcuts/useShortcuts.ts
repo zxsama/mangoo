@@ -8,6 +8,7 @@ import {
 } from "./shortcutBindings";
 
 export interface UseShortcutsOptions {
+  enabled?: boolean;
   library: LibraryState;
   fileOps: FileOpsController;
   previewOpen: boolean;
@@ -52,6 +53,7 @@ export function beginFileOperationOverlay({
  * locally from Settings.
  */
 export function useShortcuts({
+  enabled = true,
   fileOps,
   library,
   onClosePreview,
@@ -66,6 +68,7 @@ export function useShortcuts({
   const overlays = useOverlayStack();
 
   useEffect(() => {
+    if (!enabled) return;
     function handler(event: KeyboardEvent) {
       // Registered overlay surfaces own their keyboard interaction. In particular,
       // Tab must navigate their controls instead of toggling the Library sidebars.
@@ -212,7 +215,7 @@ export function useShortcuts({
 
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [
+  }, [enabled,
     bindings,
     fileOperationRestoreFocusRef,
     fileOps,

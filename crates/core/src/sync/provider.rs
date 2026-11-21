@@ -635,7 +635,7 @@ pub fn validate_download(object: &DownloadedObject, max_bytes: u64) -> ProviderR
     Ok(())
 }
 
-fn file_size_and_sha256(path: &Path) -> ProviderResult<(u64, [u8; 32])> {
+pub(super) fn file_size_and_sha256(path: &Path) -> ProviderResult<(u64, [u8; 32])> {
     let mut file = std::fs::File::open(path).map_err(storage_error)?;
     let size = file.metadata().map_err(storage_error)?.len();
     let mut hasher = Sha256::new();

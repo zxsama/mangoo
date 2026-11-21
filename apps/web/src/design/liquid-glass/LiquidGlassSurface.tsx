@@ -187,6 +187,9 @@ export function LiquidGlassLayer({ children }: { children: ReactNode }) {
     // reflows. Both route through handleLayoutShift, which re-anchors the glow to
     // the stationary cursor against fresh geometry. Invalidating is O(1).
     window.addEventListener("scroll", handleLayoutShift, { capture: true, passive: true });
+    // A native disclosure changes the positions of existing controls without
+    // inserting children or resizing the window.
+    document.addEventListener("toggle", handleLayoutShift, true);
     window.addEventListener("resize", handleLayoutShift, { passive: true });
     const resizeObserver =
       typeof ResizeObserver === "undefined" ? null : new ResizeObserver(handleLayoutShift);
@@ -202,6 +205,7 @@ export function LiquidGlassLayer({ children }: { children: ReactNode }) {
       window.removeEventListener("pointerleave", handlePointerExit);
       window.removeEventListener("blur", handlePointerExit);
       window.removeEventListener("scroll", handleLayoutShift, { capture: true });
+      document.removeEventListener("toggle", handleLayoutShift, true);
       window.removeEventListener("resize", handleLayoutShift);
       resizeObserver?.disconnect();
       mutationObserver?.disconnect();

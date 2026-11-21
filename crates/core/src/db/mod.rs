@@ -1,4 +1,5 @@
 mod directory_preferences;
+pub mod notebook;
 pub mod plugin_records;
 pub use directory_preferences::{
     DirectorySortMutationResult, DirectorySortRule, DirectorySortState, DirectoryTarget,
@@ -1905,6 +1906,14 @@ impl Database {
         if !self.migration_applied(40)? {
             self.connection
                 .execute_batch(migrations::PLUGIN_RECORDS_MIGRATION)?;
+        }
+        if !self.migration_applied(41)? {
+            self.connection
+                .execute_batch(migrations::NOTEBOOK_SEARCH_MIGRATION)?;
+        }
+        if !self.migration_applied(42)? {
+            self.connection
+                .execute_batch(migrations::NOTEBOOK_SEARCH_PARTS_MIGRATION)?;
         }
         self.backfill_media_fts_if_empty()?;
         self.checkpoint_wal_if_larger_than(WAL_TRUNCATE_THRESHOLD_BYTES)?;

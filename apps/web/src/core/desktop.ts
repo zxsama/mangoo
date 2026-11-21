@@ -455,7 +455,15 @@ function ensureLibraryContextChannel(): void {
   });
 }
 
+const beforeLibraryChange = new Set<() => Promise<void>>();
+
+export function subscribeBeforeLibraryChange(save: () => Promise<void>): () => void {
+  beforeLibraryChange.add(save);
+  return () => { beforeLibraryChange.delete(save); };
+}
+
 async function withLibraryContextChange<T>(change: () => Promise<T>): Promise<T> {
+  for (const save of beforeLibraryChange) await save();
   ensureLibraryContextChannel();
   libraryMutationGeneration += 1;
   pendingLibraryContextChanges += 1;

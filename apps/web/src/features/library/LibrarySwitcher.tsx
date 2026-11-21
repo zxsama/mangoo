@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useRef, useState } from "react";
-import { Check, FolderMinus, FolderOpen, FolderPlus, Library, Minus, MoreHorizontal, Palette, Search, X } from "../../design/icons";
+import { Check, FolderMinus, FolderOpen, FolderPlus, Library, Minus, MoreHorizontal, Notepad, Palette, Search, X } from "../../design/icons";
 import { createCoreClient } from "../../core/client";
 import {
   listLibraries,
@@ -7,6 +7,7 @@ import {
   getDesktopBridge,
   getDesktopShellActions,
   openPath,
+  openPluginsWindow,
   pickNativeFolder,
   setLibraryIcon,
   switchLibrary,
@@ -55,6 +56,7 @@ const LIBRARY_SWITCHER_FALLBACK_ANCHOR = pointOverlayAnchor(
 );
 
 export interface LibrarySwitcherProps {
+  notebookEnabled: boolean;
   anchor: HTMLElement | null;
   autoFocus: boolean;
   library: LibraryState;
@@ -78,6 +80,7 @@ function ensureDesktopMutationSucceeded(
 export function LibrarySwitcher({
   anchor,
   autoFocus,
+  notebookEnabled,
   library,
   notificationContext,
   onClose,
@@ -88,6 +91,7 @@ export function LibrarySwitcher({
   const [libs, setLibs] = useState<LibrarySummary[]>([]);
   const [query, setQuery] = useState("");
   const [wizardOpen, setWizardOpen] = useState(false);
+  const [creationKind, setCreationKind] = useState<"notes" | "media">("media");
   const [firstRun, setFirstRun] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -201,7 +205,7 @@ export function LibrarySwitcher({
     }
   }
 
-  const filtered = libs.filter(
+  const filtered = libs.filter((item) => notebookEnabled || item.kind !== "notes").filter(
     (item) =>
       item.name.toLowerCase().includes(query.trim().toLowerCase()) ||
       item.databasePath.toLowerCase().includes(query.trim().toLowerCase()),
@@ -217,7 +221,8 @@ export function LibrarySwitcher({
     });
   }
 
-  function openManagedLibraryWizard() {
+  function openManagedLibraryWizard(kind: "media" | "notes") {
+    setCreationKind(kind);
     wizardRestoreFocusRef.current = restoreFocusTarget;
     setFirstRun(false);
     overlays.openRoot("managed-library");
@@ -353,15 +358,15 @@ export function LibrarySwitcher({
         <button
           aria-current={item.active ? "true" : undefined}
           className="library-switcher-main"
-          disabled={item.availability !== "available" || forgetPending}
+          disabled={loading || item.availability !== "available" || forgetPending}
           onClick={() => void onSwitch(item)}
           title={`${item.name}\n${item.databasePath}${item.availability === "available" ? "" : "\n资源库暂不可用"}`}
           type="button"
         >
           <LibraryGlyph color={color} icon={icon} selected={item.active} size={24} />
-          <span className="library-switcher-identity">
+          <span data-button-content className="library-switcher-identity">
             <span className="library-switcher-name">{item.name}</span>
-            <span className="library-switcher-path">{item.databasePath}</span>
+            <span className="library-switcher-path">{item.kind === "notes" ? "笔记库 · " : ""}{item.databasePath}</span>
           </span>
           {item.active ? <Check aria-label="当前资源库" className="library-switcher-check" size={16} /> : null}
         </button>
@@ -388,7 +393,7 @@ export function LibrarySwitcher({
               dispatch({ type: "close-root" });
             }}>图标与颜色…</OverlayMenuItem>
             {getDesktopShellActions()?.openPath ? <OverlayMenuItem icon={<FolderOpen size={16} />} onClick={() => void runMutation("library-open-location", item.libraryUuid, async () => { if (!await openPath(item.databasePath)) throw new Error("无法打开此文件夹，请检查位置是否可用。"); })}>在文件资源管理器中打开</OverlayMenuItem> : null}
-            {item.active ? <>
+            {item.active && item.kind !== "notes" ? <>
               <div className="library-switcher-menu-separator" role="separator" />
               {getDesktopBridge()?.pickFolder ? <OverlayMenuItem aria-label="Add folder" icon={<FolderPlus size={16} />} onClick={() => void onAddFolder()}>添加文件夹…</OverlayMenuItem> : null}
               <OverlayMenuItem aria-controls="library-remove-folders" aria-expanded={removeMenuOpen} aria-label="Remove folder" icon={<FolderMinus size={16} />} onClick={(event) => { removeTriggerRef.current = event.currentTarget; dispatch({ anchor: event.currentTarget, kind: "remove", libraryId: item.libraryUuid, type: "toggle-nested" }); }} submenu>移除文件夹…</OverlayMenuItem>
@@ -409,8 +414,9 @@ export function LibrarySwitcher({
 
   const footerActions = (
     <>
-      <button className="library-switcher-footer-action" data-interactive-pointer-target="true" onClick={openManagedLibraryWizard} type="button"><Library aria-hidden="true" size={18} />创建资源库…</button>
-      <button className="library-switcher-footer-action" data-interactive-pointer-target="true" onClick={openExistingLibraryDialog} type="button"><FolderOpen aria-hidden="true" size={18} />打开其它资源库…</button>
+      <button className="library-switcher-footer-action" data-interactive-pointer-target="true" onClick={() => openManagedLibraryWizard("media")} type="button"><Library aria-hidden="true" size={18} /><span data-button-content>创建资源库…</span></button>
+      {notebookEnabled && <button className="library-switcher-footer-action" data-interactive-pointer-target="true" onClick={() => openManagedLibraryWizard("notes")} type="button"><Notepad aria-hidden="true" size={18} /><span data-button-content>创建笔记库…</span></button>}
+      <button className="library-switcher-footer-action" data-interactive-pointer-target="true" onClick={openExistingLibraryDialog} type="button"><FolderOpen aria-hidden="true" size={18} /><span data-button-content>打开其它资源库…</span></button>
       <PluginContributionsSlot slot="library-menu" libraryUuid={libs.find((item) => item.active)?.libraryUuid ?? null} />
     </>
   );
@@ -438,7 +444,7 @@ export function LibrarySwitcher({
         </div>
         <ul aria-busy={loading} aria-label="资源库列表" className="library-switcher-list">{libraryRows}</ul>
         {loading && libs.length === 0 ? <div className="library-switcher-status" role="status">正在加载资源库…</div> : !loading && filtered.length === 0 ? <div className="library-switcher-status" role="status">{query.trim() ? "未找到匹配的资源库" : "还没有资源库"}</div> : null}
-        {error && !menu ? <div className="library-switcher-status" role="alert">{error}<button data-interactive-pointer-target="true" onClick={() => void reload()} type="button">重试</button></div> : null}
+        {error && !menu ? <div className="library-switcher-status" role="alert">{error}<button data-interactive-pointer-target="true" onClick={() => void reload()} type="button"><span data-button-content>重试</span></button></div> : null}
         <footer className="library-switcher-footer">{footerActions}</footer>
       </AnchoredOverlay>
       {appearanceTarget ? <LibraryAppearanceEditor
@@ -503,6 +509,10 @@ export function LibrarySwitcher({
       </ModalSurface>
       <OpenLibraryDialog onClose={() => { setOpenDialog(false); overlays.closeRoot("managed-library"); }} onFailure={(cause) => void reportFailure("library-open", "managed-root", cause)} onOpened={() => { setFirstRun(false); void reload(); }} open={openDialog} restoreFocusRef={wizardRestoreFocusRef} />
       <ManagedLibraryWizard
+        key={creationKind}
+        kind={creationKind}
+        onOpenPlugins={getDesktopBridge()?.openPluginsWindow ? () => { void openPluginsWindow(); } : undefined}
+        onChangeKind={firstRun && notebookEnabled ? setCreationKind : undefined}
         firstRun={firstRun}
         onOpenExisting={() => { setWizardOpen(false); setOpenDialog(true); }}
         onClose={closeManagedLibraryWizard}
@@ -511,7 +521,7 @@ export function LibrarySwitcher({
           void reload();
         }}
         onFailure={(cause) => void reportFailure("library-create", "managed-root", cause)}
-        open={wizardOpen}
+        open={wizardOpen && (creationKind === "media" || notebookEnabled)}
         restoreFocusRef={wizardRestoreFocusRef}
       />
     </>

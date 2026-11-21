@@ -33,7 +33,7 @@ const FilmstripThumb = memo(function FilmstripThumb({ entry }: { entry: ImageEnt
     };
   }, [entry]);
   if (url) return <img alt="" className="iv-film-image" draggable={false} src={url} />;
-  return <span className="iv-film-placeholder" data-failed={failed ? "true" : "false"}>{entry.ext.replace(".", "").toUpperCase()}</span>;
+  return <span data-button-content className="iv-film-placeholder" data-failed={failed ? "true" : "false"}>{entry.ext.replace(".", "").toUpperCase()}</span>;
 });
 
 export function Filmstrip({

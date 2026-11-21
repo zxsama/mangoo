@@ -7,6 +7,17 @@ import { LiquidGlassButton } from "../../design/liquid-glass";
 import { ModalSurface, OverlayDialogActions, OverlayDialogBody, OverlayDialogHeader, OverlayInlineStatus } from "../../design/overlays";
 import { broadcastPluginChange, invalidatePluginQueries } from "./pluginQuerySync";
 import { createPluginUiBridge, pluginUiDocument, type PluginUiContext } from "./pluginUiBridge";
+import { isThemeColor, pluginColorTokens, type PluginUiTheme } from "../../../../../packages/plugin-sdk/src/theme";
+
+function currentPluginTheme(): PluginUiTheme {
+  const style = getComputedStyle(window.document.documentElement);
+  const colors: NonNullable<PluginUiTheme["colors"]> = {};
+  for (const name of pluginColorTokens) {
+    const value = style.getPropertyValue(name).trim();
+    if (isThemeColor(value)) colors[name] = value;
+  }
+  return { colorScheme: style.colorScheme === "light" ? "light" : "dark", colors };
+}
 
 export interface PluginViewSelection extends PluginUiContext { plugin: HostPluginProjection; viewId: string; expectedContextRevision?: number; }
 
@@ -35,7 +46,7 @@ export function PluginView({ selection, onClose, onStateChanged, restoreFocusRef
     const receive = (event: MessageEvent<unknown>) => {
       if (!iframe.current?.contentWindow || event.source !== iframe.current.contentWindow || disposed || !sessionClient) return;
       if (!bridge) {
-        bridge = createPluginUiBridge({ client: sessionClient, plugin: selection.plugin, viewId: selection.viewId, context: { libraryUuid: selection.libraryUuid, rootId: selection.rootId, rootUuid: selection.rootUuid }, contextRevision, theme: { colorScheme: getComputedStyle(window.document.documentElement).colorScheme === "light" ? "light" : "dark" }, sessionId: crypto.randomUUID(), source: iframe.current.contentWindow, post: (message) => iframe.current?.contentWindow?.postMessage(message, "*"), abort: () => controller.abort(), host: desktop,
+        bridge = createPluginUiBridge({ client: sessionClient, plugin: selection.plugin, viewId: selection.viewId, context: { libraryUuid: selection.libraryUuid, rootId: selection.rootId, rootUuid: selection.rootUuid }, contextRevision, theme: currentPluginTheme(), sessionId: crypto.randomUUID(), source: iframe.current.contentWindow, post: (message) => iframe.current?.contentWindow?.postMessage(message, "*"), abort: () => controller.abort(), host: desktop,
           changed: async () => {
             const current = await client.getPlugin(selection.plugin.pluginId);
             if (!disposed && (current.lifecycleEpoch !== selection.plugin.lifecycleEpoch || current.accountUuid !== selection.plugin.accountUuid)) { bridge?.revoke(); onStateChangedRef.current(); }
@@ -46,6 +57,10 @@ export function PluginView({ selection, onClose, onStateChanged, restoreFocusRef
       void bridge.receive(event).catch((cause: unknown) => { if (!disposed) setError(cause instanceof Error ? cause.message : String(cause)); });
     };
     window.addEventListener("message", receive);
+    const themeChanged = (event: Event) => {
+      if (event instanceof CustomEvent && isThemeColor(event.detail)) bridge?.updateTheme(currentPluginTheme());
+    };
+    window.document.addEventListener("mangoo-accent-changed", themeChanged);
     void Promise.all([client.getPluginViewDocument(selection.plugin.pluginId, selection.viewId), client.getActiveLibrary()]).then(([view, active]) => {
       if (disposed) return;
       if (view.pluginId !== selection.plugin.pluginId || view.version !== selection.plugin.selectedVersion || view.viewId !== selection.viewId || view.lifecycleEpoch !== selection.plugin.lifecycleEpoch) throw new Error("Plugin view changed while loading");
@@ -59,7 +74,15 @@ export function PluginView({ selection, onClose, onStateChanged, restoreFocusRef
         if (!disposed && bridge && active.contextRevision !== contextRevision) { bridge.revoke(); onCloseRef.current(); }
       }).catch(() => { /* A subsequent dispatch rechecks the authoritative context. */ });
     });
-    return () => { disposed = true; controller.abort(); bridge?.revoke(); bridgeRef.current = null; unsubscribe(); window.removeEventListener("message", receive); };
+    return () => {
+      disposed = true;
+      controller.abort();
+      bridge?.revoke();
+      bridgeRef.current = null;
+      unsubscribe();
+      window.removeEventListener("message", receive);
+      window.document.removeEventListener("mangoo-accent-changed", themeChanged);
+    };
   }, [selection.plugin.pluginId, selection.plugin.selectedVersion, selection.plugin.lifecycleEpoch, selection.plugin.contributions?.ui?.sha256, selection.viewId, selection.libraryUuid, selection.rootId, selection.rootUuid, selection.expectedContextRevision, queryClient]);
 
   return <ModalSurface ariaLabelledBy="plugin-view-title" className="plugin-view-modal" id="plugin-view" initialFocusRef={closeRef} onDismiss={onClose} open restoreFocusRef={restoreFocusRef} role="dialog" rootId="plugin-view">

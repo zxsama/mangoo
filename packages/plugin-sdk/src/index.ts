@@ -3,6 +3,8 @@ import type { createCoreClient as createHttpClient } from "../../core-client/src
 import type { DesktopFolderPickerRequest } from "../../notification-contract/src/index";
 import type { PluginExternalLinkRequest } from "../../core-client/src/generated-contract";
 import { CORE_METHODS } from "./core-methods";
+import { pluginThemeProperties, readPluginTheme, type PluginUiTheme } from "./theme";
+export type { PluginUiTheme } from "./theme";
 
 export type * from "../../core-client/src/generated-contract";
 export type { DesktopFolderPickerRequest } from "../../notification-contract/src/index";
@@ -14,10 +16,11 @@ export interface PluginUiInit {
   pluginId: string;
   viewId: string;
   context: { libraryUuid: string | null; rootUuid: string | null; rootId?: number | null };
-  theme: { colorScheme: "light" | "dark" };
+  theme: PluginUiTheme;
 }
 interface Pending { resolve(value: unknown): void; reject(error: Error): void; cleanup(): void }
 export interface BridgeWindow {
+  document?: { documentElement: { style: Pick<CSSStyleDeclaration, "setProperty"> } };
   parent: { postMessage(message: unknown, targetOrigin: string): void };
   addEventListener(type: "message", listener: (event: MessageEvent) => void): void;
   removeEventListener(type: "message", listener: (event: MessageEvent) => void): void;
@@ -38,6 +41,10 @@ export function createPluginBridge(target: BridgeWindow, timeoutMs = 30_000) {
   // Consumers can call readContext before awaiting ready without an unhandled rejection.
   void ready.catch(() => undefined);
   const initTimeout = setTimeout(() => dispose(new Error("Plugin host initialization timed out")), timeoutMs);
+  function applyTheme(theme: PluginUiTheme) {
+    const style = target.document?.documentElement.style;
+    if (style) for (const [name, value] of Object.entries(pluginThemeProperties(theme))) style.setProperty(name, value);
+  }
   function receive(event: MessageEvent) {
     if (stopped || event.source !== target.parent || !record(event.data)) return;
     const message = event.data;
@@ -46,13 +53,21 @@ export function createPluginBridge(target: BridgeWindow, timeoutMs = 30_000) {
       if (![message.context.libraryUuid, message.context.rootUuid].every((value) => value === null || identity(value))) return;
       const rootId = message.context.rootId ?? null;
       if (rootId !== null && (typeof rootId !== "number" || !Number.isSafeInteger(rootId) || rootId <= 0)) return;
-      if (message.theme.colorScheme !== "light" && message.theme.colorScheme !== "dark") return;
-      init = { ...message, context: { ...message.context, rootId } } as unknown as PluginUiInit;
+      const theme = readPluginTheme(message.theme);
+      if (!theme) return;
+      init = { ...message, context: { ...message.context, rootId }, theme } as unknown as PluginUiInit;
+      applyTheme(theme);
       clearTimeout(initTimeout);
       resolveReady(init);
       return;
     }
-    if (message.type !== "mangoo-plugin-ui:response" || !init || message.sessionId !== init.sessionId || typeof message.requestId !== "string") return;
+    if (!init || message.sessionId !== init.sessionId) return;
+    if (message.type === "mangoo-plugin-ui:theme") {
+      const theme = readPluginTheme(message.theme);
+      if (theme) { init.theme = theme; applyTheme(theme); }
+      return;
+    }
+    if (message.type !== "mangoo-plugin-ui:response" || typeof message.requestId !== "string") return;
     const item = pending.get(message.requestId);
     if (!item) return;
     pending.delete(message.requestId); item.cleanup();
@@ -93,7 +108,7 @@ export function createPluginBridge(target: BridgeWindow, timeoutMs = 30_000) {
     });
   }
   target.addEventListener("message", receive);
-  target.parent.postMessage({ type: "mangoo-plugin-ui:ready" }, "*");
+  target.parent.postMessage({ type: "mangoo-plugin-ui:ready", handlesTheme: true }, "*");
   return { ready, call, dispose, readContext: () => { if (!init) throw new Error("Plugin host is not initialized"); return init; } };
 }
 export type PluginBridge = ReturnType<typeof createPluginBridge>;

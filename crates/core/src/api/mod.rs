@@ -23,6 +23,7 @@ use crate::library_manager::{ActiveSnapshot, LibraryManager, LibraryRuntimeResou
 use crate::roots::reachability::{refresh_root_reachability, RootReachability};
 
 mod image_viewer;
+mod notebook;
 mod playback;
 mod plugin_data;
 mod plugin_ui_admission;
@@ -317,10 +318,7 @@ impl AppState {
         Ok(self.resources()?.task_queue.clone())
     }
 
-    pub fn notification_outbox_wake(&self) -> anyhow::Result<Arc<tokio::sync::Notify>> {
-        Ok(Arc::clone(&self.resources()?.notification_outbox_wake))
-    }
-
+    #[cfg(test)]
     pub fn notification_outbox_read_gate(&self) -> anyhow::Result<Arc<tokio::sync::Semaphore>> {
         Ok(Arc::clone(&self.resources()?.notification_outbox_read_gate))
     }
@@ -475,6 +473,7 @@ pub fn router_with_state(state: AppState, config: ApiConfig) -> Router {
         .merge(playback::authenticated_router(state.clone()))
         .merge(image_viewer::router(state.clone()))
         .merge(plugin_data::router(state.clone()))
+        .merge(notebook::router(state.clone()))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             attach_library_context,
@@ -1419,7 +1418,7 @@ fn cors_layer(origin: HeaderValue) -> CorsLayer {
 
 async fn attach_library_context(
     axum::extract::State(state): axum::extract::State<AppState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     start_runtime_background_tasks(&state);
@@ -1463,7 +1462,9 @@ async fn attach_library_context(
     } else {
         Some(gate.read_owned().await)
     };
-    if request_guard.is_some() && is_mutation {
+    let notebook_read_fence = request.uri().path().starts_with("/api/notebooks/")
+        && request.headers().contains_key("x-mangoo-context-revision");
+    if request_guard.is_some() && (is_mutation || notebook_read_fence) {
         if let Some(manager) = state.library_manager.as_ref() {
             let snapshot = manager.active_snapshot();
             let expected = request
@@ -1493,10 +1494,27 @@ async fn attach_library_context(
         )
             .into_response();
     }
-    let _request_guard = request_guard;
+    // Outbox polling keeps the response's originating Library identity, but
+    // only the individual database reads need to block Library activation.
+    let is_outbox =
+        request.method() == Method::GET && request.uri().path() == "/api/notifications/outbox";
+    let poll_snapshot = is_outbox.then(|| {
+        state
+            .active
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    });
+    let _request_guard = if let Some(snapshot) = &poll_snapshot {
+        request.extensions_mut().insert(snapshot.clone());
+        drop(request_guard);
+        None
+    } else {
+        request_guard
+    };
     let mut response = next.run(request).await;
     if let Some(manager) = state.library_manager.as_ref() {
-        let snapshot = manager.active_snapshot();
+        let snapshot = poll_snapshot.unwrap_or_else(|| manager.active_snapshot());
         if let Some(library_uuid) = snapshot.library_uuid {
             if let Ok(value) = HeaderValue::from_str(&library_uuid) {
                 response.headers_mut().insert("x-mangoo-library-id", value);

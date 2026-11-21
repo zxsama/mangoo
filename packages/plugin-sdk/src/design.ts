@@ -3,3 +3,5 @@ export { LiquidGlassButton, LiquidGlassLayer, LiquidGlassSurface } from "../../.
 export * from "../../../apps/web/src/design/overlays/index";
 export { applyInterfaceStyleVariables, DEFAULT_INTERFACE_STYLE } from "../../../apps/web/src/features/settings/interfaceStyle";
 export { useOverlayScrollbars } from "../../../apps/web/src/app-shell/useOverlayScrollbars";
+export { DisclosureButton, DisclosureSummary } from "../../../apps/web/src/design/SectionDisclosure";
+export { ParameterSlider } from "../../../apps/web/src/design/ParameterSlider";

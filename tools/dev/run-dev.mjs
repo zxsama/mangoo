@@ -13,6 +13,8 @@ const webHost = parsedWebUrl.hostname;
 const webPort = parsedWebUrl.port || (parsedWebUrl.protocol === "https:" ? "443" : "80");
 const dataDir = path.join(root, ".data");
 const hostDir = path.join(dataDir, "mangoo", "host");
+const releaseCore = process.env.MANGOO_CORE_PROFILE === "release";
+const coreProfileDir = path.resolve(root, process.env.CARGO_TARGET_DIR ?? "target", releaseCore ? "release" : "debug");
 
 fs.mkdirSync(dataDir, { recursive: true });
 
@@ -23,6 +25,10 @@ function spawnChild(command, args, options = {}) {
     cwd: root,
     env: {
       ...process.env,
+      ...(process.env.CARGO_TARGET_DIR ? {
+        MANGOO_CORE_BINARY: process.env.MANGOO_CORE_BINARY ?? path.join(coreProfileDir, process.platform === "win32" ? "mangoo-core.exe" : "mangoo-core"),
+        MANGOO_PLUGINS_DIR: process.env.MANGOO_PLUGINS_DIR ?? path.join(coreProfileDir, "bundled-plugins")
+      } : {}),
       MANGOO_WEB_URL: webUrl,
       MANGOO_HOST_DB_PATH: process.env.MANGOO_HOST_DB_PATH ?? path.join(hostDir, "host.sqlite"),
       MANGOO_LIBRARIES_DIR: process.env.MANGOO_LIBRARIES_DIR ?? path.join(hostDir, "libraries")
@@ -87,8 +93,8 @@ process.on("SIGTERM", () => {
 process.on("exit", shutdown);
 
 if (process.env.MANGOO_CORE_EXTERNAL !== "1") {
-  run("node", ["tools/build/build-bundled-plugins.mjs"]);
-  run(findCargoCommand(), ["build", "-p", "mangoo-core"]);
+  run("node", ["tools/build/build-bundled-plugins.mjs", ...(releaseCore ? ["--release-profile"] : [])]);
+  run(findCargoCommand(), ["build", "-p", "mangoo-core", ...(releaseCore ? ["--release"] : [])]);
 }
 
 if (await isMangooWebServerReady(webUrl)) {

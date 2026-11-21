@@ -7,6 +7,7 @@ import {
   OverlayMenuList
 } from "../../design/overlays";
 import { LiquidGlassButton } from "../../design/liquid-glass";
+import { titlebarIcon } from "../../design/tokens";
 
 type Kind = "image" | "video" | "other";
 type MinRating = 1 | 2 | 3 | 4 | 5;
@@ -71,7 +72,7 @@ export function FilterMenu({
         tone="control"
         type="button"
       >
-        <SlidersHorizontal aria-hidden="true" size={15} />
+        <SlidersHorizontal {...titlebarIcon.filter} />
         {hasFilters ? <span className="filter-menu-dot" aria-hidden="true" /> : null}
       </LiquidGlassButton>
 
@@ -102,7 +103,7 @@ export function FilterMenu({
                   role="menuitemcheckbox"
                   type="button"
                 >
-                  {option.label}
+                  <span data-button-content>{option.label}</span>
                 </button>
               ))}
             </div>

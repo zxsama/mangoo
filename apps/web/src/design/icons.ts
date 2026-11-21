@@ -1,4 +1,5 @@
 import { createElement, forwardRef, type ComponentPropsWithoutRef, type ForwardRefExoticComponent, type RefAttributes } from "react";
+import "./buttonIconArtwork.css";
 import { ApertureIcon as ApertureGlyph } from "@phosphor-icons/react/dist/csr/Aperture";
 import { ArrowClockwiseIcon as ArrowClockwiseGlyph } from "@phosphor-icons/react/dist/csr/ArrowClockwise";
 import { FlipHorizontalIcon as FlipHorizontalGlyph } from "@phosphor-icons/react/dist/csr/FlipHorizontal";
@@ -136,16 +137,21 @@ import { XCircleIcon as XCircleGlyph } from "@phosphor-icons/react/dist/csr/XCir
 /** Project-owned SVG contract; keep third-party types out of SDK declarations. */
 export interface AppIconProps extends ComponentPropsWithoutRef<"svg"> {
   size?: number | string;
-  weight?: "light" | "regular" | "fill";
+  weight?: "light" | "regular" | "bold" | "fill";
 }
 export type AppIcon = ForwardRefExoticComponent<AppIconProps & RefAttributes<SVGSVGElement>>;
 
-// Keep the existing intrinsic box. Phosphor uses filled outlines: use weight,
-// never SVG fill/strokeWidth, to select outline versus selected-state artwork.
+// The control stylesheet swaps only the artwork within the same SVG. Explicit
+// filled states and icons with their own calibrated viewBox keep their drawing.
 function appIcon(Glyph: typeof CheckGlyph, name: string): AppIcon {
-  const Icon = forwardRef<SVGSVGElement, AppIconProps>(({ size = 24, weight = "regular", ...props }, ref) =>
-    createElement(Glyph, { ...props, ref, size, weight }),
-  );
+  const Icon = forwardRef<SVGSVGElement, AppIconProps>(({ size = 24, weight = "regular", ...props }, ref) => {
+    const svgProps = {
+      ...props, ref, size, weight,
+      "data-button-icon": !props.viewBox && (weight === "regular" || weight === "light") ? name : undefined,
+      "data-icon-weight": weight === "light" ? weight : undefined
+    };
+    return createElement(Glyph, svgProps);
+  });
   Icon.displayName = name;
   return Icon;
 }

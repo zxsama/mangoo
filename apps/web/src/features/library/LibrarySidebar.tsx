@@ -285,9 +285,9 @@ function RootNode({
           type="button"
         >
           <FolderGlyph icon={root.icon} color={root.color} open={folderShowsOpenIcon({ expanded, knownChildless, selected })} />
-          <span className="tree-name">{root.displayName}</span>
+          <span data-button-content className="tree-name">{root.displayName}</span>
           {root.reachable === false ? <FolderX size={14} className="tree-root-offline" aria-label="资源库离线" /> : null}
-          <span
+          <span data-button-content
             aria-label={`${root.fileCount ?? root.mediaCount} files`}
             className="tree-media-count"
             title={`${(root.fileCount ?? root.mediaCount).toLocaleString()} files including subfolders`}
@@ -378,8 +378,8 @@ function FolderNode({
           type="button"
         >
           <FolderGlyph icon={folder.icon} color={folder.color} open={showsOpenIcon} size={16} />
-          <span className="tree-name">{folder.name}</span>
-          <span
+          <span data-button-content className="tree-name">{folder.name}</span>
+          <span data-button-content
             aria-label={`${folder.fileCount ?? folder.mediaCount} files`}
             className="tree-media-count"
             title={`${(folder.fileCount ?? folder.mediaCount).toLocaleString()} files including subfolders`}
@@ -646,7 +646,7 @@ function LoadMoreChildren({
       onClick={() => void library.loadMoreFolderChildren(folderId)}
       type="button"
     >
-      Load more children
+      <span data-button-content>Load more children</span>
       </button>
     </div>
   );

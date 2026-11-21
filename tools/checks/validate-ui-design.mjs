@@ -920,6 +920,11 @@ for (const [selector, checks, message] of [
       /height:\s*var\(--titlebar-window-control-height\)/
     ],
     "main window controls must use the approved 32x28px titlebar tokens"
+  ],
+  [
+    ".app-shell .window-chrome-button",
+    [/padding-inline:\s*0\s*;/],
+    "fixed-width caption buttons must leave room for the full icon"
   ]
 ]) {
   const blocks = [
@@ -1491,9 +1496,7 @@ for (const retiredValue of ["LiquidGlassSurface", "aria-pressed", "plugin-card-e
 
 for (const value of [
   '<details className="plugin-disclosure plugin-technical-details">',
-  'data-pointer-glow="off"',
-  'className="plugin-disclosure-label"',
-  "技术信息",
+  '<DisclosureSummary label="技术信息"',
   'tone="danger"',
   "plugin-detail-actions"
 ]) {
@@ -1506,8 +1509,11 @@ for (const value of ["plugin-detail-enable-row", "aria-label={toggleLabel}", "on
     fail(`PluginDetail enable-control contract missing ${value}`);
   }
 }
-if (!/plugin-disclosure-chevron[\s\S]{0,180}plugin-disclosure-label/.test(pluginDetail)) {
-  fail("PluginDetail disclosure chevron must precede its label");
+const sectionDisclosure = read("apps/web/src/design/SectionDisclosure.tsx");
+if (!/section-disclosure-chevron[^>]*\/>\s*<span className="section-disclosure-label"/.test(sectionDisclosure)
+  || !/<summary[^>]*data-pointer-glow="off"/.test(sectionDisclosure)
+  || !/<button[^>]*data-pointer-glow="off"/.test(sectionDisclosure)) {
+  fail("Disclosure buttons and native summaries must opt out of row glow and keep the chevron immediately beside the label");
 }
 for (const retiredValue of ["plugin-detail-id", "<dt>Intent</dt>", "<dt>Authentication</dt>"]) {
   if (pluginDetail.includes(retiredValue)) {
@@ -1639,7 +1645,7 @@ for (const value of [
 if (/type=["']password["']|client.?secret[^\n]{0,120}<input/i.test(pluginSetupWizard)) {
   fail("Plugin self-managed setup must not accept passwords or Client Secrets");
 }
-if (liquidGlassSurface.includes('".plugin-card"') || liquidGlassSurface.includes('".plugin-disclosure-summary"')) {
+if (liquidGlassSurface.includes('".plugin-card"') || liquidGlassSurface.includes('".section-disclosure"')) {
   fail("plugin navigation and disclosure summaries must not be registered as global pointer-glow owners");
 }
 
@@ -1673,19 +1679,23 @@ for (const selector of [
     fail(`${selector} must keep full-row shape feedback transparent`);
   }
 }
-const pluginDisclosureSummaryCss = cssBlocksForExactSelector(stylesForChecks, ".plugin-disclosure-summary").join("\n");
+const sectionDisclosureCss = cssBlocksForExactSelector(stylesForChecks, ".section-disclosure").join("\n");
 if (
-  latestDeclarationValue(pluginDisclosureSummaryCss, "border") !== "0" ||
-  latestBackgroundValue(pluginDisclosureSummaryCss) !== "transparent" ||
-  latestDeclarationValue(pluginDisclosureSummaryCss, "box-shadow") !== "none" ||
-  latestDeclarationValue(pluginDisclosureSummaryCss, "outline") !== "none"
+  latestDeclarationValue(sectionDisclosureCss, "border") !== "0" ||
+  latestBackgroundValue(sectionDisclosureCss) !== "transparent" ||
+  latestDeclarationValue(sectionDisclosureCss, "box-shadow") !== "none" ||
+  latestDeclarationValue(sectionDisclosureCss, "outline") !== "none" ||
+  latestDeclarationValue(sectionDisclosureCss, "width") !== "100%" ||
+  latestDeclarationValue(sectionDisclosureCss, "justify-content") !== "flex-start"
 ) {
-  fail("plugin disclosure summaries must not draw a full-row background, border, shadow, or outline");
+  fail("Section disclosures must keep a transparent full-width hit area and group the chevron with the title");
 }
 for (const selector of [
-  ".plugin-disclosure-summary:hover",
-  ".plugin-disclosure-summary:focus-visible",
-  ".plugin-disclosure[open] > .plugin-disclosure-summary"
+  ".section-disclosure:hover:not(:disabled)",
+  ".section-disclosure:active:not(:disabled)",
+  ".section-disclosure:focus-visible",
+  '.section-disclosure[aria-expanded="true"]',
+  "details[open] > .section-disclosure"
 ]) {
   const stateCss = cssBlocksForExactSelector(stylesForChecks, selector).join("\n");
   if (
@@ -1696,6 +1706,10 @@ for (const selector of [
   ) {
     fail(`${selector} must limit feedback to disclosure text and chevron`);
   }
+}
+if (!cssBlocksForExactSelector(stylesForChecks, ".section-disclosure:focus-visible .section-disclosure-label")
+  .some(block => latestDeclarationValue(block, "text-decoration") === "underline")) {
+  fail("Keyboard focus must remain visible on the disclosure label");
 }
 for (const retiredValue of ["预览更改", "收起高级配置", "plugin-config-summary", "plugin-auth-state", "配置 Client ID", "Mangoo 内置应用配置"]) {
   if (pluginAccountSetup.includes(retiredValue)) {
@@ -2528,9 +2542,23 @@ for (const retiredAlias of ["--surface-corner-radius", "--control-corner-radius"
   }
 }
 
-const settingsPanelRadiusBlocks = cssBlocksForExactSelector(stylesForChecks, ".settings-group-body");
+const sharedSettingsCss = stripCssComments(read("apps/web/src/design/settingsControls.css"));
+const settingsPanelRadiusBlocks = cssBlocksForExactSelector(sharedSettingsCss, ".settings-control-rows");
 if (!settingsPanelRadiusBlocks.some((block) => /border-radius:\s*var\(--radius-panel\)/.test(block))) {
   fail("Settings panel surfaces must consume --radius-panel");
+}
+const settingsControls = read("apps/web/src/design/SettingsControls.tsx");
+const viewerSettings = read("bundled-plugins/com.mangoo.image-viewer/src/web/ViewerSettings.tsx");
+const notebookSettings = read("bundled-plugins/com.mangoo.notebook/src/web/NotebookSettings.tsx");
+for (const [name, source] of [["main", settingsView], ["image viewer", viewerSettings], ["notebook", notebookSettings]]) {
+  if (!source.includes("SettingRow")) fail(`The ${name} settings must use the shared setting rows`);
+}
+if (!settingsControls.includes("settings-control-rows") || !settingsView.includes("useSettingsNavigation(sectionIds)") ||
+    !settingsView.includes('aria-current={active === id ? "location" : undefined}') ||
+    !settingsView.includes("data-section={id}") || !settingsView.includes("{content[id]}") ||
+    !settingsView.includes('className="settings-control-rows settings-group-body"') ||
+    !settingsView.includes('useHostCapability("notebook.v1")')) {
+  fail("Host Settings must render navigable sections in one scroll pane with shared group surfaces and respect the notebook capability");
 }
 
 const settingsControlRadiusBlocks = cssBlocksForExactSelector(stylesForChecks, ".liquid-glass-button");
@@ -3144,8 +3172,26 @@ if (
 ) {
   fail("generic button hover must not paint a full-control background or border over the unified pointer highlight");
 }
-if (!legacyButtonHoverBlocks.some((block) => latestDeclarationValue(block, "transform") === "translateY(-1px)")) {
-  fail("generic button hover must preserve the existing one-pixel lift feedback");
+for (const selector of [
+  ':where(button, [role="button"]):hover:not(:disabled)',
+  ':where(button, [role="button"]):active:not(:disabled)',
+  '.liquid-glass[data-glass-pressed="true"]',
+  '.liquid-glass[data-glass-pressed="true"] .liquid-glass-lens',
+  '.subfolder-card-expand:hover:not(:disabled)'
+]) {
+  const movesFrame = cssBlocksForExactSelector(stylesForChecks, selector)
+    .some(block => ["transform", "translate", "scale"].some(property => hasNonNoneDeclaration(block, property)));
+  if (movesFrame) fail(`Button frames and material layers must stay fixed: ${selector}`);
+}
+const buttonFeedbackOwner = ':where(button, [role="button"], [role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], summary, [data-button-feedback])';
+const feedbackBlocks = cssBlocksForExactSelector(stylesForChecks, buttonFeedbackOwner);
+const onePixelForeground = /^\s*--button-content-offset:\s*0px;\s*&:hover[^{}]*:disabled[^{}]*:active[^{}]*aria-disabled[^{}]*\{\s*--button-content-offset:\s*-1px;/;
+if (!feedbackBlocks.some(block =>
+  onePixelForeground.test(block) &&
+  block.includes("[data-button-content]") && block.includes(".liquid-glass-content") &&
+  /translate:\s*0 var\(--button-content-offset\)/.test(block)
+)) {
+  fail("Enabled button foregrounds must lift one pixel on hover under either motion preference and return to rest on press");
 }
 
 if (!liquidGlassSurface.includes('data-direct-contact-feedback="foreground"')) {
@@ -3182,7 +3228,7 @@ for (const [stylesheet, source] of [
         ".plugin-card-body",
         ".plugin-toggle",
         ".plugin-action",
-        ".plugin-disclosure-summary"
+        ".section-disclosure"
       ].some((family) => cssSelectorContainsClass(selector, family))
   ).find(
     ({ block }) =>
@@ -3276,7 +3322,7 @@ for (const selector of [
         latestDeclarationValue(block, "transform") === null
     )
   ) {
-    fail(`${selector} must suppress only the pressed background while inheriting global press scale motion`);
+    fail(`${selector} must preserve the shared foreground feedback and stationary hit target`);
   }
 }
 
@@ -3316,6 +3362,11 @@ if (!settingsView.includes("settings-style-slider-control")) {
 
 if (!settingsView.includes("data-settings-slider-control={id}")) {
   fail("Interface style slider visual owners must be addressable by slider id for pointer-highlight verification");
+}
+
+const parameterRow = settingsView.match(/<div className="settings-control-row host-settings-parameter no-drag">([\s\S]*?)<\/div>/)?.[1] ?? "";
+if (!/<label\b[^>]*htmlFor=\{id\}[^>]*>[\s\S]*?<\/label>\s*<span\b[^>]*data-settings-slider-control=\{id\}[^>]*>\s*<ParameterSlider\b[\s\S]*?<\/span>\s*<label\b[^>]*className="host-settings-parameter-value"[^>]*>[\s\S]*?<input\b[\s\S]*?type="number"/.test(parameterRow)) {
+  fail("Host settings parameter rows must contain the associated label, slider capsule, and editable numeric field in reading order");
 }
 
 const settingsSliderControlBlocks = cssBlocksForExactSelector(stylesForChecks, ".settings-style-slider-control");
@@ -3744,7 +3795,13 @@ const workbenchColumnAfterShadow = latestDeclarationValueAcrossBlocks(
   "box-shadow"
 );
 if (workbenchColumnAfterBlocks.length === 0 || workbenchColumnAfterShadow !== "none") {
-  fail("structural pane dividers must use the native stroke without inset highlights");
+  fail("structural pane dividers must not add an inset highlight to the resize rail");
+}
+
+const resizeRailLine = cssBlocksForExactSelector(stylesForChecks, ".shell-column-resizer::after");
+if (latestDeclarationValueAcrossBlocks(resizeRailLine, "width") !== "1px" ||
+    latestDeclarationValueAcrossBlocks(resizeRailLine, "background") !== "var(--workbench-divider)") {
+  fail("the workbench resize rail must draw a single subdued 1px seam");
 }
 
 for (const selector of [

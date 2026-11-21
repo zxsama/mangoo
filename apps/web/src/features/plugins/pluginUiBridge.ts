@@ -2,13 +2,27 @@ import { CoreApiError, type HostPluginProjection } from "@mangoo/core-client";
 import { pluginUiCoreMethods, type PluginUiCoreClient, type PluginUiCoreMethod } from "./pluginUiCoreMethods.ts";
 import { isBoundedJson, nullable, object, oneOf, optional, record, text, tuple } from "./pluginUiValidation.ts";
 import type * as desktop from "../../core/desktop";
+import { pluginThemeProperties, type PluginUiTheme } from "../../../../../packages/plugin-sdk/src/theme.ts";
 
 export interface PluginUiContext { libraryUuid: string | null; rootId: number | null; rootUuid: string | null; }
-export interface PluginUiTheme { colorScheme: "light" | "dark"; }
+export type { PluginUiTheme };
 export type PluginUiHost = Pick<typeof desktop, "pickNativeFolder" | "pickNewLibraryPath" | "revealPath" | "copyText" | "openPluginExternalLink" | "requestOAuthReturnFocus">;
 type Operation = "core-api" | "pick-folder" | "reveal-path" | "clipboard-write" | "external-link";
 export const PLUGIN_UI_CSP = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'";
-export const pluginUiDocument = (document: string): string => `<!doctype html><meta http-equiv="Content-Security-Policy" content="${PLUGIN_UI_CSP}"><meta name="referrer" content="no-referrer">${document}`;
+// Older SDKs do the ready handshake but only read colorScheme once. The Host
+// includes prevalidated theme properties for these frames, inside the sandbox.
+const legacyThemeListener = `<script>(() => {
+  let session;
+  window.addEventListener("message", event => {
+    const message = event.data;
+    if (event.source !== parent || !message || typeof message.sessionId !== "string") return;
+    if (message.type === "mangoo-plugin-ui:init" && !session) session = message.sessionId;
+    else if (message.type !== "mangoo-plugin-ui:theme" || message.sessionId !== session) return;
+    for (const [name, value] of Object.entries(message.themeProperties || {}))
+      document.documentElement.style.setProperty(name, value);
+  });
+})()</script>`;
+export const pluginUiDocument = (document: string): string => `<!doctype html><meta http-equiv="Content-Security-Policy" content="${PLUGIN_UI_CSP}"><meta name="referrer" content="no-referrer">${legacyThemeListener}${document}`;
 
 export function pluginUiAvailable(plugin: HostPluginProjection): boolean {
   return Boolean(plugin.contributions?.ui) && plugin.enabledIntent && !plugin.permissionRequired
@@ -58,11 +72,20 @@ export function createPluginUiBridge(o: PluginUiBridgeOptions) {
   const pickedPaths = new Set<string>();
   let live = true;
   let ready = false;
+  let theme = o.theme;
+  let frameHandlesTheme = false;
   let mutationsInFlight = 0;
   let admissionRevoked = false;
   const assertLive = () => { if (!live) throw new Error("Plugin view session ended"); };
   const revoke = () => { live = false; pending.clear(); o.abort(); };
   const post = (message: unknown) => { if (live) o.post(message); };
+  function themeFields() {
+    return frameHandlesTheme || !theme.colors ? { theme } : { theme, themeProperties: pluginThemeProperties(theme) };
+  }
+  function updateTheme(next: PluginUiTheme) {
+    theme = next;
+    if (ready) post({ type: "mangoo-plugin-ui:theme", sessionId: o.sessionId, ...themeFields() });
+  }
   const deny = (): never => { throw new Error("Plugin view operation is not permitted"); };
 
   async function check(operation: Operation): Promise<HostPluginProjection> {
@@ -227,7 +250,8 @@ export function createPluginUiBridge(o: PluginUiBridgeOptions) {
     if (message.type === "mangoo-plugin-ui:ready") {
       if (ready) return;
       ready = true;
-      post({ type: "mangoo-plugin-ui:init", sessionId: o.sessionId, pluginId: o.plugin.pluginId, viewId: o.viewId, context: o.context, theme: o.theme });
+      frameHandlesTheme = message.handlesTheme === true;
+      post({ type: "mangoo-plugin-ui:init", sessionId: o.sessionId, pluginId: o.plugin.pluginId, viewId: o.viewId, context: o.context, ...themeFields() });
       return;
     }
     if (!ready || message.type !== "mangoo-plugin-ui:request" || message.sessionId !== o.sessionId || typeof message.requestId !== "string" || !/^[1-9][0-9]{0,15}$/u.test(message.requestId) || typeof message.method !== "string" || !Array.isArray(message.args)) return;
@@ -263,5 +287,5 @@ export function createPluginUiBridge(o: PluginUiBridgeOptions) {
       if (live && admissionRevoked && mutationsInFlight === 0) { revoke(); o.close(); }
     }
   }
-  return { receive, revoke, get live() { return live; } };
+  return { receive, revoke, updateTheme, get live() { return live; } };
 }

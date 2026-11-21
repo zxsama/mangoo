@@ -11,7 +11,8 @@ use uuid::Uuid;
 
 use crate::db::{Database, DbWriter, NewRoot, SyncRootLocalBindingRecord};
 use crate::host_registry::{
-    CreationIntent, HostRegistry, LibraryDescriptor, LibraryOpenIntent, OwnedCreationArtifact,
+    CreationIntent, HostRegistry, LibraryDescriptor, LibraryKind, LibraryOpenIntent,
+    OwnedCreationArtifact,
 };
 #[cfg(test)]
 use crate::library_path::{known_cloud_roots, preflight, PreflightResult};
@@ -2858,6 +2859,7 @@ impl LibraryManager {
         // Resolve ambiguous source/target journal states before prepare_runtime
         // starts ordinary root workers and publishes their execution tokens.
         let _ = self.resume_pending_root_relocations().await?;
+        self.close_unavailable_notebook().await?;
         let snapshot = self.registry.snapshot()?;
         if let Some(library_uuid) = snapshot.active_library_uuid {
             let descriptor = self
@@ -3094,13 +3096,37 @@ impl LibraryManager {
         Ok(())
     }
 
+    pub fn preflight_kind(
+        &self,
+        kind: LibraryKind,
+        name: &str,
+        database: &Path,
+        roots: &[LibraryContentRootInput],
+    ) -> anyhow::Result<LibraryPlanPreflight> {
+        self.validate_kind_roots(kind, roots)?;
+        self.preflight_plan_internal(name, database, roots, kind == LibraryKind::Notes, None)
+    }
+
+    fn validate_kind_roots(
+        &self,
+        kind: LibraryKind,
+        roots: &[LibraryContentRootInput],
+    ) -> anyhow::Result<()> {
+        self.registry.ensure_kind_available(kind)?;
+        if kind == LibraryKind::Notes && !roots.is_empty() {
+            anyhow::bail!("invalid-notebook-content-roots");
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn preflight_plan(
         &self,
         name: &str,
         database: &Path,
         roots: &[LibraryContentRootInput],
     ) -> anyhow::Result<LibraryPlanPreflight> {
-        self.preflight_plan_internal(name, database, roots, false, None)
+        self.preflight_kind(LibraryKind::Media, name, database, roots)
     }
 
     pub fn preflight_restore_plan(
@@ -3133,7 +3159,7 @@ impl LibraryManager {
             if (descriptor.local_data_dir == descriptor.managed_root
                 || marker
                     .as_ref()
-                    .is_some_and(|marker| marker.format_version == STORAGE_FORMAT_VERSION))
+                    .is_some_and(|marker| marker.format_version == marker.kind.marker_version()))
                 && !self
                     .registry
                     .is_pending_restore_library(&descriptor.library_uuid)?
@@ -3264,9 +3290,10 @@ impl LibraryManager {
         let marker = read_marker(final_path).ok();
         if recovery.phase != "restore-cancelling"
             && marker.as_ref().is_some_and(|marker| {
-                marker.format_version == STORAGE_FORMAT_VERSION
+                marker.format_version == marker.kind.marker_version()
                     && marker.state == MarkerState::Committed
                     && marker.library_uuid == recovery.library_uuid
+                    && marker.kind == recovery.kind
                     && marker.root_uuid == recovery.root_uuid
                     && marker.creation_txn_uuid == txn
             })
@@ -3306,6 +3333,7 @@ impl LibraryManager {
                 }
             }
             let descriptor = LibraryDescriptor {
+                kind: recovery.kind,
                 library_uuid: recovery.library_uuid,
                 root_uuid: recovery.root_uuid,
                 name: recovery.name,
@@ -3358,6 +3386,7 @@ impl LibraryManager {
         self.ensure_library_operations_open()?;
         self.ensure_context_revision(expected_revision)?;
         let candidate = ExistingLibraryRoot::open(&managed_root)?;
+        self.registry.ensure_kind_available(candidate.marker.kind)?;
         let candidate_content = Database::inspect_existing_catalog(
             &candidate.path.join("catalog.sqlite"),
             Uuid::parse_str(&candidate.marker.library_uuid)?,
@@ -3454,6 +3483,42 @@ impl LibraryManager {
         Ok(())
     }
 
+    /// Retire the displayed notebook when its owning plugin loses admission.
+    /// Its list entry and files survive, so re-enabling restores the same Library.
+    pub async fn close_unavailable_notebook(&self) -> anyhow::Result<()> {
+        let _operation = self.operation.lock().await;
+        if self.registry.notebook_enabled()? {
+            return Ok(());
+        }
+        let snapshot = self.registry.snapshot()?;
+        if snapshot.libraries.iter().any(|library| {
+            library.kind == LibraryKind::Notes
+                && Some(&library.library_uuid) == snapshot.active_library_uuid.as_ref()
+        }) {
+            self.close_active_library_locked().await?;
+        }
+        self.sync_coordinator.drain_notebook_work().await;
+        Ok(())
+    }
+
+    async fn close_active_library_locked(&self) -> anyhow::Result<()> {
+        let _gate = self.request_gate.write().await;
+        let previous = self.active_snapshot();
+        let txn = Uuid::now_v7().to_string();
+        let revision = self.registry.begin_activation(&txn, None)?;
+        self.registry.commit_activation(&txn, None, revision)?;
+        *self.active.write().unwrap_or_else(|p| p.into_inner()) = ActiveSnapshot {
+            library_uuid: None,
+            runtime: None,
+            context_revision: revision,
+            runtime_generation: previous.runtime_generation,
+        };
+        if let Some(runtime) = previous.runtime {
+            self.stop_owned_runtime(&runtime).await?;
+        }
+        Ok(())
+    }
+
     async fn finish_pending_runtime_stop(&self) -> anyhow::Result<()> {
         let pending = self
             .pending_runtime_stop
@@ -3523,6 +3588,7 @@ impl LibraryManager {
         .await
     }
 
+    #[cfg(test)]
     pub async fn create_library_with_content(
         &self,
         name: String,
@@ -3533,7 +3599,32 @@ impl LibraryManager {
         preflight_token: Option<String>,
         activate: bool,
     ) -> anyhow::Result<(LibraryDescriptor, bool, Option<String>)> {
+        self.create_library_of_kind(
+            LibraryKind::Media,
+            name,
+            icon,
+            color,
+            database_path,
+            content_roots,
+            preflight_token,
+            activate,
+        )
+        .await
+    }
+
+    pub async fn create_library_of_kind(
+        &self,
+        kind: LibraryKind,
+        name: String,
+        icon: Option<String>,
+        color: Option<String>,
+        database_path: PathBuf,
+        content_roots: Vec<LibraryContentRootInput>,
+        preflight_token: Option<String>,
+        activate: bool,
+    ) -> anyhow::Result<(LibraryDescriptor, bool, Option<String>)> {
         self.create_library_internal(
+            kind,
             name,
             icon,
             color,
@@ -3559,6 +3650,7 @@ impl LibraryManager {
         self.registry.ensure_sync_provider_ready(account_uuid)?;
         let (descriptor, _, _) = self
             .create_library_internal(
+                LibraryKind::Media,
                 name,
                 None,
                 None,
@@ -3647,6 +3739,7 @@ impl LibraryManager {
         }
         let (descriptor, _, _) = self
             .create_library_internal(
+                self.registry.restore_plan_kind(restore_uuid)?,
                 name,
                 None,
                 None,
@@ -3672,6 +3765,7 @@ impl LibraryManager {
 
     async fn create_library_internal(
         &self,
+        kind: LibraryKind,
         name: String,
         icon: Option<String>,
         color: Option<String>,
@@ -3685,6 +3779,7 @@ impl LibraryManager {
     ) -> anyhow::Result<(LibraryDescriptor, bool, Option<String>)> {
         let _operation = self.operation.lock().await;
         self.ensure_library_operations_open()?;
+        self.validate_kind_roots(kind, &content_roots)?;
         let library_uuid = requested_library_uuid.unwrap_or_else(|| Uuid::now_v7().to_string());
         Uuid::parse_str(&library_uuid)?;
         self.registry
@@ -3693,7 +3788,7 @@ impl LibraryManager {
             &name,
             &database_path,
             &content_roots,
-            !initialize_catalog,
+            !initialize_catalog || kind == LibraryKind::Notes,
             restore_owner.map(|(txn, _)| txn),
         )?;
         if !validation.ok {
@@ -3727,6 +3822,7 @@ impl LibraryManager {
             .unwrap_or_else(|| Uuid::now_v7().to_string());
         let staging = database_path.join(format!(".mangoo-create-{txn_uuid}"));
         let mut descriptor = LibraryDescriptor {
+            kind,
             library_uuid: library_uuid.clone(),
             root_uuid: root_uuid.clone(),
             name: crate::library_path::safe_library_name(&name)
@@ -3783,7 +3879,8 @@ impl LibraryManager {
                 None,
             )?;
             let pending = LibraryMarker {
-                format_version: STORAGE_FORMAT_VERSION,
+                kind,
+                format_version: kind.marker_version(),
                 library_uuid: library_uuid.clone(),
                 root_uuid: root_uuid.clone(),
                 state: MarkerState::Pending,
@@ -4010,6 +4107,7 @@ impl LibraryManager {
 
     async fn activate_locked(&self, descriptor: &LibraryDescriptor) -> anyhow::Result<u64> {
         self.ensure_library_operations_open()?;
+        self.registry.ensure_kind_available(descriptor.kind)?;
         if descriptor.lifecycle_state != "ready" || descriptor.availability != "available" {
             anyhow::bail!("library-unavailable");
         }
@@ -4260,6 +4358,7 @@ impl LibraryManager {
             .registry
             .library(library_uuid)?
             .ok_or_else(|| anyhow::anyhow!("library-not-found"))?;
+        self.registry.ensure_kind_available(descriptor.kind)?;
         if descriptor.binding_state != "local-only" {
             anyhow::bail!("library-already-synchronized");
         }
@@ -5043,7 +5142,8 @@ impl LibraryRegistrationStorage {
             self.registry.device_uuid()?,
         )?;
         let descriptor = if let Some(existing) = self.registry.library(&root.marker.library_uuid)? {
-            if existing.root_uuid != root.marker.root_uuid
+            if existing.kind != root.marker.kind
+                || existing.root_uuid != root.marker.root_uuid
                 || existing.marker_identity != root.marker_identity
                 || !same_library_path(&existing.managed_root, &root.path)
                 || existing.local_data_dir != existing.managed_root
@@ -5068,6 +5168,7 @@ impl LibraryRegistrationStorage {
             } else {
                 let intent = LibraryOpenIntent {
                     descriptor: LibraryDescriptor {
+                        kind: root.marker.kind,
                         library_uuid: root.marker.library_uuid.clone(),
                         root_uuid: root.marker.root_uuid.clone(),
                         name: root
@@ -5219,10 +5320,11 @@ fn same_library_path(left: &Path, right: &Path) -> bool {
 
 pub(crate) fn verify_descriptor_identity(descriptor: &LibraryDescriptor) -> anyhow::Result<()> {
     let marker = read_marker(&descriptor.managed_root)?;
-    if marker.format_version != STORAGE_FORMAT_VERSION {
+    if marker.format_version != marker.kind.marker_version() {
         anyhow::bail!("unsupported-library-marker");
     }
     if marker.state != MarkerState::Committed
+        || marker.kind != descriptor.kind
         || marker.library_uuid != descriptor.library_uuid
         || marker.root_uuid != descriptor.root_uuid
     {
@@ -7514,6 +7616,7 @@ mod tests {
         CreationIntent {
             txn_uuid: format!("txn-{suffix}"),
             descriptor: LibraryDescriptor {
+                kind: Default::default(),
                 library_uuid: library_uuid.clone(),
                 root_uuid: format!("root-{suffix}"),
                 name: format!("Library {suffix}"),
@@ -7641,6 +7744,7 @@ mod tests {
         fs::create_dir_all(&intent.staging_dir).unwrap();
         fs::write(intent.staging_dir.join("catalog.sqlite"), b"catalog").unwrap();
         let marker = LibraryMarker {
+            kind: Default::default(),
             format_version: 1,
             library_uuid: intent.descriptor.library_uuid.clone(),
             root_uuid: intent.descriptor.root_uuid.clone(),
@@ -7692,6 +7796,7 @@ mod tests {
             )
             .unwrap();
             let marker = LibraryMarker {
+                kind: Default::default(),
                 format_version: 1,
                 library_uuid: intent.descriptor.library_uuid.clone(),
                 root_uuid: intent.descriptor.root_uuid.clone(),
@@ -8057,16 +8162,16 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(migration, 40);
-        let presentation_tables: i64 = database
+        assert_eq!(migration, 42);
+        let required_tables: i64 = database
             .connection_for_fsops()
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('file_browse_fts_progress','decoder_presentations')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('file_browse_fts_progress','decoder_presentations','notebook_fts','notebook_search_parts')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(presentation_tables, 2);
+        assert_eq!(required_tables, 4);
         assert_eq!(
             Uuid::from_slice(&identity.0).unwrap().to_string(),
             created.library_uuid
@@ -8999,6 +9104,393 @@ mod tests {
         }
         drop(manager);
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn notebook_plugin_lifecycle_and_two_host_cloud_restore() {
+        use crate::db::notebook::{tree::FolderInput, NoteInput};
+        use crate::host_registry::RegisterBundledPlugin;
+        use crate::plugins::NOTEBOOK_PLUGIN_ID;
+        use crate::sync::provider::{InMemorySyncProvider, SyncProvider, TransportContext};
+
+        let devices = tempfile::tempdir().unwrap();
+        let cloud = Arc::new(InMemorySyncProvider::default());
+        let provider: Arc<dyn SyncProvider> = cloud.clone();
+        let first = test_manager(&devices.path().join("first"));
+        let second = test_manager(&devices.path().join("second"));
+        let manifest =
+            include_str!("../../../bundled-plugins/com.mangoo.notebook/plugin.template.json");
+        let permissions = r#"[{"kind":"library-data","access":"plugin-records"}]"#;
+        let root = devices.path().join("notes");
+        assert!(first
+            .preflight_kind(LibraryKind::Notes, "Notes", &root, &[])
+            .is_err());
+        for manager in [&first, &second] {
+            let registry = manager.registry();
+            registry
+                .register_bundled_plugin(RegisterBundledPlugin {
+                    plugin_id: NOTEBOOK_PLUGIN_ID,
+                    version: "1.0.0",
+                    manifest_json: manifest,
+                    entry_relative_path: crate::plugins::HOST_ENGINE_ENTRY,
+                    entry_sha256: &[0; 32],
+                    install_root: Path::new("bundled"),
+                    trust_policy_id: "embedded-v1",
+                    requested_permissions_json: permissions,
+                })
+                .unwrap();
+            registry
+                .set_plugin_grants(NOTEBOOK_PLUGIN_ID, permissions, true)
+                .unwrap();
+            registry
+                .set_plugin_intent(NOTEBOOK_PLUGIN_ID, true, true)
+                .unwrap();
+            assert!(registry.notebook_enabled().unwrap());
+            registry
+                .register_bundled_plugin(RegisterBundledPlugin {
+                    plugin_id: FAKE_PLUGIN_ID,
+                    version: "1.0.0",
+                    manifest_json: r#"{"manifestVersion":2}"#,
+                    entry_relative_path: "bin/provider",
+                    entry_sha256: &[1; 32],
+                    install_root: Path::new("bundled"),
+                    trust_policy_id: "test",
+                    requested_permissions_json: "[]",
+                })
+                .unwrap();
+            registry
+                .upsert_plugin_account(
+                    FAKE_ACCOUNT_ID,
+                    FAKE_PLUGIN_ID,
+                    Some("Cloud"),
+                    "authenticated",
+                )
+                .unwrap();
+            registry
+                .set_plugin_intent(FAKE_PLUGIN_ID, true, true)
+                .unwrap();
+            registry
+                .record_plugin_runtime_ready(
+                    FAKE_PLUGIN_ID,
+                    "notebook-test",
+                    &["sync-provider.v1".into()],
+                )
+                .unwrap();
+            manager
+                .provider_manager()
+                .register(FAKE_PLUGIN_ID, FAKE_ACCOUNT_ID, Arc::clone(&provider))
+                .unwrap();
+        }
+        let preflight = first
+            .preflight_kind(LibraryKind::Notes, "Notes", &root, &[])
+            .unwrap();
+        let (library, active, error) = first
+            .create_library_of_kind(
+                LibraryKind::Notes,
+                "Notes".into(),
+                None,
+                None,
+                root.clone(),
+                vec![],
+                preflight.token,
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(active, "{error:?}");
+        let marker = read_marker(&root).unwrap();
+        assert_eq!(marker.kind, LibraryKind::Notes);
+        assert_eq!(marker.format_version, 3);
+        first
+            .registry()
+            .set_plugin_intent(NOTEBOOK_PLUGIN_ID, false, true)
+            .unwrap();
+        first.close_unavailable_notebook().await.unwrap();
+        assert!(first.active_snapshot().library_uuid.is_none());
+        assert!(first
+            .registry()
+            .listed_snapshot()
+            .unwrap()
+            .libraries
+            .is_empty());
+        assert!(first.activate(&library.library_uuid).await.is_err());
+        assert!(root.join("catalog.sqlite").exists());
+        first
+            .registry()
+            .finish_plugin_stop(NOTEBOOK_PLUGIN_ID)
+            .unwrap();
+        first
+            .registry()
+            .set_plugin_intent(NOTEBOOK_PLUGIN_ID, true, true)
+            .unwrap();
+        assert_eq!(
+            first.registry().listed_snapshot().unwrap().libraries[0].kind,
+            LibraryKind::Notes
+        );
+
+        let catalog = root.join("catalog.sqlite");
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+        let source = "同步正文🌿 ".repeat(310_000) + "尾部查询";
+        // Keep the unique sync payload small, but cross both the former 64 MiB
+        // file limit and the first chunk-index page boundary with real bytes.
+        let prefix: Vec<u8> = (0..2 * 1024 * 1024)
+            .map(|offset| ((offset / 65537 + offset * 7) % 251) as u8)
+            .collect();
+        let contents = || {
+            prefix
+                .as_slice()
+                .chain(std::io::repeat(77).take(96 * 1024 * 1024))
+                .chain(&b"tail"[..])
+        };
+        let (note, attachment, folder_id, child_id) = {
+            let db = Database::open(&catalog).unwrap();
+            let folder = db
+                .save_notebook_folder(
+                    None,
+                    FolderInput {
+                        name: "Project".into(),
+                        parent_id: None,
+                    },
+                )
+                .unwrap();
+            let child = db
+                .save_notebook_folder(
+                    None,
+                    FolderInput {
+                        name: "Research".into(),
+                        parent_id: Some(folder.id),
+                    },
+                )
+                .unwrap();
+            let document = db
+                .create_note_in_folder(
+                    NoteInput {
+                        title: "Saved note".into(),
+                        markdown: source.clone(),
+                        format: Default::default(),
+                        styles: Default::default(),
+                    },
+                    Some(child.id),
+                )
+                .unwrap();
+            let note = document.summary.id.to_string();
+            let attachment = db
+                .collect_note_attachment(
+                    &note,
+                    "source.txt".into(),
+                    "text/plain".into(),
+                    contents(),
+                )
+                .unwrap();
+            (note, attachment.id.to_string(), folder.id, child.id)
+        };
+        let uuid = &library.library_uuid;
+        first
+            .enable_library_sync_with_revision(
+                uuid,
+                first.active_snapshot().context_revision,
+                FAKE_PLUGIN_ID,
+                FAKE_ACCOUNT_ID,
+            )
+            .await
+            .unwrap();
+        let context = TransportContext {
+            namespace: uuid.clone(),
+            binding_epoch: Uuid::nil().to_string(),
+            transport_generation: 1,
+        };
+        for _ in 0..8 {
+            first
+                .sync_coordinator
+                .run_library_turn(uuid, &catalog)
+                .await
+                .unwrap();
+            if provider
+                .object_head(&context, crate::sync::descriptor::LEGACY_KEY)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+        }
+        let seed = provider
+            .object_head(&context, crate::sync::descriptor::LEGACY_KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        let (candidate, _, _) =
+            crate::sync::descriptor::download_candidate(provider.as_ref(), &context, &seed)
+                .await
+                .unwrap();
+        assert_eq!(candidate.kind, LibraryKind::Notes);
+        let checkpoint_key = &candidate.evidence.as_ref().unwrap().checkpoint_key;
+        let index = provider
+            .object_get(&context, checkpoint_key, 64 * 1024)
+            .await
+            .unwrap();
+        assert!(fs::read(&index.path)
+            .unwrap()
+            .starts_with(b"Mangoo notebook checkpoint parts v1\n"));
+        // Simulate an unavailable checkpoint. Account discovery can advance other
+        // libraries while the notebook plugin is disabled without fetching this payload.
+        let index_bytes = fs::read(&index.path).unwrap();
+        cloud.replace_fixture_object(checkpoint_key, b"unavailable".to_vec());
+        second
+            .registry()
+            .set_plugin_intent(NOTEBOOK_PLUGIN_ID, false, true)
+            .unwrap();
+        second
+            .sync_coordinator
+            .run_root_discovery_turns()
+            .await
+            .unwrap();
+        assert!(second
+            .registry()
+            .list_remote_libraries()
+            .unwrap()
+            .is_empty());
+        assert!(second.registry().provider_root_transports().unwrap()[0]
+            .cursor
+            .is_some());
+        cloud.replace_fixture_object(checkpoint_key, index_bytes);
+        second
+            .registry()
+            .finish_plugin_stop(NOTEBOOK_PLUGIN_ID)
+            .unwrap();
+        second
+            .registry()
+            .set_plugin_intent(NOTEBOOK_PLUGIN_ID, true, true)
+            .unwrap();
+        second.registry().resume_notebook_discovery().unwrap();
+        assert!(second.registry().provider_root_transports().unwrap()[0]
+            .cursor
+            .is_none());
+        second
+            .sync_coordinator
+            .run_root_discovery_turns()
+            .await
+            .unwrap();
+        assert_eq!(
+            second.registry().list_remote_libraries().unwrap()[0].kind,
+            LibraryKind::Notes
+        );
+        let target = devices.path().join("restored");
+        let restored = second
+            .create_planned_restore_fixture(
+                uuid.clone(),
+                "Notes".into(),
+                target.clone(),
+                FAKE_ACCOUNT_ID,
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored.kind, LibraryKind::Notes);
+        let restored_catalog = restored.local_data_dir.join("catalog.sqlite");
+        for _ in 0..6 {
+            second
+                .sync_coordinator
+                .run_library_turn(uuid, &restored_catalog)
+                .await
+                .unwrap();
+            if second
+                .registry()
+                .binding_transport(uuid, "library")
+                .unwrap()
+                .is_some_and(|binding| binding.state == "active")
+            {
+                break;
+            }
+        }
+        let db = Database::open(&restored_catalog).unwrap();
+        let downloaded = db.notebook_note(&note).unwrap();
+        let restored_tree = db.notebook_tree().unwrap();
+        assert_eq!(restored_tree.note_parents[&downloaded.summary.id], child_id);
+        let child = restored_tree
+            .folders
+            .iter()
+            .find(|folder| folder.id == child_id)
+            .unwrap();
+        assert_eq!(child.parent_id, Some(folder_id));
+        db.save_notebook_folder(
+            Some((child.id, child.revision)),
+            FolderInput {
+                name: "Archive".into(),
+                parent_id: None,
+            },
+        )
+        .unwrap();
+        db.move_notebook_note(downloaded.summary.id, Some(child_id), Some(folder_id))
+            .unwrap();
+        assert_eq!(downloaded.markdown, source);
+        assert_eq!(
+            db.search_notes("尾部查询").unwrap()[0].id,
+            downloaded.summary.id
+        );
+        let mut expected = Sha256::new();
+        let expected_size = std::io::copy(&mut contents(), &mut expected).unwrap();
+        let mut actual = Sha256::new();
+        let (_, actual_size) = db
+            .write_note_attachment(&note, &attachment, &mut actual)
+            .unwrap();
+        assert_eq!(actual_size as u64, expected_size);
+        assert_eq!(actual.finalize(), expected.finalize());
+        assert!(!target.join("Files").exists());
+        db.save_note(
+            Some((&note, downloaded.summary.revision)),
+            NoteInput {
+                title: "Edited on second host".into(),
+                markdown: "Second device edit".into(),
+                styles: Default::default(),
+                format: Default::default(),
+            },
+        )
+        .unwrap();
+        drop(db);
+        for _ in 0..6 {
+            second
+                .sync_coordinator
+                .run_library_turn(uuid, &restored_catalog)
+                .await
+                .unwrap();
+            first
+                .sync_coordinator
+                .run_library_turn(uuid, &catalog)
+                .await
+                .unwrap();
+            if Database::open(&catalog)
+                .unwrap()
+                .notebook_note(&note)
+                .unwrap()
+                .markdown
+                == "Second device edit"
+            {
+                break;
+            }
+        }
+        let uploaded = Database::open(&catalog)
+            .unwrap()
+            .notebook_note(&note)
+            .unwrap();
+        assert_eq!(uploaded.markdown, "Second device edit");
+        let synced_tree = Database::open(&catalog).unwrap().notebook_tree().unwrap();
+        assert_eq!(synced_tree.note_parents[&uploaded.summary.id], folder_id);
+        let synced_child = synced_tree
+            .folders
+            .iter()
+            .find(|folder| folder.id == child_id)
+            .unwrap();
+        assert_eq!(synced_child.name, "Archive");
+        assert_eq!(synced_child.parent_id, None);
+        second.activate(uuid).await.unwrap();
+        second
+            .active_snapshot()
+            .runtime
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

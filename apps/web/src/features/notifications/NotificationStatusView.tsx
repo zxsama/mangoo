@@ -425,7 +425,7 @@ function ThumbnailStatus({
                 onClick={() => activateThumbnailFailureLogs(summary, onOpenFailureLogs)}
                 type="button"
               >
-                {summary.failedCount.toLocaleString()}
+                <span data-button-content>{summary.failedCount.toLocaleString()}</span>
               </button>
             ) : summary.failedCount > 0 ? (
               <span title={unavailableMessage ?? undefined}>

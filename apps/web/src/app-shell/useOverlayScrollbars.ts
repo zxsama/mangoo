@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { normalizeWheelDelta } from "../core/dampedMotion";
 import { registerOverlayScrollbarOwner, resolveOverlayScrollbarOwner } from "../design/overlays/overlayScrollbarOwner";
 
 type ScrollAxis = "vertical" | "horizontal";
@@ -20,10 +21,11 @@ const SCROLLBAR_RAIL_SIZE_PX = 10;
 const SCROLLBAR_MIN_THUMB_PX = 32;
 const SCROLLBAR_SCROLL_IDLE_MS = 180;
 
-export function useOverlayScrollbars() {
+export function useOverlayScrollbars(primaryViewportSelector?: string) {
   useEffect(() => {
     const vertical = createScrollbar("vertical");
     const horizontal = createScrollbar("horizontal");
+    const primaryViewport = primaryViewportSelector ? document.querySelector<HTMLElement>(primaryViewportSelector) : null;
     let activeElement: HTMLElement | null = null;
     let dragging: DragState | null = null;
     let animationFrame = 0;
@@ -101,6 +103,12 @@ export function useOverlayScrollbars() {
       }
       const element = activeElement;
       if (!element || !element.isConnected) {
+        if (primaryViewport?.isConnected) {
+          setActiveElement(primaryViewport);
+          return;
+        }
+        if (!vertical.rail.hidden) vertical.rail.hidden = true;
+        if (!horizontal.rail.hidden) horizontal.rail.hidden = true;
         setOverlayVisible(vertical, false);
         setOverlayVisible(horizontal, false);
         return;
@@ -111,6 +119,10 @@ export function useOverlayScrollbars() {
         elementStyle.display === "none" ||
         element.getClientRects().length === 0
       ) {
+        if (element !== primaryViewport && primaryViewport?.isConnected) {
+          setActiveElement(primaryViewport);
+          return;
+        }
         setOverlayVisible(vertical, false);
         setOverlayVisible(horizontal, false);
         return;
@@ -122,7 +134,7 @@ export function useOverlayScrollbars() {
         horizontal.rail.dataset.scrollbarHover === "true" ||
         vertical.rail.dataset.scrollbarAreaHover === "true" ||
         horizontal.rail.dataset.scrollbarAreaHover === "true";
-      const overlayVisible = Boolean(dragging) || scrollActive || scrollbarHovered;
+      const overlayVisible = element === primaryViewport || Boolean(dragging) || scrollActive || scrollbarHovered;
 
       const rect = element.getBoundingClientRect();
       const canScrollVertical = element.scrollHeight > element.clientHeight + 1;
@@ -139,6 +151,7 @@ export function useOverlayScrollbars() {
       canScroll: boolean,
       overlayVisible: boolean
     ) {
+      if (scrollbar.rail.hidden === canScroll) scrollbar.rail.hidden = !canScroll;
       setOverlayVisible(scrollbar, canScroll && overlayVisible);
       scrollbar.rail.setAttribute(
         "data-scrollbar-dragging",
@@ -242,6 +255,18 @@ export function useOverlayScrollbars() {
       }
     }
 
+    function handleRailWheel(event: WheelEvent) {
+      const owner = resolveOverlayScrollbarOwner(event.target);
+      if (!owner || event.ctrlKey || event.defaultPrevented) return;
+      const lineHeight = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? parseFloat(getComputedStyle(owner).lineHeight) || 16 : 16;
+      event.preventDefault();
+      owner.scrollBy({
+        left: normalizeWheelDelta(event.deltaX, event.deltaMode, lineHeight, owner.clientWidth),
+        top: normalizeWheelDelta(event.deltaY, event.deltaMode, lineHeight, owner.clientHeight),
+        behavior: "instant"
+      });
+    }
+
     function handleShellResizeState() {
       if (document.body.dataset.shellResizing === "true") {
         scrollActiveUntil = 0;
@@ -298,6 +323,8 @@ export function useOverlayScrollbars() {
     }
 
     vertical.rail.addEventListener("pointerdown", handlePointerDown);
+    vertical.rail.addEventListener("wheel", handleRailWheel, { passive: false });
+    horizontal.rail.addEventListener("wheel", handleRailWheel, { passive: false });
     horizontal.rail.addEventListener("pointerdown", handlePointerDown);
     vertical.thumb.addEventListener("pointerenter", handleVerticalThumbEnter);
     horizontal.thumb.addEventListener("pointerenter", handleHorizontalThumbEnter);
@@ -314,7 +341,7 @@ export function useOverlayScrollbars() {
       });
       visibilityObserver.observe(document.body, {
         attributes: true,
-        attributeFilter: ["class", "style", "hidden"],
+        attributeFilter: ["class", "style", "hidden", "data-secondary-content-visible"],
         subtree: true
       });
     }
@@ -325,10 +352,13 @@ export function useOverlayScrollbars() {
     document.addEventListener("scroll", handleScroll, true);
     window.addEventListener("mangoo:shell-resize-state", handleShellResizeState);
     window.addEventListener("resize", handleResize, { passive: true });
+    if (primaryViewport) setActiveElement(primaryViewport);
 
     return () => {
       activeElement?.removeEventListener("scroll", scheduleOverlaySync);
       vertical.rail.removeEventListener("pointerdown", handlePointerDown);
+      vertical.rail.removeEventListener("wheel", handleRailWheel);
+      horizontal.rail.removeEventListener("wheel", handleRailWheel);
       horizontal.rail.removeEventListener("pointerdown", handlePointerDown);
       vertical.thumb.removeEventListener("pointerenter", handleVerticalThumbEnter);
       horizontal.thumb.removeEventListener("pointerenter", handleHorizontalThumbEnter);
@@ -346,7 +376,7 @@ export function useOverlayScrollbars() {
       window.removeEventListener("resize", handleResize);
       cleanup();
     };
-  }, []);
+  }, [primaryViewportSelector]);
 }
 
 function readOverlayScrollbarInset(element: HTMLElement, propertyName: string) {

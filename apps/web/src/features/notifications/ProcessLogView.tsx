@@ -486,15 +486,15 @@ interface LogRowContentValue {
 function LogRowContent({ content }: { content: LogRowContentValue }) {
   return (
     <>
-      <time
+      <time data-button-content
         aria-label={`序列 ${content.sequence}，${formatLogTime(content.timestamp)}`}
         dateTime={new Date(content.timestamp).toISOString()}
       >
         {formatLogTime(content.timestamp)}
       </time>
-      <span className="notification-log-source">{content.source}</span>
-      <span className="notification-log-level">{content.level}</span>
-      <span className="notification-log-message">{content.message}{content.metadata}</span>
+      <span data-button-content className="notification-log-source">{content.source}</span>
+      <span data-button-content className="notification-log-level">{content.level}</span>
+      <span data-button-content className="notification-log-message">{content.message}{content.metadata}</span>
     </>
   );
 }

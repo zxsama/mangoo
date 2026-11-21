@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync, existsSync } from "node:fs";
 import { describe, it } from "node:test";
+import { runInNewContext } from "node:vm";
 import { CoreApiError, type HostPluginProjection } from "@mangoo/core-client";
 import { createPluginUiBridge, pluginUiAvailable, pluginUiDocument, type PluginUiHost, type PluginUiBridgeOptions } from "../src/features/plugins/pluginUiBridge.ts";
 import { pluginUiCoreMethods, type PluginUiCoreClient } from "../src/features/plugins/pluginUiCoreMethods.ts";
@@ -60,6 +61,32 @@ describe("isolated plugin UI bridge", () => {
     assert.deepEqual(f.output[0], { type: "mangoo-plugin-ui:init", sessionId: "session-1", pluginId: plugin.pluginId, viewId: "main", context: { libraryUuid: "library-a", rootId: null, rootUuid: null }, theme: { colorScheme: "dark" } });
     await f.request("core.beginPluginAuth", [plugin.pluginId], { sessionId: "old" });
     assert.deepEqual(f.calls, []);
+  });
+  it("keeps a legacy plugin document themed for its session without reloading", async () => {
+    const f = fixture();
+    const parent = {};
+    const colors = new Map<string, string>();
+    let receive!: (event: { source: object; data: unknown }) => void;
+    const shim = pluginUiDocument("").match(/<script>([\s\S]*?)<\/script>/u)?.[1];
+    assert.ok(shim);
+    runInNewContext(shim, { parent, window: { addEventListener: (_: string, listener: typeof receive) => { receive = listener; } },
+      document: { documentElement: { style: { setProperty: (name: string, value: string) => colors.set(name, value) } } } });
+    const theme = (accent: string) => ({ colorScheme: "dark" as const, colors: { "--accent-primary": accent } });
+    f.bridge.updateTheme(theme("#33aa44"));
+    assert.equal(f.output.length, 0);
+    await f.ready();
+    receive({ source: parent, data: f.output[0] });
+    assert.equal(colors.get("--accent"), "#33aa44");
+    f.bridge.updateTheme(theme("#1122cc"));
+    const update = f.output[1] as Record<string, unknown>;
+    receive({ source: {}, data: update });
+    receive({ source: parent, data: { ...update, sessionId: "stale" } });
+    assert.equal(colors.get("--accent"), "#33aa44");
+    receive({ source: parent, data: update });
+    assert.equal(colors.get("--accent-rgb"), "17 34 204");
+    f.bridge.revoke();
+    f.bridge.updateTheme(theme("#ffffff"));
+    assert.equal(f.output.length, 2);
   });
   it("denies arbitrary dispatch, malformed arguments, cross-plugin IDs, accounts and libraries", async () => {
     const f = fixture(); await f.ready();

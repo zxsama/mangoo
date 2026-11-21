@@ -324,6 +324,10 @@ fn write_row(
             now_ms()
         ],
     )?;
+    if plugin_id == super::notebook::PLUGIN && collection == super::notebook::DOCUMENTS {
+        let head = if deleted { None } else { fields.get("head") };
+        super::notebook::project_search_entry(connection, id, head)?;
+    }
     Ok(())
 }
 
@@ -425,7 +429,7 @@ fn live_tombstones(
 
 // ------------------------------------------------------------- local writes
 
-fn apply_operation(
+pub(super) fn apply_operation(
     transaction: &Transaction<'_>,
     plugin_id: &str,
     operation: PluginRecordOperation,

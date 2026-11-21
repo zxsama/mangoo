@@ -19,11 +19,11 @@ export function MediaLoadingRing({ className, size }: MediaLoadingRingProps) {
     >
       <defs>
         <linearGradient id={gradientId} x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" stopColor="#d8e5e3" />
-          <stop offset="0.32" stopColor="#a9c7c0" />
-          <stop offset="0.62" stopColor="#6d9f9f" />
-          <stop offset="0.84" stopColor="#7d99aa" />
-          <stop offset="1" stopColor="#d8e5e3" />
+          <stop offset="0" stopColor="color-mix(in srgb, var(--accent) 50%, white)" />
+          <stop offset="0.32" stopColor="var(--accent)" />
+          <stop offset="0.62" stopColor="color-mix(in srgb, var(--accent) 68%, black)" />
+          <stop offset="0.84" stopColor="color-mix(in srgb, var(--accent) 84%, black)" />
+          <stop offset="1" stopColor="color-mix(in srgb, var(--accent) 50%, white)" />
         </linearGradient>
       </defs>
       <g className="media-loading-ring-flow">

@@ -111,7 +111,7 @@ describe("shared overlay source contract", () => {
   });
 
   it("installs the shared overlay scrollbar controller in secondary dialog windows", () => {
-    assert.match(settingsWindowSource, /useOverlayScrollbars\(\)/);
+    assert.match(settingsWindowSource, /useOverlayScrollbars\("\.host-settings"\)/);
     assert.match(pluginsWindowSource, /useOverlayScrollbars\(\)/);
   });
 

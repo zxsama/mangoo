@@ -16,12 +16,12 @@
   --todo-control-sm: 24px;
   --todo-control: 28px;
   --todo-control-lg: 32px;
-  --todo-priority-1: #5b8def;
-  --todo-priority-2: #e5a33b;
-  --todo-priority-3: #e5534b;
-  --todo-overdue: #f0776f;
-  --todo-today: #6cc497;
-  --todo-selected: rgba(142, 199, 208, 0.16);
+  --todo-priority-1: var(--status-info);
+  --todo-priority-2: var(--status-warning);
+  --todo-priority-3: var(--status-danger);
+  --todo-overdue: var(--status-danger);
+  --todo-today: var(--status-success);
+  --todo-selected: var(--accent-muted);
   --todo-stage: rgba(8, 10, 12, 0.42);
 }
 
@@ -365,7 +365,8 @@ html:has(.todo-sticky) #root {
 }
 
 button.todo-group-title {
-  cursor: pointer;
+  align-self: stretch;
+  width: auto;
 }
 
 .todo-group-title[data-tone="overdue"] {
@@ -694,7 +695,7 @@ button.todo-group-title {
   color: var(--accent);
   font-size: var(--todo-text-caption);
   border-radius: var(--radius-pill);
-  background: rgba(142, 199, 208, 0.12);
+  background: rgb(var(--accent-rgb) / 0.12);
 }
 
 .todo-tag button {
@@ -827,12 +828,13 @@ button.todo-group-title {
 .todo-check-ring {
   fill: transparent;
   stroke: var(--todo-check-ring);
-  stroke-width: 1.6;
+  /* With r=8.2 the thicker ring keeps the original outer radii (9.4 / 9.5). */
+  stroke-width: 2.4;
   transition: fill 120ms ease, stroke 120ms ease;
 }
 
 .todo-check[data-size="small"] .todo-check-ring {
-  stroke-width: 1.8;
+  stroke-width: 2.6;
 }
 
 .todo-check[data-priority="1"] { --todo-check-ring: var(--todo-priority-1); }
@@ -840,8 +842,8 @@ button.todo-group-title {
 .todo-check[data-priority="3"] { --todo-check-ring: var(--todo-priority-3); }
 
 .todo-check[data-checked="true"] .todo-check-ring {
-  fill: var(--accent);
-  stroke: var(--accent);
+  fill: var(--accent-fill);
+  stroke: var(--accent-fill);
 }
 
 .todo-check:focus-visible {
@@ -948,9 +950,9 @@ button.todo-group-title {
 }
 
 .todo-button-primary {
-  color: #fff;
+  color: var(--on-accent);
   border-color: transparent;
-  background: var(--accent);
+  background: var(--accent-fill);
 }
 
 .todo-button:disabled,
@@ -1141,8 +1143,21 @@ button.todo-group-title {
 }
 
 .todo-rich ul[data-type="checklist"] > li[data-checked="true"]::before {
-  border-color: var(--accent);
-  background: var(--accent) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.5 8.5l3 3 6-7' fill='none' stroke='%230b0d0f' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / 11px no-repeat;
+  border-color: var(--accent-fill);
+  background: var(--accent-fill);
+}
+
+.todo-rich ul[data-type="checklist"] > li[data-checked="true"]::after {
+  position: absolute;
+  top: 6px;
+  left: 5px;
+  width: 4px;
+  height: 8px;
+  border: solid var(--on-accent);
+  border-width: 0 1.5px 1.5px 0;
+  transform: rotate(45deg);
+  content: "";
+  pointer-events: none;
 }
 
 .todo-notes-view {
@@ -1388,7 +1403,7 @@ button.todo-group-title {
 
 .todo-shortcut-hint[data-tone="warning"],
 .todo-accelerator-note[data-tone="warning"] {
-  color: var(--todo-warning, #e8b86a);
+  color: var(--status-warning);
 }
 
 .todo-shortcut-group {
@@ -1563,7 +1578,7 @@ button.todo-group-title {
 
 .todo-segment[data-selected="true"] {
   color: var(--text-primary);
-  background: rgba(142, 199, 208, 0.2);
+  background: rgb(var(--accent-rgb) / 0.2);
 }
 
 .todo-segment:focus-visible {
@@ -2110,16 +2125,9 @@ html:has(.todo-settings-window) #root {
 
 /* --------------------------------------------- stability, reach, contrast */
 
-/* The Host lifts hovered buttons 1px (translateY). Inside these dense,
-   clipped columns that shift moved titles and chips half out of their
-   cards and under neighbours; the shared pointer glow is the hover cue
-   here, so nothing moves. */
-.todo-window :where(button, [role="button"]),
-.todo-sticky :where(button, [role="button"]),
-.todo-settings-window :where(button, [role="button"]),
-.todo-plugin-panel :where(button, [role="button"]),
-.todo-menu :where(button, [role="button"]) {
-  transform: none !important;
+.todo-check[data-size="small"] .todo-check-mark {
+  /* The 20-unit viewBox is rendered at 16px in the small checkbox. */
+  translate: 0 calc(var(--button-content-offset, 0px) * 1.25);
 }
 
 /* Interactive icons: readable on frosted glass at rest, full on use. The
@@ -2175,8 +2183,8 @@ html:has(.todo-settings-window) #root {
 /* A stroked tick on the accent fill. */
 .todo-check-mark {
   fill: none;
-  stroke: #0b0d0f;
-  stroke-width: 2;
+  stroke: var(--on-accent);
+  stroke-width: 2.8;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -2352,7 +2360,7 @@ html:has(.todo-settings-window) #root {
 }
 
 .todo-settings-status[data-tone="warning"] {
-  color: var(--todo-warning, #e8b86a);
+  color: var(--status-warning);
 }
 
 /* ---------------------------------------------------- alignment pass */

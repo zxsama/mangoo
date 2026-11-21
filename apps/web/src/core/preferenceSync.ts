@@ -9,7 +9,7 @@
 // sender — receives its own message, so we tag messages with a per-window source
 // id and ignore our own.
 
-export type PreferenceChannelKind = "grid" | "preview" | "interfaceStyle" | "shortcuts";
+export type PreferenceChannelKind = "grid" | "preview" | "interfaceStyle" | "interfaceColorPreview" | "shortcuts";
 
 interface PreferenceMessage {
   source: string;

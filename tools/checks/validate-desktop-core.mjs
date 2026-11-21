@@ -649,7 +649,7 @@ for (const value of ["MANGOO_CORE_EXTERNAL", "findCargoCommand", "cargo", "build
     fail(`dev runner must build internal Core before Electron startup: ${value}`);
   }
 }
-if (!/run\(\s*findCargoCommand\(\)\s*,\s*\[\s*"build"\s*,\s*"-p"\s*,\s*"mangoo-core"\s*\]\s*\)/.test(devRunner)) {
+if (!devRunner.includes('run(findCargoCommand(), ["build", "-p", "mangoo-core", ...(releaseCore ? ["--release"] : [])])')) {
   fail("dev runner must use cargo build -p mangoo-core instead of leaving Core build to Electron startup");
 }
 if (!/build-bundled-plugins\.mjs"\s*,\s*"--release-profile"/.test(prodRunner)) {
@@ -670,7 +670,7 @@ for (const value of ["import.meta.dirname", "desktop-release", "win-unpacked", "
     fail(`production runner missing packaged executable launch contract: ${value}`);
   }
 }
-for (const value of ["electron-builder", "Platform.WINDOWS", 'createTarget(["dir"])', "electronDist", "extraResources", "mangoo-core.exe", "core/bundled-plugins", "readInventory", "inventory.plugins.flatMap", "renderTrust", "apps", "web", "dist", "icon.ico"]) {
+for (const value of ["electron-builder", "Platform.WINDOWS", 'createTarget(["dir"])', "electronDist", "extraResources", "mangoo-core.exe", "core/bundled-plugins", "readInventory", "inventory.plugins.flatMap", "assertCoreTrust", "apps", "web", "dist", "icon.ico"]) {
   if (!packageDesktop.includes(value)) {
     fail(`desktop packager missing ${value}`);
   }
@@ -724,7 +724,8 @@ if (!rootPackage.includes('"build:desktop-package"') || !rootPackage.includes("b
 for (const value of [
   "crates/fake-provider/src",
   "bundled-plugins",
-  "generated_trust.rs",
+  "crates/core/build.rs",
+  "assertCoreTrust",
   "externalArtifacts",
   "assertSelectedInventory",
   "readInventory"

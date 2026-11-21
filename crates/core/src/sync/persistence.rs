@@ -193,19 +193,16 @@ pub fn build_checkpoint(
     )?;
     let payload_checkpoint = checkpoint;
     payload_checkpoint.verify()?;
-    let bytes = canonical_bytes(&payload_checkpoint)?;
-    let hash = sha256(&bytes);
     let final_path = spool_dir.join(format!("{}.checkpoint", fence.checkpoint_uuid));
-    let temporary = spool_dir.join(format!("{}.checkpoint.tmp", fence.checkpoint_uuid));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)?;
-    file.write_all(&bytes)?;
-    file.flush()?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&temporary, &final_path)?;
+    let mut file = tempfile::NamedTempFile::new_in(spool_dir)?;
+    {
+        let mut writer = std::io::BufWriter::new(file.as_file_mut());
+        super::codec::write_canonical(&mut writer, &payload_checkpoint)?;
+        writer.flush()?;
+    }
+    file.as_file().sync_all()?;
+    let (_, hash) = super::provider::file_size_and_sha256(file.path())?;
+    file.persist(&final_path)?;
     if let Ok(directory) = OpenOptions::new().read(true).open(spool_dir) {
         let _ = directory.sync_all();
     }
@@ -2651,6 +2648,7 @@ mod tests {
 
     fn test_host(library_uuid: uuid::Uuid) -> HostMetadataSnapshot {
         HostMetadataSnapshot {
+            kind: Default::default(),
             library_uuid: library_uuid.to_string(),
             name: "Managed".into(),
             icon: None,

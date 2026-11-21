@@ -15,7 +15,7 @@ const fixtureWindow = window as typeof window & { __overlayLifecycleResult?: { o
 const listeners = new Set<(phase: LibraryLoadPhase) => void>();
 let revision = 1;
 let libraryId = "first";
-const original: FolderRecord = { id: 2, rootId: 1, parentId: 1, name: "Child", status: "active", hasChildren: false, mediaCount: 0, fileCount: 0, icon: "future-icon", color: "#123456" };
+const original: FolderRecord = { id: 2, rootId: 1, parentId: 1, name: "Child", status: "active", hasChildren: false, mediaCount: 0, fileCount: 0, icon: "future-icon", color: "rgba(18, 52, 86, 0.4)" };
 let saved = { ...original };
 let library: LibraryState;
 type TreeCase = { leaf: boolean; selected: boolean; expanded: boolean; icon: string | null };
@@ -110,6 +110,10 @@ async function run() {
     await open();
     check(document.querySelector('[aria-label="文件夹图标"]'), "folder-specific group");
     check(document.querySelector('.library-appearance-preview [data-identity-icon="folder"]'), "unknown editor fallback");
+    await click('.color-picker-trigger');
+    await click('.color-picker-confirm');
+    check(document.querySelector('.library-icon-picker-swatch[aria-checked="true"]')?.getAttribute("data-color") === original.color,
+      "confirming without an edit preserves the saved CSS color and alpha");
     await click('[data-color="#5ce1a6"]');
     check(patches.length === 0, "preview does not save");
     await click(applySelector);
@@ -119,9 +123,17 @@ async function run() {
 
     await open();
     await click('[data-icon="camera"]');
+    await click('.color-picker-trigger');
+    const comparedColors = document.querySelectorAll<HTMLElement>('.color-picker-popup:not([aria-hidden="true"]) .color-picker-sample i');
+    check(comparedColors.length === 2, "the picker shows original and draft colors together");
+    const originalSample = getComputedStyle(comparedColors[0]).backgroundColor;
     await input('[aria-label="HEX 颜色"]', "#bad-value");
-    check(document.querySelector<HTMLButtonElement>(applySelector)?.disabled, "invalid HEX disables apply");
+    check(document.querySelector<HTMLButtonElement>('.color-picker-confirm')?.disabled, "invalid HEX disables confirmation");
     await input('[aria-label="HEX 颜色"]', "#224466");
+    check(getComputedStyle(comparedColors[0]).backgroundColor === originalSample &&
+      getComputedStyle(comparedColors[1]).backgroundColor === 'rgb(34, 68, 102)', "only the new swatch follows the draft");
+    check(getComputedStyle(document.querySelector('.library-appearance-preview svg')!).color === 'rgb(34, 68, 102)', "custom color previews before confirmation");
+    await click('.color-picker-confirm');
     check(document.querySelector('.library-appearance-preview [data-identity-icon="camera"]'), "camera preview");
     const mediaBefore = requests.filter(({ path }) => path === "/api/media").length;
     const mediaRef = library.media;

@@ -1,4 +1,5 @@
-import { ChevronRight, Database, Loader2, Trash2 } from "../../design/icons";
+import { Database, Loader2, Trash2 } from "../../design/icons";
+import { DisclosureSummary } from "../../design/SectionDisclosure";
 import type { HostPluginProjection, PluginCapability } from "@mangoo/core-client";
 import { LiquidGlassButton } from "../../design/liquid-glass";
 import { StatusPill } from "./StatusPill";
@@ -21,7 +22,8 @@ const CAPABILITY_LABEL: Record<PluginCapability, string> = {
   "sync-provider.v1": "Sync provider v1",
   "file-decoder.v1": "文件解析",
   "image-viewer.v1": "看图",
-  "todo-notes.v1": "便笺"
+  "todo-notes.v1": "便笺",
+  "notebook.v1": "笔记库"
 };
 
 export function PluginDetail({
@@ -110,10 +112,7 @@ export function PluginDetail({
       ) : null}
 
       <details className="plugin-disclosure plugin-technical-details">
-        <summary className="plugin-disclosure-summary" data-pointer-glow="off">
-          <ChevronRight aria-hidden="true" className="plugin-disclosure-chevron" size={15} />
-          <span className="plugin-disclosure-label">技术信息</span>
-        </summary>
+        <DisclosureSummary label="技术信息" />
         <div className="plugin-disclosure-body">
           <div className="plugin-detail-section">
             <div className="plugin-detail-section-title">Capabilities</div>

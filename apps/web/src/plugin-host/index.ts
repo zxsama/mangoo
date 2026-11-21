@@ -9,7 +9,7 @@
  * isolated iframe bridge described by the plugin-owned UI contract.
  */
 export { CoreApiError, createCoreClient } from "../core/client";
-export { getDesktopBridge, getWindowControls } from "../core/desktop";
+export { getDesktopBridge, getWindowControls, subscribeBeforeLibraryChange } from "../core/desktop";
 export type { MangooDesktopBridge } from "../core/desktop";
 export { broadcastPreference, subscribePreference } from "../core/preferenceSync";
 export {
@@ -21,6 +21,10 @@ export {
 } from "../design/liquid-glass";
 export { useSecondaryWindowInterfaceStyle } from "../app-shell/useSecondaryWindowInterfaceStyle";
 export { useOverlayScrollbars } from "../app-shell/useOverlayScrollbars";
+export { SettingRow, SettingsSection, SettingsSegmented, SettingsSwitch, useSettingsNavigation } from "../design/SettingsControls";
+export { DisclosureButton, DisclosureSummary } from "../design/SectionDisclosure";
+export { ParameterSlider } from "../design/ParameterSlider";
+export { ColorPicker } from "../design/ColorPicker";
 export * as icons from "../design/icons";
 export type { AppIcon } from "../design/icons";
 export {

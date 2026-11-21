@@ -240,13 +240,13 @@ function ExpandedCard({ store, item, items, lists, today, pinned, onExpand, onTo
         );
       }
       case "priority":
-        return <PropertyChip active={popover?.kind === "priority"} filled icon={<span className="todo-flag" data-priority={item.priority}><icons.Flag aria-hidden="true" size={13} weight="fill" /></span>} key="priority" label={PRIORITY_LABELS[item.priority]} onOpen={open("priority")} title="优先级" />;
+        return <PropertyChip active={popover?.kind === "priority"} filled icon={<span data-button-content className="todo-flag" data-priority={item.priority}><icons.Flag aria-hidden="true" size={13} weight="fill" /></span>} key="priority" label={PRIORITY_LABELS[item.priority]} onOpen={open("priority")} title="优先级" />;
       case "tags":
         return <PropertyChip active={popover?.kind === "tags"} filled icon={<icons.Tag aria-hidden="true" size={13} />} key="tags" label={item.tags.map((tag) => `#${tag}`).join(" ")} onOpen={open("tags")} title="标签" />;
       case "repeat":
         return <PropertyChip active={popover?.kind === "repeat"} filled icon={<icons.Repeat aria-hidden="true" size={13} />} key="repeat" label={item.recurrence ? RECURRENCE_LABELS[item.recurrence.freq] : ""} onOpen={open("repeat")} title="重复" />;
       case "list":
-        return <PropertyChip active={popover?.kind === "list"} filled icon={list ? <ColorDot color={list.color} /> : <icons.ListTodo aria-hidden="true" size={13} />} key="list" label={list?.name ?? "清单"} onOpen={open("list")} title="清单" />;
+        return <PropertyChip active={popover?.kind === "list"} filled icon={list ? <ColorDot buttonContent color={list.color} /> : <icons.ListTodo aria-hidden="true" size={13} />} key="list" label={list?.name ?? "清单"} onOpen={open("list")} title="清单" />;
     }
   };
 
@@ -294,7 +294,7 @@ function ExpandedCard({ store, item, items, lists, today, pinned, onExpand, onTo
       {readOnly ? (
         <div className="todo-banner">
           <span>在“最近删除”中</span>
-          <button className="todo-link-button" onClick={() => store.restoreItems([item.id])} type="button">恢复</button>
+          <button className="todo-link-button" onClick={() => store.restoreItems([item.id])} type="button"><span data-button-content>恢复</span></button>
         </div>
       ) : (
         <div aria-label="属性" className="todo-props" role="toolbar">
@@ -388,7 +388,7 @@ function ExpandedCard({ store, item, items, lists, today, pinned, onExpand, onTo
         </span>
         <div className="todo-card-add">
           {readOnly ? (
-            <button className="todo-link-button" onClick={() => store.purgeItems([item.id])} type="button">永久删除</button>
+            <button className="todo-link-button" onClick={() => store.purgeItems([item.id])} type="button"><span data-button-content>永久删除</span></button>
           ) : (
             <>
               <button aria-label={pinned ? "从桌面取下" : "贴到桌面"} aria-pressed={pinned} className="todo-icon-button" data-active={pinned ? "true" : "false"} onClick={() => onPinToggle(item.id)} title={pinned ? "从桌面取下" : "贴到桌面"} type="button">

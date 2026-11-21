@@ -452,7 +452,7 @@ try {
   const technicalDisclosure = {
     collapsedInitially: !technicalDetails.open,
     pointerGlowDisabled: technicalSummary.getAttribute("data-pointer-glow") === "off",
-    chevronBeforeLabel: technicalSummary.firstElementChild?.classList.contains("plugin-disclosure-chevron") === true,
+    chevronBeforeLabel: technicalSummary.firstElementChild?.classList.contains("section-disclosure-chevron") === true,
     diagnosticsNested: technicalDetails.textContent?.includes("raw provider failure") === true,
     removalNested: Boolean(removeButton)
   };

@@ -246,7 +246,7 @@ function OverlaySelectDropdown({
       role="option"
       tabIndex={-1}
       type="button"
-    >{option.label}</button>
+    ><span data-button-content>{option.label}</span></button>
   );
 
   return (

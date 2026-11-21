@@ -25,7 +25,7 @@ import { SettingsPanels } from "./settingsPanels";
 // BroadcastChannel reaches across them without any per-setting IPC.
 export function SettingsWindow() {
   const interfaceStyle = useSecondaryWindowInterfaceStyle({ broadcastChanges: true });
-  useOverlayScrollbars();
+  useOverlayScrollbars(".host-settings");
   const [gridPreferences, setGridPreferences] = useState<LibraryGridPreferences>(() =>
     readStoredLibraryGridPreferences()
   );

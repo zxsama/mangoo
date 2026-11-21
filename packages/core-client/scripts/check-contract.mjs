@@ -427,8 +427,10 @@ assertInterfaceMatchesSchema("OpenLibraryRequest");
 assertInterfaceMatchesSchema("OpenLibraryResponse");
 for (const name of ["LibraryPreflightRequest", "CreateLibraryRequest"]) {
   const roots = schema(name).properties.contentRoots;
-  if (roots?.minItems !== 1 || roots?.items?.$ref !== "#/components/schemas/LibraryContentRootInput") {
-    fail(`${name} must require one or more ordered LibraryContentRootInput entries`);
+  const kindBranch = schema(name).allOf?.find((branch) => branch.if?.required?.includes("kind") && branch.if.properties?.kind?.const === "notes");
+  if (kindBranch?.else?.properties?.contentRoots?.minItems !== 1 || kindBranch?.then?.properties?.contentRoots?.maxItems !== 0
+      || roots?.minItems || roots?.items?.$ref !== "#/components/schemas/LibraryContentRootInput") {
+    fail(`${name} requires ordered roots for media libraries and an empty root list for notebooks`);
   }
 }
 for (const name of ["LibrarySummary", "LibraryPreflightRequest", "CreateLibraryRequest", "OpenLibraryRequest", "SyncRestoreLegacyItem", "SyncRestorePlan"]) {
@@ -437,8 +439,8 @@ for (const name of ["LibrarySummary", "LibraryPreflightRequest", "CreateLibraryR
 }
 const normalizedRoots = schema("LibraryPreflightResponse").properties.normalizedContentRoots;
 const successRoots = normalizedRoots.anyOf?.find((variant) => variant.type === "array");
-if (!schemaAllowsNull(normalizedRoots) || successRoots?.minItems !== 1 || successRoots?.items?.$ref !== "#/components/schemas/LibraryContentRootInput") {
-  fail("LibraryPreflightResponse must allow null failure roots and nonempty successful LibraryContentRootInput roots");
+if (!schemaAllowsNull(normalizedRoots) || (successRoots?.minItems ?? 0) !== 0 || successRoots?.items?.$ref !== "#/components/schemas/LibraryContentRootInput") {
+  fail("LibraryPreflightResponse must allow null failure roots and successful LibraryContentRootInput roots including empty notebooks");
 }
 if (schema("LibraryContentRootInput").properties.path.minLength !== 1) {
   fail("LibraryContentRootInput must reject empty placeholder paths");
@@ -1082,6 +1084,31 @@ if (!client.includes("x-mangoo-session")) {
 if (!generated.includes("Generated-client boundary placeholder")) {
   fail("generated-contract.ts must mark the generated-client boundary");
 }
+
+const notesPath = "/notebooks/{libraryId}/notes";
+const notePath = notesPath + "/{noteId}";
+for (const [id, verb, route] of [
+  ["getNotebookTree", "get", "/notebooks/{libraryId}/tree"],
+  ["createNotebookFolder", "post", "/notebooks/{libraryId}/folders"],
+  ["updateNotebookFolder", "put", "/notebooks/{libraryId}/folders/{notebookFolderId}"],
+  ["deleteNotebookFolder", "delete", "/notebooks/{libraryId}/folders/{notebookFolderId}"],
+  ["moveNotebookNote", "put", notePath + "/folder"],
+  ["listNotes", "get", notesPath], ["createNote", "post", notesPath],
+  ["getNote", "get", notePath], ["updateNote", "put", notePath], ["deleteNote", "delete", notePath],
+  ["uploadNoteAttachment", "post", notePath + "/attachments"],
+  ["getNoteAttachment", "get", notePath + "/attachments/{attachmentId}"]
+]) {
+  assertOperationRoute(id, verb, route);
+  if (verb !== "get") assertOperationParameters(id, ["contextRevision"]);
+}
+assertEnumMatchesGeneratedType("NoteFormat");
+assertOperationParameters("listNotes", ["query"]);
+for (const name of ["NoteInput", "NoteSummary", "NoteAttachment"]) assertInterfaceMatchesSchema(name);
+assertOperationRequestSchema("createNote", "CreateNoteRequest");
+assertOperationRequestSchema("createNotebookFolder", "NotebookFolderInput");
+assertOperationRequestSchema("updateNotebookFolder", "UpdateNotebookFolderRequest");
+assertOperationRequestSchema("moveNotebookNote", "MoveNotebookNoteRequest");
+assertOperationRequestSchema("updateNote", "UpdateNoteRequest");
 
 if (!process.exitCode) {
   console.log("PASS: core-client contract boundary");

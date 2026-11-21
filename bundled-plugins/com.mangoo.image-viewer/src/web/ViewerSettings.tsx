@@ -1,5 +1,4 @@
-import type { ReactNode } from "react";
-import { icons } from "@mangoo/web/plugin-host";
+import { icons, SettingRow, SettingsSection, SettingsSegmented, SettingsSwitch } from "@mangoo/web/plugin-host";
 
 import type { ImageSortKey } from "../shared/navigation.ts";
 import type { ImageViewerSettingsSection } from "../shared/ipc.ts";
@@ -25,90 +24,6 @@ export const SETTINGS_SECTION_LABELS: Record<ImageViewerSettingsSection, string>
   shortcuts: "快捷键",
   system: "系统"
 };
-
-export function Switch({ checked, label, onChange, disabled = false }: {
-  checked: boolean;
-  label: string;
-  onChange(next: boolean): void;
-  disabled?: boolean;
-}) {
-  return (
-    <label className={`plugin-toggle iv-switch${checked ? " on" : ""}${disabled ? " disabled" : ""}`}>
-      <input aria-label={label} checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} role="switch" type="checkbox" />
-      <span aria-hidden="true" className="plugin-toggle-track">
-        <span className="plugin-toggle-thumb" />
-      </span>
-    </label>
-  );
-}
-
-export function Segmented<T extends string | number>({ value, options, label, onChange }: {
-  value: T;
-  options: ReadonlyArray<{ value: T; label: ReactNode; title?: string }>;
-  label: string;
-  onChange(next: T): void;
-}) {
-  return (
-    <div aria-label={label} className="iv-segmented" role="radiogroup">
-      {options.map((option) => {
-        const selected = option.value === value;
-        return (
-          <button
-            aria-checked={selected}
-            className="iv-segment"
-            data-pointer-glow="off"
-            data-selected={selected ? "true" : "false"}
-            key={String(option.value)}
-            onClick={() => onChange(option.value)}
-            role="radio"
-            title={option.title}
-            type="button"
-          >
-            {option.label}
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-export function SettingRow({ title, description, children, htmlFor, stacked = false }: {
-  title: string;
-  stacked?: boolean;
-  description?: ReactNode;
-  children: ReactNode;
-  htmlFor?: string;
-}) {
-  return (
-    <div className="iv-setting-row" data-layout={stacked ? "stacked" : "inline"}>
-      <div
-        className="iv-setting-text"
-        onClick={(event) => {
-          // Clicking a row's text toggles its switch, like system settings.
-          const row = (event.currentTarget as HTMLElement).parentElement;
-          const input = row?.querySelector<HTMLInputElement>('.iv-setting-control input[type="checkbox"]');
-          if (input && !input.disabled) input.click();
-        }}
-      >
-        <label className="iv-setting-title" htmlFor={htmlFor}>{title}</label>
-        {description ? <p className="iv-setting-description">{description}</p> : null}
-      </div>
-      <div className="iv-setting-control">{children}</div>
-    </div>
-  );
-}
-
-function Section({ id, title, icon, children }: { id: ImageViewerSettingsSection; title: string; icon: ReactNode; children: ReactNode }) {
-  return (
-    <section className="iv-settings-section" data-section={id} id={`iv-settings-${id}`}>
-      <h3 className="iv-settings-section-title">
-        {icon}
-        <span>{title}</span>
-      </h3>
-      <div className="iv-settings-rows">{children}</div>
-    </section>
-  );
-}
 
 const BACKGROUNDS: Array<{ value: ViewerBackground; label: string }> = [
   { value: "interface", label: "跟随界面" },
@@ -149,11 +64,11 @@ function BackgroundPicker({ value, onChange }: { value: ViewerBackground; onChan
               <span className="iv-bg-photo" />
               {selected ? (
                 <span className="iv-bg-check">
-                  <icons.Check size={11} weight="fill" />
+                  <icons.Check data-button-content size={11} weight="fill" />
                 </span>
               ) : null}
             </span>
-            <span className="iv-bg-label">{option.label}</span>
+            <span data-button-content className="iv-bg-label">{option.label}</span>
           </button>
         );
       })}
@@ -170,13 +85,13 @@ export function ViewerSettingsForm({ preferences, onChange, showSystem = true, s
   showShortcuts?: boolean;
 }) {
   return (
-    <div className="iv-settings-form">
-      <Section icon={<icons.Image aria-hidden="true" size={14} />} id="display" title="显示">
+    <div className="iv-settings-form settings-layout-form">
+      <SettingsSection anchorId="iv-settings-display" icon={<icons.Image aria-hidden="true" size={14} />} id="display" title="显示">
         <SettingRow description="图片后面的底色。查看带透明区域的图片时，用棋盘格更容易分辨透明部分。" stacked title="背景">
           <BackgroundPicker onChange={(background) => onChange({ background })} value={preferences.background} />
         </SettingRow>
         <SettingRow description="打开或切换图片时的初始大小。" title="默认缩放">
-          <Segmented
+          <SettingsSegmented
             label="默认缩放"
             onChange={(fitMode) => onChange({ fitMode })}
             options={[
@@ -188,10 +103,10 @@ export function ViewerSettingsForm({ preferences, onChange, showSystem = true, s
           />
         </SettingRow>
         <SettingRow description="关闭时，比窗口小的图片保持原始大小，不会被放大到模糊。" title="放大小图片以适应窗口">
-          <Switch checked={preferences.upscaleSmall} label="放大小图片以适应窗口" onChange={(upscaleSmall) => onChange({ upscaleSmall })} />
+          <SettingsSwitch checked={preferences.upscaleSmall} label="放大小图片以适应窗口" onChange={(upscaleSmall) => onChange({ upscaleSmall })} />
         </SettingRow>
         <SettingRow description="图片显示得比原始像素更大时如何补出中间的像素。“像素”清晰显示每个像素，适合检查细节和像素画。" title="放大时的插值">
-          <Segmented
+          <SettingsSegmented
             label="放大时的插值"
             onChange={(upscaleInterpolation) => onChange({ upscaleInterpolation })}
             options={[
@@ -202,7 +117,7 @@ export function ViewerSettingsForm({ preferences, onChange, showSystem = true, s
           />
         </SettingRow>
         <SettingRow description="图片显示得比原始像素更小时如何合并像素。“平滑”画质更好，“像素”保留锐利的细线但可能出现锯齿。" title="缩小时的插值">
-          <Segmented
+          <SettingsSegmented
             label="缩小时的插值"
             onChange={(downscaleInterpolation) => onChange({ downscaleInterpolation })}
             options={[
@@ -213,13 +128,13 @@ export function ViewerSettingsForm({ preferences, onChange, showSystem = true, s
           />
         </SettingRow>
         <SettingRow description={<>按 Alt+1/2/3/4 只看红、绿、蓝或透明通道，Alt+0 恢复。开启后红绿蓝通道先乘以透明度，半透明区域会按透明度变暗。完全透明的像素不保存颜色，两种方式下都显示为黑色。</>} title="单通道显示预乘 Alpha">
-          <Switch checked={preferences.channelPremultiply} label="单通道显示预乘 Alpha" onChange={(channelPremultiply) => onChange({ channelPremultiply })} />
+          <SettingsSwitch checked={preferences.channelPremultiply} label="单通道显示预乘 Alpha" onChange={(channelPremultiply) => onChange({ channelPremultiply })} />
         </SettingRow>
-      </Section>
+      </SettingsSection>
 
-      <Section icon={<icons.Images aria-hidden="true" size={14} />} id="browse" title="浏览">
+      <SettingsSection anchorId="iv-settings-browse" icon={<icons.Images aria-hidden="true" size={14} />} id="browse" title="浏览">
         <SettingRow description="按住 Ctrl 滚动总是缩放。图片放大后，滚轮会先平移图片。" title="鼠标滚轮">
-          <Segmented
+          <SettingsSegmented
             label="鼠标滚轮"
             onChange={(wheelAction) => onChange({ wheelAction })}
             options={[
@@ -231,7 +146,7 @@ export function ViewerSettingsForm({ preferences, onChange, showSystem = true, s
         </SettingRow>
         <SettingRow description="文件夹里图片的排列顺序，缩略图条和上一张/下一张都按这个顺序。" stacked title="排序方式">
           <span className="iv-setting-inline">
-            <Segmented label="排序方式" onChange={(sortKey) => onChange({ sortKey })} options={SORT_KEYS} value={preferences.sortKey} />
+            <SettingsSegmented label="排序方式" onChange={(sortKey) => onChange({ sortKey })} options={SORT_KEYS} value={preferences.sortKey} />
             <button
               aria-label={preferences.sortDirection === "asc" ? "升序" : "降序"}
               className="iv-direction-button"
@@ -246,16 +161,16 @@ export function ViewerSettingsForm({ preferences, onChange, showSystem = true, s
           </span>
         </SettingRow>
         <SettingRow description="在最后一张按下一张时回到第一张。" title="循环浏览">
-          <Switch checked={preferences.loop} label="循环浏览" onChange={(loop) => onChange({ loop })} />
+          <SettingsSwitch checked={preferences.loop} label="循环浏览" onChange={(loop) => onChange({ loop })} />
         </SettingRow>
         <SettingRow description="相机同时保存 RAW 和 JPEG 时，同名的两个文件只显示为一张图片（显示 RAW，可按 J 切换为内嵌 JPEG）。关闭后两个文件分别显示。" title="合并同名 RAW 与 JPEG">
-          <Switch checked={preferences.pairRawJpeg} label="合并同名 RAW 与 JPEG" onChange={(pairRawJpeg) => onChange({ pairRawJpeg })} />
+          <SettingsSwitch checked={preferences.pairRawJpeg} label="合并同名 RAW 与 JPEG" onChange={(pairRawJpeg) => onChange({ pairRawJpeg })} />
         </SettingRow>
         <SettingRow description="把文件夹里的图片纵向连成一条长图，像在浏览器里看条漫一样滚动阅读。按 M 或工具栏按钮开关，Ctrl+滚轮或 +/- 调整宽度，0 恢复铺满宽度。" title="漫画（条漫）模式">
-          <Switch checked={preferences.comicMode} label="漫画（条漫）模式" onChange={(comicMode) => onChange({ comicMode })} />
+          <SettingsSwitch checked={preferences.comicMode} label="漫画（条漫）模式" onChange={(comicMode) => onChange({ comicMode })} />
         </SettingRow>
         <SettingRow description="漫画模式下相邻两张图片之间的空隙。条漫一般用“无”，单页漫画可以留一点间距。" title="漫画页间距">
-          <Segmented
+          <SettingsSegmented
             label="漫画页间距"
             onChange={(comicGap) => onChange({ comicGap })}
             options={[
@@ -267,50 +182,50 @@ export function ViewerSettingsForm({ preferences, onChange, showSystem = true, s
           />
         </SettingRow>
         <SettingRow description="缩略图条上方的细长拖动条：拖动或悬停即可预览文件夹里任意位置的图片，松开后打开。图片很多时只加载拖动条像素能覆盖到的图片。" title="快速浏览拖动条">
-          <Switch checked={preferences.showScrubBar} label="快速浏览拖动条" onChange={(showScrubBar) => onChange({ showScrubBar })} />
+          <SettingsSwitch checked={preferences.showScrubBar} label="快速浏览拖动条" onChange={(showScrubBar) => onChange({ showScrubBar })} />
         </SettingRow>
         <SettingRow description="比较同一构图的多张照片时很有用。" title="切换图片时保持缩放与旋转">
-          <Switch checked={preferences.keepTransform} label="切换图片时保持缩放与旋转" onChange={(keepTransform) => onChange({ keepTransform })} />
+          <SettingsSwitch checked={preferences.keepTransform} label="切换图片时保持缩放与旋转" onChange={(keepTransform) => onChange({ keepTransform })} />
         </SettingRow>
         <SettingRow description="幻灯片放映时每张图片停留的时间。" stacked title="幻灯片间隔">
-          <Segmented
+          <SettingsSegmented
             label="幻灯片间隔"
             onChange={(slideshowSeconds) => onChange({ slideshowSeconds })}
             options={SLIDESHOW_INTERVALS.map((seconds) => ({ value: seconds, label: `${seconds} 秒` }))}
             value={preferences.slideshowSeconds}
           />
         </SettingRow>
-      </Section>
+      </SettingsSection>
 
-      <Section icon={<icons.LayoutPanelTop aria-hidden="true" size={14} />} id="window" title="窗口">
+      <SettingsSection anchorId="iv-settings-window" icon={<icons.LayoutPanelTop aria-hidden="true" size={14} />} id="window" title="窗口">
         <SettingRow description="关闭后标题栏会自动隐藏，把鼠标移到窗口顶部即可显示。也可以用标题栏上的图钉按钮切换。" title="固定标题栏">
-          <Switch checked={preferences.titlebarPinned} label="固定标题栏" onChange={(titlebarPinned) => onChange({ titlebarPinned })} />
+          <SettingsSwitch checked={preferences.titlebarPinned} label="固定标题栏" onChange={(titlebarPinned) => onChange({ titlebarPinned })} />
         </SettingRow>
         <SettingRow description="打开 GIF、APNG、WebP 动图时自动显示帧控制面板，可暂停、逐帧查看和调整速度。" title="动图自动显示帧面板">
-          <Switch checked={preferences.framesAutoOpen} label="动图自动显示帧面板" onChange={(framesAutoOpen) => onChange({ framesAutoOpen })} />
+          <SettingsSwitch checked={preferences.framesAutoOpen} label="动图自动显示帧面板" onChange={(framesAutoOpen) => onChange({ framesAutoOpen })} />
         </SettingRow>
-      </Section>
+      </SettingsSection>
 
-      <Section icon={<icons.SlidersHorizontal aria-hidden="true" size={14} />} id="actions" title="操作">
+      <SettingsSection anchorId="iv-settings-actions" icon={<icons.SlidersHorizontal aria-hidden="true" size={14} />} id="actions" title="操作">
         <SettingRow description="删除的图片会移到回收站，随时可以恢复。" title="删除前确认">
-          <Switch checked={preferences.confirmDelete} label="删除前确认" onChange={(confirmDelete) => onChange({ confirmDelete })} />
+          <SettingsSwitch checked={preferences.confirmDelete} label="删除前确认" onChange={(confirmDelete) => onChange({ confirmDelete })} />
         </SettingRow>
         <SettingRow description="全屏或幻灯片时，Esc 总是先退出全屏或幻灯片。" title="按 Esc 关闭窗口">
-          <Switch checked={preferences.escapeCloses} label="按 Esc 关闭窗口" onChange={(escapeCloses) => onChange({ escapeCloses })} />
+          <SettingsSwitch checked={preferences.escapeCloses} label="按 Esc 关闭窗口" onChange={(escapeCloses) => onChange({ escapeCloses })} />
         </SettingRow>
-      </Section>
+      </SettingsSection>
 
       {showShortcuts ? (
-        <Section icon={<icons.Keyboard aria-hidden="true" size={14} />} id="shortcuts" title="快捷键">
+        <SettingsSection anchorId="iv-settings-shortcuts" icon={<icons.Keyboard aria-hidden="true" size={14} />} id="shortcuts" title="快捷键">
           <ShortcutEditor onChange={(shortcuts: ShortcutOverrides) => onChange({ shortcuts })} overrides={preferences.shortcuts} />
-        </Section>
+        </SettingsSection>
       ) : null}
 
       {showSystem ? (
-        <Section icon={<icons.Settings aria-hidden="true" size={14} />} id="system" title="系统">
+        <SettingsSection anchorId="iv-settings-system" icon={<icons.Settings aria-hidden="true" size={14} />} id="system" title="系统">
           <AssociationControls />
           <ExplorerThumbnailControls />
-        </Section>
+        </SettingsSection>
       ) : null}
     </div>
   );

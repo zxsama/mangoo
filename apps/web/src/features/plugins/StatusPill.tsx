@@ -23,7 +23,7 @@ export function StatusPill({ status, title }: StatusPillProps) {
       className={`plugin-status-pill plugin-status-pill-${status}`}
       title={title}
     >
-      {STATUS_LABEL[status]}
+      <span data-button-content>{STATUS_LABEL[status]}</span>
     </span>
   );
 }

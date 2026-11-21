@@ -100,6 +100,7 @@ fn repeated_field_history_is_canonical_and_checkpoint_serializable() {
         )]),
         BTreeMap::new(),
         HostMetadataSnapshot {
+            kind: Default::default(),
             library_uuid: id(1).to_string(),
             name: "Library".into(),
             icon: None,
@@ -493,6 +494,7 @@ fn checkpoint_selection_uses_vector_coverage_not_creation_order() {
             BTreeMap::from([(actor.clone(), seq)]),
             BTreeMap::new(),
             HostMetadataSnapshot {
+                kind: Default::default(),
                 library_uuid: id(1).to_string(),
                 name: "Library".into(),
                 icon: None,
@@ -567,6 +569,7 @@ fn checkpoint_digest_detects_truth_tampering() {
         BTreeMap::new(),
         BTreeMap::new(),
         HostMetadataSnapshot {
+            kind: Default::default(),
             library_uuid: id(1).to_string(),
             name: "Library".into(),
             icon: None,
@@ -606,6 +609,7 @@ fn checkpoint_round_trips_media_index_shards() {
         BTreeMap::new(),
         BTreeMap::new(),
         HostMetadataSnapshot {
+            kind: Default::default(),
             library_uuid: id(1).to_string(),
             name: "Library".into(),
             icon: None,

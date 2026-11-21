@@ -1,0 +1,259 @@
+.settings-layout-body {
+  display: grid;
+  flex: 1 1 auto;
+  grid-template-columns: 168px minmax(0, 1fr);
+  min-height: 0;
+}
+
+.settings-layout-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 14px 10px;
+  min-height: 0;
+  overflow-y: auto;
+  border-right: 1px solid var(--line);
+}
+
+.settings-layout-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 34px;
+  flex-shrink: 0;
+  padding: 0 12px;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  cursor: pointer;
+  transition: color 140ms ease, background-color 140ms ease;
+}
+
+.settings-layout-nav-item[data-active="true"] {
+  color: var(--text-primary);
+  background: var(--accent-muted);
+}
+
+.settings-layout-nav-item > svg {
+  flex: none;
+}
+
+.settings-layout-nav-item[data-active="true"] > svg {
+  color: var(--accent);
+}
+
+.settings-layout-nav-item:focus-visible {
+  outline: 1px solid var(--interactive-focus);
+  outline-offset: -1px;
+}
+
+.settings-layout-scroll {
+  min-height: 0;
+  padding: 18px 22px 28px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.settings-layout-scroll .settings-control-heading {
+  color: var(--text-primary);
+  font-size: 15px;
+  letter-spacing: 0;
+  margin-bottom: 8px;
+}
+
+.settings-layout-scroll .settings-control-heading > svg {
+  color: var(--accent);
+}
+
+/* Rows whose control is wide stack the control under the text. */
+.settings-control-row[data-layout="stacked"] {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+}
+
+.settings-control-row[data-layout="stacked"] .settings-control-value {
+  justify-content: flex-start;
+}
+
+.settings-layout-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 26px;
+}
+
+.settings-layout-form .liquid-glass-button {
+  gap: 6px;
+  min-height: 28px;
+  padding-inline: 10px;
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.settings-layout-form .liquid-glass-button .liquid-glass-content > svg {
+  display: block;
+  flex-shrink: 0;
+}
+
+.settings-control-section {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+  container-type: inline-size;
+  gap: 2px;
+}
+
+.settings-control-heading {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 0 4px;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+}
+
+.settings-control-rows {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.settings-control-group > h4 {
+  margin: 0;
+  padding: 12px 14px 2px;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.settings-control-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px;
+  min-height: 52px;
+  padding: 10px 14px;
+}
+
+.settings-control-group + .settings-control-group,
+.settings-control-group + .settings-control-row,
+.settings-control-row + .settings-control-group,
+.settings-control-group .settings-control-row + .settings-control-row,
+.settings-control-rows > .settings-control-row + .settings-control-row {
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.settings-control-copy {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.settings-control-label {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 550;
+}
+
+.settings-control-description {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.settings-control-value {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* Segmented control: one boundary around the group, fill for selection. */
+.settings-control-segmented {
+  display: inline-flex;
+  max-width: 100%;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.settings-control-segment {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 52px;
+  height: 26px;
+  padding: 0 10px;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12.5px;
+  white-space: nowrap;
+  border: 0;
+  border-radius: calc(var(--radius-control) - 2px);
+  background: transparent;
+  cursor: pointer;
+  transition: color 120ms ease, background-color 120ms ease;
+}
+
+.settings-control-segment[data-selected="true"] {
+  color: var(--text-primary);
+  background: rgb(var(--accent-rgb) / 0.2);
+}
+
+.settings-control-segment:focus-visible {
+  outline: 1px solid var(--interactive-focus);
+  outline-offset: -1px;
+}
+
+/* Toggle used as a settings switch (re-uses the plugin toggle visuals). */
+.settings-control-switch {
+  flex: 0 0 auto;
+}
+
+.settings-control-row:has(input[role="switch"]:enabled) .settings-control-copy,
+.settings-control-label[for] {
+  cursor: pointer;
+}
+
+.settings-control-input {
+  min-width: 0;
+  max-width: 100%;
+  height: 30px;
+  padding: 0 8px;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12.5px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.settings-control-input:focus-visible {
+  outline: 0;
+  border-color: var(--interactive-focus);
+}
+
+@container (max-width: 400px) {
+  .settings-control-row:has(.settings-control-segmented) {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+  }
+
+  .settings-control-row:has(.settings-control-segmented) .settings-control-value {
+    justify-content: flex-start;
+  }
+}

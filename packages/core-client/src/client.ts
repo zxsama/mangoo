@@ -81,6 +81,10 @@ import type {
   UserMetadataUpdate
 } from "./generated-contract.ts";
 import type { ListPluginRecordsParams, ListSharedPluginRecordsParams, PluginRecord, PluginRecordBatchResponse, PluginRecordChanges, PluginRecordOperation, PluginRecordPage, WaitPluginRecordChangesParams } from "./generated-contract.ts";
+import type {
+  CreateNoteRequest, MoveNotebookNoteRequest, NoteAttachment, NotebookFolder, NotebookFolderInput,
+  NotebookNote, NotebookTree, NoteSummary, UpdateNotebookFolderRequest, UpdateNoteRequest,
+} from "./generated-contract.ts";
 import type { RemoteLibraryListResponse, RemoteLibraryRootListResponse, SyncCommandRequest, SyncConflictListResponse, SyncConflictResolutionRequest, SyncEnableRequest, SyncOperation, SyncPreflightRequest, SyncPreflightResponse, SyncReconnectCommitRequest, SyncReconnectPlan, SyncReconnectPreflightRequest, SyncRestoreListResponse, SyncRestorePlan, SyncRestorePreflight, SyncRestorePreflightRequest, SyncRestoreStartRequest, SyncStatusSnapshot, SyncUnbindCommitRequest, SyncUnbindPlan } from "./generated-contract.ts";
 import type { RootCommandRequest, RootComparisonItem, RootComparisonItemListResponse, RootComparisonItemResolutionRequest, RootComparisonPlan, RootConflictListResponse, RootEnrollmentCommitRequest, RootLocationConflictResolutionRequest, RootLogicalRenameCommitRequest, RootLogicalRenamePlan, RootLogicalRenameRequest, RootOperation, RootOperationFenceRequest, RootOperationListResponse, RootOperationPageResponse, RootPathPreflightRequest, RootPathPreflightResult, RootRebindCommitRequest, RootRebindPlan, RootRebindPreflightRequest, RootReenableCommitRequest, RootRelocationCommitRequest, RootRelocationPreflightRequest, RootSelectionCommitRequest, RootSelectionPreflightRequest, RootSelectionPreflightResult, RootStopCommitRequest, RootStopPlan, SyncFolderListResponse, SyncFolderRecord, SyncFolderSettings, UpdateSyncFolderSettingsRequest } from "./generated-contract.ts";
 
@@ -144,6 +148,48 @@ export interface CoreRequestOptions {
   requestPriority?: CoreRequestPriority;
 }
 
+export interface NoteRequestOptions extends CoreRequestOptions {
+  libraryId: string;
+  contextRevision?: number;
+}
+
+function notebookUrl(options: NoteRequestOptions) {
+  return `/notebooks/${encodeURIComponent(options.libraryId)}`;
+}
+
+function notesUrl(options: NoteRequestOptions, noteId?: string) {
+  const base = `${notebookUrl(options)}/notes`;
+  return noteId === undefined ? base : `${base}/${encodeURIComponent(noteId)}`;
+}
+
+function noteRequest(options: NoteRequestOptions): ScheduledRequestInit {
+  return {
+    signal: options.signal,
+    requestPriority: options.requestPriority ?? "interactive",
+    headers: options.contextRevision === undefined ? undefined : {
+      "x-mangoo-context-revision": String(options.contextRevision)
+    }
+  };
+}
+
+// Blob parts keep JSON escaping from allocating a second monolithic string
+// when the editor holds a large source. Preserve surrogate pairs across parts.
+function noteBody(input: CreateNoteRequest | UpdateNoteRequest): BodyInit {
+  const block = 128 * 1024;
+  const { markdown, ...metadata } = input;
+  if (markdown.length <= block) return JSON.stringify(input);
+  const parts: BlobPart[] = [JSON.stringify(metadata).slice(0, -1), ',"markdown":"'];
+  for (let start = 0; start < markdown.length;) {
+    let end = Math.min(start + block, markdown.length);
+    const last = markdown.charCodeAt(end - 1);
+    if (end < markdown.length && last >= 0xd800 && last <= 0xdbff) end--;
+    parts.push(JSON.stringify(markdown.slice(start, end)).slice(1, -1));
+    start = end;
+  }
+  parts.push('"}');
+  return new Blob(parts, { type: "application/json" });
+}
+
 export type CoreRequestPriority =
   | "background"
   | "resource"
@@ -152,6 +198,7 @@ export type CoreRequestPriority =
   | "navigation";
 
 type ScheduledRequestInit = RequestInit & {
+  contentTransfer?: boolean;
   requestPriority?: CoreRequestPriority;
 };
 
@@ -251,6 +298,7 @@ export function createCoreClient(config: CoreClientConfig) {
     const {
       requestPriority = "metadata",
       signal: callerSignal,
+      contentTransfer = false,
       ...fetchInit
     } = init;
     const signal = requestSignal(callerSignal);
@@ -283,7 +331,8 @@ export function createCoreClient(config: CoreClientConfig) {
             }
             const body = await readJson(response);
             return body as T;
-          }
+          },
+          contentTransfer
         ),
       path
     );
@@ -297,6 +346,9 @@ export function createCoreClient(config: CoreClientConfig) {
     const signal = requestSignal(callerSignal);
     const headers = new Headers(init.headers);
     applyPluginUiHeaders(headers);
+    if (init.body && !headers.has("content-type")) {
+      headers.set("content-type", "application/json");
+    }
     if (config.sessionToken) {
       headers.set("x-mangoo-session", config.sessionToken);
     }
@@ -324,10 +376,13 @@ export function createCoreClient(config: CoreClientConfig) {
     );
   }
 
-  async function fetchBlob(path: string, options: BlobRequestOptions = {}): Promise<Blob> {
+  async function fetchBlob(path: string, options: BlobRequestOptions = {}, contextRevision?: number, contentTransfer = false): Promise<Blob> {
     const signal = requestSignal(options.signal);
     const headers = new Headers();
     applyPluginUiHeaders(headers);
+    if (contextRevision !== undefined) {
+      headers.set("x-mangoo-context-revision", String(contextRevision));
+    }
     if (config.sessionToken) {
       headers.set("x-mangoo-session", config.sessionToken);
     }
@@ -345,7 +400,8 @@ export function createCoreClient(config: CoreClientConfig) {
               throw new CoreApiError(response.status, body);
             }
             return response.blob();
-          }
+          },
+          contentTransfer
         ),
       path
     );
@@ -891,6 +947,42 @@ export function createCoreClient(config: CoreClientConfig) {
         requestPriority: options.requestPriority ?? "metadata",
         signal: options.signal
       }),
+    getNotebookTree: (options: NoteRequestOptions) =>
+      request<NotebookTree>(`${notebookUrl(options)}/tree`, noteRequest(options)),
+    createNotebookFolder: (input: NotebookFolderInput, options: NoteRequestOptions) =>
+      request<NotebookFolder>(`${notebookUrl(options)}/folders`,
+        { ...noteRequest(options), method: "POST", body: JSON.stringify(input) }),
+    updateNotebookFolder: (id: string, input: UpdateNotebookFolderRequest, options: NoteRequestOptions) =>
+      request<NotebookFolder>(`${notebookUrl(options)}/folders/${encodeURIComponent(id)}`,
+        { ...noteRequest(options), method: "PUT", body: JSON.stringify(input) }),
+    deleteNotebookFolder: (id: string, expectedRevision: number, options: NoteRequestOptions) =>
+      requestNoContent(`${notebookUrl(options)}/folders/${encodeURIComponent(id)}?expectedRevision=${expectedRevision}`,
+        { ...noteRequest(options), method: "DELETE" }),
+    moveNotebookNote: (id: string, input: MoveNotebookNoteRequest, options: NoteRequestOptions) =>
+      requestNoContent(`${notesUrl(options, id)}/folder`,
+        { ...noteRequest(options), method: "PUT", body: JSON.stringify(input) }),
+    listNotes: (options: NoteRequestOptions & { query?: string }) => {
+      const query = options.query?.trim();
+      const path = query ? `${notesUrl(options)}?${new URLSearchParams({ query })}` : notesUrl(options);
+      return request<NoteSummary[]>(path, noteRequest(options));
+    },
+    getNote: (id: string, options: NoteRequestOptions) =>
+      request<NotebookNote>(notesUrl(options, id), { ...noteRequest(options), contentTransfer: true, requestPriority: options.requestPriority ?? "resource" }),
+    createNote: (input: CreateNoteRequest, options: NoteRequestOptions) =>
+      request<NotebookNote>(notesUrl(options), { ...noteRequest(options), contentTransfer: true, requestPriority: options.requestPriority ?? "resource", method: "POST", body: noteBody(input) }),
+    updateNote: (id: string, input: UpdateNoteRequest, options: NoteRequestOptions) =>
+      request<NotebookNote>(notesUrl(options, id), { ...noteRequest(options), contentTransfer: true, requestPriority: options.requestPriority ?? "resource", method: "PUT", body: noteBody(input) }),
+    deleteNote: (id: string, expectedRevision: number, options: NoteRequestOptions) =>
+      requestNoContent(`${notesUrl(options, id)}?expectedRevision=${expectedRevision}`, { ...noteRequest(options), method: "DELETE" }),
+    uploadNoteAttachment: (id: string, file: File, options: NoteRequestOptions) => {
+      const query = new URLSearchParams({ name: file.name, mimeType: file.type || "application/octet-stream" });
+      const init = noteRequest(options);
+      const headers = new Headers(init.headers);
+      headers.set("content-type", "application/octet-stream");
+      return request<NoteAttachment>(`${notesUrl(options, id)}/attachments?${query}`, { ...init, contentTransfer: true, requestPriority: options.requestPriority ?? "resource", method: "POST", headers, body: file });
+    },
+    getNoteAttachment: (id: string, attachmentId: string, options: NoteRequestOptions) =>
+      fetchBlob(`${notesUrl(options, id)}/attachments/${encodeURIComponent(attachmentId)}`, options, options.contextRevision, true),
     // Generic Host-engine plugin data in the active Library (library-data).
     listPluginRecords: (pluginId: string, params: ListPluginRecordsParams, options: CoreRequestOptions = {}) => {
       const search = new URLSearchParams({ collection: params.collection });
@@ -1202,7 +1294,8 @@ function fetchWithTimeout<T>(
   url: string,
   init: RequestInit,
   callerSignal: AbortSignal | null | undefined,
-  consumeResponse: (response: Response) => Promise<T>
+  consumeResponse: (response: Response) => Promise<T>,
+  contentTransfer = false
 ): Promise<T> {
   const requestController = new AbortController();
   const forwardCallerAbort = () => {
@@ -1213,7 +1306,10 @@ function fetchWithTimeout<T>(
   } else {
     callerSignal?.addEventListener("abort", forwardCallerAbort, { once: true });
   }
-  const timer = setTimeout(() => {
+  // Authored files and source can legitimately take longer than the metadata
+  // deadline to stage, verify and transfer. They use resource slots by default
+  // and still observe the caller's cancellation and the underlying disconnect.
+  const timer = contentTransfer ? undefined : setTimeout(() => {
     requestController.abort(new Error("Core request timed out"));
   }, CORE_REQUEST_TIMEOUT_MS);
   let rejectOnAbort: (() => void) | null = null;
@@ -1232,7 +1328,7 @@ function fetchWithTimeout<T>(
     return consumeResponse(response);
   })();
   return Promise.race([fetchRequest, abortRequest]).finally(() => {
-    clearTimeout(timer);
+    if (timer !== undefined) clearTimeout(timer);
     callerSignal?.removeEventListener("abort", forwardCallerAbort);
     if (rejectOnAbort) {
       requestController.signal.removeEventListener("abort", rejectOnAbort);

@@ -11,7 +11,8 @@
     "packages/notification-contract",
     "packages/plugin-sdk",
     "bundled-plugins/com.mangoo.image-viewer",
-    "bundled-plugins/com.mangoo.todo-notes"
+    "bundled-plugins/com.mangoo.todo-notes",
+    "bundled-plugins/com.mangoo.notebook"
   ],
   "scripts": {
     "dev": "node tools/dev/run-dev.mjs",

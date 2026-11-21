@@ -8,6 +8,70 @@ export interface PlaybackSession {
   renewAfterMs: number;
 }
 
+export type NoteFormat = "markdown" | "html" | "document";
+export type NoteStyles = Record<string, unknown>;
+
+export interface NotebookFolderInput {
+  name: string;
+  parentId: string | null;
+}
+
+export interface NotebookFolder extends NotebookFolderInput {
+  id: string;
+  revision: number;
+}
+
+export interface NotebookTree {
+  folders: NotebookFolder[];
+  noteParents: Record<string, string>;
+}
+
+export interface UpdateNotebookFolderRequest extends NotebookFolderInput {
+  expectedRevision: number;
+}
+
+export interface MoveNotebookNoteRequest {
+  parentId: string | null;
+  expectedParentId: string | null;
+}
+
+export interface CreateNoteRequest extends NoteInput {
+  folderId?: string | null;
+}
+
+export interface NoteInput {
+  title: string;
+  markdown: string;
+  styles: NoteStyles;
+  format?: NoteFormat;
+}
+
+export interface UpdateNoteRequest extends NoteInput {
+  expectedRevision: number;
+}
+
+export interface NoteSummary {
+  id: string;
+  title: string;
+  format: NoteFormat;
+  revision: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface NoteAttachment {
+  id: string;
+  name: string;
+  mimeType: string;
+  size: number;
+}
+
+export interface NotebookNote extends NoteSummary {
+  markdown: string;
+  styles: NoteStyles;
+  attachments: NoteAttachment[];
+}
+
 export interface Page<T> {
   items: T[];
   nextCursor: string | null;
@@ -47,7 +111,10 @@ export interface LibraryContentRootInput {
   createIfMissing: boolean;
 }
 
+export type LibraryKind = "media" | "notes";
+
 export interface LibrarySummary {
+  kind: LibraryKind;
   libraryUuid: string;
   rootUuid: string;
   name: string;
@@ -73,6 +140,7 @@ export interface ActiveLibraryResponse {
 }
 
 export interface LibraryPreflightRequest {
+  kind?: LibraryKind;
   name: string;
   databasePath: string;
   contentRoots: LibraryContentRootInput[];
@@ -90,6 +158,7 @@ export interface LibraryPreflightResponse {
 }
 
 export interface CreateLibraryRequest {
+  kind?: LibraryKind;
   name: string;
   databasePath: string;
   contentRoots: LibraryContentRootInput[];
@@ -200,7 +269,7 @@ export interface SyncUnbindCommitRequest { operationUuid: string; planUuid: stri
 export interface SyncReconnectPreflightRequest { accountUuid: string; remoteLibraryUuid: string; }
 export interface SyncReconnectPlan { planUuid: string; libraryUuid: string; remoteLibraryUuid: string; originIdentity?: string | null; localDivergenceCount: number; remoteDivergenceCount: number; remoteExists: boolean; remoteCompatible: boolean; sameRemoteIdentity: boolean; originRemoteWatermark: number; baseRemoteObjectCount: number; remoteObjectCount: number; remoteDescriptorSha256?: string | null; remoteBindingEpoch?: string | null; remoteAdvanced: boolean; mergeAllowed: boolean; publishNewAllowed: boolean; }
 export interface SyncReconnectCommitRequest { operationUuid: string; planUuid: string; choice: "merge-local-fork" | "publish-new-remote"; }
-export interface RemoteLibrarySummary { accountUuid: string; libraryUuid: string; name: string; icon: string | null; mediaCount: number | null; logicalBytes: number | null; lastSyncedAt: number | null; descriptorSize: number; updatedAt: number; compatible: boolean; boundLocally: boolean; errorCode: string | null; }
+export interface RemoteLibrarySummary { kind: LibraryKind; accountUuid: string; libraryUuid: string; name: string; icon: string | null; mediaCount: number | null; logicalBytes: number | null; lastSyncedAt: number | null; descriptorSize: number; updatedAt: number; compatible: boolean; boundLocally: boolean; errorCode: string | null; }
 export interface RemoteLibraryListResponse { items: RemoteLibrarySummary[]; nextCursor: string | null; totalCount?: number; }
 export interface SyncRestoreLegacyItem { restoreMode?: "legacy-library"; accountUuid: string; libraryUuid: string; name: string; placementBase: string; }
 export interface SyncRestoreRootChoice { rootUuid: string; expectedLogicalRevision: number; expectedMaterializationFingerprint: string; selected: boolean; targetPath?: string; }
@@ -660,7 +729,7 @@ export interface ListFileOperationsParams {
   cursor?: string;
 }
 
-export type PluginCapability = "sync-provider.v1" | "file-decoder.v1" | "image-viewer.v1" | "todo-notes.v1";
+export type PluginCapability = "sync-provider.v1" | "file-decoder.v1" | "image-viewer.v1" | "todo-notes.v1" | "notebook.v1";
 export type PluginRuntimeState =
   | "disabled"
   | "stopping"

@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, test } from "node:test";
+import { relativeLuminance } from "../src/design/themeColors.ts";
 
 import {
   DEFAULT_INTERFACE_STYLE,
+  INTERFACE_COLOR_ROLES,
   INTERFACE_STYLE_LIMITS,
   interfaceStyleToCssVariables,
   normalizeInterfaceStyle
@@ -13,6 +15,46 @@ const paneVariables = [
   "--secondary-window-pane-light",
   "--secondary-window-pane-end"
 ] as const;
+
+test("legacy settings inherit the default accent and an invalid choice cannot enter CSS", () => {
+  assert.equal(normalizeInterfaceStyle({ sideBlur: 0 }).accentColor, DEFAULT_INTERFACE_STYLE.accentColor);
+  assert.equal(normalizeInterfaceStyle({ accentColor: "var(--unknown)" }).accentColor, DEFAULT_INTERFACE_STYLE.accentColor);
+  assert.equal(normalizeInterfaceStyle({ accentColor: " #BA55FF " }).accentColor, "#ba55ff");
+});
+
+test("legacy and partial palettes preserve valid role colors and default each missing or invalid role", () => {
+  const defaults = DEFAULT_INTERFACE_STYLE.roleColors;
+  assert.deepEqual(normalizeInterfaceStyle({ sideBlur: 0 }).roleColors, defaults);
+  const partial = normalizeInterfaceStyle({
+    roleColors: { favorite: " #BA55FF ", danger: "var(--unknown)", warning: 42, unknown: "#ffffff" }
+  });
+  assert.deepEqual(partial.roleColors, { ...defaults, favorite: "#ba55ff" });
+  assert.deepEqual(normalizeInterfaceStyle(JSON.parse(JSON.stringify(partial))), partial);
+  assert.deepEqual(normalizeInterfaceStyle(DEFAULT_INTERFACE_STYLE).roleColors, defaults);
+});
+
+test("each role updates only its own CSS token and keeps a dark choice readable", () => {
+  const original = interfaceStyleToCssVariables(DEFAULT_INTERFACE_STYLE);
+  for (const { role, token } of INTERFACE_COLOR_ROLES) {
+    const style = normalizeInterfaceStyle({ roleColors: { [role]: "#000000" } });
+    const tokens = interfaceStyleToCssVariables(style);
+    const rgb = [1, 3, 5].map(i => Number.parseInt(tokens[token].slice(i, i + 2), 16));
+    assert.equal(style.roleColors[role], "#000000");
+    assert.ok(relativeLuminance(rgb) >= 0.315);
+    assert.deepEqual(Object.keys(original).filter(key => original[key] !== tokens[key]), [token]);
+  }
+});
+
+test("selected accents retain their exact fill and readable text at both brightness extremes", () => {
+  for (const color of ["#000000", "#ffffff", "#0000ff", "#777777", "#ff4b98", "#97dbe2"]) {
+    const tokens = interfaceStyleToCssVariables({ ...DEFAULT_INTERFACE_STYLE, accentColor: color });
+    const fillLuminance = relativeLuminance([1, 3, 5].map(i => Number.parseInt(color.slice(i, i + 2), 16)));
+    const contrast = tokens["--on-accent"] === "#ffffff" ? 1.05 / (fillLuminance + 0.05) : (fillLuminance + 0.05) / 0.05;
+    assert.equal(tokens["--accent-fill"], color);
+    assert.ok(contrast >= 4.5);
+    assert.ok(relativeLuminance(tokens["--accent-rgb"].split(" ").map(Number)) >= 0.315);
+  }
+});
 
 function rgbChannels(color: string) {
   return color.slice(0, color.indexOf(" / "));

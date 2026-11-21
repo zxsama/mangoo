@@ -6,6 +6,7 @@ import {
   OverlayMenuList
 } from "../../design/overlays";
 import { LiquidGlassButton } from "../../design/liquid-glass";
+import { titlebarIcon } from "../../design/tokens";
 
 export type SortOption =
   | "mtime_desc"
@@ -69,7 +70,7 @@ export function SortMenu({
         tone="control"
         type="button"
       >
-        <ArrowDownUp aria-hidden="true" size={14} />
+        <ArrowDownUp {...titlebarIcon.sort} />
         {iconOnly ? null : <span>{selectedLabel}</span>}
       </LiquidGlassButton>
 

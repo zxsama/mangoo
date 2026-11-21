@@ -35,7 +35,7 @@ export function TagChip({ tag, onRemove, onClick, active = false, size = "md" }:
           type="button"
           aria-pressed={active}
         >
-          {tag.name}
+          <span data-button-content>{tag.name}</span>
         </button>
       ) : (
         <span className="tag-chip-label">{tag.name}</span>

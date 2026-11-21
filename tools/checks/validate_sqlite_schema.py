@@ -29,6 +29,7 @@ HOST_MIGRATIONS = [
     ROOT / "crates" / "core" / "host_migrations" / "0021_library_registration_visibility.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0022_separated_library_storage.sql",
     ROOT / "crates" / "core" / "host_migrations" / "0023_host_plugin_records.sql",
+    ROOT / "crates" / "core" / "host_migrations" / "0024_notebook_libraries.sql",
 ]
 MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0001_initial.sql",
@@ -70,6 +71,8 @@ MIGRATIONS = [
     ROOT / "crates" / "core" / "migrations" / "0038_folder_appearance.sql",
     ROOT / "crates" / "core" / "migrations" / "0039_directory_preferences.sql",
     ROOT / "crates" / "core" / "migrations" / "0040_plugin_records.sql",
+    ROOT / "crates" / "core" / "migrations" / "0041_notebook_search.sql",
+    ROOT / "crates" / "core" / "migrations" / "0042_notebook_search_parts.sql",
 ]
 
 TASK_PROGRESS_COLUMNS = {
@@ -86,6 +89,9 @@ TASK_PROGRESS_COLUMNS = {
 REQUIRED_TABLES = {
     "schema_migrations",
     "plugin_records",
+    "notebook_fts",
+    "notebook_search_pending",
+    "notebook_search_parts",
     "plugin_record_revisions",
     "directory_sort_rules",
     "roots",
@@ -164,6 +170,7 @@ REQUIRED_HOST_SYNC_ROOT_TABLES = {
 }
 
 REQUIRED_INDEXES = {
+    "idx_notebook_search_parts_record",
     "idx_plugin_records_owner_collection",
     "idx_plugin_records_owner_revision",
     "idx_plugin_records_uncaptured",
@@ -1315,7 +1322,7 @@ def verify_host_sync_root_binding_contract() -> None:
         for table in ("host_plugin_records", "host_plugin_record_revisions", "host_plugin_mirror_state"):
             if table not in host_tables:
                 fail(f"host migrations missing {table}")
-        if conn.execute("SELECT schema_version FROM host_meta WHERE singleton=1").fetchone()[0] != 23:
+        if conn.execute("SELECT schema_version FROM host_meta WHERE singleton=1").fetchone()[0] != 24:
             fail("managed-root orchestration migrations did not update schema_version")
         expected_host_tables = {
             "library_list_visibility",
@@ -1772,7 +1779,12 @@ def main() -> None:
         meta = host_conn.execute(
             "SELECT schema_version, active_library_uuid, context_revision, sync_scheduler_state FROM host_meta WHERE singleton = 1"
         ).fetchone()
-        if meta != (23, None, 0, "stopped"):
+        for table in ("libraries", "library_open_journal", "library_creation_journal", "provider_remote_libraries", "sync_restore_plans"):
+            columns = {column[1]: column for column in host_conn.execute(f"PRAGMA table_info({table})")}
+            kind = columns.get("kind")
+            if not kind or not kind[3] or kind[4] != "'media'":
+                fail(f"{table}.kind must keep existing media libraries readable")
+        if meta != (24, None, 0, "stopped"):
             fail(f"unexpected Host Registry metadata seed: {meta}")
         auth_flow_columns = {
             row[1]

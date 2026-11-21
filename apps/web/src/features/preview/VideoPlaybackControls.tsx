@@ -1,6 +1,8 @@
 import { Pause, Play, Volume2, VolumeX } from "../../design/icons";
+import { ParameterSlider } from "../../design/ParameterSlider";
 import { LiquidGlassButton } from "../../design/liquid-glass";
 import {
+  EMPTY_VIDEO_PLAYBACK_SNAPSHOT,
   formatMediaTime,
   playbackProgress,
   type VideoPlaybackSnapshot
@@ -74,14 +76,15 @@ export function VideoPlaybackControls({
         )}
       </LiquidGlassButton>
       <label className="video-volume-range-control" data-pointer-glow="off">
-        <input
+        <ParameterSlider
           aria-label="Video volume"
           disabled={disabled}
           max="1"
           min="0"
-          onChange={(event) => onVolumeChange(Number(event.currentTarget.value))}
+          onChange={onVolumeChange}
+          resetLabel={`${EMPTY_VIDEO_PLAYBACK_SNAPSHOT.volume * 100}%`}
+          resetValue={EMPTY_VIDEO_PLAYBACK_SNAPSHOT.volume}
           step="0.01"
-          type="range"
           value={state.volume}
         />
       </label>

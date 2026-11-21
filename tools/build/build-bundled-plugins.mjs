@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { assertNoLinks, currentPlatform, DEFAULT_PLUGIN_IDS, FAKE_PLUGIN_ID, HOST_ENGINE_PLUGIN_IDS, PPM_PLUGIN_ID, parsePluginArgs, renderTrust, sha256, stageArtifacts, validateArtifact, validateSelection } from "./plugin-artifacts.mjs";
+import { assertNoLinks, currentPlatform, DEFAULT_PLUGIN_IDS, FAKE_PLUGIN_ID, HOST_ENGINE_PLUGIN_IDS, PPM_PLUGIN_ID, parsePluginArgs, sha256, stageArtifacts, validateArtifact, validateSelection } from "./plugin-artifacts.mjs";
 
 const root = process.cwd();
 const options = parsePluginArgs(process.argv.slice(2));
@@ -46,9 +46,6 @@ try {
   assertNoLinks(scratch);
   fs.rmSync(scratch, { recursive: true, force: true });
 }
-const generatedTrustPath = path.join(root, "crates", "core", "src", "plugins", "runtime", "generated_trust.rs");
-const generatedTrust = renderTrust(inventory.plugins);
-if (!fs.existsSync(generatedTrustPath) || fs.readFileSync(generatedTrustPath, "utf8") !== generatedTrust) fs.writeFileSync(generatedTrustPath, generatedTrust);
 for (const plugin of inventory.plugins) console.log(`[bundled-plugin] ${plugin.id} ${plugin.version} ${plugin.platform} ${plugin.engine === "host" ? "host-engine" : plugin.sha256}`);
 if (options.release) {
   execFileSync("cargo", ["build", "--release", "-p", "mangoo-core"], { cwd: root, stdio: "inherit", shell: false, windowsHide: true });

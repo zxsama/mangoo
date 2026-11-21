@@ -1,7 +1,8 @@
-import { Maximize2, Minimize2, Minus, X } from "../../design/icons";
+import { Copy, Minus, Square, X } from "../../design/icons";
 import { useEffect, useState } from "react";
 import { getWindowControls } from "../../core/desktop";
 import { LiquidGlassButton } from "../../design/liquid-glass";
+import { titlebarIcon } from "../../design/tokens";
 
 /**
  * Frameless-window controls. Renders nothing when the desktop bridge does
@@ -57,7 +58,7 @@ export function WindowChrome() {
         tone="control"
         type="button"
       >
-        <Minus size={14} />
+        <Minus aria-hidden="true" size={14} />
       </LiquidGlassButton>
       <LiquidGlassButton
         aria-label={isMaximized ? "还原" : "最大化"}
@@ -68,7 +69,7 @@ export function WindowChrome() {
         tone="control"
         type="button"
       >
-        {isMaximized ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+        {isMaximized ? <Copy {...titlebarIcon.restore} /> : <Square {...titlebarIcon.maximize} />}
       </LiquidGlassButton>
       <LiquidGlassButton
         aria-label="关闭"
@@ -79,7 +80,7 @@ export function WindowChrome() {
         tone="danger"
         type="button"
       >
-        <X size={14} />
+        <X {...titlebarIcon.close} />
       </LiquidGlassButton>
     </div>
   );

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type MouseEvent as ReactMouseEvent } from "react";
 import {
   AnchoredOverlay,
+  DisclosureButton,
   LiquidGlassLayer,
   LiquidGlassSurface,
   ModalSurface,
@@ -578,9 +579,9 @@ export function TodoNotesWindow() {
         <div className="overlay-menu-separator" role="separator" />
         <div aria-label="日期" className="todo-menu-row" role="group">
           <icons.Calendar aria-hidden="true" className="todo-menu-row-icon" size={14} />
-          <button className="todo-menu-chip" data-selected={item.dueDate === today ? "true" : "false"} onClick={() => { store.updateItem(item.id, { dueDate: today }); closeMenu(); }} title={hint("dueToday") ? `今天（${hint("dueToday")}）` : "今天"} type="button">今天</button>
-          <button className="todo-menu-chip" data-selected={item.dueDate === addDays(today, 1) ? "true" : "false"} onClick={() => { store.updateItem(item.id, { dueDate: addDays(today, 1) }); closeMenu(); }} title={hint("dueTomorrow") ? `明天（${hint("dueTomorrow")}）` : "明天"} type="button">明天</button>
-          <button className="todo-menu-chip" onClick={() => { store.updateItem(item.id, { dueDate: addDays(today, 7) }); closeMenu(); }} type="button">下周</button>
+          <button className="todo-menu-chip" data-selected={item.dueDate === today ? "true" : "false"} onClick={() => { store.updateItem(item.id, { dueDate: today }); closeMenu(); }} title={hint("dueToday") ? `今天（${hint("dueToday")}）` : "今天"} type="button"><span data-button-content>今天</span></button>
+          <button className="todo-menu-chip" data-selected={item.dueDate === addDays(today, 1) ? "true" : "false"} onClick={() => { store.updateItem(item.id, { dueDate: addDays(today, 1) }); closeMenu(); }} title={hint("dueTomorrow") ? `明天（${hint("dueTomorrow")}）` : "明天"} type="button"><span data-button-content>明天</span></button>
+          <button className="todo-menu-chip" onClick={() => { store.updateItem(item.id, { dueDate: addDays(today, 7) }); closeMenu(); }} type="button"><span data-button-content>下周</span></button>
           {item.dueDate ? <button aria-label="清除日期" className="todo-menu-chip" onClick={() => { store.updateItem(item.id, { dueDate: null, dueTime: null, recurrence: null }); closeMenu(); }} title="清除日期" type="button"><icons.X aria-hidden="true" size={12} /></button> : null}
         </div>
         <div aria-label="优先级" className="todo-menu-row" role="radiogroup">
@@ -591,8 +592,8 @@ export function TodoNotesWindow() {
                 const key = hint((["priorityNone", "priorityLow", "priorityMedium", "priorityHigh"] as const)[priority]);
                 return key ? `${name}（${key}）` : name;
               })()} type="button">
-              <span className="todo-flag" data-priority={priority}><icons.Flag aria-hidden="true" size={13} weight={priority ? "fill" : "regular"} /></span>
-              {priority ? PRIORITY_LABELS[priority] : null}
+              <span data-button-content className="todo-flag" data-priority={priority}><icons.Flag aria-hidden="true" size={13} weight={priority ? "fill" : "regular"} /></span>
+              {priority ? <span data-button-content>{PRIORITY_LABELS[priority]}</span> : null}
             </button>
           ))}
         </div>
@@ -708,7 +709,7 @@ export function TodoNotesWindow() {
       return (
         <EmptyState icon={<icons.AlertTriangle size={24} weight="light" />} title="无法读取便笺">
           {snapshot.error}
-          <button className="todo-button" onClick={() => void store.load()} type="button">重试</button>
+          <button className="todo-button" onClick={() => void store.load()} type="button"><span data-button-content>重试</span></button>
         </EmptyState>
       );
     }
@@ -732,10 +733,8 @@ export function TodoNotesWindow() {
         <section className="todo-group" key={group.key}>
           {group.title ? (
             group.collapsible ? (
-              <button className="todo-group-title" data-pointer-glow="off" onClick={() => setPreferences({ showCompleted: !preferences.showCompleted })} type="button">
-                {hidden ? <icons.ChevronRight aria-hidden="true" size={12} /> : <icons.ChevronDown aria-hidden="true" size={12} />}
-                {group.title}
-              </button>
+              <DisclosureButton aria-expanded={!hidden} className="todo-group-title" label={group.title}
+                onClick={() => setPreferences({ showCompleted: !preferences.showCompleted })} />
             ) : (
               <div className="todo-group-title" data-tone={group.tone}>{group.title}</div>
             )
@@ -820,7 +819,7 @@ export function TodoNotesWindow() {
                 title="所有视图与清单"
                 type="button"
               >
-                <span className="todo-view-name">{viewTitle(view, lists)}</span>
+                <span data-button-content className="todo-view-name">{viewTitle(view, lists)}</span>
                 <icons.ChevronDown aria-hidden="true" size={12} />
               </button>
               <div className="todo-header-actions">
@@ -910,8 +909,8 @@ export function TodoNotesWindow() {
           <nav aria-label="视图" className="todo-chips" ref={chipsRef}>
             {CHIP_VIEWS.map((smart) => (
               <button aria-current={view === smart ? "page" : undefined} className="todo-view-chip" data-selected={view === smart ? "true" : "false"} data-view={smart} key={smart} onClick={() => selectView(smart)} type="button">
-                {smart === "all" ? "全部" : SMART_VIEW_LABELS[smart]}
-                {counts[smart] ? <span className="todo-chip-count">{counts[smart]}</span> : null}
+                <span data-button-content>{smart === "all" ? "全部" : SMART_VIEW_LABELS[smart]}</span>
+                {counts[smart] ? <span data-button-content className="todo-chip-count">{counts[smart]}</span> : null}
               </button>
             ))}
             {lists.length ? <span aria-hidden="true" className="todo-chips-divider" /> : null}
@@ -940,8 +939,8 @@ export function TodoNotesWindow() {
                 title="双击编辑 · 右键管理 · 可把便笺拖到这里"
                 type="button"
               >
-                <ColorDot color={list.color} />
-                {list.name}
+                <ColorDot buttonContent color={list.color} />
+                <span data-button-content>{list.name}</span>
               </button>
             ))}
 
@@ -963,7 +962,7 @@ export function TodoNotesWindow() {
             <span>{notice.message}</span>
             {notice.action ? (
               <button className="todo-link-button" onClick={() => { notice.action?.run(); setNotices((current) => current.filter((entry) => entry.id !== notice.id)); }} type="button">
-                {notice.action.label}
+                <span data-button-content>{notice.action.label}</span>
               </button>
             ) : null}
           </div>
@@ -1019,8 +1018,8 @@ export function TodoNotesWindow() {
                 ))}
               </div>
               <div className="todo-dialog-actions">
-                <button className="todo-button" onClick={() => setEditingList(null)} type="button">取消</button>
-                <button className="todo-button todo-button-primary" disabled={!editingList.name.trim()} type="submit">{editingList.id ? "保存" : "创建"}</button>
+                <button className="todo-button" onClick={() => setEditingList(null)} type="button"><span data-button-content>取消</span></button>
+                <button className="todo-button todo-button-primary" disabled={!editingList.name.trim()} type="submit"><span data-button-content>{editingList.id ? "保存" : "创建"}</span></button>
               </div>
             </form>
           ) : null}

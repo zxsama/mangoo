@@ -1192,6 +1192,15 @@ async function createWindow(): Promise<void> {
     }
   });
   const window = mainWindow;
+  window.webContents.on("will-frame-navigate", (event) => {
+    // Notebook pages may run their own inline scripts in an opaque iframe.
+    // Keep user-authored documents inside the local preview on navigation.
+    const fromLocalPreview = event.frame?.url.startsWith("about:srcdoc") ||
+      event.frame?.name === "mangoo-notebook-preview";
+    if (!event.isMainFrame && fromLocalPreview && event.url !== "about:srcdoc" && event.url !== "about:blank") {
+      event.preventDefault();
+    }
+  });
   installVisualFixtureLifecycle(window);
   const releaseIpcTargetLifecycle = notificationIpcTargetLifecycle.track(window.webContents);
   applyWindowMaterial(window);

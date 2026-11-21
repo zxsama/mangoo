@@ -161,7 +161,7 @@ describe("Plugin auth presentation", () => {
     assert.doesNotMatch(card, /LiquidGlassSurface|aria-pressed/);
     assert.doesNotMatch(card, /plugin-card-error|plugin-toggle-label/);
     assert.match(detail, /<details className="plugin-disclosure plugin-technical-details">/);
-    assert.match(detail, /<summary[^>]*data-pointer-glow="off"[\s\S]*plugin-disclosure-chevron[\s\S]*plugin-disclosure-label">技术信息/);
+    assert.match(detail, /<DisclosureSummary label="技术信息"\s*\/>/);
     assert.match(detail, /plugin-detail-title">\{plugin\.name\}/);
     assert.match(detail, /plugin-detail-enable-row/);
     assert.match(detail, /aria-label=\{toggleLabel\}/);

@@ -32,9 +32,9 @@ export function Checkbox({ checked, onToggle, label, priority = 0, size = "norma
       title={checked ? "标记为未完成" : "标记为完成"}
       type="button"
     >
-      <svg aria-hidden="true" className="todo-check-svg" viewBox="0 0 20 20">
-        <circle className="todo-check-ring" cx="10" cy="10" r="8.6" />
-        {checked ? <path className="todo-check-mark" d="M6.1 10.4 8.7 12.9 13.9 7.3" /> : null}
+      <svg data-button-motion="static" aria-hidden="true" className="todo-check-svg" viewBox="0 0 20 20">
+        <circle className="todo-check-ring" cx="10" cy="10" r="8.2" />
+        {checked ? <path data-button-content className="todo-check-mark" d="M6.5 10.4 8.8 12.5 13.5 7.7" /> : null}
       </svg>
     </button>
   );
@@ -73,6 +73,6 @@ export function EmptyState({ icon, title, children }: { icon: ReactNode; title: 
 }
 
 /** A small colored dot (list color). */
-export function ColorDot({ color }: { color: string }) {
-  return <span aria-hidden="true" className="todo-dot" style={{ background: color }} />;
+export function ColorDot({ color, buttonContent }: { color: string; buttonContent?: boolean }) {
+  return <span data-button-content={buttonContent || undefined} aria-hidden="true" className="todo-dot" style={{ background: color }} />;
 }

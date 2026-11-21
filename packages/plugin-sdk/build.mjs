@@ -17,8 +17,9 @@ for (let i = 0; i < css.length; i++) {
     const block = css.slice(start, i + 1); start = i + 1;
     const selector = block.slice(0, block.indexOf("{"));
     const clean = selector.replace(/\/\*[\s\S]*?\*\//g, "").trim();
-    if (/^(?::root|:where\(|@media\s*\(forced-colors:|html\b|body\b|button\b|input\b|select\b|textarea\b|\*|\.liquid-glass\b|\.glass-|\[data-interactive-pointer-target\b|\.mangoo-overlay-scrollbar)/.test(clean)) blocks.push(block);
+    if (/^(?::root|:where\(|@media\s*\(forced-colors:|html\b|body\b|button\b|input\b|select\b|textarea\b|\*|\.liquid-glass\b|\.glass-|\.section-disclosure\b|details\[open\] > \.section-disclosure\b|\[data-interactive-pointer-target\b|\.mangoo-overlay-scrollbar)/.test(clean)) blocks.push(block);
   }
 }
 blocks.push(await readFile(path.join(root, "../../apps/web/src/design/overlays/overlay.css"), "utf8"));
+blocks.push(await readFile(path.join(root, "../../apps/web/src/design/buttonIconArtwork.css"), "utf8"));
 await writeFile(path.join(root, "dist/design.css"), blocks.join("\n"));

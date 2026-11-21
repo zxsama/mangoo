@@ -621,10 +621,10 @@ function MoveTreeRow({
         }}
       >
         {expandable ? (
-          expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />
+          expanded ? <ChevronDown data-button-content size={14} /> : <ChevronRight data-button-content size={14} />
         ) : null}
       </span>
-      <span className="move-label">
+      <span data-button-content className="move-label">
         <Folder size={14} />
         <span>{label}</span>
       </span>
@@ -675,7 +675,7 @@ function MoveLoadMoreItem({
       type="button"
     >
       <span aria-hidden="true" className="move-disclosure" />
-      <span className="move-label">
+      <span data-button-content className="move-label">
         <span>{loading ? "Loading more…" : "Load more children"}</span>
       </span>
     </button>

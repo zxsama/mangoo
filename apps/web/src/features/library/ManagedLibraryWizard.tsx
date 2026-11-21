@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, type RefObject } from "react";
 import { canPickNativeFolder, createLibrary, getDesktopBridge, LibraryCreatedActivationError, pickNativeFolder, preflightLibrary } from "../../core/desktop";
 import { LiquidGlassButton } from "../../design/liquid-glass";
-import { ArrowRight, ChevronDown, FolderOpen, Loader2, Pencil, FolderPlus, X } from "../../design/icons";
+import { ArrowRight, FolderOpen, Loader2, Pencil, FolderPlus, X } from "../../design/icons";
+import { DisclosureButton } from "../../design/SectionDisclosure";
 import { ModalSurface, OverlayDialogActions, OverlayDialogBody, OverlayDialogHeader, OverlayField, OverlayInlineStatus } from "../../design/overlays";
 import { DEFAULT_LIBRARY_COLOR, DEFAULT_LIBRARY_ICON, LibraryGlyph } from "./libraryGlyph";
 
@@ -27,6 +28,9 @@ const preflightMessages: Record<string, string> = {
 type FormError = { field: "name" | "root" | "content" | "form"; rootIndex?: number | null; message: string };
 
 export interface ManagedLibraryWizardProps {
+  kind?: "media" | "notes";
+  onOpenPlugins?: () => void;
+  onChangeKind?: (kind: "media" | "notes") => void;
   firstRun?: boolean;
   onClose: () => void;
   onCreated: () => void;
@@ -36,7 +40,7 @@ export interface ManagedLibraryWizardProps {
   restoreFocusRef?: RefObject<HTMLElement | null>;
 }
 
-export function ManagedLibraryWizard({ firstRun = false, onClose, onCreated, onFailure, onOpenExisting, open, restoreFocusRef }: ManagedLibraryWizardProps) {
+export function ManagedLibraryWizard({ kind = "media", onOpenPlugins, onChangeKind, firstRun = false, onClose, onCreated, onFailure, onOpenExisting, open, restoreFocusRef }: ManagedLibraryWizardProps) {
   const [name, setName] = useState("");
   const [paths, setPaths] = useState(initialLibraryPathDraft);
   const [resolving, setResolving] = useState(false);
@@ -50,7 +54,7 @@ export function ManagedLibraryWizard({ firstRun = false, onClose, onCreated, onF
   const [databaseExpanded, setDatabaseExpanded] = useState(!resolver);
   const databasePath = paths.databasePath;
   const manualDatabase = paths.databaseSource === "manual" ? paths.databasePath : undefined;
-  const [icon, setIcon] = useState(DEFAULT_LIBRARY_ICON);
+  const [icon, setIcon] = useState(kind === "notes" ? "notebook" : DEFAULT_LIBRARY_ICON);
   const [color, setColor] = useState(DEFAULT_LIBRARY_COLOR);
   const [operation, setOperation] = useState<"picking" | "creating" | null>(null);
   const [error, setError] = useState<FormError | null>(null);
@@ -62,7 +66,7 @@ export function ManagedLibraryWizard({ firstRun = false, onClose, onCreated, onF
   const pending = useRef(false);
   const generation = useRef(0);
   const busy = operation !== null;
-  const ready = Boolean(name.trim() && databasePath && !resolving && !pathError && paths.roots.length && paths.roots.every((root) => root.path.trim()));
+  const ready = Boolean(name.trim() && databasePath && !resolving && !pathError && (kind === "notes" || (paths.roots.length && paths.roots.every((root) => root.path.trim()))));
   const appearanceOpen = open && !busy && appearanceAnchor !== null;
   const status = operation === "picking" ? "正在选择存储位置…"
     : operation === "creating" ? "正在检查位置并创建资源库…"
@@ -158,15 +162,16 @@ export function ManagedLibraryWizard({ firstRun = false, onClose, onCreated, onF
     if (!name.trim()) { setError({ field: "name", message: "请输入资源库名称" }); return; }
     if (!databasePath || pathError) { setError({ field: "root", message: pathError ?? "请输入数据库目录" }); return; }
     if (resolving) return;
-    if (!paths.roots.length || paths.roots.some((root) => !root.path.trim())) { setError({ field: "content", message: "请至少填写一个有效的文件夹" }); return; }
-    const snapshot = { name: name.trim(), databasePath, contentRoots: libraryContentInputs(paths), icon, color };
+    if (kind === "media" && (!paths.roots.length || paths.roots.some((root) => !root.path.trim()))) { setError({ field: "content", message: "请至少填写一个有效的文件夹" }); return; }
+    const snapshot = { name: name.trim(), databasePath, contentRoots: kind === "notes" ? [] : libraryContentInputs(paths), icon, color };
     pending.current = true;
     setAppearanceAnchor(null);
     setOperation("creating");
     setError(null);
     const owner = generation.current;
     try {
-      const checked = await preflightLibrary({ name: snapshot.name, databasePath: snapshot.databasePath, contentRoots: snapshot.contentRoots });
+      const libraryKind = kind === "notes" ? { kind } : {};
+      const checked = await preflightLibrary({ ...libraryKind, name: snapshot.name, databasePath: snapshot.databasePath, contentRoots: snapshot.contentRoots });
       if (owner !== generation.current) return;
       if (!checked.ok) {
         const message = preflightMessages[checked.reason] ?? "无法使用此位置，请重新选择文件夹后再试。";
@@ -174,8 +179,8 @@ export function ManagedLibraryWizard({ firstRun = false, onClose, onCreated, onF
         onFailure(new Error(message));
         return;
       }
-      if (!checked.normalizedDatabasePath || !checked.normalizedContentRoots?.length || !checked.preflightToken) throw new Error("位置检查结果不完整，请重试。");
-      await createLibrary({ activate: true, color: snapshot.color, icon: snapshot.icon, initialMode: "local-only", databasePath: checked.normalizedDatabasePath, contentRoots: checked.normalizedContentRoots, name: snapshot.name, preflightToken: checked.preflightToken });
+      if (!checked.normalizedDatabasePath || (kind === "media" && !checked.normalizedContentRoots?.length) || !checked.preflightToken) throw new Error("位置检查结果不完整，请重试。");
+      await createLibrary({ ...libraryKind, activate: true, color: snapshot.color, icon: snapshot.icon, initialMode: "local-only", databasePath: checked.normalizedDatabasePath, contentRoots: checked.normalizedContentRoots ?? [], name: snapshot.name, preflightToken: checked.preflightToken });
       if (owner !== generation.current) return;
       onCreated();
       onClose();
@@ -195,9 +200,10 @@ export function ManagedLibraryWizard({ firstRun = false, onClose, onCreated, onF
   }
 
   return <ModalSurface ariaLabelledBy="managed-library-wizard-title" busy={busy} className="managed-library-wizard" id="managed-library-wizard" initialFocusRef={nameRef} onDismiss={() => { if (!busy) onClose(); }} open={open} restoreFocusRef={restoreFocusRef} role="dialog" rootId="managed-library">
-    <OverlayDialogHeader title={firstRun ? "创建第一个资源库" : "创建资源库"} titleId="managed-library-wizard-title" />
+    <OverlayDialogHeader title={kind === "notes" ? "创建笔记库" : firstRun ? "创建第一个资源库" : "创建资源库"} titleId="managed-library-wizard-title" />
     <form className="managed-library-wizard-form" onSubmit={(event) => { event.preventDefault(); void submit(); }}>
     <OverlayDialogBody className="managed-library-wizard-body" data-overlay-scroll-container>
+      {onChangeKind && <label>资源库类型 <select value={kind} disabled={busy} onChange={event => onChangeKind(event.target.value === "notes" ? "notes" : "media")}><option value="media">媒体库</option><option value="notes">笔记库</option></select></label>}
       <section className="managed-library-form-section">
         <div className="managed-library-identity" data-interactive-pointer-owner="true" data-pointer-glow={busy ? "off" : undefined}>
           <button aria-controls="managed-library-appearance" aria-expanded={appearanceOpen} aria-haspopup="dialog" aria-label="选择图标与颜色" className="managed-library-identity-preview" disabled={busy} onClick={(event) => setAppearanceAnchor(appearanceOpen ? null : event.currentTarget)} ref={appearanceTriggerRef} style={{ color }} title="选择图标与颜色" type="button"><LibraryGlyph color={color} icon={icon} size={26} /><Pencil aria-hidden="true" className="managed-library-identity-edit" size={11} /></button>
@@ -205,12 +211,12 @@ export function ManagedLibraryWizard({ firstRun = false, onClose, onCreated, onF
         </div>
         {error?.field === "name" ? <div className="overlay-field-error" id="managed-library-name-error" role="alert">{error.message}</div> : null}
       </section>
-      <section aria-labelledby="managed-library-content-label" className="managed-library-root-field" ref={contentRef}>
+      {kind === "media" && <section aria-labelledby="managed-library-content-label" className="managed-library-root-field" ref={contentRef}>
         <div className="managed-library-content-heading"><span className="managed-library-field-label" id="managed-library-content-label">{resolver ? "文件夹" : "文件夹（Core 主机）"}</span>
           <button aria-label="添加内容文件夹" className="managed-library-add-folder" disabled={busy} onClick={() => {
             if (nativePicker) void chooseRoot("add");
             else { const id = rootId.current++; setPaths((current) => ({ ...current, roots: [...current.roots, { id, path: "", source: "manual", createIfMissing: false }] })); }
-          }} type="button"><FolderPlus aria-hidden="true" size={16} />添加</button>
+          }} type="button"><FolderPlus aria-hidden="true" size={16} /><span data-button-content>添加</span></button>
         </div>
         {paths.roots.map((root, index) => <div className="managed-library-content-entry" data-root-index={index} key={root.id}>
           <div className="managed-library-path-row managed-library-content-row" data-interactive-pointer-owner="true" data-pointer-glow={busy ? "off" : undefined}>
@@ -228,13 +234,13 @@ export function ManagedLibraryWizard({ firstRun = false, onClose, onCreated, onF
           {error?.field === "content" && error.rootIndex === index ? <div id={`managed-library-content-error-${root.id}`}><OverlayInlineStatus tone="error">{error.message}</OverlayInlineStatus></div> : null}
         </div>)}
         {!paths.roots.length ? <OverlayInlineStatus tone="error">请至少添加一个文件夹。</OverlayInlineStatus> : error?.field === "content" && error.rootIndex == null ? <OverlayInlineStatus tone="error">{error.message}</OverlayInlineStatus> : null}
-      </section>
+      </section>}
       <section aria-labelledby="managed-library-location-label" className="managed-library-database-section" ref={rootRef}>
-        <button aria-controls="managed-library-database-editor" aria-expanded={databaseExpanded} className="managed-library-database-toggle" disabled={busy} onClick={() => setDatabaseExpanded((expanded) => !expanded)} title={databasePath || undefined} type="button">
-          <span id="managed-library-location-label">{resolver ? "数据库" : "数据库（Core 主机）"}</span>
+        <DisclosureButton aria-controls="managed-library-database-editor" aria-expanded={databaseExpanded} className="managed-library-database-toggle"
+          label={resolver ? "数据库" : "数据库（Core 主机）"} labelId="managed-library-location-label"
+          disabled={busy} onClick={() => setDatabaseExpanded((expanded) => !expanded)} title={databasePath || undefined}>
           {!databaseExpanded ? <span className="managed-library-database-summary" title={databasePath}>{databasePath}</span> : null}
-          <ChevronDown aria-hidden="true" className="managed-library-database-chevron" size={14} />
-        </button>
+        </DisclosureButton>
         <div className="managed-library-database-editor" hidden={!databaseExpanded} id="managed-library-database-editor">
           <div className="managed-library-path-row managed-library-database-row" data-interactive-pointer-owner="true" data-pointer-glow={busy ? "off" : undefined}>
             <OverlayField aria-invalid={error?.field === "root" || Boolean(pathError)} aria-describedby={error?.field === "root" || pathError ? "managed-library-database-error" : undefined} aria-labelledby="managed-library-location-label" autoComplete="off" disabled={busy} inputRef={databaseRef} onChange={(event) => changeDatabase(event.target.value)} placeholder={resolver ? "填写名称后自动生成" : "输入 Core 主机上的完整路径"} title={databasePath} value={databasePath} />
@@ -248,6 +254,7 @@ export function ManagedLibraryWizard({ firstRun = false, onClose, onCreated, onF
     <OverlayDialogActions className="managed-library-wizard-actions">
       <span className="managed-library-submit-status" data-quiet={!status} id="managed-library-submit-status" role="status">{status}</span>
       <div className="managed-library-action-buttons">
+      {firstRun && onOpenPlugins && !onChangeKind && <LiquidGlassButton disabled={busy} onClick={onOpenPlugins} type="button">管理插件…</LiquidGlassButton>}
       {firstRun && onOpenExisting ? <LiquidGlassButton disabled={busy} onClick={onOpenExisting} type="button">打开已有资源库…</LiquidGlassButton> : null}
       {!firstRun ? <LiquidGlassButton disabled={busy} onClick={onClose} type="button">取消</LiquidGlassButton> : null}
       <LiquidGlassButton aria-describedby="managed-library-submit-status" className="managed-library-create" disabled={busy || !ready} type="submit">{operation === "creating" ? <Loader2 aria-hidden="true" className="managed-library-spinner" size={16} /> : null}{operation === "creating" ? "正在创建…" : "创建并打开"}{!busy ? <ArrowRight aria-hidden="true" size={16} /> : null}</LiquidGlassButton>

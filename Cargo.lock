@@ -1578,6 +1578,8 @@ dependencies = [
  "axum-extra",
  "base64",
  "filetime",
+ "futures-util",
+ "http-body-util",
  "image",
  "libc",
  "notify",

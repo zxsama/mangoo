@@ -105,9 +105,9 @@ function DateEditor({ store, item, today }: EditorProps) {
   return (
     <div className="todo-pop-body">
       <div className="todo-pop-row">
-        <Choice onClick={() => setDue(today)} selected={item.dueDate === today}>今天</Choice>
-        <Choice onClick={() => setDue(addDays(today, 1))} selected={item.dueDate === addDays(today, 1)}>明天</Choice>
-        <Choice onClick={() => setDue(addDays(today, 7))} selected={item.dueDate === addDays(today, 7)}>下周</Choice>
+        <Choice onClick={() => setDue(today)} selected={item.dueDate === today}><span data-button-content>今天</span></Choice>
+        <Choice onClick={() => setDue(addDays(today, 1))} selected={item.dueDate === addDays(today, 1)}><span data-button-content>明天</span></Choice>
+        <Choice onClick={() => setDue(addDays(today, 7))} selected={item.dueDate === addDays(today, 7)}><span data-button-content>下周</span></Choice>
       </div>
       <div className="todo-pop-row">
         <input aria-label="日期" className="todo-input" onChange={(event) => setDue(event.target.value || null)} type="date" value={item.dueDate ?? ""} />
@@ -125,9 +125,9 @@ function DateEditor({ store, item, today }: EditorProps) {
         <>
           <div aria-label="提醒时间" className="todo-pop-row todo-pop-wrap" role="radiogroup">
             {REMINDER_OFFSETS.map((entry) => (
-              <Choice key={entry.minutes} onClick={() => setReminder(entry.minutes)} selected={!custom && offset === entry.minutes}>{entry.label}</Choice>
+              <Choice key={entry.minutes} onClick={() => setReminder(entry.minutes)} selected={!custom && offset === entry.minutes}><span data-button-content>{entry.label}</span></Choice>
             ))}
-            <Choice onClick={() => store.updateItem(item.id, { remindAt: item.remindAt ?? Date.now() + 3_600_000 })} selected={custom}>自定义</Choice>
+            <Choice onClick={() => store.updateItem(item.id, { remindAt: item.remindAt ?? Date.now() + 3_600_000 })} selected={custom}><span data-button-content>自定义</span></Choice>
           </div>
           {custom && item.remindAt !== null ? (
             <input aria-label="提醒时间" className="todo-input" onChange={(event) => event.target.value && store.updateItem(item.id, { remindAt: new Date(event.target.value).getTime() })} type="datetime-local" value={toLocalInput(item.remindAt)} />
@@ -137,7 +137,7 @@ function DateEditor({ store, item, today }: EditorProps) {
       {item.dueDate || reminderOn ? (
         <button className="todo-pop-clear" onClick={() => store.updateItem(item.id, { dueDate: null, dueTime: null, remindAt: null, recurrence: null })} type="button">
           <icons.X aria-hidden="true" size={12} />
-          清除日期和提醒
+          <span data-button-content>清除日期和提醒</span>
         </button>
       ) : null}
     </div>
@@ -158,7 +158,7 @@ function RepeatEditor({ store, item, today }: EditorProps) {
             }}
             selected={(item.recurrence?.freq ?? "") === freq}
           >
-            {label}
+            <span data-button-content>{label}</span>
           </Choice>
         ))}
       </div>
@@ -187,8 +187,8 @@ function PriorityEditor({ store, item, close }: EditorProps) {
       <div aria-label="优先级" className="todo-pop-row" role="radiogroup">
         {PRIORITIES.map((priority) => (
           <Choice key={priority} onClick={() => { store.updateItem(item.id, { priority: priority as Priority }); close(); }} selected={item.priority === priority} title={priority ? `${PRIORITY_LABELS[priority]}优先级` : "无优先级"}>
-            <span className="todo-flag" data-priority={priority}><icons.Flag aria-hidden="true" size={12} weight={priority ? "fill" : "regular"} /></span>
-            {priority ? PRIORITY_LABELS[priority] : "无"}
+            <span data-button-content className="todo-flag" data-priority={priority}><icons.Flag aria-hidden="true" size={12} weight={priority ? "fill" : "regular"} /></span>
+            <span data-button-content>{priority ? PRIORITY_LABELS[priority] : "无"}</span>
           </Choice>
         ))}
       </div>
@@ -239,7 +239,7 @@ function TagsEditor({ store, item }: EditorProps) {
       {suggestions.length ? (
         <div aria-label="已有标签" className="todo-pop-row todo-pop-wrap">
           {suggestions.map((tag) => (
-            <button className="todo-pill" key={tag} onClick={() => add(tag)} type="button">#{tag}</button>
+            <button className="todo-pill" key={tag} onClick={() => add(tag)} type="button"><span data-button-content>#{tag}</span></button>
           ))}
         </div>
       ) : null}

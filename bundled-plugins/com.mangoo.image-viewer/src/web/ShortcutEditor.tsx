@@ -107,7 +107,7 @@ export function ShortcutEditor({
             }}
             type="button"
           >
-            撤销
+            <span data-button-content>撤销</span>
           </button>
         ) : null}
       </p>
@@ -117,13 +117,13 @@ export function ShortcutEditor({
         return (
           <section className="iv-shortcut-group-block" key={group}>
             <h4 className="iv-shortcut-group-heading">{group}</h4>
-            <div className="iv-settings-rows">
+            <div className="iv-settings-rows settings-control-rows">
               {actions.map((action) => {
                 const chords = bindings[action.id];
                 const customized = isCustomized(overrides, action.id);
                 return (
                   <div className="iv-shortcut-edit-row" data-customized={customized ? "true" : "false"} data-empty={chords.length === 0 ? "true" : "false"} key={action.id}>
-                    <span className="iv-setting-title">{action.label}</span>
+                    <span className="iv-setting-title settings-control-label">{action.label}</span>
                     <span className="iv-shortcut-chords">
                       {chords.map((chord, index) => {
                         const active = recording?.action === action.id && recording.index === index;
@@ -138,7 +138,9 @@ export function ShortcutEditor({
                             onClick={() => setRecording(active ? null : { action: action.id, index })}
                             type="button"
                           >
-                            {active ? "按下快捷键…" : chordParts(chord).map((part, partIndex) => <kbd className="iv-keycap" key={partIndex}>{part}</kbd>)}
+                            {active ? <span data-button-content>按下快捷键…</span> : chordParts(chord).map((part, partIndex) => (
+                              <kbd className="iv-keycap" key={partIndex}><span data-button-content>{part}</span></kbd>
+                            ))}
                           </button>
                           </span>
                         );
@@ -154,7 +156,7 @@ export function ShortcutEditor({
                           title="添加快捷键"
                           type="button"
                         >
-                          {recording?.action === action.id && recording.index === null ? "按下快捷键…" : <icons.Plus aria-hidden="true" size={12} />}
+                          {recording?.action === action.id && recording.index === null ? <span data-button-content>按下快捷键…</span> : <icons.Plus aria-hidden="true" size={12} />}
                         </button>
                       ) : null}
 

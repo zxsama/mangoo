@@ -1,4 +1,4 @@
-import { icons } from "@mangoo/web/plugin-host";
+import { DisclosureSummary, icons, SettingsSection } from "@mangoo/web/plugin-host";
 
 import { AssociationControls } from "./AssociationControls.tsx";
 import { useViewerPreferences } from "./preferences.ts";
@@ -80,21 +80,12 @@ export function ImageViewerPluginPanel({ enabled }: { enabled: boolean; refreshK
   }
   return (
     <div className="plugin-detail-section iv-plugin-panel">
-      <section className="iv-settings-section">
-        <h3 className="iv-settings-section-title">
-          <icons.Settings aria-hidden="true" size={14} />
-          <span>系统</span>
-        </h3>
-        <div className="iv-settings-rows">
-          <AssociationControls />
-        </div>
-      </section>
+      <SettingsSection icon={<icons.Settings aria-hidden="true" size={14} />} id="system" title="系统">
+        <AssociationControls />
+      </SettingsSection>
       <ViewerSettingsForm onChange={setPreferences} preferences={preferences} showSystem={false} />
       <details className="iv-shortcuts">
-        <summary data-pointer-glow="off">
-          <icons.Keyboard aria-hidden="true" size={14} />
-          <span>键盘快捷键</span>
-        </summary>
+        <DisclosureSummary icon={<icons.Keyboard aria-hidden="true" size={14} />} label="键盘快捷键" />
         <ShortcutList />
       </details>
     </div>

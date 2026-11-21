@@ -24,7 +24,8 @@
     "test": "node --no-warnings --experimental-strip-types --test tests/*.test.mts"
   },
   "dependencies": {
-    "@mangoo/core-client": "*"
+    "@mangoo/core-client": "*",
+    "@tanstack/react-virtual": "3.13.24"
   },
   "devDependencies": {
     "typescript": "^5.6.0"

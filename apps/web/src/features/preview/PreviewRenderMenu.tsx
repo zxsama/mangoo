@@ -2,6 +2,7 @@ import { SlidersHorizontal } from "../../design/icons";
 import { useRef } from "react";
 
 import { LiquidGlassButton } from "../../design/liquid-glass";
+import { titlebarIcon } from "../../design/tokens";
 import { AnchoredOverlay, OverlayMenuItem, OverlayMenuList } from "../../design/overlays";
 
 import {
@@ -51,7 +52,7 @@ export function PreviewRenderMenu({
         tone="control"
         type="button"
       >
-        <SlidersHorizontal aria-hidden="true" size={15} />
+        <SlidersHorizontal {...titlebarIcon.filter} />
       </LiquidGlassButton>
 
       <AnchoredOverlay

@@ -196,6 +196,11 @@ pub fn preflight_plan(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryMarker {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::host_registry::LibraryKind::is_media"
+    )]
+    pub kind: crate::host_registry::LibraryKind,
     pub format_version: u32,
     pub library_uuid: String,
     pub root_uuid: String,
@@ -1626,7 +1631,7 @@ impl ExistingLibraryRoot {
         }
         let marker: LibraryMarker = serde_json::from_slice(&bytes)
             .map_err(|_| anyhow::anyhow!("invalid-library-marker"))?;
-        if marker.format_version != STORAGE_FORMAT_VERSION {
+        if marker.format_version != marker.kind.marker_version() {
             anyhow::bail!("unsupported-library-marker");
         }
         if marker.state != MarkerState::Committed {

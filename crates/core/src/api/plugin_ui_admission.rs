@@ -159,6 +159,9 @@ fn target_owned(
     {
         return Ok(false);
     }
+    if route.starts_with("/api/notebooks/") && expected.plugin_id != crate::db::notebook::PLUGIN {
+        return Ok(false);
+    }
     if let Some(id) = paths.get("account_uuid").or(body.account_uuid.as_ref()) {
         if !account_owned(id)? {
             return Ok(false);
@@ -284,7 +287,8 @@ pub(super) async fn admit_plugin_ui(
     } else {
         None
     };
-    let read_lease = if !is_write && (expected.is_some() || is_view) {
+    let is_notebook = route.starts_with("/api/notebooks/");
+    let read_lease = if !is_write && (expected.is_some() || is_view || is_notebook) {
         Some(gate.read_owned().await)
     } else {
         None

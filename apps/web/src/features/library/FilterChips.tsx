@@ -55,7 +55,7 @@ export function FilterChips({
             onClick={() => onSetKind(kind === k ? undefined : k)}
             type="button"
           >
-            {KIND_LABELS[k]}
+            <span data-button-content>{KIND_LABELS[k]}</span>
           </button>
         ))}
       </div>

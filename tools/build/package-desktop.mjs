@@ -5,9 +5,10 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { assertNoLinks, INVENTORY_FILE, readInventory, renderTrust } from "./plugin-artifacts.mjs";
+import { assertCoreTrust, assertNoLinks, INVENTORY_FILE, readInventory } from "./plugin-artifacts.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const releaseDir = path.resolve(root, process.env.CARGO_TARGET_DIR ?? "target", "release");
 const desktopDir = path.join(root, "apps", "desktop");
 const stageDir = path.join(root, ".data", "desktop-package-stage");
 const outputDir = path.join(root, ".data", "desktop-release");
@@ -28,12 +29,11 @@ function assertFile(filePath, label) {
 }
 
 assertFile(path.join(root, "apps", "web", "dist", "index.html"), "web build");
-assertFile(path.join(root, "target", "release", "mangoo-core.exe"), "release Core");
-assertFile(path.join(root, "target", "release", "mangoo_explorer_thumbnails.dll"), "Explorer thumbnail provider");
-const bundledRoot = path.join(root, "target", "release", "bundled-plugins");
+assertFile(path.join(releaseDir, "mangoo-core.exe"), "release Core");
+assertFile(path.join(releaseDir, "mangoo_explorer_thumbnails.dll"), "Explorer thumbnail provider");
+const bundledRoot = path.join(releaseDir, "bundled-plugins");
 const inventory = readInventory(bundledRoot);
-const generatedTrust = fs.readFileSync(path.join(root, "crates", "core", "src", "plugins", "runtime", "generated_trust.rs"), "utf8");
-if (generatedTrust !== renderTrust(inventory.plugins)) throw new Error("release inventory does not match Core compile-time trust input; rebuild release artifacts");
+assertCoreTrust(path.join(releaseDir, "mangoo-core.exe"), inventory);
 assertFile(iconIco, "Windows icon");
 assertFile(iconPng, "window icon");
 assertFile(path.join(electronDist, "electron.exe"), "local Electron distribution");
@@ -102,11 +102,11 @@ await buildElectron({
         to: "web"
       },
       {
-        from: path.join(root, "target", "release", "mangoo-core.exe"),
+        from: path.join(releaseDir, "mangoo-core.exe"),
         to: "core/mangoo-core.exe"
       },
       {
-        from: path.join(root, "target", "release", "mangoo_explorer_thumbnails.dll"),
+        from: path.join(releaseDir, "mangoo_explorer_thumbnails.dll"),
         to: "core/mangoo_explorer_thumbnails.dll"
       },
       {
@@ -145,4 +145,5 @@ for (const [relativePath, label] of [
 }
 const packagedInventory = readInventory(path.join(outputDir, "win-unpacked", "resources", "core", "bundled-plugins"));
 if (JSON.stringify(packagedInventory) !== JSON.stringify(inventory)) throw new Error("packaged plugin inventory differs from release build");
+assertCoreTrust(path.join(outputDir, "win-unpacked", "resources", "core", "mangoo-core.exe"), packagedInventory);
 console.log(`[desktop-package] ready: ${executable}`);
